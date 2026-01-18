@@ -1,0 +1,71 @@
+﻿use std::collections::HashMap;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use crate::db::database::Database;
+use crate::utils::timing::CommandTimer;
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct PendingQRequest {
+    pub user_id: i64,
+    pub username: String,
+    pub query: String,
+    pub original_query: String,
+    pub db_query_text: String,
+    pub language: String,
+    pub image_data_list: Vec<Vec<u8>>,
+    pub video_data: Option<Vec<u8>>,
+    pub video_mime_type: Option<String>,
+    pub audio_data: Option<Vec<u8>>,
+    pub audio_mime_type: Option<String>,
+    pub youtube_urls: Vec<String>,
+    pub telegraph_contents: Vec<String>,
+    pub twitter_contents: Vec<String>,
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub selection_message_id: i64,
+    pub original_user_id: i64,
+    pub reply_to_message_id: Option<i64>,
+    pub timestamp: i64,
+    pub command_timer: Option<CommandTimer>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct PendingImageRequest {
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub prompt: String,
+    pub image_urls: Vec<String>,
+    pub telegraph_contents: Vec<String>,
+    pub original_message_text: String,
+    pub selection_message_id: i64,
+    pub resolution: Option<String>,
+    pub aspect_ratio: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaGroupItem {
+    pub file_id: String,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Database,
+    pub pending_q_requests: Arc<Mutex<HashMap<String, PendingQRequest>>>,
+    pub pending_image_requests: Arc<Mutex<HashMap<String, PendingImageRequest>>>,
+    pub media_groups: Arc<Mutex<HashMap<String, Vec<MediaGroupItem>>>>,
+}
+
+impl AppState {
+    pub fn new(db: Database) -> Self {
+        AppState {
+            db,
+            pending_q_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_image_requests: Arc::new(Mutex::new(HashMap::new())),
+            media_groups: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}

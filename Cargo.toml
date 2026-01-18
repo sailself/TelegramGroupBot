@@ -1,0 +1,33 @@
+﻿[package]
+name = "telegram_group_helper_bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "time", "sync", "signal", "fs"] }
+teloxide = { version = "0.12", default-features = false, features = ["macros", "auto-send", "rustls", "webhooks-axum"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "gzip", "brotli", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_urlencoded = "0.7"
+once_cell = "1.19"
+thiserror = "1.0"
+anyhow = "1.0"
+regex = "1.10"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "macros", "chrono"] }
+base64 = "0.22"
+url = "2.5"
+infer = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+parking_lot = "0.12"
+whatlang = "0.16"
+dotenvy = "0.15"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.sqlx-macros]
+opt-level = 3
