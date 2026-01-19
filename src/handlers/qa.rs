@@ -352,8 +352,9 @@ pub async fn q_handler(
 
     let (query_text, youtube_urls) = extract_youtube_urls(&query_base, 10);
 
-    let language = detect(&query_text)
+    let language = detect(&original_query)
         .map(|info| info.lang().code().to_string())
+        .or_else(|| detect(&query_text).map(|info| info.lang().code().to_string()))
         .unwrap_or_else(|| "English".to_string());
 
     let username = message
