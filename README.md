@@ -160,6 +160,19 @@ Example `openrouter_models.json`:
 
 ## Development notes
 - After big code changes, run `cargo build` and fix any compilation errors.
+- On small VMs (1 vCPU/1GB), consider `cargo check`, `CARGO_BUILD_JOBS=1`, and setting `[profile.dev] debug = 0` to speed up builds.
+  - Optional setup: install `sccache`, export `RUSTC_WRAPPER=sccache`, and add swap to avoid OOM during linking.
+  - Example (Ubuntu):
+```bash
+sudo apt update && sudo apt install -y sccache
+export RUSTC_WRAPPER=sccache
+CARGO_BUILD_JOBS=1 cargo check
+
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+```
 
 ## Example `.env`
 ```bash
