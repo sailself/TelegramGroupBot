@@ -275,6 +275,7 @@ pub async fn q_handler(
         .unwrap_or_default();
     if is_rate_limited(user_id) {
         bot.send_message(message.chat.id, "You're sending commands too quickly. Please wait a moment before trying again.")
+            .reply_to_message_id(message.id)
             .await?;
         return Ok(());
     }
@@ -323,6 +324,7 @@ pub async fn q_handler(
 
     if original_query.trim().is_empty() {
         bot.send_message(message.chat.id, "Please provide a question or reply to a message with /q.")
+            .reply_to_message_id(message.id)
             .await?;
         return Ok(());
     }
@@ -410,7 +412,31 @@ pub async fn q_handler(
         || !is_openrouter_available()
         || CONFIG.iter_openrouter_models().is_empty();
     if must_use_gemini {
-        let processing_message = bot.send_message(message.chat.id, "Processing your question...")
+        let processing_message_text = if has_video {
+            "Analyzing video and processing your question...".to_string()
+        } else if has_audio {
+            "Analyzing audio and processing your question...".to_string()
+        } else if has_images {
+            format!(
+                "Analyzing {} image(s) and processing your question...",
+                image_data_list.len()
+            )
+        } else if !twitter_contents.is_empty() {
+            format!(
+                "Analyzing {} Twitter post(s) and processing your question...",
+                twitter_contents.len()
+            )
+        } else if !youtube_urls.is_empty() {
+            format!(
+                "Analyzing {} YouTube video(s) and processing your question...",
+                youtube_urls.len()
+            )
+        } else {
+            "Processing your question...".to_string()
+        };
+        let processing_message = bot
+            .send_message(message.chat.id, processing_message_text)
+            .reply_to_message_id(message.id)
             .await?;
         let mut timer = start_command_timer(command_name, &message);
         let use_pro = has_images || has_video || has_audio || !youtube_urls.is_empty();
@@ -443,19 +469,16 @@ pub async fn q_handler(
         return Ok(());
     }
 
-    let selection_text = if has_video {
-        "Pick a model to analyze the video and answer your question:".to_string()
-    } else if has_audio {
-        "Pick a model to analyze the audio and answer your question:".to_string()
-    } else if has_images {
-        format!("Pick a model to analyze {} image(s) and answer your question:", image_data_list.len())
-    } else {
-        "Pick a model to answer your question:".to_string()
-    };
+    let has_media = has_images || has_video || has_audio;
+    let mut selection_text = "Please select which AI model to use for your question:".to_string();
+    if has_media {
+        selection_text.push_str("\n\n*Note: Only models that support media are shown.*");
+    }
 
     let keyboard = create_model_selection_keyboard(has_images, has_video, has_audio);
     let selection_message = bot
         .send_message(message.chat.id, selection_text)
+        .reply_to_message_id(message.id)
         .reply_markup(keyboard)
         .parse_mode(ParseMode::Markdown)
         .await?;

@@ -103,7 +103,11 @@ pub async fn check_access_control(bot: &Bot, message: &Message, command: &str) -
 
     if !is_access_allowed(user_id, chat_id) {
         let _ = bot
-            .send_message(message.chat.id, "You are not authorized to use this command. Please contact the administrator.")
+            .send_message(
+                message.chat.id,
+                "You are not authorized to use this command. Please contact the administrator.",
+            )
+            .reply_to_message_id(message.id)
             .await;
         return false;
     }
