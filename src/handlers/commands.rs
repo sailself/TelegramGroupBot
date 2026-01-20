@@ -1,9 +1,10 @@
-﻿use std::time::Duration;
+﻿use std::collections::HashSet;
+use std::time::Duration;
 
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto,
+    FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto,
     MessageEntityRef, MessageId, ParseMode, ReplyParameters,
 };
 
@@ -138,22 +139,32 @@ async fn prepare_image_request(
 
     let prompt_raw = strip_command_prefix(&original_message_text, command_prefix);
     let mut image_urls = Vec::new();
+    let mut seen_file_ids: HashSet<FileId> = HashSet::new();
     let mut telegraph_texts = Vec::new();
     let prompt_entities = message_entities_for_text(message);
 
     if let Some(media_group_id) = message.media_group_id() {
-        let group_items = state.media_groups.lock().get(media_group_id).cloned().unwrap_or_default();
+        let group_items = state
+            .media_groups
+            .lock()
+            .get(media_group_id)
+            .cloned()
+            .unwrap_or_default();
         for item in group_items {
-            if let Ok(url) = get_file_url(bot, &item.file_id).await {
-                image_urls.push(url);
+            if seen_file_ids.insert(item.file_id.clone()) {
+                if let Ok(url) = get_file_url(bot, &item.file_id).await {
+                    image_urls.push(url);
+                }
             }
         }
     }
 
     if let Some(photo_sizes) = message.photo() {
         if let Some(photo) = photo_sizes.last() {
-            if let Ok(url) = get_file_url(bot, &photo.file.id).await {
-                image_urls.push(url);
+            if seen_file_ids.insert(photo.file.id.clone()) {
+                if let Ok(url) = get_file_url(bot, &photo.file.id).await {
+                    image_urls.push(url);
+                }
             }
         }
     }
@@ -174,11 +185,29 @@ async fn prepare_image_request(
     );
 
     if let Some(reply) = message.reply_to_message() {
+        if let Some(media_group_id) = reply.media_group_id() {
+            let group_items = state
+                .media_groups
+                .lock()
+                .get(media_group_id)
+                .cloned()
+                .unwrap_or_default();
+            for item in group_items {
+                if seen_file_ids.insert(item.file_id.clone()) {
+                    if let Ok(url) = get_file_url(bot, &item.file_id).await {
+                        image_urls.push(url);
+                    }
+                }
+            }
+        }
+
         if image_urls.is_empty() {
             if let Some(photo_sizes) = reply.photo() {
                 if let Some(photo) = photo_sizes.last() {
-                    if let Ok(url) = get_file_url(bot, &photo.file.id).await {
-                        image_urls.push(url);
+                    if seen_file_ids.insert(photo.file.id.clone()) {
+                        if let Ok(url) = get_file_url(bot, &photo.file.id).await {
+                            image_urls.push(url);
+                        }
                     }
                 }
             }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::FileId;
@@ -69,22 +71,40 @@ fn add_image(collection: &mut MediaCollection, bytes: Vec<u8>, max_images: usize
     }
 }
 
+async fn add_image_from_file_id(
+    bot: &Bot,
+    file_id: &FileId,
+    collection: &mut MediaCollection,
+    options: MediaCollectionOptions,
+    seen_file_ids: &mut HashSet<FileId>,
+) {
+    if collection.images.len() >= options.max_images {
+        return;
+    }
+    if !seen_file_ids.insert(file_id.clone()) {
+        return;
+    }
+    if let Ok(url) = get_file_url(bot, file_id).await {
+        if let Some(bytes) = crate::llm::media::download_media(&url).await {
+            add_image(collection, bytes, options.max_images);
+        }
+    }
+}
+
 async fn collect_from_message(
     bot: &Bot,
     message: &Message,
     collection: &mut MediaCollection,
     options: MediaCollectionOptions,
     fill_mode: MediaFillMode,
+    seen_file_ids: &mut HashSet<FileId>,
 ) {
     let allow_images = matches!(fill_mode, MediaFillMode::Always) || collection.images.is_empty();
     if allow_images {
         if let Some(photo_sizes) = message.photo() {
             if let Some(photo) = photo_sizes.last() {
-                if let Ok(url) = get_file_url(bot, &photo.file.id).await {
-                    if let Some(bytes) = crate::llm::media::download_media(&url).await {
-                        add_image(collection, bytes, options.max_images);
-                    }
-                }
+                add_image_from_file_id(bot, &photo.file.id, collection, options, seen_file_ids)
+                    .await;
             }
         }
     }
@@ -153,24 +173,63 @@ pub async fn collect_message_media(
     options: MediaCollectionOptions,
 ) -> MediaCollection {
     let mut collection = MediaCollection::default();
+    let mut seen_file_ids: HashSet<FileId> = HashSet::new();
 
-    collect_from_message(bot, message, &mut collection, options, MediaFillMode::Always).await;
+    collect_from_message(
+        bot,
+        message,
+        &mut collection,
+        options,
+        MediaFillMode::Always,
+        &mut seen_file_ids,
+    )
+    .await;
 
     if options.include_reply {
         if let Some(reply) = message.reply_to_message() {
-            collect_from_message(bot, reply, &mut collection, options, MediaFillMode::FillMissing).await;
+            collect_from_message(
+                bot,
+                reply,
+                &mut collection,
+                options,
+                MediaFillMode::FillMissing,
+                &mut seen_file_ids,
+            )
+            .await;
         }
     }
 
     if options.include_media_group {
+        let mut group_ids = Vec::new();
         if let Some(media_group_id) = message.media_group_id() {
-            let group_items = state.media_groups.lock().get(media_group_id).cloned().unwrap_or_default();
-            for item in group_items {
-                if let Ok(url) = get_file_url(bot, &item.file_id).await {
-                    if let Some(bytes) = crate::llm::media::download_media(&url).await {
-                        add_image(&mut collection, bytes, options.max_images);
+            group_ids.push(media_group_id.clone());
+        }
+        if options.include_reply {
+            if let Some(reply) = message.reply_to_message() {
+                if let Some(media_group_id) = reply.media_group_id() {
+                    if !group_ids.iter().any(|id| id == media_group_id) {
+                        group_ids.push(media_group_id.clone());
                     }
                 }
+            }
+        }
+
+        for media_group_id in group_ids {
+            let group_items = state
+                .media_groups
+                .lock()
+                .get(&media_group_id)
+                .cloned()
+                .unwrap_or_default();
+            for item in group_items {
+                add_image_from_file_id(
+                    bot,
+                    &item.file_id,
+                    &mut collection,
+                    options,
+                    &mut seen_file_ids,
+                )
+                .await;
             }
         }
     }
