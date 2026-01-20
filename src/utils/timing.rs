@@ -34,7 +34,7 @@ impl CommandTimer {
                 }
             });
 
-        let user = message.from();
+        let user = message.from.as_ref();
         CommandTimer {
             command: command.to_string(),
             chat_id: Some(message.chat.id.0),

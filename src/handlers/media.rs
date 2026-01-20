@@ -1,5 +1,6 @@
 use anyhow::Result;
 use teloxide::prelude::*;
+use teloxide::types::FileId;
 
 use crate::config::CONFIG;
 use crate::state::AppState;
@@ -53,8 +54,8 @@ enum MediaFillMode {
     FillMissing,
 }
 
-pub async fn get_file_url(bot: &Bot, file_id: &str) -> Result<String> {
-    let file = bot.get_file(file_id).await?;
+pub async fn get_file_url(bot: &Bot, file_id: &FileId) -> Result<String> {
+    let file = bot.get_file(file_id.clone()).await?;
     Ok(format!(
         "https://api.telegram.org/file/bot{}/{}",
         CONFIG.bot_token,

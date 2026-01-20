@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use teloxide::types::{FileId, MediaGroupId};
 use crate::db::database::Database;
 use crate::utils::timing::CommandTimer;
 
@@ -48,7 +49,7 @@ pub struct PendingImageRequest {
 
 #[derive(Debug, Clone)]
 pub struct MediaGroupItem {
-    pub file_id: String,
+    pub file_id: FileId,
 }
 
 #[derive(Clone)]
@@ -56,7 +57,7 @@ pub struct AppState {
     pub db: Database,
     pub pending_q_requests: Arc<Mutex<HashMap<String, PendingQRequest>>>,
     pub pending_image_requests: Arc<Mutex<HashMap<String, PendingImageRequest>>>,
-    pub media_groups: Arc<Mutex<HashMap<String, Vec<MediaGroupItem>>>>,
+    pub media_groups: Arc<Mutex<HashMap<MediaGroupId, Vec<MediaGroupItem>>>>,
 }
 
 impl AppState {

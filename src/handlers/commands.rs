@@ -4,7 +4,7 @@ use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto,
-    MessageEntityRef, MessageId, ParseMode,
+    MessageEntityRef, MessageId, ParseMode, ReplyParameters,
 };
 
 use crate::config::{
@@ -332,7 +332,7 @@ async fn finalize_image_request(
             .await;
         if edit_result.is_err() {
             bot.send_photo(ChatId(request.chat_id), InputFile::memory(first_image))
-                .reply_to_message_id(MessageId(request.message_id as i32))
+                .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -341,7 +341,7 @@ async fn finalize_image_request(
 
     for image in image_iter {
         bot.send_photo(ChatId(request.chat_id), InputFile::memory(image))
-            .reply_to_message_id(MessageId(request.message_id as i32))
+            .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
             .await?;
     }
 
@@ -376,9 +376,16 @@ pub async fn image_selection_callback(
         }
 
         if let Some(message) = &query.message {
-            bot.edit_message_text(message.chat.id, message.id, format!("Resolution set to {}. Choose an aspect ratio (default: {}).", resolution, IMAGE_DEFAULT_ASPECT_RATIO))
-                .reply_markup(build_aspect_ratio_keyboard(request_key))
-                .await?;
+            bot.edit_message_text(
+                message.chat().id,
+                message.id(),
+                format!(
+                    "Resolution set to {}. Choose an aspect ratio (default: {}).",
+                    resolution, IMAGE_DEFAULT_ASPECT_RATIO
+                ),
+            )
+            .reply_markup(build_aspect_ratio_keyboard(request_key))
+            .await?;
         }
         return Ok(());
     }
@@ -415,12 +422,12 @@ pub async fn img_handler(
         return Ok(());
     }
     let user_id = message
-        .from()
+        .from.as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
         bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
@@ -428,14 +435,14 @@ pub async fn img_handler(
     let context = prepare_image_request(&bot, &state, &message, "/img").await?;
     if context.prompt.trim().is_empty() && context.image_urls.is_empty() {
         bot.send_message(message.chat.id, "Please provide a prompt or reply to an image.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
 
     let processing_message = bot
         .send_message(message.chat.id, "Generating your image...")
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .await?;
 
     let mut prompt_text = context.prompt.clone();
@@ -490,7 +497,7 @@ pub async fn img_handler(
             .await;
         if edit_result.is_err() {
             bot.send_photo(message.chat.id, InputFile::memory(first_image))
-                .reply_to_message_id(message.id)
+                .reply_parameters(ReplyParameters::new(message.id))
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -502,7 +509,7 @@ pub async fn img_handler(
 
     for image in image_iter {
         bot.send_photo(message.chat.id, InputFile::memory(image))
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
     }
 
@@ -520,12 +527,12 @@ pub async fn image_handler(
     }
 
     let user_id = message
-        .from()
+        .from.as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
         bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
@@ -533,7 +540,7 @@ pub async fn image_handler(
     let context = prepare_image_request(&bot, &state, &message, "/image").await?;
     if context.prompt.trim().is_empty() && context.image_urls.is_empty() {
         bot.send_message(message.chat.id, "Please provide a prompt or reply to an image.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
@@ -541,7 +548,7 @@ pub async fn image_handler(
     let request_key = format!("{}_{}", message.chat.id.0, message.id.0);
     let selection_message = bot
         .send_message(message.chat.id, "Choose a resolution (default: 2K):")
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .reply_markup(build_resolution_keyboard(&request_key))
         .await?;
     let pending = PendingImageRequest {
@@ -583,12 +590,12 @@ pub async fn vid_handler(
     }
 
     let user_id = message
-        .from()
+        .from.as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
         bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
@@ -602,7 +609,7 @@ pub async fn vid_handler(
 
     let processing_message = bot
         .send_message(message.chat.id, "Generating your video...")
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .await?;
     let (video_bytes, _mime_type) = generate_video_with_veo(&prompt_text, None).await?;
 
@@ -628,12 +635,12 @@ pub async fn tldr_handler(
     }
 
     let user_id = message
-        .from()
+        .from.as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
         bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
@@ -641,7 +648,7 @@ pub async fn tldr_handler(
     let mut timer = start_command_timer("tldr", &message);
     let processing_message = bot
         .send_message(message.chat.id, "Summarizing recent messages...")
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .await?;
 
     let messages = if let Some(reply) = message.reply_to_message() {
@@ -804,12 +811,12 @@ pub async fn factcheck_handler(
     }
 
     let user_id = message
-        .from()
+        .from.as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
         bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
@@ -868,7 +875,7 @@ pub async fn factcheck_handler(
 
     if statement.trim().is_empty() {
         bot.send_message(message.chat.id, "Please reply to a message to fact-check.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
@@ -990,7 +997,7 @@ pub async fn factcheck_handler(
 
     let processing_message = bot
         .send_message(message.chat.id, processing_message_text)
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .await?;
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let system_prompt = FACTCHECK_SYSTEM_PROMPT.replace("{current_datetime}", &now);
@@ -1035,19 +1042,19 @@ pub async fn profileme_handler(
     }
 
     let user_id = message
-        .from()
+        .from.as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
         bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
 
     let processing_message = bot
         .send_message(message.chat.id, "Generating your profile...")
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .await?;
     let history = state
         .db
@@ -1120,19 +1127,19 @@ pub async fn paintme_handler(
     }
 
     let user_id = message
-        .from()
+        .from.as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
         bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
 
     let processing_message = bot
         .send_message(message.chat.id, "Creating your image prompt...")
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .await?;
     let history = state
         .db
@@ -1221,7 +1228,7 @@ pub async fn paintme_handler(
             .await;
         if edit_result.is_err() {
             bot.send_photo(message.chat.id, InputFile::memory(first_image))
-                .reply_to_message_id(message.id)
+                .reply_parameters(ReplyParameters::new(message.id))
                 .caption(caption)
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -1233,7 +1240,7 @@ pub async fn paintme_handler(
 
     for image in image_iter {
         bot.send_photo(message.chat.id, InputFile::memory(image))
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
     }
 
@@ -1289,7 +1296,7 @@ Usage: `/support`
 ";
 
     bot.send_message(message.chat.id, help_text)
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .parse_mode(ParseMode::Markdown)
         .await?;
     Ok(())
@@ -1305,7 +1312,7 @@ pub async fn support_handler(bot: Bot, message: Message) -> Result<()> {
         Ok(url) => url,
         Err(_) => {
             bot.send_message(message.chat.id, CONFIG.support_message.clone())
-                .reply_to_message_id(message.id)
+                .reply_parameters(ReplyParameters::new(message.id))
                 .parse_mode(ParseMode::Markdown)
                 .await?;
             return Ok(());
@@ -1318,7 +1325,7 @@ pub async fn support_handler(bot: Bot, message: Message) -> Result<()> {
     )]]);
 
     bot.send_message(message.chat.id, CONFIG.support_message.clone())
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .reply_markup(keyboard)
         .parse_mode(ParseMode::Markdown)
         .await?;
@@ -1327,7 +1334,7 @@ pub async fn support_handler(bot: Bot, message: Message) -> Result<()> {
 
 pub async fn start_handler(bot: Bot, message: Message) -> Result<()> {
     bot.send_message(message.chat.id, "Hello! I am TelegramGroupHelperBot. Use /help to see commands.")
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .await?;
     Ok(())
 }
@@ -1337,7 +1344,7 @@ pub async fn handle_media_group(state: AppState, message: Message) {
         if let Some(photo_sizes) = message.photo() {
             if let Some(photo) = photo_sizes.last() {
                 let mut groups = state.media_groups.lock();
-                let entry = groups.entry(media_group_id.to_string()).or_default();
+                let entry = groups.entry(media_group_id.clone()).or_default();
                 entry.push(MediaGroupItem {
                     file_id: photo.file.id.clone(),
                 });

@@ -4,6 +4,7 @@ use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityRef, MessageId, ParseMode,
+    ReplyParameters,
 };
 use whatlang::detect;
 
@@ -270,12 +271,12 @@ pub async fn q_handler(
     }
 
     let user_id = message
-        .from()
+        .from.as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
         bot.send_message(message.chat.id, "You're sending commands too quickly. Please wait a moment before trying again.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
@@ -324,7 +325,7 @@ pub async fn q_handler(
 
     if original_query.trim().is_empty() {
         bot.send_message(message.chat.id, "Please provide a question or reply to a message with /q.")
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         return Ok(());
     }
@@ -360,7 +361,7 @@ pub async fn q_handler(
         .unwrap_or_else(|| "English".to_string());
 
     let username = message
-        .from()
+        .from.as_ref()
         .map(|user| user.full_name())
         .unwrap_or_else(|| "Anonymous".to_string());
 
@@ -436,7 +437,7 @@ pub async fn q_handler(
         };
         let processing_message = bot
             .send_message(message.chat.id, processing_message_text)
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await?;
         let mut timer = start_command_timer(command_name, &message);
         let use_pro = has_images || has_video || has_audio || !youtube_urls.is_empty();
@@ -478,7 +479,7 @@ pub async fn q_handler(
     let keyboard = create_model_selection_keyboard(has_images, has_video, has_audio);
     let selection_message = bot
         .send_message(message.chat.id, selection_text)
-        .reply_to_message_id(message.id)
+        .reply_parameters(ReplyParameters::new(message.id))
         .reply_markup(keyboard)
         .parse_mode(ParseMode::Markdown)
         .await?;
@@ -596,7 +597,7 @@ pub async fn model_selection_callback(
         None => return Ok(()),
     };
 
-    let request_key = format!("{}_{}", message.chat.id.0, message.id.0);
+    let request_key = format!("{}_{}", message.chat().id.0, message.id().0);
     let request = {
         let mut pending = state.pending_q_requests.lock();
         pending.remove(&request_key)
@@ -604,7 +605,7 @@ pub async fn model_selection_callback(
     let mut request = match request {
         Some(req) => req,
         None => {
-            bot.edit_message_text(message.chat.id, message.id, "This request has expired.")
+            bot.edit_message_text(message.chat().id, message.id(), "This request has expired.")
                 .await?;
             return Ok(());
         }
@@ -625,7 +626,7 @@ pub async fn model_selection_callback(
         if let Some(mut timer) = request.command_timer.take() {
             complete_command_timer(&mut timer, "expired", Some("selection_timeout".to_string()));
         }
-        bot.edit_message_text(message.chat.id, message.id, "Selection timed out. Please try again.")
+        bot.edit_message_text(message.chat().id, message.id(), "Selection timed out. Please try again.")
             .await?;
         return Ok(());
     }
@@ -646,7 +647,7 @@ pub async fn model_selection_callback(
         format!("Processing your question with {}...", display_name)
     };
 
-    bot.edit_message_text(message.chat.id, message.id, processing_text)
+    bot.edit_message_text(message.chat().id, message.id(), processing_text)
         .await?;
 
     let command_timer = request.command_timer.take();

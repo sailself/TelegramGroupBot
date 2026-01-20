@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use teloxide::prelude::*;
+use teloxide::types::ReplyParameters;
 use tracing::{info, warn};
 
 use crate::config::CONFIG;
@@ -96,7 +97,8 @@ pub async fn check_access_control(bot: &Bot, message: &Message, command: &str) -
     }
 
     let user_id = message
-        .from()
+        .from
+        .as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     let chat_id = message.chat.id.0;
@@ -107,7 +109,7 @@ pub async fn check_access_control(bot: &Bot, message: &Message, command: &str) -
                 message.chat.id,
                 "You are not authorized to use this command. Please contact the administrator.",
             )
-            .reply_to_message_id(message.id)
+            .reply_parameters(ReplyParameters::new(message.id))
             .await;
         return false;
     }

@@ -110,7 +110,7 @@ pub async fn log_message(state: &AppState, message: &Message) {
         .map(|info| info.lang().code().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let username = if let Some(user) = message.from() {
+    let username = if let Some(user) = message.from.as_ref() {
         if !user.full_name().is_empty() {
             user.full_name()
         } else if let Some(username) = &user.username {
@@ -124,7 +124,7 @@ pub async fn log_message(state: &AppState, message: &Message) {
 
     let insert = build_message_insert(
         message
-            .from()
+            .from.as_ref()
             .and_then(|user| i64::try_from(user.id.0).ok()),
         Some(username),
         Some(text),
