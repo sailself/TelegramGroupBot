@@ -25,6 +25,7 @@ tracing-appender = "0.2"
 parking_lot = "0.12"
 whatlang = "0.16"
 dotenvy = "0.15"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [profile.dev]
 opt-level = 1

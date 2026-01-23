@@ -107,6 +107,49 @@ async fn collect_from_message(
                     .await;
             }
         }
+
+        if let Some(document) = message.document() {
+            let mime_is_image = document
+                .mime_type
+                .as_ref()
+                .map(|mime| mime.essence_str().starts_with("image/"))
+                .unwrap_or(false);
+            let name_is_image = document
+                .file_name
+                .as_ref()
+                .map(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    lower.ends_with(".png")
+                        || lower.ends_with(".jpg")
+                        || lower.ends_with(".jpeg")
+                        || lower.ends_with(".webp")
+                        || lower.ends_with(".gif")
+                })
+                .unwrap_or(false);
+            if mime_is_image || name_is_image {
+                add_image_from_file_id(
+                    bot,
+                    &document.file.id,
+                    collection,
+                    options,
+                    seen_file_ids,
+                )
+                .await;
+            }
+        }
+
+        if let Some(sticker) = message.sticker() {
+            if !sticker.flags.is_animated && !sticker.flags.is_video {
+                add_image_from_file_id(
+                    bot,
+                    &sticker.file.id,
+                    collection,
+                    options,
+                    seen_file_ids,
+                )
+                .await;
+            }
+        }
     }
 
     let allow_video = matches!(fill_mode, MediaFillMode::Always) || collection.video.is_none();

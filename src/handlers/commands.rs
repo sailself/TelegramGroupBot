@@ -19,7 +19,10 @@ use crate::handlers::content::{
 use crate::handlers::media::{collect_message_media, get_file_url, MediaCollectionOptions};
 use crate::handlers::responses::send_response;
 use crate::llm::media::detect_mime_type;
-use crate::llm::{call_gemini, generate_image_with_gemini, generate_image_with_vertex, generate_video_with_veo};
+use crate::llm::{
+    call_gemini, generate_image_with_gemini, generate_image_with_vertex, generate_video_with_veo,
+    GeminiImageConfig,
+};
 use crate::state::{AppState, MediaGroupItem, PendingImageRequest};
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
@@ -310,9 +313,19 @@ async fn finalize_image_request(
             prompt.push('\n');
         }
     }
-    if !final_resolution.is_empty() || !final_aspect.is_empty() {
-        prompt.push_str(&format!("\n\nResolution: {}. Aspect ratio: {}.", final_resolution, final_aspect));
-    }
+
+    let image_config = Some(GeminiImageConfig {
+        aspect_ratio: if final_aspect.trim().is_empty() {
+            None
+        } else {
+            Some(final_aspect.to_string())
+        },
+        image_size: if final_resolution.trim().is_empty() {
+            None
+        } else {
+            Some(final_resolution.to_string())
+        },
+    });
 
     let processing_message_id = MessageId(request.selection_message_id as i32);
     let _ = bot
@@ -329,11 +342,16 @@ async fn finalize_image_request(
         } else {
             Some(CONFIG.vertex_image_model.as_str())
         };
-        generate_image_with_vertex(&prompt, &request.image_urls, model_hint)
+        generate_image_with_vertex(&prompt, &request.image_urls, model_hint, image_config.clone())
             .await
             .map_err(|err| anyhow::anyhow!(err.0))?
     } else {
-        generate_image_with_gemini(&prompt, &request.image_urls, None, !CONFIG.cwd_pw_api_key.is_empty())
+        generate_image_with_gemini(
+            &prompt,
+            &request.image_urls,
+            image_config,
+            !CONFIG.cwd_pw_api_key.is_empty(),
+        )
             .await
             .map_err(|err| anyhow::anyhow!(err.0))?
     };
@@ -489,7 +507,7 @@ pub async fn img_handler(
         } else {
             Some(CONFIG.vertex_image_model.as_str())
         };
-        generate_image_with_vertex(&prompt_text, &context.image_urls, model_hint)
+        generate_image_with_vertex(&prompt_text, &context.image_urls, model_hint, None)
             .await
             .map_err(|err| anyhow::anyhow!(err.0))?
     } else {
@@ -721,7 +739,7 @@ pub async fn tldr_handler(
         false,
         Some(&CONFIG.gemini_thinking_level),
         None,
-        false,
+        true,
         None,
         None,
         None,
@@ -741,7 +759,7 @@ pub async fn tldr_handler(
     }
 
     let summary_text = response;
-    let summary_with_model = format!("{}\n\n_Model: {}_", summary_text, CONFIG.gemini_model);
+    let summary_with_model = format!("{}\n\n_Model: {}_", summary_text, CONFIG.gemini_pro_model);
 
     let _ = bot
         .edit_message_text(
@@ -755,12 +773,16 @@ pub async fn tldr_handler(
         "Create a clear infographic (no walls of text) summarizing the key points below. \
 Use a 16:9 layout with readable labels and visual hierarchy suitable for Telegram. \
 Use the same language as the summary text for any labels.\
-\n\n{}\n\nResolution: 4K. Aspect ratio: 16:9.",
+\n\n{}",
         summary_text
     );
 
     let mut infographic_url = None;
-    match generate_image_with_gemini(&infographic_prompt, &[], None, false).await {
+    let infographic_config = Some(GeminiImageConfig {
+        aspect_ratio: Some("16:9".to_string()),
+        image_size: Some("2K".to_string()),
+    });
+    match generate_image_with_gemini(&infographic_prompt, &[], infographic_config, false).await {
         Ok(images) => {
             if let Some(image) = images.into_iter().next() {
                 if CONFIG.cwd_pw_api_key.trim().is_empty() {
@@ -793,7 +815,7 @@ Use the same language as the summary text for any labels.\
     if let Some(url) = &infographic_url {
         let telegraph_content = format!(
             "![Infographic]({})\n\n{}\n\n_Model: {}_",
-            url, summary_text, CONFIG.gemini_model
+            url, summary_text, CONFIG.gemini_pro_model
         );
         telegraph_url =
             create_telegraph_page("Message Summary with Infographic", &telegraph_content).await;
@@ -892,7 +914,7 @@ pub async fn factcheck_handler(
         query_text = query_text_processed;
     }
 
-    let statement = if query_text.trim().is_empty() {
+    let mut statement = if query_text.trim().is_empty() {
         reply_text.clone()
     } else if reply_text.trim().is_empty() {
         query_text
@@ -903,24 +925,12 @@ pub async fn factcheck_handler(
         )
     };
 
-    if statement.trim().is_empty() {
-        bot.send_message(message.chat.id, "Please reply to a message to fact-check.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
-        return Ok(());
-    }
-    let statement = statement;
-
-    let mut image_data_list = Vec::new();
-    let mut video_data = None;
-    let mut audio_data = None;
-
-    if let Some(reply) = reply_message {
-        let reply_media = collect_message_media(&bot, &state, reply, MediaCollectionOptions::for_commands()).await;
-        image_data_list.extend(reply_media.images);
-        video_data = reply_media.video;
-        audio_data = reply_media.audio;
-    }
+    let mut media_options = MediaCollectionOptions::for_commands();
+    media_options.include_reply = true;
+    let collected_media = collect_message_media(&bot, &state, &message, media_options).await;
+    let mut image_data_list = collected_media.images;
+    let mut video_data = collected_media.video;
+    let audio_data = collected_media.audio;
 
     let (telegraph_images, telegraph_video, _telegraph_video_mime) =
         crate::handlers::content::download_telegraph_media(&telegraph_contents, 5, 1).await;
@@ -934,6 +944,27 @@ pub async fn factcheck_handler(
     image_data_list.extend(twitter_images);
     if video_data.is_none() {
         video_data = twitter_video;
+    }
+
+    if statement.trim().is_empty() {
+        if video_data.is_some() {
+            statement =
+                "Please analyze this video and fact-check any claims or content shown in it."
+                    .to_string();
+        } else if audio_data.is_some() {
+            statement =
+                "Please analyze this audio and fact-check any claims or content shown in it."
+                    .to_string();
+        } else if !image_data_list.is_empty() {
+            statement =
+                "Please analyze these images and fact-check any claims or content shown in them."
+                    .to_string();
+        } else {
+            bot.send_message(message.chat.id, "Please reply to a message to fact-check.")
+                .reply_parameters(ReplyParameters::new(message.id))
+                .await?;
+            return Ok(());
+        }
     }
 
     let mut processing_message_text = if video_data.is_some() {
@@ -1226,7 +1257,7 @@ pub async fn paintme_handler(
         } else {
             Some(CONFIG.vertex_image_model.as_str())
         };
-        generate_image_with_vertex(&prompt, &[], model_hint)
+        generate_image_with_vertex(&prompt, &[], model_hint, None)
             .await
             .map_err(|err| anyhow::anyhow!(err.0))?
     } else {

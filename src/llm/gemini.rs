@@ -3,8 +3,8 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
-use serde_json::{json, Value};
-use tracing::warn;
+use serde_json::{json, Map, Value};
+use tracing::{debug, warn};
 
 use crate::config::CONFIG;
 use crate::llm::media::{detect_mime_type, download_media};
@@ -14,6 +14,12 @@ use crate::utils::timing::log_llm_timing;
 #[derive(Debug, thiserror::Error)]
 #[error("Image generation failed: {0}")]
 pub struct ImageGenerationError(pub String);
+
+#[derive(Debug, Clone)]
+pub struct GeminiImageConfig {
+    pub aspect_ratio: Option<String>,
+    pub image_size: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct GeminiResponse {
@@ -64,12 +70,145 @@ fn build_safety_settings() -> Vec<serde_json::Value> {
     ]
 }
 
+fn build_image_config(config: Option<&GeminiImageConfig>) -> Option<Value> {
+    let config = config?;
+    let mut map = Map::new();
+
+    if let Some(aspect_ratio) = config.aspect_ratio.as_deref() {
+        let trimmed = aspect_ratio.trim();
+        if !trimmed.is_empty() {
+            map.insert("aspectRatio".to_string(), json!(trimmed));
+        }
+    }
+
+    if let Some(image_size) = config.image_size.as_deref() {
+        let trimmed = image_size.trim();
+        if !trimmed.is_empty() {
+            map.insert("imageSize".to_string(), json!(trimmed));
+        }
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
+}
+
 fn truncate_for_log(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         return value.to_string();
     }
     let truncated: String = value.chars().take(limit).collect();
     format!("{truncated}... (truncated)")
+}
+
+fn summarize_gemini_parts(parts: &[Value]) -> Vec<Value> {
+    parts
+        .iter()
+        .map(|part| {
+            if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                json!({ "text": truncate_for_log(text, 200) })
+            } else if let Some(inline_data) = part.get("inlineData") {
+                let mime_type = inline_data
+                    .get("mimeType")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let data_len = inline_data
+                    .get("data")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.len())
+                    .unwrap_or(0);
+                json!({ "inlineData": { "mimeType": mime_type, "dataLen": data_len } })
+            } else if let Some(file_data) = part.get("fileData") {
+                let file_uri = file_data
+                    .get("fileUri")
+                    .and_then(|value| value.as_str())
+                    .map(|value| truncate_for_log(value, 200));
+                json!({ "fileData": { "fileUri": file_uri } })
+            } else {
+                json!({ "unknownPart": true })
+            }
+        })
+        .collect()
+}
+
+fn summarize_gemini_payload(payload: &Value) -> Value {
+    let mut summary = Map::new();
+
+    if let Some(system_parts) = payload.pointer("/systemInstruction/parts").and_then(|value| value.as_array()) {
+        summary.insert(
+            "systemInstruction".to_string(),
+            Value::Array(summarize_gemini_parts(system_parts)),
+        );
+    }
+
+    if let Some(contents) = payload.get("contents").and_then(|value| value.as_array()) {
+        let mut summarized_contents = Vec::new();
+        for content in contents {
+            let role = content
+                .get("role")
+                .and_then(|value| value.as_str())
+                .unwrap_or("user");
+            let parts = content
+                .get("parts")
+                .and_then(|value| value.as_array())
+                .map(|parts| summarize_gemini_parts(parts))
+                .unwrap_or_default();
+            summarized_contents.push(json!({ "role": role, "parts": parts }));
+        }
+        summary.insert("contents".to_string(), Value::Array(summarized_contents));
+    }
+
+    if let Some(config) = payload.get("generationConfig") {
+        summary.insert("generationConfig".to_string(), config.clone());
+    }
+
+    if let Some(tools) = payload.get("tools") {
+        summary.insert("tools".to_string(), tools.clone());
+    }
+
+    if let Some(safety) = payload.get("safetySettings").and_then(|value| value.as_array()) {
+        summary.insert("safetySettingsCount".to_string(), json!(safety.len()));
+    }
+
+    Value::Object(summary)
+}
+
+fn summarize_gemini_response(response: &GeminiResponse) -> Value {
+    let mut text_parts = 0usize;
+    let mut image_parts = 0usize;
+    let mut text_preview = None;
+
+    let candidates = response.candidates.as_deref().unwrap_or(&[]);
+    for candidate in candidates {
+        if let Some(content) = &candidate.content {
+            if let Some(parts) = &content.parts {
+                for part in parts {
+                    match part {
+                        GeminiPart::Text { text } => {
+                            text_parts += 1;
+                            if text_preview.is_none() && !text.trim().is_empty() {
+                                text_preview = Some(truncate_for_log(text, 200));
+                            }
+                        }
+                        GeminiPart::InlineData { inline_data } => {
+                            if inline_data.mime_type.starts_with("image/") {
+                                image_parts += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    json!({
+        "candidates": response.candidates.as_ref().map(|candidates| candidates.len()).unwrap_or(0),
+        "textParts": text_parts,
+        "imageParts": image_parts,
+        "textPreview": text_preview
+    })
 }
 
 fn summarize_error_body(body: &str) -> (Option<String>, String) {
@@ -203,6 +342,11 @@ async fn call_gemini_api(model: &str, payload: serde_json::Value) -> Result<Gemi
         model, CONFIG.gemini_api_key
     );
 
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let payload_summary = summarize_gemini_payload(&payload);
+        debug!(target: "llm.gemini", model = model, payload = %payload_summary);
+    }
+
     let response = client
         .post(url)
         .timeout(Duration::from_secs(90))
@@ -220,6 +364,10 @@ async fn call_gemini_api(model: &str, payload: serde_json::Value) -> Result<Gemi
     }
 
     let value = response.json::<GeminiResponse>().await?;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let response_summary = summarize_gemini_response(&value);
+        debug!(target: "llm.gemini", model = model, response = %response_summary);
+    }
     Ok(value)
 }
 
@@ -288,16 +436,9 @@ pub async fn call_gemini(
 pub async fn generate_image_with_gemini(
     prompt: &str,
     image_urls: &[String],
-    prompt_hint: Option<&str>,
+    image_config: Option<GeminiImageConfig>,
     upload_to_cwd: bool,
 ) -> Result<Vec<Vec<u8>>, ImageGenerationError> {
-    let mut user_prompt = prompt.to_string();
-    if let Some(hint) = prompt_hint {
-        if !hint.trim().is_empty() {
-            user_prompt.push_str(&format!("\n\n{}", hint));
-        }
-    }
-
     let mut images = Vec::new();
     for url in image_urls {
         if let Some(data) = download_media(url).await {
@@ -312,17 +453,24 @@ pub async fn generate_image_with_gemini(
     };
 
     let system_instruction = base_instruction.to_string();
-    let parts = build_gemini_parts(&user_prompt, &images, None, None, &[], false);
+    let parts = build_gemini_parts(prompt, &images, None, None, &[], false);
+    let mut generation_config = json!({
+        "temperature": 0.8,
+        "topK": 40,
+        "topP": 0.95,
+        "maxOutputTokens": 65535,
+        "responseModalities": ["TEXT", "IMAGE"]
+    });
+    if let Some(image_config) = build_image_config(image_config.as_ref()) {
+        if let Some(config_object) = generation_config.as_object_mut() {
+            config_object.insert("imageConfig".to_string(), image_config);
+        }
+    }
+
     let payload = json!({
         "systemInstruction": { "parts": [{ "text": system_instruction }] },
         "contents": [{ "role": "user", "parts": parts }],
-        "generationConfig": {
-            "temperature": 0.8,
-            "topK": 40,
-            "topP": 0.95,
-            "maxOutputTokens": 65535,
-            "responseModalities": ["TEXT", "IMAGE"]
-        },
+        "generationConfig": generation_config,
         "safetySettings": build_safety_settings(),
         "tools": [{ "google_search": {} }],
     });
@@ -357,10 +505,17 @@ pub async fn generate_image_with_gemini(
 pub async fn generate_image_with_vertex(
     prompt: &str,
     image_urls: &[String],
-    model_hint: Option<&str>,
+    _model_hint: Option<&str>,
+    image_config: Option<GeminiImageConfig>,
 ) -> Result<Vec<Vec<u8>>, ImageGenerationError> {
     warn!("Vertex image generation is not implemented; falling back to Gemini image generation.");
-    generate_image_with_gemini(prompt, image_urls, model_hint, !CONFIG.cwd_pw_api_key.is_empty()).await
+    generate_image_with_gemini(
+        prompt,
+        image_urls,
+        image_config,
+        !CONFIG.cwd_pw_api_key.is_empty(),
+    )
+    .await
 }
 
 pub async fn generate_video_with_veo(

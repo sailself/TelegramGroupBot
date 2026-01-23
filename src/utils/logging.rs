@@ -41,7 +41,11 @@ pub fn init_logging() -> LoggingGuards {
     let general_level = parse_log_level(&CONFIG.log_level);
     let general_filter = Targets::new()
         .with_default(general_level)
-        .with_target("bot.timing", LevelFilter::OFF);
+        .with_target("bot.timing", LevelFilter::OFF)
+        .with_target("hyper", LevelFilter::WARN)
+        .with_target("hyper_util", LevelFilter::WARN)
+        .with_target("hyper_util::client::legacy::pool", LevelFilter::WARN)
+        .with_target("reqwest", LevelFilter::WARN);
     let timing_filter = Targets::new()
         .with_default(LevelFilter::OFF)
         .with_target("bot.timing", LevelFilter::INFO);
