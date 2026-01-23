@@ -25,6 +25,7 @@ use crate::utils::timing::{complete_command_timer, start_command_timer};
 
 pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 pub const MODEL_GEMINI: &str = "gemini";
+const MIN_LANGUAGE_CONFIDENCE: f64 = 0.6;
 
 fn now_unix_seconds() -> i64 {
     SystemTime::now()
@@ -39,6 +40,14 @@ fn message_entities_for_text(message: &Message) -> Option<Vec<MessageEntityRef<'
     } else {
         message.parse_caption_entities()
     }
+}
+
+fn detect_language_name(text: &str) -> Option<String> {
+    let info = detect(text.trim())?;
+    if !info.is_reliable() || info.confidence() < MIN_LANGUAGE_CONFIDENCE {
+        return None;
+    }
+    Some(info.lang().eng_name().to_string())
 }
 
 fn resolve_alias_to_model_id(alias: &str) -> Option<String> {
@@ -355,9 +364,8 @@ pub async fn q_handler(
 
     let (query_text, youtube_urls) = extract_youtube_urls(&query_base, 10);
 
-    let language = detect(&original_query)
-        .map(|info| info.lang().code().to_string())
-        .or_else(|| detect(&query_text).map(|info| info.lang().code().to_string()))
+    let language = detect_language_name(&original_query)
+        .or_else(|| detect_language_name(&query_text))
         .unwrap_or_else(|| "English".to_string());
 
     let username = message

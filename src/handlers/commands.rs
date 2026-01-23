@@ -712,11 +712,11 @@ pub async fn tldr_handler(
         chat_content.push_str(&format!("{} {}: {}\n", timestamp, username, text));
     }
 
-    let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", "TelegramGroupHelperBot");
+    let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph_author_name);
     let response = call_gemini(
         &system_prompt,
         &chat_content,
-        Some("Chinese"),
+        None,
         true,
         false,
         Some(&CONFIG.gemini_thinking_level),
@@ -753,7 +753,8 @@ pub async fn tldr_handler(
 
     let infographic_prompt = format!(
         "Create a clear infographic (no walls of text) summarizing the key points below. \
-Use a 16:9 layout with readable labels and visual hierarchy suitable for Telegram.\
+Use a 16:9 layout with readable labels and visual hierarchy suitable for Telegram. \
+Use the same language as the summary text for any labels.\
 \n\n{}\n\nResolution: 4K. Aspect ratio: 16:9.",
         summary_text
     );

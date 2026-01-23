@@ -11,6 +11,16 @@ use crate::db::database::build_message_insert;
 use crate::handlers::content::create_telegraph_page;
 use crate::state::AppState;
 
+const MIN_LANGUAGE_CONFIDENCE: f64 = 0.6;
+
+fn detect_language_name(text: &str) -> Option<String> {
+    let info = detect(text.trim())?;
+    if !info.is_reliable() || info.confidence() < MIN_LANGUAGE_CONFIDENCE {
+        return None;
+    }
+    Some(info.lang().eng_name().to_string())
+}
+
 async fn edit_text_with_retry(
     bot: &Bot,
     chat_id: ChatId,
@@ -106,9 +116,7 @@ pub async fn log_message(state: &AppState, message: &Message) {
         return;
     };
 
-    let language = detect(&text)
-        .map(|info| info.lang().code().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let language = detect_language_name(&text).unwrap_or_else(|| "unknown".to_string());
 
     let username = if let Some(user) = message.from.as_ref() {
         if !user.full_name().is_empty() {
