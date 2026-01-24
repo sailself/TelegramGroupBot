@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 use teloxide::types::{MessageEntityKind, MessageEntityRef};
 use tracing::warn;
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
 use crate::config::CONFIG;
 use crate::llm::media::download_media;
@@ -13,36 +14,239 @@ use crate::tools::twitter_extractor::{extract_twitter_content, TwitterContent};
 use crate::utils::http::get_http_client;
 
 fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
-    let mut nodes = Vec::new();
-    let image_regex = Regex::new(r"^!\[([^\]]*)\]\(([^)]+)\)$").unwrap();
-    for paragraph in content.split("\n\n") {
-        let text = paragraph.trim();
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+
+    #[derive(Debug)]
+    struct NodeBuilder {
+        tag: String,
+        attrs: Option<serde_json::Map<String, serde_json::Value>>,
+        children: Vec<serde_json::Value>,
+    }
+
+    enum StackEntry {
+        Node(NodeBuilder),
+        Image { src: String, alt: String },
+    }
+
+    fn push_text(children: &mut Vec<serde_json::Value>, text: &str) {
         if text.is_empty() {
-            continue;
+            return;
         }
-        if let Some(captures) = image_regex.captures(text) {
-            let alt = captures.get(1).map(|m| m.as_str()).unwrap_or("");
-            let src = captures.get(2).map(|m| m.as_str()).unwrap_or("");
-            if !src.is_empty() {
-                nodes.push(json!({
-                    "tag": "img",
-                    "attrs": { "src": src }
-                }));
-                if !alt.is_empty() {
-                    nodes.push(json!({
-                        "tag": "figcaption",
-                        "children": [alt]
-                    }));
+        if let Some(serde_json::Value::String(existing)) = children.last_mut() {
+            existing.push_str(text);
+            return;
+        }
+        children.push(serde_json::Value::String(text.to_string()));
+    }
+
+    fn push_value(
+        stack: &mut Vec<StackEntry>,
+        root: &mut Vec<serde_json::Value>,
+        value: serde_json::Value,
+    ) {
+        if let Some(StackEntry::Node(parent)) = stack.last_mut() {
+            parent.children.push(value);
+        } else {
+            root.push(value);
+        }
+    }
+
+    fn close_node(stack: &mut Vec<StackEntry>, root: &mut Vec<serde_json::Value>) {
+        let Some(entry) = stack.pop() else {
+            return;
+        };
+        match entry {
+            StackEntry::Node(node) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("tag".to_string(), serde_json::Value::String(node.tag));
+                if let Some(attrs) = node.attrs {
+                    obj.insert("attrs".to_string(), serde_json::Value::Object(attrs));
                 }
-                continue;
+                if !node.children.is_empty() {
+                    obj.insert("children".to_string(), serde_json::Value::Array(node.children));
+                }
+                push_value(stack, root, serde_json::Value::Object(obj));
+            }
+            StackEntry::Image { src, alt } => {
+                if !src.is_empty() {
+                    push_value(
+                        stack,
+                        root,
+                        json!({
+                            "tag": "img",
+                            "attrs": { "src": src }
+                        }),
+                    );
+                }
+                if !alt.trim().is_empty() {
+                    push_value(
+                        stack,
+                        root,
+                        json!({
+                            "tag": "figcaption",
+                            "children": [alt.trim()]
+                        }),
+                    );
+                }
             }
         }
-        nodes.push(json!({
-            "tag": "p",
-            "children": [text],
-        }));
     }
-    nodes
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let parser = Parser::new_ext(content, options);
+    let mut root: Vec<serde_json::Value> = Vec::new();
+    let mut stack: Vec<StackEntry> = Vec::new();
+
+    for event in parser {
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => stack.push(StackEntry::Node(NodeBuilder {
+                    tag: "p".to_string(),
+                    attrs: None,
+                    children: Vec::new(),
+                })),
+                Tag::Heading(level, _, _) => {
+                    let tag_name = match level {
+                        HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => "h3",
+                        _ => "h4",
+                    };
+                    stack.push(StackEntry::Node(NodeBuilder {
+                        tag: tag_name.to_string(),
+                        attrs: None,
+                        children: Vec::new(),
+                    }))
+                }
+                Tag::BlockQuote => stack.push(StackEntry::Node(NodeBuilder {
+                    tag: "blockquote".to_string(),
+                    attrs: None,
+                    children: Vec::new(),
+                })),
+                Tag::List(Some(_)) => stack.push(StackEntry::Node(NodeBuilder {
+                    tag: "ol".to_string(),
+                    attrs: None,
+                    children: Vec::new(),
+                })),
+                Tag::List(None) => stack.push(StackEntry::Node(NodeBuilder {
+                    tag: "ul".to_string(),
+                    attrs: None,
+                    children: Vec::new(),
+                })),
+                Tag::Item => stack.push(StackEntry::Node(NodeBuilder {
+                    tag: "li".to_string(),
+                    attrs: None,
+                    children: Vec::new(),
+                })),
+                Tag::Emphasis => stack.push(StackEntry::Node(NodeBuilder {
+                    tag: "em".to_string(),
+                    attrs: None,
+                    children: Vec::new(),
+                })),
+                Tag::Strong => stack.push(StackEntry::Node(NodeBuilder {
+                    tag: "strong".to_string(),
+                    attrs: None,
+                    children: Vec::new(),
+                })),
+                Tag::Strikethrough => stack.push(StackEntry::Node(NodeBuilder {
+                    tag: "s".to_string(),
+                    attrs: None,
+                    children: Vec::new(),
+                })),
+                Tag::CodeBlock(_kind) => stack.push(StackEntry::Node(NodeBuilder {
+                    tag: "pre".to_string(),
+                    attrs: None,
+                    children: Vec::new(),
+                })),
+                Tag::Link(_, dest, _) => {
+                    let mut attrs = serde_json::Map::new();
+                    attrs.insert("href".to_string(), serde_json::Value::String(dest.to_string()));
+                    stack.push(StackEntry::Node(NodeBuilder {
+                        tag: "a".to_string(),
+                        attrs: Some(attrs),
+                        children: Vec::new(),
+                    }))
+                }
+                Tag::Image(_, dest, _) => stack.push(StackEntry::Image {
+                    src: dest.to_string(),
+                    alt: String::new(),
+                }),
+                _ => {}
+            },
+            Event::End(tag) => match tag {
+                Tag::Image(_, _, _) => close_node(&mut stack, &mut root),
+                Tag::Paragraph
+                | Tag::Heading(..)
+                | Tag::BlockQuote
+                | Tag::List(_)
+                | Tag::Item
+                | Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough
+                | Tag::Link(_, _, _)
+                | Tag::CodeBlock(_) => close_node(&mut stack, &mut root),
+                _ => {}
+            },
+            Event::Text(text) => {
+                if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
+                    alt.push_str(&text);
+                } else if let Some(StackEntry::Node(parent)) = stack.last_mut() {
+                    push_text(&mut parent.children, &text);
+                } else {
+                    push_text(&mut root, &text);
+                }
+            }
+            Event::Code(text) => {
+                if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
+                    alt.push_str(&text);
+                } else {
+                    push_value(
+                        &mut stack,
+                        &mut root,
+                        json!({
+                            "tag": "code",
+                            "children": [text.as_ref()]
+                        }),
+                    );
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                push_value(&mut stack, &mut root, json!({ "tag": "br" }));
+            }
+            Event::Rule => {
+                push_value(&mut stack, &mut root, json!({ "tag": "hr" }));
+            }
+            Event::Html(html) => {
+                if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
+                    alt.push_str(&html);
+                } else if let Some(StackEntry::Node(parent)) = stack.last_mut() {
+                    push_text(&mut parent.children, &html);
+                } else {
+                    push_text(&mut root, &html);
+                }
+            }
+            Event::TaskListMarker(checked) => {
+                let marker = if checked { "[x] " } else { "[ ] " };
+                if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
+                    alt.push_str(marker);
+                } else if let Some(StackEntry::Node(parent)) = stack.last_mut() {
+                    push_text(&mut parent.children, marker);
+                } else {
+                    push_text(&mut root, marker);
+                }
+            }
+            Event::FootnoteReference(_) => {}
+        }
+    }
+
+    while !stack.is_empty() {
+        close_node(&mut stack, &mut root);
+    }
+
+    root
 }
 
 #[derive(Debug, Deserialize)]
