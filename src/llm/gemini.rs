@@ -347,18 +347,38 @@ async fn call_gemini_api(model: &str, payload: serde_json::Value) -> Result<Gemi
         debug!(target: "llm.gemini", model = model, payload = %payload_summary);
     }
 
-    let response = client
+    let response = match client
         .post(url)
         .timeout(Duration::from_secs(90))
         .json(&payload)
         .send()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(
+                "Gemini request failed to send: {err} (timeout={}, connect={}, status={:?}, url={:?})",
+                err.is_timeout(),
+                err.is_connect(),
+                err.status(),
+                err.url(),
+            );
+            return Err(anyhow!("Gemini request failed: {}", err));
+        }
+    };
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         let (message, body_summary) = summarize_error_body(&body);
         warn!("Gemini API error: status={}, body={}", status, body_summary);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                target: "llm.gemini",
+                status = %status,
+                body = %truncate_for_log(&body, 4000)
+            );
+        }
         let detail = message.unwrap_or(body_summary);
         return Err(anyhow!("Gemini request failed with status {}: {}", status, detail));
     }
@@ -455,10 +475,6 @@ pub async fn generate_image_with_gemini(
     let system_instruction = base_instruction.to_string();
     let parts = build_gemini_parts(prompt, &images, None, None, &[], false);
     let mut generation_config = json!({
-        "temperature": 0.8,
-        "topK": 40,
-        "topP": 0.95,
-        "maxOutputTokens": 65535,
         "responseModalities": ["TEXT", "IMAGE"]
     });
     if let Some(image_config) = build_image_config(image_config.as_ref()) {

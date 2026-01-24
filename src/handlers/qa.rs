@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use teloxide::prelude::*;
+use teloxide::RequestError;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityRef, MessageId, ParseMode,
     ReplyParameters,
@@ -22,10 +23,13 @@ use crate::handlers::responses::send_response;
 use crate::llm::{call_gemini, call_openrouter};
 use crate::state::{AppState, PendingQRequest};
 use crate::utils::timing::{complete_command_timer, start_command_timer};
+use tracing::warn;
 
 pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 pub const MODEL_GEMINI: &str = "gemini";
 const MIN_LANGUAGE_CONFIDENCE: f64 = 0.6;
+const SEND_MESSAGE_RETRY_ATTEMPTS: usize = 3;
+const USER_ERROR_DETAIL_LIMIT: usize = 400;
 
 fn now_unix_seconds() -> i64 {
     SystemTime::now()
@@ -48,6 +52,92 @@ fn detect_language_name(text: &str) -> Option<String> {
         return None;
     }
     Some(info.lang().eng_name().to_string())
+}
+
+fn truncate_for_user(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(limit).collect();
+    format!("{truncated}...")
+}
+
+fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
+    let display_model = if model_name == MODEL_GEMINI {
+        "Gemini"
+    } else {
+        model_name
+    };
+    let err_text = err.to_string();
+
+    let friendly = if err_text.contains("OpenRouter request failed") {
+        if err_text.contains("status 404") || err_text.contains("404 Not Found") {
+            format!(
+                "Sorry, {display_model} is unavailable on OpenRouter right now. Please pick another model or try again later."
+            )
+        } else {
+            format!(
+                "Sorry, {display_model} returned an OpenRouter error. Please try again later or choose another model."
+            )
+        }
+    } else {
+        format!(
+            "Sorry, I couldn't process your request with {display_model}. Please try again later."
+        )
+    };
+
+    let detail = truncate_for_user(&err_text, USER_ERROR_DETAIL_LIMIT);
+    format!("{friendly}\n\nError: {detail}")
+}
+
+async fn send_message_with_retry(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    reply_to: Option<MessageId>,
+    parse_mode: Option<ParseMode>,
+    reply_markup: Option<InlineKeyboardMarkup>,
+) -> Result<Message> {
+    let text = text.to_string();
+    let mut delay = Duration::from_secs_f32(1.5);
+    let mut last_err: Option<RequestError> = None;
+
+    for attempt in 0..SEND_MESSAGE_RETRY_ATTEMPTS {
+        let mut request = bot.send_message(chat_id, text.clone());
+        if let Some(reply_to) = reply_to {
+            request = request.reply_parameters(ReplyParameters::new(reply_to));
+        }
+        if let Some(mode) = parse_mode {
+            request = request.parse_mode(mode);
+        }
+        if let Some(markup) = reply_markup.clone() {
+            request = request.reply_markup(markup);
+        }
+
+        match request.await {
+            Ok(message) => return Ok(message),
+            Err(err) => {
+                let retryable = matches!(
+                    err,
+                    RequestError::Network(_) | RequestError::RetryAfter(_) | RequestError::Io(_)
+                );
+                if !retryable || attempt + 1 == SEND_MESSAGE_RETRY_ATTEMPTS {
+                    return Err(err.into());
+                }
+
+                warn!("send_message attempt {} failed: {err}", attempt + 1);
+                if let RequestError::RetryAfter(wait) = err {
+                    tokio::time::sleep(wait.duration()).await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(last_err.expect("send_message retry exhausted").into())
 }
 
 fn resolve_alias_to_model_id(alias: &str) -> Option<String> {
@@ -216,7 +306,7 @@ async fn process_request(
             request.audio_data.clone(),
             Some(request.youtube_urls.clone()),
         )
-        .await?
+        .await
     } else {
         call_openrouter(
             &system_prompt,
@@ -226,7 +316,20 @@ async fn process_request(
             &request.image_data_list,
             supports_tools,
         )
-        .await?
+        .await
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            let message = format_llm_error_message(model_name, &err);
+            bot.edit_message_text(
+                ChatId(request.chat_id),
+                MessageId(request.selection_message_id as i32),
+                message,
+            )
+            .await?;
+            return Err(err);
+        }
     };
 
     if response.trim().is_empty() {
@@ -284,9 +387,15 @@ pub async fn q_handler(
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        bot.send_message(message.chat.id, "You're sending commands too quickly. Please wait a moment before trying again.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "You're sending commands too quickly. Please wait a moment before trying again.",
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -333,9 +442,15 @@ pub async fn q_handler(
     };
 
     if original_query.trim().is_empty() {
-        bot.send_message(message.chat.id, "Please provide a question or reply to a message with /q.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "Please provide a question or reply to a message with /q.",
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -443,10 +558,15 @@ pub async fn q_handler(
         } else {
             "Processing your question...".to_string()
         };
-        let processing_message = bot
-            .send_message(message.chat.id, processing_message_text)
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        let processing_message = send_message_with_retry(
+            &bot,
+            message.chat.id,
+            &processing_message_text,
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
         let mut timer = start_command_timer(command_name, &message);
         let use_pro = has_images || has_video || has_audio || !youtube_urls.is_empty();
         let response = call_gemini(
@@ -463,7 +583,16 @@ pub async fn q_handler(
             audio_data.clone(),
             Some(youtube_urls.clone()),
         )
-        .await?;
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                let message = format_llm_error_message(MODEL_GEMINI, &err);
+                bot.edit_message_text(processing_message.chat.id, processing_message.id, message)
+                    .await?;
+                return Err(err);
+            }
+        };
 
         send_response(
             &bot,
@@ -485,12 +614,15 @@ pub async fn q_handler(
     }
 
     let keyboard = create_model_selection_keyboard(has_images, has_video, has_audio);
-    let selection_message = bot
-        .send_message(message.chat.id, selection_text)
-        .reply_parameters(ReplyParameters::new(message.id))
-        .reply_markup(keyboard)
-        .parse_mode(ParseMode::Markdown)
-        .await?;
+    let selection_message = send_message_with_retry(
+        &bot,
+        message.chat.id,
+        &selection_text,
+        Some(message.id),
+        Some(ParseMode::Markdown),
+        Some(keyboard),
+    )
+    .await?;
 
     let request_key = format!("{}_{}", message.chat.id.0, selection_message.id.0);
     let timer = start_command_timer(command_name, &message);
@@ -572,7 +704,12 @@ pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String
     }
 
     let _ = bot
-        .edit_message_text(ChatId(request.chat_id), MessageId(request.selection_message_id as i32), "No model selected in time. Using default model...")
+        .edit_message_text(
+            ChatId(request.chat_id),
+            MessageId(request.selection_message_id as i32),
+            "No model selected in time. Using default model...",
+        )
+        .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
         .await;
 
     let command_timer = request.command_timer.take();
@@ -614,6 +751,7 @@ pub async fn model_selection_callback(
         Some(req) => req,
         None => {
             bot.edit_message_text(message.chat().id, message.id(), "This request has expired.")
+                .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
                 .await?;
             return Ok(());
         }
@@ -635,6 +773,7 @@ pub async fn model_selection_callback(
             complete_command_timer(&mut timer, "expired", Some("selection_timeout".to_string()));
         }
         bot.edit_message_text(message.chat().id, message.id(), "Selection timed out. Please try again.")
+            .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
             .await?;
         return Ok(());
     }
@@ -656,6 +795,7 @@ pub async fn model_selection_callback(
     };
 
     bot.edit_message_text(message.chat().id, message.id(), processing_text)
+        .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
         .await?;
 
     let command_timer = request.command_timer.take();

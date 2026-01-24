@@ -65,7 +65,8 @@ async fn main() -> HandlerResult {
         .branch(dptree::filter(|msg: Message| msg.media_group_id().is_some())
             .endpoint(handle_media_group))
         .branch(dptree::filter(|msg: Message| msg.text().is_some() || msg.caption().is_some())
-            .endpoint(handle_log_message));
+            .endpoint(handle_log_message))
+        .endpoint(ignore_message);
 
     let callback_state = state.clone();
     let callback_handler = Update::filter_callback_query().endpoint(
@@ -260,5 +261,9 @@ async fn handle_log_message(state: AppState, message: Message) -> HandlerResult 
         }
     }
     handlers::responses::log_message(&state, &message).await;
+    Ok(())
+}
+
+async fn ignore_message(_message: Message) -> HandlerResult {
     Ok(())
 }
