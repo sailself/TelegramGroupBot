@@ -4,7 +4,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use teloxide::types::{MessageEntityKind, MessageEntityRef};
-use tracing::warn;
+use tracing::{debug, warn};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
 use crate::config::CONFIG;
@@ -12,6 +12,26 @@ use crate::llm::media::download_media;
 use crate::tools::telegraph_extractor::{extract_telegraph_content, TelegraphContent};
 use crate::tools::twitter_extractor::{extract_twitter_content, TwitterContent};
 use crate::utils::http::get_http_client;
+
+fn truncate_for_log(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(limit).collect();
+    format!("{}...", truncated)
+}
+
+fn log_extracted_content(source: &str, url: &str, text: &str, images: usize, videos: usize, audios: usize) {
+    debug!(
+        target: "content.extract",
+        source = source,
+        url = url,
+        images = images,
+        videos = videos,
+        audios = audios,
+        text = %truncate_for_log(text, 200)
+    );
+}
 
 fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
     if content.trim().is_empty() {
@@ -404,6 +424,14 @@ pub async fn extract_telegraph_urls_and_content(
     for url in urls.into_iter().take(max_urls) {
         match extract_telegraph_content(&url).await {
             Ok(content) => {
+                log_extracted_content(
+                    "telegraph",
+                    &url,
+                    &content.text_content,
+                    content.image_urls.len(),
+                    content.video_urls.len(),
+                    0,
+                );
                 let formatted = format!("\n[Telegraph content extracted from {}]\n{}\n", url, content.text_content);
                 new_text.push_str(&formatted);
                 extracted.push(content);
@@ -479,6 +507,14 @@ pub async fn extract_twitter_urls_and_content(
     for url in urls.into_iter().take(max_urls) {
         match extract_twitter_content(&url).await {
             Ok(content) => {
+                log_extracted_content(
+                    "twitter",
+                    &url,
+                    &content.text_content,
+                    content.image_urls.len(),
+                    content.video_urls.len(),
+                    0,
+                );
                 if !content.formatted_content.is_empty() {
                     new_text.push_str(&content.formatted_content);
                 }

@@ -133,13 +133,14 @@ fn summarize_gemini_parts(parts: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-fn summarize_gemini_payload(payload: &Value) -> Value {
+fn summarize_gemini_payload(payload: &Value, system_prompt_label: Option<&str>) -> Value {
     let mut summary = Map::new();
 
-    if let Some(system_parts) = payload.pointer("/systemInstruction/parts").and_then(|value| value.as_array()) {
+    if payload.pointer("/systemInstruction").is_some() {
+        let label = system_prompt_label.unwrap_or("inline_system_prompt");
         summary.insert(
             "systemInstruction".to_string(),
-            Value::Array(summarize_gemini_parts(system_parts)),
+            Value::String(label.to_string()),
         );
     }
 
@@ -335,7 +336,11 @@ fn extract_images_from_response(response: GeminiResponse) -> Vec<Vec<u8>> {
     images
 }
 
-async fn call_gemini_api(model: &str, payload: serde_json::Value) -> Result<GeminiResponse> {
+async fn call_gemini_api(
+    model: &str,
+    payload: serde_json::Value,
+    system_prompt_label: Option<&str>,
+) -> Result<GeminiResponse> {
     let client = get_http_client();
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
@@ -343,7 +348,7 @@ async fn call_gemini_api(model: &str, payload: serde_json::Value) -> Result<Gemi
     );
 
     if tracing::enabled!(tracing::Level::DEBUG) {
-        let payload_summary = summarize_gemini_payload(&payload);
+        let payload_summary = summarize_gemini_payload(&payload, system_prompt_label);
         debug!(target: "llm.gemini", model = model, payload = %payload_summary);
     }
 
@@ -404,6 +409,7 @@ pub async fn call_gemini(
     video_data: Option<Vec<u8>>,
     audio_data: Option<Vec<u8>>,
     youtube_urls: Option<Vec<String>>,
+    system_prompt_label: Option<&str>,
 ) -> Result<String> {
     let mut content = user_content.to_string();
     if let Some(lang) = response_language {
@@ -447,7 +453,7 @@ pub async fn call_gemini(
     let operation = if use_pro_model { "call_gemini_pro" } else { "call_gemini" };
 
     log_llm_timing("gemini", model, operation, None, || async {
-        let response = call_gemini_api(model, payload).await?;
+        let response = call_gemini_api(model, payload, system_prompt_label).await?;
         Ok(extract_text_from_response(response))
     })
     .await
@@ -492,7 +498,7 @@ pub async fn generate_image_with_gemini(
     });
 
     let model = &CONFIG.gemini_image_model;
-    let response = call_gemini_api(model, payload)
+    let response = call_gemini_api(model, payload, Some("image_generation_system_prompt"))
         .await
         .map_err(|err| ImageGenerationError(err.to_string()))?;
 

@@ -18,7 +18,7 @@ use crate::handlers::content::{
     download_telegraph_media, download_twitter_media, extract_telegraph_urls_and_content,
     extract_twitter_urls_and_content, extract_youtube_urls,
 };
-use crate::handlers::media::{collect_message_media, MediaCollectionOptions};
+use crate::handlers::media::{collect_message_media, message_has_media, MediaCollectionOptions};
 use crate::handlers::responses::send_response;
 use crate::llm::{call_gemini, call_openrouter};
 use crate::state::{AppState, PendingQRequest};
@@ -305,6 +305,7 @@ async fn process_request(
             request.video_data.clone(),
             request.audio_data.clone(),
             Some(request.youtube_urls.clone()),
+            Some("Q_SYSTEM_PROMPT"),
         )
         .await
     } else {
@@ -414,24 +415,24 @@ pub async fn q_handler(
             .or_else(|| reply.caption().map(|value| value.to_string()))
             .unwrap_or_default();
         if !reply_text_raw.trim().is_empty() {
-            let reply_entities = message_entities_for_text(reply);
-            let (reply_text_processed, reply_telegraph) =
-                extract_telegraph_urls_and_content(
-                    &reply_text_raw,
-                    reply_entities.as_deref(),
-                    5,
-                )
-                .await;
-            let (reply_text_processed, reply_twitter) =
-                extract_twitter_urls_and_content(
-                    &reply_text_processed,
-                    reply_entities.as_deref(),
-                    5,
-                )
-                .await;
-            telegraph_contents.extend(reply_telegraph);
-            twitter_contents.extend(reply_twitter);
-            reply_text = reply_text_processed;
+                let reply_entities = message_entities_for_text(reply);
+                let (reply_text_processed, reply_telegraph) =
+                    extract_telegraph_urls_and_content(
+                        &reply_text_raw,
+                        reply_entities.as_deref(),
+                        5,
+                    )
+                    .await;
+                let (reply_text_processed, reply_twitter) =
+                    extract_twitter_urls_and_content(
+                        &reply_text_processed,
+                        reply_entities.as_deref(),
+                        5,
+                    )
+                    .await;
+                telegraph_contents.extend(reply_telegraph);
+                twitter_contents.extend(reply_twitter);
+                reply_text = reply_text_processed;
         }
     }
 
@@ -532,6 +533,8 @@ pub async fn q_handler(
     let has_audio = audio_data.is_some();
 
     let must_use_gemini = force_gemini
+        || has_video
+        || has_audio
         || !youtube_urls.is_empty()
         || !is_openrouter_available()
         || CONFIG.iter_openrouter_models().is_empty();
@@ -582,6 +585,7 @@ pub async fn q_handler(
             video_data.clone(),
             audio_data.clone(),
             Some(youtube_urls.clone()),
+            Some("Q_SYSTEM_PROMPT"),
         )
         .await;
         let response = match response {

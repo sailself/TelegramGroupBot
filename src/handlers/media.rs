@@ -56,6 +56,15 @@ enum MediaFillMode {
     FillMissing,
 }
 
+pub fn message_has_media(message: &Message) -> bool {
+    message.photo().is_some()
+        || message.video().is_some()
+        || message.audio().is_some()
+        || message.voice().is_some()
+        || message.document().is_some()
+        || message.sticker().is_some()
+}
+
 pub async fn get_file_url(bot: &Bot, file_id: &FileId) -> Result<String> {
     let file = bot.get_file(file_id.clone()).await?;
     Ok(format!(

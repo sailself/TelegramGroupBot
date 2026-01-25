@@ -128,6 +128,43 @@ async fn build_image_caption(model_name: &str, prompt: &str) -> String {
     }
 }
 
+fn message_has_image(message: &Message) -> bool {
+    if message.photo().is_some() {
+        return true;
+    }
+
+    if let Some(document) = message.document() {
+        let mime_is_image = document
+            .mime_type
+            .as_ref()
+            .map(|mime| mime.essence_str().starts_with("image/"))
+            .unwrap_or(false);
+        let name_is_image = document
+            .file_name
+            .as_ref()
+            .map(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.ends_with(".png")
+                    || lower.ends_with(".jpg")
+                    || lower.ends_with(".jpeg")
+                    || lower.ends_with(".webp")
+                    || lower.ends_with(".gif")
+            })
+            .unwrap_or(false);
+        if mime_is_image || name_is_image {
+            return true;
+        }
+    }
+
+    if let Some(sticker) = message.sticker() {
+        if !sticker.flags.is_animated && !sticker.flags.is_video {
+            return true;
+        }
+    }
+
+    false
+}
+
 async fn prepare_image_request(
     bot: &Bot,
     state: &AppState,
@@ -188,6 +225,7 @@ async fn prepare_image_request(
     );
 
     if let Some(reply) = message.reply_to_message() {
+        let reply_has_images = message_has_image(reply);
         if let Some(media_group_id) = reply.media_group_id() {
             let group_items = state
                 .media_groups
@@ -221,7 +259,7 @@ async fn prepare_image_request(
             .map(|value| value.to_string())
             .or_else(|| reply.caption().map(|value| value.to_string()))
             .unwrap_or_default();
-        if !reply_text.trim().is_empty() {
+        if !reply_text.trim().is_empty() && !reply_has_images {
             let reply_entities = message_entities_for_text(reply);
             let (reply_text, reply_telegraph) =
                 extract_telegraph_urls_and_content(&reply_text, reply_entities.as_deref(), 5).await;
@@ -240,7 +278,7 @@ async fn prepare_image_request(
 
             if prompt.trim().is_empty() {
                 prompt = reply_text;
-            } else if image_urls.is_empty() {
+            } else {
                 prompt = format!("{}\n\n{}", reply_text, prompt);
             }
         }
@@ -744,6 +782,7 @@ pub async fn tldr_handler(
         None,
         None,
         None,
+        Some("TLDR_SYSTEM_PROMPT"),
     )
     .await?;
 
@@ -1075,6 +1114,7 @@ pub async fn factcheck_handler(
         video_data,
         audio_data,
         None,
+        Some("FACTCHECK_SYSTEM_PROMPT"),
     )
     .await?;
 
@@ -1161,6 +1201,7 @@ pub async fn profileme_handler(
         None,
         None,
         None,
+        Some("PROFILEME_SYSTEM_PROMPT"),
     )
     .await?;
 
@@ -1239,6 +1280,11 @@ pub async fn paintme_handler(
         None,
         None,
         None,
+        Some(if portrait {
+            "PORTRAIT_SYSTEM_PROMPT"
+        } else {
+            "PAINTME_SYSTEM_PROMPT"
+        }),
     )
     .await?;
 
