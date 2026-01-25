@@ -18,7 +18,8 @@ use crate::handlers::content::{
     download_telegraph_media, download_twitter_media, extract_telegraph_urls_and_content,
     extract_twitter_urls_and_content, extract_youtube_urls,
 };
-use crate::handlers::media::{collect_message_media, message_has_media, MediaCollectionOptions};
+use crate::handlers::media::{collect_message_media, summarize_media_files, MediaCollectionOptions};
+use crate::llm::media::MediaKind;
 use crate::handlers::responses::send_response;
 use crate::llm::{call_gemini, call_openrouter};
 use crate::state::{AppState, PendingQRequest};
@@ -205,10 +206,40 @@ fn is_model_configured(model_key: &str) -> bool {
     CONFIG.get_openrouter_model_config(&normalized).is_some()
 }
 
+fn model_supports_media(
+    model_name: &str,
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+) -> bool {
+    if model_name == MODEL_GEMINI {
+        return true;
+    }
+    if has_documents {
+        return false;
+    }
+
+    let Some(config) = CONFIG.get_openrouter_model_config(model_name) else {
+        return false;
+    };
+    if has_images && !config.image {
+        return false;
+    }
+    if has_video && !config.video {
+        return false;
+    }
+    if has_audio && !config.audio {
+        return false;
+    }
+    true
+}
+
 pub fn create_model_selection_keyboard(
     has_images: bool,
     has_video: bool,
     has_audio: bool,
+    has_documents: bool,
 ) -> InlineKeyboardMarkup {
     let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     let gemini_button = InlineKeyboardButton::callback(
@@ -220,6 +251,9 @@ pub fn create_model_selection_keyboard(
     let mut openrouter_buttons = Vec::new();
 
     for config in CONFIG.iter_openrouter_models() {
+        if has_documents {
+            continue;
+        }
         if has_images && !config.image {
             continue;
         }
@@ -288,10 +322,7 @@ async fn process_request(
     };
 
     let response = if model_name == MODEL_GEMINI {
-        let use_pro = !request.image_data_list.is_empty()
-            || request.video_data.is_some()
-            || request.audio_data.is_some()
-            || !request.youtube_urls.is_empty();
+        let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
         call_gemini(
             &system_prompt,
             &query,
@@ -301,20 +332,24 @@ async fn process_request(
             Some(&CONFIG.gemini_thinking_level),
             None,
             use_pro,
-            Some(request.image_data_list.clone()),
-            request.video_data.clone(),
-            request.audio_data.clone(),
+            Some(request.media_files.clone()),
             Some(request.youtube_urls.clone()),
             Some("Q_SYSTEM_PROMPT"),
         )
         .await
     } else {
+        let image_data_list: Vec<Vec<u8>> = request
+            .media_files
+            .iter()
+            .filter(|file| file.kind == MediaKind::Image)
+            .map(|file| file.bytes.clone())
+            .collect();
         call_openrouter(
             &system_prompt,
             &query,
             model_name,
             "Answer to Your Question",
-            &request.image_data_list,
+            &image_data_list,
             supports_tools,
         )
         .await
@@ -342,10 +377,7 @@ async fn process_request(
     let mut response_text = response;
     if !model_name.is_empty() {
         let display_model = if model_name == MODEL_GEMINI {
-            if !request.image_data_list.is_empty()
-                || request.video_data.is_some()
-                || request.audio_data.is_some()
-                || !request.youtube_urls.is_empty()
+            if !request.media_files.is_empty() || !request.youtube_urls.is_empty()
             {
                 CONFIG.gemini_pro_model.as_str()
             } else {
@@ -507,34 +539,33 @@ pub async fn q_handler(
         query_text.clone()
     };
 
-    let media = collect_message_media(&bot, &state, &message, MediaCollectionOptions::for_qa()).await;
-    let mut image_data_list = media.images;
-    let mut video_data = media.video;
-    let mut video_mime_type = media.video_mime_type;
-    let audio_data = media.audio;
-    let audio_mime_type = media.audio_mime_type;
+    let media_options = MediaCollectionOptions::for_qa();
+    let max_files = media_options.max_files;
+    let media = collect_message_media(&bot, &state, &message, media_options).await;
+    let mut media_files = media.files;
 
-    let (telegraph_images, telegraph_video, telegraph_video_mime) = download_telegraph_media(&telegraph_contents, 5, 1).await;
-    image_data_list.extend(telegraph_images);
-    if video_data.is_none() {
-        video_data = telegraph_video;
-        video_mime_type = telegraph_video_mime;
+    let mut remaining = max_files.saturating_sub(media_files.len());
+    if remaining > 0 {
+        let telegraph_files = download_telegraph_media(&telegraph_contents, remaining).await;
+        remaining = remaining.saturating_sub(telegraph_files.len());
+        media_files.extend(telegraph_files);
     }
 
-    let (twitter_images, twitter_video, twitter_video_mime) = download_twitter_media(&twitter_contents, 5, 1).await;
-    image_data_list.extend(twitter_images);
-    if video_data.is_none() {
-        video_data = twitter_video;
-        video_mime_type = twitter_video_mime;
+    if remaining > 0 {
+        let twitter_files = download_twitter_media(&twitter_contents, remaining).await;
+        media_files.extend(twitter_files);
     }
 
-    let has_images = !image_data_list.is_empty();
-    let has_video = video_data.is_some();
-    let has_audio = audio_data.is_some();
+    let media_summary = summarize_media_files(&media_files);
+    let has_images = media_summary.images > 0;
+    let has_video = media_summary.videos > 0;
+    let has_audio = media_summary.audios > 0;
+    let has_documents = media_summary.documents > 0;
 
     let must_use_gemini = force_gemini
         || has_video
         || has_audio
+        || has_documents
         || !youtube_urls.is_empty()
         || !is_openrouter_available()
         || CONFIG.iter_openrouter_models().is_empty();
@@ -546,7 +577,12 @@ pub async fn q_handler(
         } else if has_images {
             format!(
                 "Analyzing {} image(s) and processing your question...",
-                image_data_list.len()
+                media_summary.images
+            )
+        } else if has_documents {
+            format!(
+                "Analyzing {} document(s) and processing your question...",
+                media_summary.documents
             )
         } else if !twitter_contents.is_empty() {
             format!(
@@ -571,7 +607,7 @@ pub async fn q_handler(
         )
         .await?;
         let mut timer = start_command_timer(command_name, &message);
-        let use_pro = has_images || has_video || has_audio || !youtube_urls.is_empty();
+        let use_pro = media_summary.total > 0 || !youtube_urls.is_empty();
         let response = call_gemini(
             &build_system_prompt(&language),
             &query_text,
@@ -581,9 +617,7 @@ pub async fn q_handler(
             Some(&CONFIG.gemini_thinking_level),
             None,
             use_pro,
-            Some(image_data_list.clone()),
-            video_data.clone(),
-            audio_data.clone(),
+            Some(media_files.clone()),
             Some(youtube_urls.clone()),
             Some("Q_SYSTEM_PROMPT"),
         )
@@ -611,13 +645,13 @@ pub async fn q_handler(
         return Ok(());
     }
 
-    let has_media = has_images || has_video || has_audio;
+    let has_media = has_images || has_video || has_audio || has_documents;
     let mut selection_text = "Please select which AI model to use for your question:".to_string();
     if has_media {
         selection_text.push_str("\n\n*Note: Only models that support media are shown.*");
     }
 
-    let keyboard = create_model_selection_keyboard(has_images, has_video, has_audio);
+    let keyboard = create_model_selection_keyboard(has_images, has_video, has_audio, has_documents);
     let selection_message = send_message_with_retry(
         &bot,
         message.chat.id,
@@ -638,11 +672,7 @@ pub async fn q_handler(
         original_query: original_query.clone(),
         db_query_text: db_query_text.clone(),
         language: language.clone(),
-        image_data_list,
-        video_data,
-        video_mime_type,
-        audio_data,
-        audio_mime_type,
+        media_files,
         youtube_urls,
         telegraph_contents: telegraph_contents.iter().map(|c| c.text_content.clone()).collect(),
         twitter_contents: twitter_contents.iter().map(|c| c.text_content.clone()).collect(),
@@ -702,9 +732,24 @@ pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String
         return;
     };
 
-    let default_model = normalize_model_identifier(&CONFIG.default_q_model);
+    let mut default_model = normalize_model_identifier(&CONFIG.default_q_model);
     if default_model != MODEL_GEMINI && !is_model_configured(&default_model) {
-        return;
+        default_model = MODEL_GEMINI.to_string();
+    }
+
+    let summary = summarize_media_files(&request.media_files);
+    let has_images = summary.images > 0;
+    let has_video = summary.videos > 0;
+    let has_audio = summary.audios > 0;
+    let has_documents = summary.documents > 0;
+    if !model_supports_media(
+        &default_model,
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+    ) {
+        default_model = MODEL_GEMINI.to_string();
     }
 
     let _ = bot
@@ -782,18 +827,49 @@ pub async fn model_selection_callback(
         return Ok(());
     }
 
+    let summary = summarize_media_files(&request.media_files);
+    let has_images = summary.images > 0;
+    let has_video = summary.videos > 0;
+    let has_audio = summary.audios > 0;
+    let has_documents = summary.documents > 0;
+    if !model_supports_media(
+        &selected_model,
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+    ) {
+        bot.edit_message_text(
+            message.chat().id,
+            message.id(),
+            "Selected model does not support the attached media. Please choose Gemini.",
+        )
+        .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
+        .await?;
+        return Ok(());
+    }
+
     let display_name = if selected_model == MODEL_GEMINI {
         "Gemini".to_string()
     } else {
         selected_model.clone()
     };
 
-    let processing_text = if request.video_data.is_some() {
+    let summary = summarize_media_files(&request.media_files);
+    let processing_text = if summary.videos > 0 {
         format!("Analyzing video and processing your question with {}...", display_name)
-    } else if request.audio_data.is_some() {
+    } else if summary.audios > 0 {
         format!("Analyzing audio and processing your question with {}...", display_name)
-    } else if !request.image_data_list.is_empty() {
-        format!("Analyzing {} image(s) and processing your question with {}...", request.image_data_list.len(), display_name)
+    } else if summary.images > 0 {
+        format!(
+            "Analyzing {} image(s) and processing your question with {}...",
+            summary.images, display_name
+        )
+    } else if summary.documents > 0 {
+        format!(
+            "Analyzing {} document(s) and processing your question with {}...",
+            summary.documents, display_name
+        )
     } else {
         format!("Processing your question with {}...", display_name)
     };

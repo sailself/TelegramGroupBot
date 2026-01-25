@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
 use crate::config::CONFIG;
-use crate::llm::media::download_media;
+use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
 use crate::tools::telegraph_extractor::{extract_telegraph_content, TelegraphContent};
 use crate::tools::twitter_extractor::{extract_twitter_content, TwitterContent};
 use crate::utils::http::get_http_client;
@@ -530,92 +530,120 @@ pub async fn extract_twitter_urls_and_content(
     (new_text, extracted)
 }
 
+fn display_name_from_url(url: &str) -> Option<String> {
+    let trimmed = url.split('?').next().unwrap_or(url);
+    trimmed
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn video_mime_from_url(url: &str) -> Option<&'static str> {
+    let lowered = url.to_ascii_lowercase();
+    if lowered.ends_with(".m3u8") {
+        Some("application/x-mpegURL")
+    } else if lowered.ends_with(".mpd") {
+        Some("application/dash+xml")
+    } else if lowered.ends_with(".webm") {
+        Some("video/webm")
+    } else if lowered.ends_with(".mp4") {
+        Some("video/mp4")
+    } else {
+        None
+    }
+}
+
 pub async fn download_telegraph_media(
     contents: &[TelegraphContent],
-    max_images: usize,
-    max_videos: usize,
-) -> (Vec<Vec<u8>>, Option<Vec<u8>>, Option<String>) {
-    let mut image_data_list = Vec::new();
-    let mut video_data = None;
-    let mut video_mime_type = None;
+    max_files: usize,
+) -> Vec<MediaFile> {
+    let mut files = Vec::new();
+    if max_files == 0 {
+        return files;
+    }
 
     for content in contents {
         for url in &content.image_urls {
-            if image_data_list.len() >= max_images {
-                break;
+            if files.len() >= max_files {
+                return files;
             }
             if let Some(bytes) = download_media(url).await {
-                image_data_list.push(bytes);
+                let mime_type = detect_mime_type(&bytes).unwrap_or_else(|| "image/png".to_string());
+                files.push(MediaFile::new(
+                    bytes,
+                    mime_type,
+                    MediaKind::Image,
+                    display_name_from_url(url),
+                ));
             }
-        }
-
-        if video_data.is_some() || max_videos == 0 {
-            continue;
         }
 
         for url in &content.video_urls {
+            if files.len() >= max_files {
+                return files;
+            }
             if let Some(bytes) = download_media(url).await {
-                let lowered = url.to_lowercase();
-                let mime = if lowered.ends_with(".m3u8") {
-                    "application/x-mpegURL"
-                } else if lowered.ends_with(".mpd") {
-                    "application/dash+xml"
-                } else if lowered.ends_with(".webm") {
-                    "video/webm"
-                } else {
-                    "video/mp4"
-                };
-                video_data = Some(bytes);
-                video_mime_type = Some(mime.to_string());
-                break;
+                let mime_type = video_mime_from_url(url)
+                    .map(|value| value.to_string())
+                    .or_else(|| detect_mime_type(&bytes))
+                    .unwrap_or_else(|| "video/mp4".to_string());
+                files.push(MediaFile::new(
+                    bytes,
+                    mime_type,
+                    MediaKind::Video,
+                    display_name_from_url(url),
+                ));
             }
         }
     }
 
-    (image_data_list, video_data, video_mime_type)
+    files
 }
 
 pub async fn download_twitter_media(
     contents: &[TwitterContent],
-    max_images: usize,
-    max_videos: usize,
-) -> (Vec<Vec<u8>>, Option<Vec<u8>>, Option<String>) {
-    let mut image_data_list = Vec::new();
-    let mut video_data = None;
-    let mut video_mime_type = None;
+    max_files: usize,
+) -> Vec<MediaFile> {
+    let mut files = Vec::new();
+    if max_files == 0 {
+        return files;
+    }
 
     for content in contents {
         for url in &content.image_urls {
-            if image_data_list.len() >= max_images {
-                break;
+            if files.len() >= max_files {
+                return files;
             }
             if let Some(bytes) = download_media(url).await {
-                image_data_list.push(bytes);
+                let mime_type = detect_mime_type(&bytes).unwrap_or_else(|| "image/png".to_string());
+                files.push(MediaFile::new(
+                    bytes,
+                    mime_type,
+                    MediaKind::Image,
+                    display_name_from_url(url),
+                ));
             }
-        }
-
-        if video_data.is_some() || max_videos == 0 {
-            continue;
         }
 
         for url in &content.video_urls {
+            if files.len() >= max_files {
+                return files;
+            }
             if let Some(bytes) = download_media(url).await {
-                let lowered = url.to_lowercase();
-                let mime = if lowered.ends_with(".m3u8") {
-                    "application/x-mpegURL"
-                } else if lowered.ends_with(".mpd") {
-                    "application/dash+xml"
-                } else if lowered.ends_with(".webm") {
-                    "video/webm"
-                } else {
-                    "video/mp4"
-                };
-                video_data = Some(bytes);
-                video_mime_type = Some(mime.to_string());
-                break;
+                let mime_type = video_mime_from_url(url)
+                    .map(|value| value.to_string())
+                    .or_else(|| detect_mime_type(&bytes))
+                    .unwrap_or_else(|| "video/mp4".to_string());
+                files.push(MediaFile::new(
+                    bytes,
+                    mime_type,
+                    MediaKind::Video,
+                    display_name_from_url(url),
+                ));
             }
         }
     }
 
-    (image_data_list, video_data, video_mime_type)
+    files
 }

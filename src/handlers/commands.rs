@@ -16,7 +16,9 @@ use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::content::{
     create_telegraph_page, extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
 };
-use crate::handlers::media::{collect_message_media, get_file_url, MediaCollectionOptions};
+use crate::handlers::media::{
+    collect_message_media, get_file_url, summarize_media_files, MediaCollectionOptions,
+};
 use crate::handlers::responses::send_response;
 use crate::llm::media::detect_mime_type;
 use crate::llm::{
@@ -780,8 +782,6 @@ pub async fn tldr_handler(
         true,
         None,
         None,
-        None,
-        None,
         Some("TLDR_SYSTEM_PROMPT"),
     )
     .await?;
@@ -966,38 +966,43 @@ pub async fn factcheck_handler(
 
     let mut media_options = MediaCollectionOptions::for_commands();
     media_options.include_reply = true;
+    let max_files = media_options.max_files;
     let collected_media = collect_message_media(&bot, &state, &message, media_options).await;
-    let mut image_data_list = collected_media.images;
-    let mut video_data = collected_media.video;
-    let audio_data = collected_media.audio;
+    let mut media_files = collected_media.files;
 
-    let (telegraph_images, telegraph_video, _telegraph_video_mime) =
-        crate::handlers::content::download_telegraph_media(&telegraph_contents, 5, 1).await;
-    image_data_list.extend(telegraph_images);
-    if video_data.is_none() {
-        video_data = telegraph_video;
+    let mut remaining = max_files.saturating_sub(media_files.len());
+    if remaining > 0 {
+        let telegraph_files =
+            crate::handlers::content::download_telegraph_media(&telegraph_contents, remaining)
+                .await;
+        remaining = remaining.saturating_sub(telegraph_files.len());
+        media_files.extend(telegraph_files);
     }
 
-    let (twitter_images, twitter_video, _twitter_video_mime) =
-        crate::handlers::content::download_twitter_media(&twitter_contents, 5, 1).await;
-    image_data_list.extend(twitter_images);
-    if video_data.is_none() {
-        video_data = twitter_video;
+    if remaining > 0 {
+        let twitter_files =
+            crate::handlers::content::download_twitter_media(&twitter_contents, remaining).await;
+        media_files.extend(twitter_files);
     }
+
+    let media_summary = summarize_media_files(&media_files);
 
     if statement.trim().is_empty() {
-        if video_data.is_some() {
+        if media_summary.videos > 0 {
             statement =
                 "Please analyze this video and fact-check any claims or content shown in it."
                     .to_string();
-        } else if audio_data.is_some() {
+        } else if media_summary.audios > 0 {
             statement =
                 "Please analyze this audio and fact-check any claims or content shown in it."
                     .to_string();
-        } else if !image_data_list.is_empty() {
+        } else if media_summary.images > 0 {
             statement =
                 "Please analyze these images and fact-check any claims or content shown in them."
                     .to_string();
+        } else if media_summary.documents > 0 {
+            statement = "Please analyze these documents and fact-check any claims or content shown in them."
+                .to_string();
         } else {
             bot.send_message(message.chat.id, "Please reply to a message to fact-check.")
                 .reply_parameters(ReplyParameters::new(message.id))
@@ -1006,14 +1011,19 @@ pub async fn factcheck_handler(
         }
     }
 
-    let mut processing_message_text = if video_data.is_some() {
+    let mut processing_message_text = if media_summary.videos > 0 {
         "Analyzing video and fact-checking content...".to_string()
-    } else if audio_data.is_some() {
+    } else if media_summary.audios > 0 {
         "Analyzing audio and fact-checking content...".to_string()
-    } else if !image_data_list.is_empty() {
+    } else if media_summary.images > 0 {
         format!(
             "Analyzing {} image(s) and fact-checking content...",
-            image_data_list.len()
+            media_summary.images
+        )
+    } else if media_summary.documents > 0 {
+        format!(
+            "Analyzing {} document(s) and fact-checking content...",
+            media_summary.documents
         )
     } else {
         "Fact-checking message...".to_string()
@@ -1109,10 +1119,8 @@ pub async fn factcheck_handler(
         false,
         Some(&CONFIG.gemini_thinking_level),
         None,
-        !image_data_list.is_empty() || video_data.is_some() || audio_data.is_some(),
-        Some(image_data_list),
-        video_data,
-        audio_data,
+        media_summary.total > 0,
+        Some(media_files),
         None,
         Some("FACTCHECK_SYSTEM_PROMPT"),
     )
@@ -1199,8 +1207,6 @@ pub async fn profileme_handler(
         false,
         None,
         None,
-        None,
-        None,
         Some("PROFILEME_SYSTEM_PROMPT"),
     )
     .await?;
@@ -1276,8 +1282,6 @@ pub async fn paintme_handler(
         Some(&CONFIG.gemini_thinking_level),
         None,
         false,
-        None,
-        None,
         None,
         None,
         Some(if portrait {

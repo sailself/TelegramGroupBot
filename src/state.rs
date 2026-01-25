@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use teloxide::types::{FileId, MediaGroupId};
+
+use crate::llm::media::MediaFile;
 use crate::db::database::Database;
 use crate::utils::timing::CommandTimer;
 
@@ -15,11 +17,7 @@ pub struct PendingQRequest {
     pub original_query: String,
     pub db_query_text: String,
     pub language: String,
-    pub image_data_list: Vec<Vec<u8>>,
-    pub video_data: Option<Vec<u8>>,
-    pub video_mime_type: Option<String>,
-    pub audio_data: Option<Vec<u8>>,
-    pub audio_mime_type: Option<String>,
+    pub media_files: Vec<MediaFile>,
     pub youtube_urls: Vec<String>,
     pub telegraph_contents: Vec<String>,
     pub twitter_contents: Vec<String>,

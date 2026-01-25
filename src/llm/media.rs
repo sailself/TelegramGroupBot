@@ -39,3 +39,47 @@ pub async fn download_media(url: &str) -> Option<Vec<u8>> {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Video,
+    Audio,
+    Document,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaFile {
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+    pub kind: MediaKind,
+    pub display_name: Option<String>,
+}
+
+impl MediaFile {
+    pub fn new(
+        bytes: Vec<u8>,
+        mime_type: String,
+        kind: MediaKind,
+        display_name: Option<String>,
+    ) -> Self {
+        Self {
+            bytes,
+            mime_type,
+            kind,
+            display_name,
+        }
+    }
+}
+
+pub fn kind_for_mime(mime_type: &str) -> MediaKind {
+    if mime_type.starts_with("image/") {
+        MediaKind::Image
+    } else if mime_type.starts_with("video/") {
+        MediaKind::Video
+    } else if mime_type.starts_with("audio/") {
+        MediaKind::Audio
+    } else {
+        MediaKind::Document
+    }
+}

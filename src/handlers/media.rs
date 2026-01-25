@@ -1,29 +1,25 @@
-use std::collections::HashSet;
+﻿use std::collections::HashSet;
 
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::FileId;
 
 use crate::config::CONFIG;
+use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
 use crate::state::AppState;
+
+const DEFAULT_MAX_FILES: usize = 10;
 
 #[derive(Debug, Default, Clone)]
 pub struct MediaCollection {
-    pub images: Vec<Vec<u8>>,
-    pub video: Option<Vec<u8>>,
-    pub video_mime_type: Option<String>,
-    pub audio: Option<Vec<u8>>,
-    pub audio_mime_type: Option<String>,
+    pub files: Vec<MediaFile>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct MediaCollectionOptions {
     pub include_reply: bool,
     pub include_media_group: bool,
-    pub max_images: usize,
-    pub clear_images_on_video_or_audio: bool,
-    pub skip_audio_if_video: bool,
-    pub skip_voice_if_audio: bool,
+    pub max_files: usize,
 }
 
 impl MediaCollectionOptions {
@@ -31,10 +27,7 @@ impl MediaCollectionOptions {
         Self {
             include_reply: false,
             include_media_group: true,
-            max_images: 5,
-            clear_images_on_video_or_audio: true,
-            skip_audio_if_video: true,
-            skip_voice_if_audio: true,
+            max_files: DEFAULT_MAX_FILES,
         }
     }
 
@@ -42,27 +35,36 @@ impl MediaCollectionOptions {
         Self {
             include_reply: true,
             include_media_group: true,
-            max_images: 5,
-            clear_images_on_video_or_audio: false,
-            skip_audio_if_video: false,
-            skip_voice_if_audio: false,
+            max_files: DEFAULT_MAX_FILES,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MediaFillMode {
-    Always,
-    FillMissing,
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MediaSummary {
+    pub total: usize,
+    pub images: usize,
+    pub videos: usize,
+    pub audios: usize,
+    pub documents: usize,
 }
 
-pub fn message_has_media(message: &Message) -> bool {
-    message.photo().is_some()
-        || message.video().is_some()
-        || message.audio().is_some()
-        || message.voice().is_some()
-        || message.document().is_some()
-        || message.sticker().is_some()
+pub fn summarize_media_files(files: &[MediaFile]) -> MediaSummary {
+    let mut summary = MediaSummary {
+        total: files.len(),
+        ..MediaSummary::default()
+    };
+
+    for file in files {
+        match file.kind {
+            MediaKind::Image => summary.images += 1,
+            MediaKind::Video => summary.videos += 1,
+            MediaKind::Audio => summary.audios += 1,
+            MediaKind::Document => summary.documents += 1,
+        }
+    }
+
+    summary
 }
 
 pub async fn get_file_url(bot: &Bot, file_id: &FileId) -> Result<String> {
@@ -74,30 +76,77 @@ pub async fn get_file_url(bot: &Bot, file_id: &FileId) -> Result<String> {
     ))
 }
 
-fn add_image(collection: &mut MediaCollection, bytes: Vec<u8>, max_images: usize) {
-    if collection.images.len() < max_images {
-        collection.images.push(bytes);
+fn extension_mime_hint(file_name: &str) -> Option<&'static str> {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        Some("image/png")
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        Some("image/jpeg")
+    } else if lower.ends_with(".webp") {
+        Some("image/webp")
+    } else if lower.ends_with(".gif") {
+        Some("image/gif")
+    } else if lower.ends_with(".mp4") {
+        Some("video/mp4")
+    } else if lower.ends_with(".mov") {
+        Some("video/quicktime")
+    } else if lower.ends_with(".webm") {
+        Some("video/webm")
+    } else if lower.ends_with(".mp3") {
+        Some("audio/mpeg")
+    } else if lower.ends_with(".ogg") {
+        Some("audio/ogg")
+    } else if lower.ends_with(".wav") {
+        Some("audio/wav")
+    } else if lower.ends_with(".pdf") {
+        Some("application/pdf")
+    } else {
+        None
     }
 }
 
-async fn add_image_from_file_id(
+async fn add_file_from_file_id(
     bot: &Bot,
     file_id: &FileId,
     collection: &mut MediaCollection,
     options: MediaCollectionOptions,
     seen_file_ids: &mut HashSet<FileId>,
+    mime_type_hint: Option<&str>,
+    display_name: Option<&str>,
+    kind_hint: Option<MediaKind>,
 ) {
-    if collection.images.len() >= options.max_images {
+    if collection.files.len() >= options.max_files {
         return;
     }
     if !seen_file_ids.insert(file_id.clone()) {
         return;
     }
-    if let Ok(url) = get_file_url(bot, file_id).await {
-        if let Some(bytes) = crate::llm::media::download_media(&url).await {
-            add_image(collection, bytes, options.max_images);
+
+    let Ok(url) = get_file_url(bot, file_id).await else {
+        return;
+    };
+    let Some(bytes) = download_media(&url).await else {
+        return;
+    };
+
+    let mut mime_type = mime_type_hint.map(|value| value.to_string());
+    if mime_type.is_none() {
+        mime_type = detect_mime_type(&bytes);
+    }
+    if mime_type.is_none() {
+        if let Some(name) = display_name {
+            mime_type = extension_mime_hint(name).map(|value| value.to_string());
         }
     }
+    let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    let kind = kind_hint.unwrap_or_else(|| kind_for_mime(&mime_type));
+
+    collection.files.push(MediaFile::new(
+        bytes,
+        mime_type,
+        kind,
+        display_name.map(|value| value.to_string()),
+    ));
 }
 
 async fn collect_from_message(
@@ -105,115 +154,129 @@ async fn collect_from_message(
     message: &Message,
     collection: &mut MediaCollection,
     options: MediaCollectionOptions,
-    fill_mode: MediaFillMode,
     seen_file_ids: &mut HashSet<FileId>,
 ) {
-    let allow_images = matches!(fill_mode, MediaFillMode::Always) || collection.images.is_empty();
-    if allow_images {
-        if let Some(photo_sizes) = message.photo() {
-            if let Some(photo) = photo_sizes.last() {
-                add_image_from_file_id(bot, &photo.file.id, collection, options, seen_file_ids)
-                    .await;
-            }
-        }
+    if collection.files.len() >= options.max_files {
+        return;
+    }
 
-        if let Some(document) = message.document() {
-            let mime_is_image = document
-                .mime_type
-                .as_ref()
-                .map(|mime| mime.essence_str().starts_with("image/"))
-                .unwrap_or(false);
-            let name_is_image = document
-                .file_name
-                .as_ref()
-                .map(|name| {
-                    let lower = name.to_ascii_lowercase();
-                    lower.ends_with(".png")
-                        || lower.ends_with(".jpg")
-                        || lower.ends_with(".jpeg")
-                        || lower.ends_with(".webp")
-                        || lower.ends_with(".gif")
-                })
-                .unwrap_or(false);
-            if mime_is_image || name_is_image {
-                add_image_from_file_id(
-                    bot,
-                    &document.file.id,
-                    collection,
-                    options,
-                    seen_file_ids,
-                )
-                .await;
-            }
-        }
-
-        if let Some(sticker) = message.sticker() {
-            if !sticker.flags.is_animated && !sticker.flags.is_video {
-                add_image_from_file_id(
-                    bot,
-                    &sticker.file.id,
-                    collection,
-                    options,
-                    seen_file_ids,
-                )
-                .await;
-            }
+    if let Some(photo_sizes) = message.photo() {
+        if let Some(photo) = photo_sizes.last() {
+            add_file_from_file_id(
+                bot,
+                &photo.file.id,
+                collection,
+                options,
+                seen_file_ids,
+                None,
+                None,
+                Some(MediaKind::Image),
+            )
+            .await;
         }
     }
 
-    let allow_video = matches!(fill_mode, MediaFillMode::Always) || collection.video.is_none();
-    if allow_video {
-        if let Some(video) = message.video() {
-            if let Ok(url) = get_file_url(bot, &video.file.id).await {
-                if let Some(bytes) = crate::llm::media::download_media(&url).await {
-                    collection.video = Some(bytes);
-                    collection.video_mime_type = Some("video/mp4".to_string());
-                    if options.clear_images_on_video_or_audio {
-                        collection.images.clear();
-                    }
-                }
-            }
-        }
+    if collection.files.len() >= options.max_files {
+        return;
     }
 
-    let allow_audio = matches!(fill_mode, MediaFillMode::Always) || collection.audio.is_none();
-    if allow_audio {
-        if options.skip_audio_if_video && collection.video.is_some() {
-            return;
-        }
-
-        if let Some(audio) = message.audio() {
-            if let Ok(url) = get_file_url(bot, &audio.file.id).await {
-                if let Some(bytes) = crate::llm::media::download_media(&url).await {
-                    collection.audio = Some(bytes);
-                    collection.audio_mime_type = Some("audio/mpeg".to_string());
-                    if options.clear_images_on_video_or_audio {
-                        collection.images.clear();
-                    }
-                }
-            }
-        }
+    if let Some(document) = message.document() {
+        let mime_hint = document.mime_type.as_ref().map(|mime| mime.essence_str());
+        let name_hint = document.file_name.as_deref();
+        add_file_from_file_id(
+            bot,
+            &document.file.id,
+            collection,
+            options,
+            seen_file_ids,
+            mime_hint,
+            name_hint,
+            None,
+        )
+        .await;
     }
 
-    let allow_voice = match fill_mode {
-        MediaFillMode::Always => !(options.skip_voice_if_audio && collection.audio.is_some()),
-        MediaFillMode::FillMissing => collection.audio.is_none(),
-    };
-    if allow_voice {
-        if options.skip_audio_if_video && collection.video.is_some() {
-            return;
-        }
+    if collection.files.len() >= options.max_files {
+        return;
+    }
 
-        if let Some(voice) = message.voice() {
-            if let Ok(url) = get_file_url(bot, &voice.file.id).await {
-                if let Some(bytes) = crate::llm::media::download_media(&url).await {
-                    collection.audio = Some(bytes);
-                    collection.audio_mime_type = Some("audio/ogg".to_string());
-                    if options.clear_images_on_video_or_audio {
-                        collection.images.clear();
-                    }
-                }
-            }
+    if let Some(video) = message.video() {
+        let mime_hint = video
+            .mime_type
+            .as_ref()
+            .map(|mime| mime.essence_str())
+            .or(Some("video/mp4"));
+        add_file_from_file_id(
+            bot,
+            &video.file.id,
+            collection,
+            options,
+            seen_file_ids,
+            mime_hint,
+            None,
+            Some(MediaKind::Video),
+        )
+        .await;
+    }
+
+    if collection.files.len() >= options.max_files {
+        return;
+    }
+
+    if let Some(audio) = message.audio() {
+        let mime_hint = audio
+            .mime_type
+            .as_ref()
+            .map(|mime| mime.essence_str())
+            .or(Some("audio/mpeg"));
+        add_file_from_file_id(
+            bot,
+            &audio.file.id,
+            collection,
+            options,
+            seen_file_ids,
+            mime_hint,
+            audio.file_name.as_deref(),
+            Some(MediaKind::Audio),
+        )
+        .await;
+    }
+
+    if collection.files.len() >= options.max_files {
+        return;
+    }
+
+    if let Some(voice) = message.voice() {
+        add_file_from_file_id(
+            bot,
+            &voice.file.id,
+            collection,
+            options,
+            seen_file_ids,
+            Some("audio/ogg"),
+            None,
+            Some(MediaKind::Audio),
+        )
+        .await;
+    }
+
+    if collection.files.len() >= options.max_files {
+        return;
+    }
+
+    if let Some(sticker) = message.sticker() {
+        if !sticker.flags.is_animated && !sticker.flags.is_video {
+            add_file_from_file_id(
+                bot,
+                &sticker.file.id,
+                collection,
+                options,
+                seen_file_ids,
+                Some("image/webp"),
+                None,
+                Some(MediaKind::Image),
+            )
+            .await;
         }
     }
 }
@@ -227,31 +290,15 @@ pub async fn collect_message_media(
     let mut collection = MediaCollection::default();
     let mut seen_file_ids: HashSet<FileId> = HashSet::new();
 
-    collect_from_message(
-        bot,
-        message,
-        &mut collection,
-        options,
-        MediaFillMode::Always,
-        &mut seen_file_ids,
-    )
-    .await;
+    collect_from_message(bot, message, &mut collection, options, &mut seen_file_ids).await;
 
     if options.include_reply {
         if let Some(reply) = message.reply_to_message() {
-            collect_from_message(
-                bot,
-                reply,
-                &mut collection,
-                options,
-                MediaFillMode::FillMissing,
-                &mut seen_file_ids,
-            )
-            .await;
+            collect_from_message(bot, reply, &mut collection, options, &mut seen_file_ids).await;
         }
     }
 
-    if options.include_media_group {
+    if options.include_media_group && collection.files.len() < options.max_files {
         let mut group_ids = Vec::new();
         if let Some(media_group_id) = message.media_group_id() {
             group_ids.push(media_group_id.clone());
@@ -267,6 +314,9 @@ pub async fn collect_message_media(
         }
 
         for media_group_id in group_ids {
+            if collection.files.len() >= options.max_files {
+                break;
+            }
             let group_items = state
                 .media_groups
                 .lock()
@@ -274,12 +324,18 @@ pub async fn collect_message_media(
                 .cloned()
                 .unwrap_or_default();
             for item in group_items {
-                add_image_from_file_id(
+                if collection.files.len() >= options.max_files {
+                    break;
+                }
+                add_file_from_file_id(
                     bot,
                     &item.file_id,
                     &mut collection,
                     options,
                     &mut seen_file_ids,
+                    None,
+                    None,
+                    Some(MediaKind::Image),
                 )
                 .await;
             }

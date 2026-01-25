@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 use tracing::{debug, warn};
 
 use crate::config::CONFIG;
-use crate::llm::media::{detect_mime_type, download_media};
+use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
 use crate::utils::http::get_http_client;
 use crate::utils::timing::log_llm_timing;
 
@@ -48,6 +48,26 @@ enum GeminiPart {
 struct GeminiInlineData {
     mime_type: String,
     data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiFileInfo {
+    name: String,
+    uri: String,
+    mime_type: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiFileResponse {
+    file: GeminiFileInfo,
+}
+
+#[derive(Debug, Clone)]
+struct UploadedFileRef {
+    uri: String,
+    mime_type: String,
 }
 
 fn build_safety_settings() -> Vec<serde_json::Value> {
@@ -235,6 +255,150 @@ fn summarize_error_body(body: &str) -> (Option<String>, String) {
     (None, truncate_for_log(trimmed, 2000))
 }
 
+fn kind_label(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Image => "image",
+        MediaKind::Video => "video",
+        MediaKind::Audio => "audio",
+        MediaKind::Document => "document",
+    }
+}
+
+async fn upload_file_bytes(
+    display_name: &str,
+    mime_type: &str,
+    bytes: &[u8],
+) -> Result<GeminiFileInfo> {
+    let client = get_http_client();
+    let start_response = client
+        .post("https://generativelanguage.googleapis.com/upload/v1beta/files")
+        .header("x-goog-api-key", &CONFIG.gemini_api_key)
+        .header("X-Goog-Upload-Protocol", "resumable")
+        .header("X-Goog-Upload-Command", "start")
+        .header("X-Goog-Upload-Header-Content-Length", bytes.len().to_string())
+        .header("X-Goog-Upload-Header-Content-Type", mime_type)
+        .json(&json!({ "file": { "display_name": display_name } }))
+        .send()
+        .await?;
+
+    if !start_response.status().is_success() {
+        let status = start_response.status();
+        let body = start_response.text().await.unwrap_or_default();
+        let (message, body_summary) = summarize_error_body(&body);
+        let detail = message.unwrap_or(body_summary);
+        return Err(anyhow!(
+            "Gemini file upload start failed with status {}: {}",
+            status,
+            detail
+        ));
+    }
+
+    let upload_url = start_response
+        .headers()
+        .get("x-goog-upload-url")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow!("Gemini file upload did not return an upload URL"))?;
+
+    let finalize_response = client
+        .post(upload_url)
+        .header("X-Goog-Upload-Command", "upload, finalize")
+        .header("X-Goog-Upload-Offset", "0")
+        .header("Content-Length", bytes.len().to_string())
+        .body(bytes.to_vec())
+        .send()
+        .await?;
+
+    if !finalize_response.status().is_success() {
+        let status = finalize_response.status();
+        let body = finalize_response.text().await.unwrap_or_default();
+        let (message, body_summary) = summarize_error_body(&body);
+        let detail = message.unwrap_or(body_summary);
+        return Err(anyhow!(
+            "Gemini file upload failed with status {}: {}",
+            status,
+            detail
+        ));
+    }
+
+    let payload = finalize_response.json::<GeminiFileResponse>().await?;
+    Ok(payload.file)
+}
+
+async fn get_file_metadata(name: &str) -> Result<GeminiFileInfo> {
+    let client = get_http_client();
+    let response = client
+        .get(format!(
+            "https://generativelanguage.googleapis.com/v1beta/files/{}",
+            name
+        ))
+        .header("x-goog-api-key", &CONFIG.gemini_api_key)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let (message, body_summary) = summarize_error_body(&body);
+        let detail = message.unwrap_or(body_summary);
+        return Err(anyhow!(
+            "Gemini file metadata fetch failed with status {}: {}",
+            status,
+            detail
+        ));
+    }
+
+    Ok(response.json::<GeminiFileResponse>().await?.file)
+}
+
+async fn wait_for_file_active(file: GeminiFileInfo) -> Result<GeminiFileInfo> {
+    let state = file.state.as_deref().unwrap_or("UNKNOWN");
+    if state == "ACTIVE" || state == "UNKNOWN" {
+        return Ok(file);
+    }
+
+    let name = file.name.clone();
+    let mut attempts = 0;
+    while attempts < 15 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let latest = get_file_metadata(&name).await?;
+        match latest.state.as_deref().unwrap_or("UNKNOWN") {
+            "ACTIVE" => return Ok(latest),
+            "FAILED" => {
+                return Err(anyhow!(
+                    "Gemini file processing failed for {}",
+                    latest.uri
+                ))
+            }
+            _ => {}
+        }
+        attempts += 1;
+    }
+
+    Err(anyhow!(
+        "Timed out waiting for Gemini file processing for {}",
+        name
+    ))
+}
+
+async fn upload_media_files(files: &[MediaFile]) -> Result<Vec<UploadedFileRef>> {
+    let mut uploaded = Vec::new();
+
+    for (index, file) in files.iter().enumerate() {
+        let display_name = file.display_name.clone().unwrap_or_else(|| {
+            format!("{}-{}", kind_label(file.kind), index + 1)
+        });
+        let info = upload_file_bytes(&display_name, &file.mime_type, &file.bytes).await?;
+        let info = wait_for_file_active(info).await?;
+        let mime_type = info.mime_type.unwrap_or_else(|| file.mime_type.clone());
+        uploaded.push(UploadedFileRef {
+            uri: info.uri,
+            mime_type,
+        });
+    }
+
+    Ok(uploaded)
+}
+
 fn build_gemini_parts(
     user_content: &str,
     image_data_list: &[Vec<u8>],
@@ -287,6 +451,43 @@ fn build_gemini_parts(
             "inlineData": {
                 "mimeType": mime_type,
                 "data": encoded
+            }
+        }));
+    }
+
+    if text_after_media {
+        parts.push(text_part);
+    }
+
+    parts
+}
+
+fn build_gemini_file_parts(
+    user_content: &str,
+    uploaded_files: &[UploadedFileRef],
+    youtube_urls: &[String],
+    text_after_media: bool,
+) -> Vec<serde_json::Value> {
+    let mut parts = Vec::new();
+    let text_part = json!({ "text": user_content });
+
+    if !text_after_media {
+        parts.push(text_part.clone());
+    }
+
+    for file in uploaded_files {
+        parts.push(json!({
+            "fileData": {
+                "fileUri": file.uri,
+                "mimeType": file.mime_type
+            }
+        }));
+    }
+
+    for url in youtube_urls {
+        parts.push(json!({
+            "fileData": {
+                "fileUri": url
             }
         }));
     }
@@ -405,9 +606,7 @@ pub async fn call_gemini(
     _thinking_level: Option<&str>,
     image_url: Option<&str>,
     use_pro_model: bool,
-    image_data_list: Option<Vec<Vec<u8>>>,
-    video_data: Option<Vec<u8>>,
-    audio_data: Option<Vec<u8>>,
+    media_files: Option<Vec<MediaFile>>,
     youtube_urls: Option<Vec<String>>,
     system_prompt_label: Option<&str>,
 ) -> Result<String> {
@@ -418,24 +617,30 @@ pub async fn call_gemini(
 
     let youtube_urls = youtube_urls.unwrap_or_default();
 
-    let mut images = image_data_list.unwrap_or_default();
-    if images.is_empty() {
+    let mut files = media_files.unwrap_or_default();
+    if files.is_empty() {
         if let Some(url) = image_url {
             if let Some(data) = download_media(url).await {
-                images.push(data);
+                let mime_type =
+                    detect_mime_type(&data).unwrap_or_else(|| "image/png".to_string());
+                files.push(MediaFile::new(
+                    data,
+                    mime_type.clone(),
+                    kind_for_mime(&mime_type),
+                    None,
+                ));
             }
         }
     }
 
-    let text_after_media = video_data.is_some() || audio_data.is_some() || !youtube_urls.is_empty();
-    let parts = build_gemini_parts(
-        &content,
-        &images,
-        video_data.as_deref(),
-        audio_data.as_deref(),
-        &youtube_urls,
-        text_after_media,
-    );
+    let uploaded_files = if files.is_empty() {
+        Vec::new()
+    } else {
+        upload_media_files(&files).await?
+    };
+
+    let text_after_media = !uploaded_files.is_empty() || !youtube_urls.is_empty();
+    let parts = build_gemini_file_parts(&content, &uploaded_files, &youtube_urls, text_after_media);
     let payload = json!({
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": [{ "role": "user", "parts": parts }],
