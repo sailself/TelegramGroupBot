@@ -1,4 +1,4 @@
-﻿use tracing::{error, warn};
+use tracing::{error, warn};
 
 use crate::utils::http::get_http_client;
 
@@ -27,7 +27,10 @@ pub async fn download_media(url: &str) -> Option<Vec<u8>> {
     };
 
     if !response.status().is_success() {
-        warn!("Media download failed for {url} with status {}", response.status());
+        warn!(
+            "Media download failed for {url} with status {}",
+            response.status()
+        );
         return None;
     }
 

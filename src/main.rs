@@ -1,4 +1,4 @@
-﻿use std::error::Error;
+use std::error::Error;
 
 use dotenvy::dotenv;
 use teloxide::dispatching::UpdateFilterExt;
@@ -17,9 +17,7 @@ mod utils;
 use config::CONFIG;
 use db::database::Database;
 use handlers::qa::MODEL_CALLBACK_PREFIX;
-use handlers::{
-    commands, qa,
-};
+use handlers::{commands, qa};
 use state::AppState;
 use utils::logging::init_logging;
 
@@ -62,19 +60,22 @@ async fn main() -> HandlerResult {
 
     let message_handler = Update::filter_message()
         .branch(command_handler)
-        .branch(dptree::filter(|msg: Message| msg.media_group_id().is_some())
-            .endpoint(handle_media_group))
-        .branch(dptree::filter(|msg: Message| msg.text().is_some() || msg.caption().is_some())
-            .endpoint(handle_log_message))
+        .branch(
+            dptree::filter(|msg: Message| msg.media_group_id().is_some())
+                .endpoint(handle_media_group),
+        )
+        .branch(
+            dptree::filter(|msg: Message| msg.text().is_some() || msg.caption().is_some())
+                .endpoint(handle_log_message),
+        )
         .endpoint(ignore_message);
 
     let callback_state = state.clone();
-    let callback_handler = Update::filter_callback_query().endpoint(
-        move |bot: Bot, query: CallbackQuery| {
+    let callback_handler =
+        Update::filter_callback_query().endpoint(move |bot: Bot, query: CallbackQuery| {
             let state = callback_state.clone();
             async move { handle_callback_query(bot, state, query).await }
-        },
-    );
+        });
 
     let handler = dptree::entry()
         .branch(message_handler)
@@ -219,11 +220,7 @@ async fn handle_command(
     Ok(())
 }
 
-async fn handle_callback_query(
-    bot: Bot,
-    state: AppState,
-    query: CallbackQuery,
-) -> HandlerResult {
+async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) -> HandlerResult {
     let Some(data) = query.data.clone() else {
         return Ok(());
     };

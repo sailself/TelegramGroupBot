@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -93,7 +93,10 @@ pub async fn search_jina_web(query: &str, max_results: usize) -> Result<JinaSear
     }
 
     let payload = serde_json::json!({ "q": query });
-    info!("Calling Jina search endpoint {} with query: {}", CONFIG.jina_search_endpoint, query);
+    info!(
+        "Calling Jina search endpoint {} with query: {}",
+        CONFIG.jina_search_endpoint, query
+    );
 
     let client = get_http_client();
     let mut request = client
@@ -120,13 +123,15 @@ pub async fn fetch_jina_reader(url: &str) -> Result<String> {
         anyhow::bail!("url must not be empty");
     }
 
-    let target = format!("{}/{}", CONFIG.jina_reader_endpoint.trim_end_matches('/'), url.trim_start_matches('/'));
+    let target = format!(
+        "{}/{}",
+        CONFIG.jina_reader_endpoint.trim_end_matches('/'),
+        url.trim_start_matches('/')
+    );
     info!("Calling Jina reader endpoint {}", target);
 
     let client = get_http_client();
-    let mut request = client
-        .get(target)
-        .timeout(Duration::from_secs(60));
+    let mut request = client.get(target).timeout(Duration::from_secs(60));
 
     if !CONFIG.jina_ai_api_key.trim().is_empty() {
         request = request.bearer_auth(&CONFIG.jina_ai_api_key);
@@ -154,7 +159,13 @@ pub fn format_search_results_markdown(results: &JinaSearchResponse) -> String {
         } else {
             &item.title
         };
-        lines.push(format!("{}. [{}]({})\n   {}", idx + 1, title, item.url, snippet));
+        lines.push(format!(
+            "{}. [{}]({})\n   {}",
+            idx + 1,
+            title,
+            item.url,
+            snippet
+        ));
     }
 
     lines.join("\n")

@@ -1,4 +1,4 @@
-﻿use std::time::Duration;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -58,7 +58,10 @@ fn extract_results(payload: ExaResponse) -> Vec<(String, String, String)> {
     results
 }
 
-pub async fn exa_search(query: &str, max_results: Option<usize>) -> Result<Vec<(String, String, String)>, ExaSearchError> {
+pub async fn exa_search(
+    query: &str,
+    max_results: Option<usize>,
+) -> Result<Vec<(String, String, String)>, ExaSearchError> {
     if CONFIG.exa_api_key.trim().is_empty() {
         return Err(ExaSearchError("EXA_API_KEY is not configured.".to_string()));
     }
@@ -72,7 +75,10 @@ pub async fn exa_search(query: &str, max_results: Option<usize>) -> Result<Vec<(
         "type": "auto"
     });
 
-    info!("Calling Exa search endpoint {} with query: {}", CONFIG.exa_search_endpoint, query);
+    info!(
+        "Calling Exa search endpoint {} with query: {}",
+        CONFIG.exa_search_endpoint, query
+    );
     let client = get_http_client();
     let response = client
         .post(&CONFIG.exa_search_endpoint)
@@ -113,7 +119,10 @@ pub fn format_results_markdown(query: &str, results: &[(String, String, String)]
     lines.join("\n")
 }
 
-pub async fn exa_search_tool(query: &str, max_results: Option<usize>) -> Result<String, ExaSearchError> {
+pub async fn exa_search_tool(
+    query: &str,
+    max_results: Option<usize>,
+) -> Result<String, ExaSearchError> {
     let results = exa_search(query, max_results).await?;
     Ok(format_results_markdown(query, &results))
 }

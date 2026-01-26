@@ -1,4 +1,4 @@
-﻿use std::time::Duration;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -34,7 +34,10 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
         return Err(anyhow!("Invalid Telegraph URL: Missing path component"));
     }
 
-    let api_url = format!("https://api.telegra.ph/getPage/{}?return_content=true", path);
+    let api_url = format!(
+        "https://api.telegra.ph/getPage/{}?return_content=true",
+        path
+    );
     let client = get_http_client();
     let response = client
         .get(&api_url)
@@ -43,7 +46,10 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
         .await?;
 
     if !response.status().is_success() {
-        return Err(anyhow!("Telegraph API request failed with status {}", response.status()));
+        return Err(anyhow!(
+            "Telegraph API request failed with status {}",
+            response.status()
+        ));
     }
 
     let data = response.json::<TelegraphResponse>().await?;
@@ -81,7 +87,11 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
             };
 
             let tag = obj.get("tag").and_then(|v| v.as_str()).unwrap_or("");
-            let children = obj.get("children").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let children = obj
+                .get("children")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
 
             match tag {
                 "img" => {
@@ -121,11 +131,22 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
                     }
                 }
                 "figure" => {
-                    current_text.push_str(&process_nodes(&children, content, image_counter, video_counter));
+                    current_text.push_str(&process_nodes(
+                        &children,
+                        content,
+                        image_counter,
+                        video_counter,
+                    ));
                     current_text.push('\n');
                 }
-                "p" | "a" | "li" | "h3" | "h4" | "em" | "strong" | "figcaption" | "blockquote" | "code" | "span" => {
-                    current_text.push_str(&process_nodes(&children, content, image_counter, video_counter));
+                "p" | "a" | "li" | "h3" | "h4" | "em" | "strong" | "figcaption" | "blockquote"
+                | "code" | "span" => {
+                    current_text.push_str(&process_nodes(
+                        &children,
+                        content,
+                        image_counter,
+                        video_counter,
+                    ));
                     if matches!(tag, "p" | "h3" | "h4" | "li" | "blockquote") {
                         current_text.push('\n');
                     }
@@ -136,17 +157,36 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
                     for child in &children {
                         if let Some(child_tag) = child.get("tag").and_then(|v| v.as_str()) {
                             if child_tag == "li" {
-                                let child_nodes = child.get("children").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                                let child_nodes = child
+                                    .get("children")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
                                 current_text.push_str("- ");
-                                current_text.push_str(&process_nodes(&child_nodes, content, image_counter, video_counter));
+                                current_text.push_str(&process_nodes(
+                                    &child_nodes,
+                                    content,
+                                    image_counter,
+                                    video_counter,
+                                ));
                                 current_text.push('\n');
                                 continue;
                             }
                         }
                         if let Some(child_nodes) = child.as_array() {
-                            current_text.push_str(&process_nodes(child_nodes, content, image_counter, video_counter));
+                            current_text.push_str(&process_nodes(
+                                child_nodes,
+                                content,
+                                image_counter,
+                                video_counter,
+                            ));
                         } else {
-                            current_text.push_str(&process_nodes(&[child.clone()], content, image_counter, video_counter));
+                            current_text.push_str(&process_nodes(
+                                &[child.clone()],
+                                content,
+                                image_counter,
+                                video_counter,
+                            ));
                         }
                     }
                     current_text.push('\n');
@@ -155,17 +195,36 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
                     let mut code_block = String::new();
                     for child in &children {
                         if child.get("tag").and_then(|v| v.as_str()) == Some("code") {
-                            let child_nodes = child.get("children").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                            code_block.push_str(&process_nodes(&child_nodes, content, image_counter, video_counter));
+                            let child_nodes = child
+                                .get("children")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            code_block.push_str(&process_nodes(
+                                &child_nodes,
+                                content,
+                                image_counter,
+                                video_counter,
+                            ));
                         } else {
-                            code_block.push_str(&process_nodes(&[child.clone()], content, image_counter, video_counter));
+                            code_block.push_str(&process_nodes(
+                                &[child.clone()],
+                                content,
+                                image_counter,
+                                video_counter,
+                            ));
                         }
                     }
                     current_text.push_str(&format!("\n```\n{}\n```\n", code_block.trim()));
                 }
                 _ => {
                     if !children.is_empty() {
-                        current_text.push_str(&process_nodes(&children, content, image_counter, video_counter));
+                        current_text.push_str(&process_nodes(
+                            &children,
+                            content,
+                            image_counter,
+                            video_counter,
+                        ));
                     }
                 }
             }
@@ -173,9 +232,10 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
         current_text
     }
 
-    content.text_content = process_nodes(&nodes, &mut content, &mut image_counter, &mut video_counter)
-        .trim()
-        .to_string();
+    content.text_content =
+        process_nodes(&nodes, &mut content, &mut image_counter, &mut video_counter)
+            .trim()
+            .to_string();
 
     Ok(content)
 }

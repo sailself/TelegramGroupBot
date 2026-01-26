@@ -1,11 +1,11 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use teloxide::types::{FileId, MediaGroupId};
 
-use crate::llm::media::MediaFile;
 use crate::db::database::Database;
+use crate::llm::media::MediaFile;
 use crate::utils::timing::CommandTimer;
 
 #[allow(dead_code)]

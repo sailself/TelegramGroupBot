@@ -1,4 +1,4 @@
-﻿use std::time::Duration;
+use std::time::Duration;
 
 use anyhow::Result;
 use teloxide::prelude::*;
@@ -90,14 +90,8 @@ pub async fn send_response(
         return Ok(());
     }
 
-    if let Err(err) = edit_text_with_retry(
-        bot,
-        chat_id,
-        message_id,
-        response,
-        Some(parse_mode),
-    )
-    .await
+    if let Err(err) =
+        edit_text_with_retry(bot, chat_id, message_id, response, Some(parse_mode)).await
     {
         warn!("Failed to send formatted response: {err}");
         edit_text_with_retry(bot, chat_id, message_id, response, None).await?;
@@ -132,7 +126,8 @@ pub async fn log_message(state: &AppState, message: &Message) {
 
     let insert = build_message_insert(
         message
-            .from.as_ref()
+            .from
+            .as_ref()
             .and_then(|user| i64::try_from(user.id.0).ok()),
         Some(username),
         Some(text),

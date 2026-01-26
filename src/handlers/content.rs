@@ -1,11 +1,12 @@
-﻿use std::time::Duration;
+use std::time::Duration;
 
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 use regex::Regex;
+use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde_json::json;
 use teloxide::types::{MessageEntityKind, MessageEntityRef};
 use tracing::{debug, warn};
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
 use crate::config::CONFIG;
 use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
@@ -21,7 +22,14 @@ fn truncate_for_log(value: &str, limit: usize) -> String {
     format!("{}...", truncated)
 }
 
-fn log_extracted_content(source: &str, url: &str, text: &str, images: usize, videos: usize, audios: usize) {
+fn log_extracted_content(
+    source: &str,
+    url: &str,
+    text: &str,
+    images: usize,
+    videos: usize,
+    audios: usize,
+) {
     debug!(
         target: "content.extract",
         source = source,
@@ -85,7 +93,10 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
                     obj.insert("attrs".to_string(), serde_json::Value::Object(attrs));
                 }
                 if !node.children.is_empty() {
-                    obj.insert("children".to_string(), serde_json::Value::Array(node.children));
+                    obj.insert(
+                        "children".to_string(),
+                        serde_json::Value::Array(node.children),
+                    );
                 }
                 push_value(stack, root, serde_json::Value::Object(obj));
             }
@@ -183,7 +194,10 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
                 })),
                 Tag::Link(_, dest, _) => {
                     let mut attrs = serde_json::Map::new();
-                    attrs.insert("href".to_string(), serde_json::Value::String(dest.to_string()));
+                    attrs.insert(
+                        "href".to_string(),
+                        serde_json::Value::String(dest.to_string()),
+                    );
                     stack.push(StackEntry::Node(NodeBuilder {
                         tag: "a".to_string(),
                         attrs: Some(attrs),
@@ -290,9 +304,18 @@ pub async fn create_telegraph_page(title: &str, content: &str) -> Option<String>
     let nodes = markdown_to_telegraph_nodes(content);
     let content_json = serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".to_string());
     let mut form = Vec::new();
-    form.push(("access_token".to_string(), CONFIG.telegraph_access_token.clone()));
-    form.push(("author_name".to_string(), CONFIG.telegraph_author_name.clone()));
-    form.push(("author_url".to_string(), CONFIG.telegraph_author_url.clone()));
+    form.push((
+        "access_token".to_string(),
+        CONFIG.telegraph_access_token.clone(),
+    ));
+    form.push((
+        "author_name".to_string(),
+        CONFIG.telegraph_author_name.clone(),
+    ));
+    form.push((
+        "author_url".to_string(),
+        CONFIG.telegraph_author_url.clone(),
+    ));
     form.push(("title".to_string(), title.to_string()));
     form.push(("content".to_string(), content_json));
     form.push(("return_content".to_string(), "false".to_string()));
@@ -307,7 +330,10 @@ pub async fn create_telegraph_page(title: &str, content: &str) -> Option<String>
         .ok()?;
 
     if !response.status().is_success() {
-        warn!("Telegraph API call failed with status {}", response.status());
+        warn!(
+            "Telegraph API call failed with status {}",
+            response.status()
+        );
         return None;
     }
 
@@ -357,7 +383,12 @@ pub fn extract_youtube_urls(text: &str, max_urls: usize) -> (String, Vec<String>
 }
 
 fn clean_url_candidate(url: &str) -> &str {
-    url.trim_end_matches(|ch: char| matches!(ch, ')' | ']' | '}' | '>' | '"' | '\'' | ',' | '.' | ';' | ':'))
+    url.trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            ')' | ']' | '}' | '>' | '"' | '\'' | ',' | '.' | ';' | ':'
+        )
+    })
 }
 
 fn is_telegraph_url(url: &str) -> bool {
@@ -432,13 +463,19 @@ pub async fn extract_telegraph_urls_and_content(
                     content.video_urls.len(),
                     0,
                 );
-                let formatted = format!("\n[Telegraph content extracted from {}]\n{}\n", url, content.text_content);
+                let formatted = format!(
+                    "\n[Telegraph content extracted from {}]\n{}\n",
+                    url, content.text_content
+                );
                 new_text.push_str(&formatted);
                 extracted.push(content);
             }
             Err(err) => {
                 warn!("Telegraph extraction failed for {}: {}", url, err);
-                new_text.push_str(&format!("\n[Telegraph content extraction failed for {}]\n", url));
+                new_text.push_str(&format!(
+                    "\n[Telegraph content extraction failed for {}]\n",
+                    url
+                ));
             }
         }
     }
@@ -522,7 +559,10 @@ pub async fn extract_twitter_urls_and_content(
             }
             Err(err) => {
                 warn!("Twitter extraction failed for {}: {}", url, err);
-                new_text.push_str(&format!("\n[Twitter content extraction failed for {}]\n", url));
+                new_text.push_str(&format!(
+                    "\n[Twitter content extraction failed for {}]\n",
+                    url
+                ));
             }
         }
     }
@@ -537,6 +577,101 @@ fn display_name_from_url(url: &str) -> Option<String> {
         .next()
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
+}
+
+fn image_mime_from_url(url: &str) -> Option<&'static str> {
+    let lowered = url.to_ascii_lowercase();
+    if lowered.contains("format=png") || lowered.ends_with(".png") {
+        Some("image/png")
+    } else if lowered.contains("format=jpg")
+        || lowered.contains("format=jpeg")
+        || lowered.ends_with(".jpg")
+        || lowered.ends_with(".jpeg")
+    {
+        Some("image/jpeg")
+    } else if lowered.contains("format=webp") || lowered.ends_with(".webp") {
+        Some("image/webp")
+    } else if lowered.ends_with(".heic") {
+        Some("image/heic")
+    } else if lowered.ends_with(".heif") {
+        Some("image/heif")
+    } else {
+        None
+    }
+}
+
+async fn download_image_with_content_type(url: &str, source: &str) -> Option<(Vec<u8>, String)> {
+    let client = get_http_client();
+    let response = match client.get(url).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            warn!(
+                target: "content.extract",
+                source = source,
+                media_url = %url,
+                error = %err,
+                "Failed to fetch image"
+            );
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        warn!(
+            target: "content.extract",
+            source = source,
+            media_url = %url,
+            status = %response.status(),
+            "Image download failed"
+        );
+        return None;
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    let Some(content_type) = content_type else {
+        warn!(
+            target: "content.extract",
+            source = source,
+            media_url = %url,
+            reason = "missing_content_type",
+            "Skipping image without Content-Type"
+        );
+        return None;
+    };
+
+    if !content_type.starts_with("image/") {
+        warn!(
+            target: "content.extract",
+            source = source,
+            media_url = %url,
+            content_type = %content_type,
+            reason = "non_image_content_type",
+            "Skipping non-image content"
+        );
+        return None;
+    }
+
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes.to_vec(),
+        Err(err) => {
+            warn!(
+                target: "content.extract",
+                source = source,
+                media_url = %url,
+                error = %err,
+                "Failed to read image bytes"
+            );
+            return None;
+        }
+    };
+
+    Some((bytes, content_type))
 }
 
 fn video_mime_from_url(url: &str) -> Option<&'static str> {
@@ -568,8 +703,23 @@ pub async fn download_telegraph_media(
             if files.len() >= max_files {
                 return files;
             }
-            if let Some(bytes) = download_media(url).await {
-                let mime_type = detect_mime_type(&bytes).unwrap_or_else(|| "image/png".to_string());
+            if url.to_ascii_lowercase().contains(".svg") {
+                warn!(target: "content.extract", source = "twitter", media_url = %url, reason = "svg", "Skipping Twitter image");
+                continue;
+            }
+            if let Some((bytes, mime_type)) = download_image_with_content_type(url, "twitter").await
+            {
+                if mime_type == "image/svg+xml" {
+                    warn!(
+                        target: "content.extract",
+                        source = "twitter",
+                        media_url = %url,
+                        content_type = %mime_type,
+                        reason = "svg",
+                        "Skipping Twitter image"
+                    );
+                    continue;
+                }
                 files.push(MediaFile::new(
                     bytes,
                     mime_type,

@@ -1,26 +1,26 @@
-﻿use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::RequestError;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityRef, MessageId, ParseMode,
     ReplyParameters,
 };
+use teloxide::RequestError;
 use whatlang::detect;
 
-use crate::config::{
-    CONFIG, Q_SYSTEM_PROMPT,
-};
+use crate::config::{CONFIG, Q_SYSTEM_PROMPT};
 use crate::db::database::build_message_insert;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::content::{
     download_telegraph_media, download_twitter_media, extract_telegraph_urls_and_content,
     extract_twitter_urls_and_content, extract_youtube_urls,
 };
-use crate::handlers::media::{collect_message_media, summarize_media_files, MediaCollectionOptions};
-use crate::llm::media::MediaKind;
+use crate::handlers::media::{
+    collect_message_media, summarize_media_files, MediaCollectionOptions,
+};
 use crate::handlers::responses::send_response;
+use crate::llm::media::MediaKind;
 use crate::llm::{call_gemini, call_openrouter};
 use crate::state::{AppState, PendingQRequest};
 use crate::utils::timing::{complete_command_timer, start_command_timer};
@@ -377,8 +377,7 @@ async fn process_request(
     let mut response_text = response;
     if !model_name.is_empty() {
         let display_model = if model_name == MODEL_GEMINI {
-            if !request.media_files.is_empty() || !request.youtube_urls.is_empty()
-            {
+            if !request.media_files.is_empty() || !request.youtube_urls.is_empty() {
                 CONFIG.gemini_pro_model.as_str()
             } else {
                 CONFIG.gemini_model.as_str()
@@ -416,7 +415,8 @@ pub async fn q_handler(
     }
 
     let user_id = message
-        .from.as_ref()
+        .from
+        .as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
@@ -447,24 +447,19 @@ pub async fn q_handler(
             .or_else(|| reply.caption().map(|value| value.to_string()))
             .unwrap_or_default();
         if !reply_text_raw.trim().is_empty() {
-                let reply_entities = message_entities_for_text(reply);
-                let (reply_text_processed, reply_telegraph) =
-                    extract_telegraph_urls_and_content(
-                        &reply_text_raw,
-                        reply_entities.as_deref(),
-                        5,
-                    )
+            let reply_entities = message_entities_for_text(reply);
+            let (reply_text_processed, reply_telegraph) =
+                extract_telegraph_urls_and_content(&reply_text_raw, reply_entities.as_deref(), 5)
                     .await;
-                let (reply_text_processed, reply_twitter) =
-                    extract_twitter_urls_and_content(
-                        &reply_text_processed,
-                        reply_entities.as_deref(),
-                        5,
-                    )
-                    .await;
-                telegraph_contents.extend(reply_telegraph);
-                twitter_contents.extend(reply_twitter);
-                reply_text = reply_text_processed;
+            let (reply_text_processed, reply_twitter) = extract_twitter_urls_and_content(
+                &reply_text_processed,
+                reply_entities.as_deref(),
+                5,
+            )
+            .await;
+            telegraph_contents.extend(reply_telegraph);
+            twitter_contents.extend(reply_twitter);
+            reply_text = reply_text_processed;
         }
     }
 
@@ -517,7 +512,8 @@ pub async fn q_handler(
         .unwrap_or_else(|| "English".to_string());
 
     let username = message
-        .from.as_ref()
+        .from
+        .as_ref()
         .map(|user| user.full_name())
         .unwrap_or_else(|| "Anonymous".to_string());
 
@@ -674,8 +670,14 @@ pub async fn q_handler(
         language: language.clone(),
         media_files,
         youtube_urls,
-        telegraph_contents: telegraph_contents.iter().map(|c| c.text_content.clone()).collect(),
-        twitter_contents: twitter_contents.iter().map(|c| c.text_content.clone()).collect(),
+        telegraph_contents: telegraph_contents
+            .iter()
+            .map(|c| c.text_content.clone())
+            .collect(),
+        twitter_contents: twitter_contents
+            .iter()
+            .map(|c| c.text_content.clone())
+            .collect(),
         chat_id: message.chat.id.0,
         message_id: message.id.0 as i64,
         selection_message_id: selection_message.id.0 as i64,
@@ -685,7 +687,10 @@ pub async fn q_handler(
         command_timer: Some(timer),
     };
 
-    state.pending_q_requests.lock().insert(request_key.clone(), pending_request);
+    state
+        .pending_q_requests
+        .lock()
+        .insert(request_key.clone(), pending_request);
 
     let bot_clone = bot.clone();
     let state_clone = state.clone();
@@ -758,14 +763,20 @@ pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String
             MessageId(request.selection_message_id as i32),
             "No model selected in time. Using default model...",
         )
-        .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
+        .reply_markup(InlineKeyboardMarkup::new(
+            Vec::<Vec<InlineKeyboardButton>>::new(),
+        ))
         .await;
 
     let command_timer = request.command_timer.take();
     let result = process_request(&bot, &state, request, &default_model).await;
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };
-        complete_command_timer(&mut timer, status, Some("timeout_default_model".to_string()));
+        complete_command_timer(
+            &mut timer,
+            status,
+            Some("timeout_default_model".to_string()),
+        );
     }
 }
 
@@ -800,7 +811,9 @@ pub async fn model_selection_callback(
         Some(req) => req,
         None => {
             bot.edit_message_text(message.chat().id, message.id(), "This request has expired.")
-                .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
+                .reply_markup(InlineKeyboardMarkup::new(
+                    Vec::<Vec<InlineKeyboardButton>>::new(),
+                ))
                 .await?;
             return Ok(());
         }
@@ -821,9 +834,15 @@ pub async fn model_selection_callback(
         if let Some(mut timer) = request.command_timer.take() {
             complete_command_timer(&mut timer, "expired", Some("selection_timeout".to_string()));
         }
-        bot.edit_message_text(message.chat().id, message.id(), "Selection timed out. Please try again.")
-            .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
-            .await?;
+        bot.edit_message_text(
+            message.chat().id,
+            message.id(),
+            "Selection timed out. Please try again.",
+        )
+        .reply_markup(InlineKeyboardMarkup::new(
+            Vec::<Vec<InlineKeyboardButton>>::new(),
+        ))
+        .await?;
         return Ok(());
     }
 
@@ -844,7 +863,9 @@ pub async fn model_selection_callback(
             message.id(),
             "Selected model does not support the attached media. Please choose Gemini.",
         )
-        .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
+        .reply_markup(InlineKeyboardMarkup::new(
+            Vec::<Vec<InlineKeyboardButton>>::new(),
+        ))
         .await?;
         return Ok(());
     }
@@ -857,9 +878,15 @@ pub async fn model_selection_callback(
 
     let summary = summarize_media_files(&request.media_files);
     let processing_text = if summary.videos > 0 {
-        format!("Analyzing video and processing your question with {}...", display_name)
+        format!(
+            "Analyzing video and processing your question with {}...",
+            display_name
+        )
     } else if summary.audios > 0 {
-        format!("Analyzing audio and processing your question with {}...", display_name)
+        format!(
+            "Analyzing audio and processing your question with {}...",
+            display_name
+        )
     } else if summary.images > 0 {
         format!(
             "Analyzing {} image(s) and processing your question with {}...",
@@ -875,7 +902,9 @@ pub async fn model_selection_callback(
     };
 
     bot.edit_message_text(message.chat().id, message.id(), processing_text)
-        .reply_markup(InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new()))
+        .reply_markup(InlineKeyboardMarkup::new(
+            Vec::<Vec<InlineKeyboardButton>>::new(),
+        ))
         .await?;
 
     let command_timer = request.command_timer.take();

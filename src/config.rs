@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -116,9 +116,8 @@ pub struct Config {
     pub openrouter_models_by_model: HashMap<String, OpenRouterModelConfig>,
 }
 
-pub static CONFIG: Lazy<Config> = Lazy::new(|| {
-    Config::load().expect("Failed to load configuration")
-});
+pub static CONFIG: Lazy<Config> =
+    Lazy::new(|| Config::load().expect("Failed to load configuration"));
 
 fn env_bool(name: &str, default: bool) -> bool {
     env::var(name)
@@ -193,7 +192,10 @@ fn resolve_openrouter_models_path() -> PathBuf {
         if env_path.is_absolute() {
             candidates.push(env_path);
         } else {
-            candidates.push(PathBuf::from(env::current_dir().unwrap_or_else(|_| PathBuf::from("."))).join(env_path));
+            candidates.push(
+                PathBuf::from(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                    .join(env_path),
+            );
         }
     }
     candidates.push(PathBuf::from("openrouter_models.json"));
@@ -220,7 +222,11 @@ fn load_openrouter_models_from_path(path: &Path) -> Vec<OpenRouterModelConfig> {
     let raw = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => {
-            info!("Failed to read OpenRouter model config at {}: {}", path.display(), err);
+            info!(
+                "Failed to read OpenRouter model config at {}: {}",
+                path.display(),
+                err
+            );
             return Vec::new();
         }
     };
@@ -228,7 +234,11 @@ fn load_openrouter_models_from_path(path: &Path) -> Vec<OpenRouterModelConfig> {
     let parsed: OpenRouterModelsFile = match serde_json::from_str(&raw) {
         Ok(data) => data,
         Err(err) => {
-            info!("Failed to parse OpenRouter model config at {}: {}", path.display(), err);
+            info!(
+                "Failed to parse OpenRouter model config at {}: {}",
+                path.display(),
+                err
+            );
             return Vec::new();
         }
     };
@@ -257,7 +267,14 @@ fn load_legacy_openrouter_models(config: &LegacyOpenRouterEnv) -> Vec<OpenRouter
         ("Llama 4", &config.llama_model, true, false, false, true),
         ("Grok 4", &config.grok_model, true, false, false, true),
         ("Qwen 3", &config.qwen_model, false, false, false, true),
-        ("DeepSeek 3.1", &config.deepseek_model, false, false, false, false),
+        (
+            "DeepSeek 3.1",
+            &config.deepseek_model,
+            false,
+            false,
+            false,
+            false,
+        ),
         ("GPT", &config.gpt_model, true, false, false, true),
     ];
 
@@ -283,19 +300,30 @@ fn build_openrouter_models(
 ) -> Vec<OpenRouterModelConfig> {
     let models = load_openrouter_models_from_path(path);
     if !models.is_empty() {
-        info!("Loaded {} OpenRouter model(s) from {}", models.len(), path.display());
+        info!(
+            "Loaded {} OpenRouter model(s) from {}",
+            models.len(),
+            path.display()
+        );
         return models;
     }
     let legacy_models = load_legacy_openrouter_models(legacy_env);
     if !legacy_models.is_empty() {
-        info!("Using legacy OpenRouter model configuration with {} model(s)", legacy_models.len());
+        info!(
+            "Using legacy OpenRouter model configuration with {} model(s)",
+            legacy_models.len()
+        );
     } else {
         info!("No OpenRouter models configured via JSON or environment variables");
     }
     legacy_models
 }
 
-fn resolve_model_by_keyword(value: &str, models: &[OpenRouterModelConfig], keywords: &[&str]) -> String {
+fn resolve_model_by_keyword(
+    value: &str,
+    models: &[OpenRouterModelConfig],
+    keywords: &[&str],
+) -> String {
     if !value.trim().is_empty() {
         return value.to_string();
     }
@@ -336,18 +364,27 @@ impl Config {
         };
 
         let openrouter_models_config_path = resolve_openrouter_models_path();
-        let openrouter_models = build_openrouter_models(&openrouter_models_config_path, &legacy_env);
+        let openrouter_models =
+            build_openrouter_models(&openrouter_models_config_path, &legacy_env);
         let openrouter_models_by_model = openrouter_models
             .iter()
             .cloned()
             .map(|model| (model.model.clone(), model))
             .collect::<HashMap<_, _>>();
 
-        let llama_model = resolve_model_by_keyword(&legacy_env.llama_model, &openrouter_models, &["llama"]);
-        let grok_model = resolve_model_by_keyword(&legacy_env.grok_model, &openrouter_models, &["grok"]);
-        let qwen_model = resolve_model_by_keyword(&legacy_env.qwen_model, &openrouter_models, &["qwen"]);
-        let deepseek_model = resolve_model_by_keyword(&legacy_env.deepseek_model, &openrouter_models, &["deepseek"]);
-        let gpt_model = resolve_model_by_keyword(&legacy_env.gpt_model, &openrouter_models, &["gpt"]);
+        let llama_model =
+            resolve_model_by_keyword(&legacy_env.llama_model, &openrouter_models, &["llama"]);
+        let grok_model =
+            resolve_model_by_keyword(&legacy_env.grok_model, &openrouter_models, &["grok"]);
+        let qwen_model =
+            resolve_model_by_keyword(&legacy_env.qwen_model, &openrouter_models, &["qwen"]);
+        let deepseek_model = resolve_model_by_keyword(
+            &legacy_env.deepseek_model,
+            &openrouter_models,
+            &["deepseek"],
+        );
+        let gpt_model =
+            resolve_model_by_keyword(&legacy_env.gpt_model, &openrouter_models, &["gpt"]);
 
         let access_controlled_commands = env::var("ACCESS_CONTROLLED_COMMANDS")
             .ok()
@@ -363,7 +400,10 @@ impl Config {
         Ok(Config {
             bot_token,
             log_level: env_string("LOG_LEVEL", "info").to_lowercase(),
-            database_url: normalize_database_url(env_string("DATABASE_URL", "sqlite+aiosqlite:///bot.db")),
+            database_url: normalize_database_url(env_string(
+                "DATABASE_URL",
+                "sqlite+aiosqlite:///bot.db",
+            )),
             gemini_api_key: env_string("GEMINI_API_KEY", ""),
             gemini_model: env_string("GEMINI_MODEL", "gemini-2.0-flash"),
             gemini_pro_model: env_string("GEMINI_PRO_MODEL", "gemini-2.5-pro-exp-03-25"),
@@ -374,7 +414,10 @@ impl Config {
             gemini_top_p: env_f32("GEMINI_TOP_P", 0.95),
             gemini_max_output_tokens: env_i32("GEMINI_MAX_OUTPUT_TOKENS", 2048),
             gemini_thinking_level: env_string("GEMINI_THINKING_LEVEL", "high"),
-            gemini_safety_settings: normalize_gemini_safety_settings(env_string("GEMINI_SAFETY_SETTINGS", "permissive")),
+            gemini_safety_settings: normalize_gemini_safety_settings(env_string(
+                "GEMINI_SAFETY_SETTINGS",
+                "permissive",
+            )),
             vertex_project_id: env_string("VERTEX_PROJECT_ID", ""),
             vertex_location: env_string("VERTEX_LOCATION", ""),
             use_vertex_video: env_bool("USE_VERTEX_VIDEO", false),
@@ -384,7 +427,10 @@ impl Config {
             enable_openrouter: env_bool("ENABLE_OPENROUTER", true),
             openrouter_api_key: env_string("OPENROUTER_API_KEY", ""),
             openrouter_base_url: env_string("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-            openrouter_alpha_base_url: env_string("OPENROUTER_ALPHA_BASE_URL", "https://openrouter.ai/api/alpha"),
+            openrouter_alpha_base_url: env_string(
+                "OPENROUTER_ALPHA_BASE_URL",
+                "https://openrouter.ai/api/alpha",
+            ),
             openrouter_temperature: env_f32("OPENROUTER_TEMPERATURE", 0.7),
             openrouter_top_k: env_i32("OPENROUTER_TOP_K", 40),
             openrouter_top_p: env_f32("OPENROUTER_TOP_P", 0.95),

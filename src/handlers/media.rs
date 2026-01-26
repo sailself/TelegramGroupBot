@@ -1,4 +1,4 @@
-﻿use std::collections::HashSet;
+use std::collections::HashSet;
 
 use anyhow::Result;
 use teloxide::prelude::*;
@@ -71,8 +71,7 @@ pub async fn get_file_url(bot: &Bot, file_id: &FileId) -> Result<String> {
     let file = bot.get_file(file_id.clone()).await?;
     Ok(format!(
         "https://api.telegram.org/file/bot{}/{}",
-        CONFIG.bot_token,
-        file.path
+        CONFIG.bot_token, file.path
     ))
 }
 

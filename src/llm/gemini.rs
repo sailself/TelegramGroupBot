@@ -1,4 +1,4 @@
-﻿use std::time::Duration;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -39,8 +39,13 @@ struct GeminiContent {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum GeminiPart {
-    Text { text: String },
-    InlineData { #[serde(rename = "inlineData")] inline_data: GeminiInlineData },
+    Text {
+        text: String,
+    },
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: GeminiInlineData,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,7 +72,6 @@ struct GeminiFileResponse {
 #[derive(Debug, Clone)]
 struct UploadedFileRef {
     uri: String,
-    mime_type: String,
 }
 
 fn build_safety_settings() -> Vec<serde_json::Value> {
@@ -76,7 +80,10 @@ fn build_safety_settings() -> Vec<serde_json::Value> {
         "standard" => "BLOCK_MEDIUM_AND_ABOVE",
         "permissive" => "OFF",
         _ => {
-            warn!("Unknown GEMINI_SAFETY_SETTINGS value '{}', using permissive defaults.", profile);
+            warn!(
+                "Unknown GEMINI_SAFETY_SETTINGS value '{}', using permissive defaults.",
+                profile
+            );
             "OFF"
         }
     };
@@ -145,7 +152,11 @@ fn summarize_gemini_parts(parts: &[Value]) -> Vec<Value> {
                     .get("fileUri")
                     .and_then(|value| value.as_str())
                     .map(|value| truncate_for_log(value, 200));
-                json!({ "fileData": { "fileUri": file_uri } })
+                let mime_type = file_data
+                    .get("mimeType")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string());
+                json!({ "fileData": { "fileUri": file_uri, "mimeType": mime_type } })
             } else {
                 json!({ "unknownPart": true })
             }
@@ -189,7 +200,10 @@ fn summarize_gemini_payload(payload: &Value, system_prompt_label: Option<&str>) 
         summary.insert("tools".to_string(), tools.clone());
     }
 
-    if let Some(safety) = payload.get("safetySettings").and_then(|value| value.as_array()) {
+    if let Some(safety) = payload
+        .get("safetySettings")
+        .and_then(|value| value.as_array())
+    {
         summary.insert("safetySettingsCount".to_string(), json!(safety.len()));
     }
 
@@ -264,6 +278,64 @@ fn kind_label(kind: MediaKind) -> &'static str {
     }
 }
 
+fn normalize_gemini_mime_type(mime_type: &str) -> String {
+    let lowered = mime_type.trim().to_ascii_lowercase();
+    match lowered.as_str() {
+        "image/jpg" => "image/jpeg".to_string(),
+        "audio/mpeg" => "audio/mp3".to_string(),
+        "audio/x-wav" => "audio/wav".to_string(),
+        "video/quicktime" => "video/mov".to_string(),
+        "video/x-msvideo" => "video/avi".to_string(),
+        "video/x-ms-wmv" => "video/wmv".to_string(),
+        _ => lowered,
+    }
+}
+
+fn gemini_supports_mime(kind: MediaKind, mime_type: &str) -> bool {
+    match kind {
+        MediaKind::Image => matches!(
+            mime_type,
+            "image/png" | "image/jpeg" | "image/webp" | "image/heic" | "image/heif"
+        ),
+        MediaKind::Video => matches!(
+            mime_type,
+            "video/mp4"
+                | "video/mpeg"
+                | "video/mov"
+                | "video/avi"
+                | "video/x-flv"
+                | "video/mpg"
+                | "video/webm"
+                | "video/wmv"
+                | "video/3gpp"
+        ),
+        MediaKind::Audio => matches!(
+            mime_type,
+            "audio/wav" | "audio/mp3" | "audio/aiff" | "audio/aac" | "audio/ogg" | "audio/flac"
+        ),
+        MediaKind::Document => mime_type == "application/pdf",
+    }
+}
+
+fn gemini_mime_for_file(file: &MediaFile) -> Option<String> {
+    let mut candidates = Vec::new();
+    if !file.mime_type.trim().is_empty() {
+        candidates.push(file.mime_type.clone());
+    }
+    if let Some(detected) = detect_mime_type(&file.bytes) {
+        candidates.push(detected);
+    }
+
+    for candidate in candidates {
+        let normalized = normalize_gemini_mime_type(&candidate);
+        if gemini_supports_mime(file.kind, &normalized) {
+            return Some(normalized);
+        }
+    }
+
+    None
+}
+
 async fn upload_file_bytes(
     display_name: &str,
     mime_type: &str,
@@ -275,7 +347,10 @@ async fn upload_file_bytes(
         .header("x-goog-api-key", &CONFIG.gemini_api_key)
         .header("X-Goog-Upload-Protocol", "resumable")
         .header("X-Goog-Upload-Command", "start")
-        .header("X-Goog-Upload-Header-Content-Length", bytes.len().to_string())
+        .header(
+            "X-Goog-Upload-Header-Content-Length",
+            bytes.len().to_string(),
+        )
         .header("X-Goog-Upload-Header-Content-Type", mime_type)
         .json(&json!({ "file": { "display_name": display_name } }))
         .send()
@@ -325,6 +400,8 @@ async fn upload_file_bytes(
 }
 
 async fn get_file_metadata(name: &str) -> Result<GeminiFileInfo> {
+    let name = name.trim();
+    let name = name.strip_prefix("files/").unwrap_or(name);
     let client = get_http_client();
     let response = client
         .get(format!(
@@ -351,27 +428,18 @@ async fn get_file_metadata(name: &str) -> Result<GeminiFileInfo> {
 }
 
 async fn wait_for_file_active(file: GeminiFileInfo) -> Result<GeminiFileInfo> {
-    let state = file.state.as_deref().unwrap_or("UNKNOWN");
-    if state == "ACTIVE" || state == "UNKNOWN" {
-        return Ok(file);
-    }
-
     let name = file.name.clone();
-    let mut attempts = 0;
-    while attempts < 15 {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let latest = get_file_metadata(&name).await?;
-        match latest.state.as_deref().unwrap_or("UNKNOWN") {
+    let mut latest = file;
+
+    for _ in 0..15 {
+        match latest.state.as_deref().unwrap_or("PROCESSING") {
             "ACTIVE" => return Ok(latest),
-            "FAILED" => {
-                return Err(anyhow!(
-                    "Gemini file processing failed for {}",
-                    latest.uri
-                ))
-            }
+            "FAILED" => return Err(anyhow!("Gemini file processing failed for {}", latest.uri)),
             _ => {}
         }
-        attempts += 1;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        latest = get_file_metadata(&name).await?;
     }
 
     Err(anyhow!(
@@ -384,15 +452,38 @@ async fn upload_media_files(files: &[MediaFile]) -> Result<Vec<UploadedFileRef>>
     let mut uploaded = Vec::new();
 
     for (index, file) in files.iter().enumerate() {
-        let display_name = file.display_name.clone().unwrap_or_else(|| {
-            format!("{}-{}", kind_label(file.kind), index + 1)
-        });
-        let info = upload_file_bytes(&display_name, &file.mime_type, &file.bytes).await?;
+        let display_name = file
+            .display_name
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", kind_label(file.kind), index + 1));
+        if file.bytes.is_empty() {
+            warn!("Skipping empty media file {}", display_name);
+            continue;
+        }
+        let Some(mime_type) = gemini_mime_for_file(file) else {
+            warn!(
+                "Skipping unsupported Gemini media {} (kind={}, mime={})",
+                display_name,
+                kind_label(file.kind),
+                file.mime_type
+            );
+            continue;
+        };
+        let info = upload_file_bytes(&display_name, &mime_type, &file.bytes).await?;
         let info = wait_for_file_active(info).await?;
-        let mime_type = info.mime_type.unwrap_or_else(|| file.mime_type.clone());
+        let uri = if !info.uri.trim().is_empty() {
+            info.uri
+        } else if !info.name.trim().is_empty() {
+            format!(
+                "https://generativelanguage.googleapis.com/files/{}",
+                info.name.trim_start_matches("files/")
+            )
+        } else {
+            warn!("Gemini file upload response missing uri/name for {}", display_name);
+            continue;
+        };
         uploaded.push(UploadedFileRef {
-            uri: info.uri,
-            mime_type,
+            uri,
         });
     }
 
@@ -478,8 +569,7 @@ fn build_gemini_file_parts(
     for file in uploaded_files {
         parts.push(json!({
             "fileData": {
-                "fileUri": file.uri,
-                "mimeType": file.mime_type
+                "fileUri": file.uri
             }
         }));
     }
@@ -586,7 +676,11 @@ async fn call_gemini_api(
             );
         }
         let detail = message.unwrap_or(body_summary);
-        return Err(anyhow!("Gemini request failed with status {}: {}", status, detail));
+        return Err(anyhow!(
+            "Gemini request failed with status {}: {}",
+            status,
+            detail
+        ));
     }
 
     let value = response.json::<GeminiResponse>().await?;
@@ -621,8 +715,7 @@ pub async fn call_gemini(
     if files.is_empty() {
         if let Some(url) = image_url {
             if let Some(data) = download_media(url).await {
-                let mime_type =
-                    detect_mime_type(&data).unwrap_or_else(|| "image/png".to_string());
+                let mime_type = detect_mime_type(&data).unwrap_or_else(|| "image/png".to_string());
                 files.push(MediaFile::new(
                     data,
                     mime_type.clone(),
@@ -654,8 +747,16 @@ pub async fn call_gemini(
         "tools": if use_search_grounding { vec![json!({ "google_search": {} })] } else { vec![] },
     });
 
-    let model = if use_pro_model { &CONFIG.gemini_pro_model } else { &CONFIG.gemini_model };
-    let operation = if use_pro_model { "call_gemini_pro" } else { "call_gemini" };
+    let model = if use_pro_model {
+        &CONFIG.gemini_pro_model
+    } else {
+        &CONFIG.gemini_model
+    };
+    let operation = if use_pro_model {
+        "call_gemini_pro"
+    } else {
+        "call_gemini"
+    };
 
     log_llm_timing("gemini", model, operation, None, || async {
         let response = call_gemini_api(model, payload, system_prompt_label).await?;
@@ -709,7 +810,9 @@ pub async fn generate_image_with_gemini(
 
     let images = extract_images_from_response(response);
     if images.is_empty() {
-        return Err(ImageGenerationError("No images returned by Gemini".to_string()));
+        return Err(ImageGenerationError(
+            "No images returned by Gemini".to_string(),
+        ));
     }
 
     if upload_to_cwd && !CONFIG.cwd_pw_api_key.trim().is_empty() {

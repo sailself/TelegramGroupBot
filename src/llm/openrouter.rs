@@ -1,4 +1,4 @@
-﻿use std::time::Duration;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -126,7 +126,8 @@ fn build_message_content(user_content: &str, image_data_list: &[Vec<u8>]) -> Val
     }));
 
     for image_data in image_data_list {
-        let mime_type = crate::llm::media::detect_mime_type(image_data).unwrap_or_else(|| "image/png".to_string());
+        let mime_type = crate::llm::media::detect_mime_type(image_data)
+            .unwrap_or_else(|| "image/png".to_string());
         let encoded = general_purpose::STANDARD.encode(image_data);
         let data_url = format!("data:{};base64,{}", mime_type, encoded);
         parts.push(json!({
@@ -141,9 +142,18 @@ fn build_message_content(user_content: &str, image_data_list: &[Vec<u8>]) -> Val
 async fn call_openrouter_api(payload: &Value) -> Result<Value> {
     let client = get_http_client();
     let response = client
-        .post(format!("{}/chat/completions", CONFIG.openrouter_base_url.trim_end_matches('/')))
-        .header("Authorization", format!("Bearer {}", CONFIG.openrouter_api_key))
-        .header("HTTP-Referer", "https://github.com/sailself/TelegramGroupHelperBot")
+        .post(format!(
+            "{}/chat/completions",
+            CONFIG.openrouter_base_url.trim_end_matches('/')
+        ))
+        .header(
+            "Authorization",
+            format!("Bearer {}", CONFIG.openrouter_api_key),
+        )
+        .header(
+            "HTTP-Referer",
+            "https://github.com/sailself/TelegramGroupHelperBot",
+        )
         .header("X-Title", "TelegramGroupHelperBot")
         .timeout(Duration::from_secs(60))
         .json(payload)
@@ -154,9 +164,16 @@ async fn call_openrouter_api(payload: &Value) -> Result<Value> {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         let (message, body_summary) = summarize_error_body(&body);
-        warn!("OpenRouter API error: status={}, body={}", status, body_summary);
+        warn!(
+            "OpenRouter API error: status={}, body={}",
+            status, body_summary
+        );
         let detail = message.unwrap_or(body_summary);
-        return Err(anyhow!("OpenRouter request failed with status {}: {}", status, detail));
+        return Err(anyhow!(
+            "OpenRouter request failed with status {}: {}",
+            status,
+            detail
+        ));
     }
 
     let value = response.json::<Value>().await?;
@@ -166,9 +183,17 @@ async fn call_openrouter_api(payload: &Value) -> Result<Value> {
 async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> {
     match name {
         "exa_web_search" => {
-            let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let max_results = arguments.get("max_results").and_then(|v| v.as_u64()).map(|v| v as usize);
-            exa_search_tool(query, max_results).await.map_err(|err| anyhow!(err.0))
+            let query = arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let max_results = arguments
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            exa_search_tool(query, max_results)
+                .await
+                .map_err(|err| anyhow!(err.0))
         }
         _ => Ok(String::from("Unsupported tool call")),
     }
@@ -202,8 +227,15 @@ async fn chat_completion_with_tools(
             .cloned()
             .unwrap_or(Value::Null);
 
-        let content = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let tool_calls = message.get("tool_calls").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
 
         if tool_calls.is_empty() {
             return Ok(parse_openrouter_response(model_name, content));
@@ -212,14 +244,20 @@ async fn chat_completion_with_tools(
         messages.push(message.clone());
 
         for tool_call in tool_calls {
-            let tool_name = tool_call.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+            let tool_name = tool_call
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let args_text = tool_call
                 .get("function")
                 .and_then(|f| f.get("arguments"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("{}");
             let args_value: Value = serde_json::from_str(args_text).unwrap_or(Value::Null);
-            let result = execute_function_tool(tool_name, &args_value).await.unwrap_or_else(|err| err.to_string());
+            let result = execute_function_tool(tool_name, &args_value)
+                .await
+                .unwrap_or_else(|err| err.to_string());
 
             messages.push(json!({
                 "role": "tool",
@@ -263,7 +301,15 @@ pub async fn call_openrouter(
 
     if supports_tools && CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty() {
         return log_llm_timing("openrouter", &model_name, &operation, None, || async {
-            chat_completion_with_tools(messages, &model_name, CONFIG.openrouter_temperature, CONFIG.openrouter_top_p, CONFIG.openrouter_top_k).await.map_err(|err| anyhow!(err))
+            chat_completion_with_tools(
+                messages,
+                &model_name,
+                CONFIG.openrouter_temperature,
+                CONFIG.openrouter_top_p,
+                CONFIG.openrouter_top_k,
+            )
+            .await
+            .map_err(|err| anyhow!(err))
         })
         .await;
     }

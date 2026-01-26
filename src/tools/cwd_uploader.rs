@@ -1,4 +1,4 @@
-﻿use base64::{engine::general_purpose, Engine as _};
+use base64::{engine::general_purpose, Engine as _};
 use image::codecs::jpeg::JpegEncoder;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -29,7 +29,11 @@ pub async fn upload_base64_image_to_cwd(
     let header = parts.next().unwrap_or_default();
     let payload = parts.next().unwrap_or_default();
 
-    let mime_type = header.trim_start_matches("data:").split(';').next().unwrap_or("");
+    let mime_type = header
+        .trim_start_matches("data:")
+        .split(';')
+        .next()
+        .unwrap_or("");
     if !mime_type.starts_with("image/") {
         warn!("Unsupported MIME type: {}", mime_type);
         return None;

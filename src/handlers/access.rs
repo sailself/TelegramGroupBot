@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -49,7 +49,10 @@ pub fn load_whitelist() {
             info!("Loaded whitelist file {}", path);
         }
         Err(err) => {
-            warn!("Whitelist file {} not found or failed to read: {}", path, err);
+            warn!(
+                "Whitelist file {} not found or failed to read: {}",
+                path, err
+            );
             *cache = None;
         }
     }

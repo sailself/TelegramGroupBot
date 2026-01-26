@@ -1,4 +1,4 @@
-﻿use std::collections::HashSet;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -96,7 +96,10 @@ async fn build_image_caption(model_name: &str, prompt: &str) -> String {
         prompt
     };
     let escaped_prompt = escape_html(clean_prompt);
-    let mut caption = format!("{} with prompt:\n<pre>{}</pre>", base_caption, escaped_prompt);
+    let mut caption = format!(
+        "{} with prompt:\n<pre>{}</pre>",
+        base_caption, escaped_prompt
+    );
     if caption.chars().count() <= IMAGE_CAPTION_LIMIT {
         return caption;
     }
@@ -300,7 +303,10 @@ fn build_resolution_keyboard(request_key: &str) -> InlineKeyboardMarkup {
         .map(|res| {
             InlineKeyboardButton::callback(
                 res.to_string(),
-                format!("{}{}|{}", IMAGE_RESOLUTION_CALLBACK_PREFIX, request_key, res),
+                format!(
+                    "{}{}|{}",
+                    IMAGE_RESOLUTION_CALLBACK_PREFIX, request_key, res
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -318,7 +324,10 @@ fn build_aspect_ratio_keyboard(request_key: &str) -> InlineKeyboardMarkup {
         .map(|aspect| {
             InlineKeyboardButton::callback(
                 aspect.to_string(),
-                format!("{}{}|{}", IMAGE_ASPECT_RATIO_CALLBACK_PREFIX, request_key, aspect),
+                format!(
+                    "{}{}|{}",
+                    IMAGE_ASPECT_RATIO_CALLBACK_PREFIX, request_key, aspect
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -372,7 +381,10 @@ async fn finalize_image_request(
         .edit_message_text(
             ChatId(request.chat_id),
             processing_message_id,
-            format!("Generating your image at {} resolution with {} aspect ratio...", final_resolution, final_aspect),
+            format!(
+                "Generating your image at {} resolution with {} aspect ratio...",
+                final_resolution, final_aspect
+            ),
         )
         .await?;
 
@@ -382,9 +394,14 @@ async fn finalize_image_request(
         } else {
             Some(CONFIG.vertex_image_model.as_str())
         };
-        generate_image_with_vertex(&prompt, &request.image_urls, model_hint, image_config.clone())
-            .await
-            .map_err(|err| anyhow::anyhow!(err.0))?
+        generate_image_with_vertex(
+            &prompt,
+            &request.image_urls,
+            model_hint,
+            image_config.clone(),
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!(err.0))?
     } else {
         generate_image_with_gemini(
             &prompt,
@@ -392,8 +409,8 @@ async fn finalize_image_request(
             image_config,
             !CONFIG.cwd_pw_api_key.is_empty(),
         )
-            .await
-            .map_err(|err| anyhow::anyhow!(err.0))?
+        .await
+        .map_err(|err| anyhow::anyhow!(err.0))?
     };
 
     let model_name = if CONFIG.use_vertex_image && request.image_urls.is_empty() {
@@ -509,21 +526,28 @@ pub async fn img_handler(
         return Ok(());
     }
     let user_id = message
-        .from.as_ref()
+        .from
+        .as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
     let context = prepare_image_request(&bot, &state, &message, "/img").await?;
     if context.prompt.trim().is_empty() && context.image_urls.is_empty() {
-        bot.send_message(message.chat.id, "Please provide a prompt or reply to an image.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        bot.send_message(
+            message.chat.id,
+            "Please provide a prompt or reply to an image.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
@@ -589,7 +613,11 @@ pub async fn img_handler(
                 .parse_mode(ParseMode::Html)
                 .await?;
             let _ = bot
-                .edit_message_text(message.chat.id, processing_message.id, "Generated image below.")
+                .edit_message_text(
+                    message.chat.id,
+                    processing_message.id,
+                    "Generated image below.",
+                )
                 .await;
         }
     }
@@ -614,21 +642,28 @@ pub async fn image_handler(
     }
 
     let user_id = message
-        .from.as_ref()
+        .from
+        .as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
     let context = prepare_image_request(&bot, &state, &message, "/image").await?;
     if context.prompt.trim().is_empty() && context.image_urls.is_empty() {
-        bot.send_message(message.chat.id, "Please provide a prompt or reply to an image.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        bot.send_message(
+            message.chat.id,
+            "Please provide a prompt or reply to an image.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
@@ -651,15 +686,29 @@ pub async fn image_handler(
         aspect_ratio: None,
     };
 
-    state.pending_image_requests.lock().insert(request_key.clone(), pending);
+    state
+        .pending_image_requests
+        .lock()
+        .insert(request_key.clone(), pending);
     let bot_clone = bot.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(CONFIG.model_selection_timeout)).await;
-        let request = state_clone.pending_image_requests.lock().get(&request_key).cloned();
+        let request = state_clone
+            .pending_image_requests
+            .lock()
+            .get(&request_key)
+            .cloned();
         if let Some(request) = request {
             if request.resolution.is_none() {
-                let _ = finalize_image_request(&bot_clone, &state_clone, &request_key, Some(IMAGE_DEFAULT_RESOLUTION), Some(IMAGE_DEFAULT_ASPECT_RATIO)).await;
+                let _ = finalize_image_request(
+                    &bot_clone,
+                    &state_clone,
+                    &request_key,
+                    Some(IMAGE_DEFAULT_RESOLUTION),
+                    Some(IMAGE_DEFAULT_ASPECT_RATIO),
+                )
+                .await;
             }
         }
     });
@@ -667,23 +716,23 @@ pub async fn image_handler(
     Ok(())
 }
 
-pub async fn vid_handler(
-    bot: Bot,
-    message: Message,
-    prompt: Option<String>,
-) -> Result<()> {
+pub async fn vid_handler(bot: Bot, message: Message, prompt: Option<String>) -> Result<()> {
     if !check_access_control(&bot, &message, "vid").await {
         return Ok(());
     }
 
     let user_id = message
-        .from.as_ref()
+        .from
+        .as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
@@ -704,7 +753,12 @@ pub async fn vid_handler(
         let input = InputFile::memory(video_bytes).file_name("video.mp4");
         bot.send_video(message.chat.id, input).await?;
     } else {
-        bot.edit_message_text(message.chat.id, processing_message.id, "Video generation is unavailable right now.").await?;
+        bot.edit_message_text(
+            message.chat.id,
+            processing_message.id,
+            "Video generation is unavailable right now.",
+        )
+        .await?;
     }
 
     Ok(())
@@ -722,13 +776,17 @@ pub async fn tldr_handler(
     }
 
     let user_id = message
-        .from.as_ref()
+        .from
+        .as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
@@ -902,13 +960,17 @@ pub async fn factcheck_handler(
     }
 
     let user_id = message
-        .from.as_ref()
+        .from
+        .as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
@@ -929,13 +991,12 @@ pub async fn factcheck_handler(
             let reply_entities = message_entities_for_text(reply);
             let (reply_text_processed, reply_telegraph) =
                 extract_telegraph_urls_and_content(&reply_text, reply_entities.as_deref(), 5).await;
-            let (reply_text_processed, reply_twitter) =
-                extract_twitter_urls_and_content(
-                    &reply_text_processed,
-                    reply_entities.as_deref(),
-                    5,
-                )
-                .await;
+            let (reply_text_processed, reply_twitter) = extract_twitter_urls_and_content(
+                &reply_text_processed,
+                reply_entities.as_deref(),
+                5,
+            )
+            .await;
             telegraph_contents.extend(reply_telegraph);
             twitter_contents.extend(reply_twitter);
             reply_text = reply_text_processed;
@@ -1151,13 +1212,17 @@ pub async fn profileme_handler(
     }
 
     let user_id = message
-        .from.as_ref()
+        .from
+        .as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
@@ -1167,16 +1232,26 @@ pub async fn profileme_handler(
         .await?;
     let history = state
         .db
-        .select_messages_by_user(message.chat.id.0, user_id, CONFIG.user_history_message_count, true)
+        .select_messages_by_user(
+            message.chat.id.0,
+            user_id,
+            CONFIG.user_history_message_count,
+            true,
+        )
         .await?;
 
     if history.is_empty() {
-        bot.edit_message_text(message.chat.id, processing_message.id, "I don't have enough of your messages in this chat yet.")
-            .await?;
+        bot.edit_message_text(
+            message.chat.id,
+            processing_message.id,
+            "I don't have enough of your messages in this chat yet.",
+        )
+        .await?;
         return Ok(());
     }
 
-    let mut formatted_history = String::from("Here is the user's recent chat history in this group:\n\n");
+    let mut formatted_history =
+        String::from("Here is the user's recent chat history in this group:\n\n");
     for msg in history {
         let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
         let text = msg.text.unwrap_or_default();
@@ -1235,13 +1310,17 @@ pub async fn paintme_handler(
     }
 
     let user_id = message
-        .from.as_ref()
+        .from
+        .as_ref()
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        bot.send_message(message.chat.id, "Rate limit exceeded. Please try again later.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
@@ -1251,16 +1330,26 @@ pub async fn paintme_handler(
         .await?;
     let history = state
         .db
-        .select_messages_by_user(message.chat.id.0, user_id, CONFIG.user_history_message_count, true)
+        .select_messages_by_user(
+            message.chat.id.0,
+            user_id,
+            CONFIG.user_history_message_count,
+            true,
+        )
         .await?;
 
     if history.is_empty() {
-        bot.edit_message_text(message.chat.id, processing_message.id, "I don't have enough of your messages in this chat yet.")
-            .await?;
+        bot.edit_message_text(
+            message.chat.id,
+            processing_message.id,
+            "I don't have enough of your messages in this chat yet.",
+        )
+        .await?;
         return Ok(());
     }
 
-    let mut formatted_history = String::from("Here is the user's recent chat history in this group:\n\n");
+    let mut formatted_history =
+        String::from("Here is the user's recent chat history in this group:\n\n");
     for msg in history {
         let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
         let text = msg.text.unwrap_or_default();
@@ -1344,7 +1433,11 @@ pub async fn paintme_handler(
                 .parse_mode(ParseMode::Html)
                 .await?;
             let _ = bot
-                .edit_message_text(message.chat.id, processing_message.id, "Generated image below.")
+                .edit_message_text(
+                    message.chat.id,
+                    processing_message.id,
+                    "Generated image below.",
+                )
                 .await;
         }
     }
@@ -1444,9 +1537,12 @@ pub async fn support_handler(bot: Bot, message: Message) -> Result<()> {
 }
 
 pub async fn start_handler(bot: Bot, message: Message) -> Result<()> {
-    bot.send_message(message.chat.id, "Hello! I am TelegramGroupHelperBot. Use /help to see commands.")
-        .reply_parameters(ReplyParameters::new(message.id))
-        .await?;
+    bot.send_message(
+        message.chat.id,
+        "Hello! I am TelegramGroupHelperBot. Use /help to see commands.",
+    )
+    .reply_parameters(ReplyParameters::new(message.id))
+    .await?;
     Ok(())
 }
 
