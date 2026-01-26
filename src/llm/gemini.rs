@@ -811,7 +811,7 @@ pub async fn generate_image_with_gemini(
     let images = extract_images_from_response(response);
     if images.is_empty() {
         return Err(ImageGenerationError(
-            "No images returned by Gemini".to_string(),
+            format!("No images returned by Gemini (model: {})", model),
         ));
     }
 

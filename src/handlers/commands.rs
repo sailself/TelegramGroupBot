@@ -388,7 +388,7 @@ async fn finalize_image_request(
         )
         .await?;
 
-    let images = if CONFIG.use_vertex_image {
+    let image_result = if CONFIG.use_vertex_image {
         let model_hint = if CONFIG.vertex_image_model.trim().is_empty() {
             None
         } else {
@@ -401,7 +401,6 @@ async fn finalize_image_request(
             image_config.clone(),
         )
         .await
-        .map_err(|err| anyhow::anyhow!(err.0))?
     } else {
         generate_image_with_gemini(
             &prompt,
@@ -410,17 +409,22 @@ async fn finalize_image_request(
             !CONFIG.cwd_pw_api_key.is_empty(),
         )
         .await
-        .map_err(|err| anyhow::anyhow!(err.0))?
     };
 
-    let model_name = if CONFIG.use_vertex_image && request.image_urls.is_empty() {
-        if CONFIG.vertex_image_model.trim().is_empty() {
-            "Vertex"
-        } else {
-            CONFIG.vertex_image_model.as_str()
+    let model_name = CONFIG.gemini_image_model.as_str();
+    let images = match image_result {
+        Ok(images) => images,
+        Err(err) => {
+            error!(model = model_name, "Image generation failed: {}", err.0);
+            let error_text = format!(
+                "Sorry, I couldn't generate the image using {}.\n\nError: {}",
+                model_name, err.0
+            );
+            let _ = bot
+                .edit_message_text(ChatId(request.chat_id), processing_message_id, error_text)
+                .await;
+            return Ok(());
         }
-    } else {
-        CONFIG.gemini_image_model.as_str()
     };
     let caption = build_image_caption(model_name, &prompt).await;
 
@@ -565,7 +569,7 @@ pub async fn img_handler(
         }
     }
 
-    let images = if CONFIG.use_vertex_image {
+    let image_result = if CONFIG.use_vertex_image {
         let model_hint = if CONFIG.vertex_image_model.trim().is_empty() {
             None
         } else {
@@ -573,7 +577,6 @@ pub async fn img_handler(
         };
         generate_image_with_vertex(&prompt_text, &context.image_urls, model_hint, None)
             .await
-            .map_err(|err| anyhow::anyhow!(err.0))?
     } else {
         generate_image_with_gemini(
             &prompt_text,
@@ -582,20 +585,25 @@ pub async fn img_handler(
             !CONFIG.cwd_pw_api_key.is_empty(),
         )
         .await
-        .map_err(|err| anyhow::anyhow!(err.0))?
     };
 
-    let model_name = if CONFIG.use_vertex_image && context.image_urls.is_empty() {
-        if CONFIG.vertex_image_model.trim().is_empty() {
-            "Vertex"
-        } else {
-            CONFIG.vertex_image_model.as_str()
+    let model_name = CONFIG.gemini_image_model.as_str();
+    let images = match image_result {
+        Ok(images) => images,
+        Err(err) => {
+            error!(model = model_name, "Image generation failed: {}", err.0);
+            let error_text = format!(
+                "Sorry, I couldn't generate the image using {}.\n\nError: {}",
+                model_name, err.0
+            );
+            let _ = bot
+                .edit_message_text(message.chat.id, processing_message.id, error_text)
+                .await;
+            return Ok(());
         }
-    } else {
-        CONFIG.gemini_image_model.as_str()
     };
-    let caption = build_image_caption(model_name, &prompt_text).await;
 
+    let caption = build_image_caption(model_name, &prompt_text).await;
     let mut image_iter = images.into_iter();
     if let Some(first_image) = image_iter.next() {
         let media = InputMedia::Photo(
@@ -1390,7 +1398,7 @@ pub async fn paintme_handler(
         .edit_message_text(message.chat.id, processing_message.id, status_text)
         .await;
 
-    let images = if CONFIG.use_vertex_image {
+    let image_result = if CONFIG.use_vertex_image {
         let model_hint = if CONFIG.vertex_image_model.trim().is_empty() {
             None
         } else {
@@ -1398,21 +1406,25 @@ pub async fn paintme_handler(
         };
         generate_image_with_vertex(&prompt, &[], model_hint, None)
             .await
-            .map_err(|err| anyhow::anyhow!(err.0))?
     } else {
         generate_image_with_gemini(&prompt, &[], None, !CONFIG.cwd_pw_api_key.is_empty())
             .await
-            .map_err(|err| anyhow::anyhow!(err.0))?
     };
 
-    let model_name = if CONFIG.use_vertex_image {
-        if CONFIG.vertex_image_model.trim().is_empty() {
-            "Vertex"
-        } else {
-            CONFIG.vertex_image_model.as_str()
+    let model_name = CONFIG.gemini_image_model.as_str();
+    let images = match image_result {
+        Ok(images) => images,
+        Err(err) => {
+            error!(model = model_name, "Image generation failed: {}", err.0);
+            let error_text = format!(
+                "Sorry, I couldn't generate the image using {}.\n\nError: {}",
+                model_name, err.0
+            );
+            let _ = bot
+                .edit_message_text(message.chat.id, processing_message.id, error_text)
+                .await;
+            return Ok(());
         }
-    } else {
-        CONFIG.gemini_image_model.as_str()
     };
     let caption = build_image_caption(model_name, &prompt).await;
 
