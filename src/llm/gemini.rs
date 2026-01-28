@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tracing::{debug, warn};
@@ -72,6 +73,32 @@ struct GeminiFileResponse {
 #[derive(Debug, Clone)]
 struct UploadedFileRef {
     uri: String,
+}
+
+const GEMINI_MAX_RETRY_ATTEMPTS: usize = 2;
+const GEMINI_RETRY_BASE_DELAY_MS: u64 = 900;
+
+fn redact_gemini_api_key(text: &str) -> String {
+    let key = CONFIG.gemini_api_key.trim();
+    if key.is_empty() {
+        return text.to_string();
+    }
+    text.replace(key, "[redacted]")
+}
+
+fn gemini_should_retry_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
+}
+
+fn gemini_should_retry_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+}
+
+fn gemini_retry_delay(attempt: usize) -> Duration {
+    let attempt = attempt.max(1) as u64;
+    Duration::from_millis(GEMINI_RETRY_BASE_DELAY_MS.saturating_mul(attempt))
 }
 
 fn build_safety_settings() -> Vec<serde_json::Value> {
@@ -643,52 +670,75 @@ async fn call_gemini_api(
         debug!(target: "llm.gemini", model = model, payload = %payload_summary);
     }
 
-    let response = match client
-        .post(url)
-        .timeout(Duration::from_secs(90))
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let response = match client
+            .post(&url)
+            .timeout(Duration::from_secs(90))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                let err_text = redact_gemini_api_key(&err.to_string());
+                let url = err.url().map(|url| redact_gemini_api_key(url.as_str()));
+                let should_retry =
+                    gemini_should_retry_error(&err) && attempt < GEMINI_MAX_RETRY_ATTEMPTS;
+                warn!(
+                    "Gemini request failed to send: {} (timeout={}, connect={}, status={:?}, url={:?}, retrying={})",
+                    err_text,
+                    err.is_timeout(),
+                    err.is_connect(),
+                    err.status(),
+                    url,
+                    should_retry
+                );
+                if should_retry {
+                    tokio::time::sleep(gemini_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(anyhow!("Gemini request failed: {}", err_text));
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let (message, body_summary) = summarize_error_body(&body);
+            let should_retry =
+                gemini_should_retry_status(status) && attempt < GEMINI_MAX_RETRY_ATTEMPTS;
             warn!(
-                "Gemini request failed to send: {err} (timeout={}, connect={}, status={:?}, url={:?})",
-                err.is_timeout(),
-                err.is_connect(),
-                err.status(),
-                err.url(),
+                "Gemini API error: status={}, body={}, retrying={}",
+                status, body_summary, should_retry
             );
-            return Err(anyhow!("Gemini request failed: {}", err));
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    target: "llm.gemini",
+                    status = %status,
+                    body = %truncate_for_log(&body, 4000)
+                );
+            }
+            if should_retry {
+                tokio::time::sleep(gemini_retry_delay(attempt)).await;
+                continue;
+            }
+            let detail = message.unwrap_or(body_summary);
+            return Err(anyhow!(
+                "Gemini request failed with status {}: {}",
+                status,
+                detail
+            ));
         }
-    };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let (message, body_summary) = summarize_error_body(&body);
-        warn!("Gemini API error: status={}, body={}", status, body_summary);
+        let value = response.json::<GeminiResponse>().await?;
         if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(
-                target: "llm.gemini",
-                status = %status,
-                body = %truncate_for_log(&body, 4000)
-            );
+            let response_summary = summarize_gemini_response(&value);
+            debug!(target: "llm.gemini", model = model, response = %response_summary);
         }
-        let detail = message.unwrap_or(body_summary);
-        return Err(anyhow!(
-            "Gemini request failed with status {}: {}",
-            status,
-            detail
-        ));
+        return Ok(value);
     }
-
-    let value = response.json::<GeminiResponse>().await?;
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        let response_summary = summarize_gemini_response(&value);
-        debug!(target: "llm.gemini", model = model, response = %response_summary);
-    }
-    Ok(value)
 }
 
 pub async fn call_gemini(
