@@ -47,6 +47,14 @@ enum GeminiPart {
         #[serde(rename = "inlineData")]
         inline_data: GeminiInlineData,
     },
+    ExecutableCode {
+        #[serde(rename = "executableCode")]
+        executable_code: GeminiExecutableCode,
+    },
+    CodeExecutionResult {
+        #[serde(rename = "codeExecutionResult")]
+        code_execution_result: GeminiCodeExecutionResult,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +62,20 @@ enum GeminiPart {
 struct GeminiInlineData {
     mime_type: String,
     data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiExecutableCode {
+    code: Option<String>,
+    language: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiCodeExecutionResult {
+    output: Option<String>,
+    outcome: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +279,26 @@ fn summarize_gemini_response(response: &GeminiResponse) -> Value {
                         GeminiPart::InlineData { inline_data } => {
                             if inline_data.mime_type.starts_with("image/") {
                                 image_parts += 1;
+                            }
+                        }
+                        GeminiPart::ExecutableCode { executable_code } => {
+                            if text_preview.is_none() {
+                                if let Some(code) = executable_code.code.as_deref() {
+                                    if !code.trim().is_empty() {
+                                        text_preview = Some(truncate_for_log(code, 200));
+                                    }
+                                }
+                            }
+                        }
+                        GeminiPart::CodeExecutionResult {
+                            code_execution_result,
+                        } => {
+                            if text_preview.is_none() {
+                                if let Some(output) = code_execution_result.output.as_deref() {
+                                    if !output.trim().is_empty() {
+                                        text_preview = Some(truncate_for_log(output, 200));
+                                    }
+                                }
                             }
                         }
                     }
@@ -618,20 +660,45 @@ fn build_gemini_file_parts(
 
 fn extract_text_from_response(response: GeminiResponse) -> String {
     let mut text_parts = Vec::new();
+    let mut fallback_parts = Vec::new();
     for candidate in response.candidates.unwrap_or_default() {
         if let Some(content) = candidate.content {
             if let Some(parts) = content.parts {
                 for part in parts {
-                    if let GeminiPart::Text { text } = part {
-                        if !text.trim().is_empty() {
-                            text_parts.push(text);
+                    match part {
+                        GeminiPart::Text { text } => {
+                            if !text.trim().is_empty() {
+                                text_parts.push(text);
+                            }
                         }
+                        GeminiPart::ExecutableCode { executable_code } => {
+                            if let Some(code) = executable_code.code.as_deref() {
+                                if !code.trim().is_empty() {
+                                    fallback_parts.push(code.to_string());
+                                }
+                            }
+                        }
+                        GeminiPart::CodeExecutionResult {
+                            code_execution_result,
+                        } => {
+                            if let Some(output) = code_execution_result.output.as_deref() {
+                                if !output.trim().is_empty() {
+                                    fallback_parts.push(output.to_string());
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         }
     }
-    text_parts.join("\n")
+
+    if text_parts.is_empty() {
+        fallback_parts.join("\n")
+    } else {
+        text_parts.join("\n")
+    }
 }
 
 fn extract_images_from_response(response: GeminiResponse) -> Vec<Vec<u8>> {
@@ -784,6 +851,14 @@ pub async fn call_gemini(
 
     let text_after_media = !uploaded_files.is_empty() || !youtube_urls.is_empty();
     let parts = build_gemini_file_parts(&content, &uploaded_files, &youtube_urls, text_after_media);
+    let tools = {
+        let mut tools = vec![json!({ "code_execution": {} })];
+        if use_search_grounding {
+            tools.push(json!({ "google_search": {} }));
+        }
+        tools
+    };
+
     let payload = json!({
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": [{ "role": "user", "parts": parts }],
@@ -794,7 +869,7 @@ pub async fn call_gemini(
             "maxOutputTokens": CONFIG.gemini_max_output_tokens,
         },
         "safetySettings": build_safety_settings(),
-        "tools": if use_search_grounding { vec![json!({ "google_search": {} })] } else { vec![] },
+        "tools": tools,
     });
 
     let model = if use_pro_model {
