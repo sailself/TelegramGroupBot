@@ -603,7 +603,11 @@ pub async fn q_handler(
         )
         .await?;
         let mut timer = start_command_timer(command_name, &message);
-        let use_pro = media_summary.total > 0 || !youtube_urls.is_empty();
+        let use_pro = if command_name == "qq" {
+            false
+        } else {
+            media_summary.total > 0 || !youtube_urls.is_empty()
+        };
         let response = call_gemini(
             &build_system_prompt(&language),
             &query_text,
