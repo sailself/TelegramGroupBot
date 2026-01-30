@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::StatusCode;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tracing::{debug, warn};
@@ -177,6 +179,64 @@ fn truncate_for_log(value: &str, limit: usize) -> String {
     }
     let truncated: String = value.chars().take(limit).collect();
     format!("{truncated}... (truncated)")
+}
+
+async fn decode_json_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let bytes = response.bytes().await?;
+    if bytes.is_empty() {
+        return Err(anyhow!(
+            "{} returned empty response body (status {}, content-type {})",
+            context,
+            status,
+            content_type
+        ));
+    }
+
+    match serde_json::from_slice::<T>(&bytes) {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let body = String::from_utf8_lossy(&bytes);
+            let body_summary = truncate_for_log(&body, 4000);
+            Err(anyhow!(
+                "{} failed to decode JSON (status {}, content-type {}): {} | body={}",
+                context,
+                status,
+                content_type,
+                err,
+                body_summary
+            ))
+        }
+    }
+}
+
+fn decode_file_info_from_value(value: serde_json::Value, context: &str) -> Result<GeminiFileInfo> {
+    if let Some(file_value) = value.get("file").cloned() {
+        serde_json::from_value::<GeminiFileInfo>(file_value).map_err(|err| {
+            anyhow!(
+                "{} failed to decode file metadata wrapper: {}",
+                context,
+                err
+            )
+        })
+    } else {
+        serde_json::from_value::<GeminiFileInfo>(value).map_err(|err| {
+            anyhow!(
+                "{} failed to decode file metadata: {}",
+                context,
+                err
+            )
+        })
+    }
 }
 
 fn summarize_gemini_parts(parts: &[Value]) -> Vec<Value> {
@@ -464,7 +524,9 @@ async fn upload_file_bytes(
         ));
     }
 
-    let payload = finalize_response.json::<GeminiFileResponse>().await?;
+    let payload =
+        decode_json_response::<GeminiFileResponse>(finalize_response, "Gemini file upload")
+            .await?;
     Ok(payload.file)
 }
 
@@ -493,7 +555,9 @@ async fn get_file_metadata(name: &str) -> Result<GeminiFileInfo> {
         ));
     }
 
-    Ok(response.json::<GeminiFileResponse>().await?.file)
+    let payload =
+        decode_json_response::<serde_json::Value>(response, "Gemini file metadata").await?;
+    decode_file_info_from_value(payload, "Gemini file metadata")
 }
 
 async fn wait_for_file_active(file: GeminiFileInfo) -> Result<GeminiFileInfo> {
@@ -799,7 +863,8 @@ async fn call_gemini_api(
             ));
         }
 
-        let value = response.json::<GeminiResponse>().await?;
+        let value =
+            decode_json_response::<GeminiResponse>(response, "Gemini generateContent").await?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             let response_summary = summarize_gemini_response(&value);
             debug!(target: "llm.gemini", model = model, response = %response_summary);
@@ -843,6 +908,10 @@ pub async fn call_gemini(
         }
     }
 
+    let has_video_or_audio = files
+        .iter()
+        .any(|file| matches!(file.kind, MediaKind::Video | MediaKind::Audio));
+
     let uploaded_files = if files.is_empty() {
         Vec::new()
     } else {
@@ -852,7 +921,10 @@ pub async fn call_gemini(
     let text_after_media = !uploaded_files.is_empty() || !youtube_urls.is_empty();
     let parts = build_gemini_file_parts(&content, &uploaded_files, &youtube_urls, text_after_media);
     let tools = {
-        let mut tools = vec![json!({ "code_execution": {} })];
+        let mut tools = Vec::new();
+        if !has_video_or_audio && youtube_urls.is_empty() {
+            tools.push(json!({ "code_execution": {} }));
+        }
         if use_search_grounding {
             tools.push(json!({ "google_search": {} }));
         }
