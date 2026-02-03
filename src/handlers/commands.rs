@@ -7,6 +7,7 @@ use teloxide::types::{
     FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto,
     MessageEntityRef, MessageId, ParseMode, ReplyParameters,
 };
+use teloxide::RequestError;
 
 use crate::config::{
     CONFIG, FACTCHECK_SYSTEM_PROMPT, PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT,
@@ -21,10 +22,7 @@ use crate::handlers::media::{
 };
 use crate::handlers::responses::send_response;
 use crate::llm::media::detect_mime_type;
-use crate::llm::{
-    call_gemini, generate_image_with_gemini, generate_image_with_vertex, generate_video_with_veo,
-    GeminiImageConfig,
-};
+use crate::llm::{call_gemini, generate_image_with_gemini, generate_video_with_veo, GeminiImageConfig};
 use crate::state::{AppState, MediaGroupItem, PendingImageRequest};
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
@@ -40,6 +38,7 @@ const IMAGE_DEFAULT_RESOLUTION: &str = "2K";
 const IMAGE_DEFAULT_ASPECT_RATIO: &str = "4:3";
 const IMAGE_CAPTION_LIMIT: usize = 1000;
 const IMAGE_CAPTION_PROMPT_PREVIEW: usize = 900;
+const VID_TELEGRAM_RETRY_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone)]
 struct ImageRequestContext {
@@ -168,6 +167,115 @@ fn message_has_image(message: &Message) -> bool {
     }
 
     false
+}
+
+fn telegram_retryable_error(err: &RequestError) -> bool {
+    matches!(
+        err,
+        RequestError::Network(_) | RequestError::RetryAfter(_) | RequestError::Io(_)
+    )
+}
+
+async fn send_message_with_retry(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    reply_to: Option<MessageId>,
+) -> Result<Message> {
+    let mut delay = Duration::from_secs_f32(1.5);
+    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+        let mut request = bot.send_message(chat_id, text.to_string());
+        if let Some(reply_to) = reply_to {
+            request = request.reply_parameters(ReplyParameters::new(reply_to));
+        }
+        match request.await {
+            Ok(message) => return Ok(message),
+            Err(err) => {
+                if !telegram_retryable_error(&err)
+                    || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS
+                {
+                    return Err(err.into());
+                }
+                warn!("send_message attempt {} failed: {err}", attempt + 1);
+                if let RequestError::RetryAfter(wait) = err {
+                    tokio::time::sleep(wait.duration()).await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+    }
+
+    unreachable!("send_message retry loop exhausted")
+}
+
+async fn edit_message_text_with_retry(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    text: &str,
+) -> Result<()> {
+    let mut delay = Duration::from_secs_f32(1.5);
+    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+        match bot
+            .edit_message_text(chat_id, message_id, text.to_string())
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                if !telegram_retryable_error(&err)
+                    || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS
+                {
+                    return Err(err.into());
+                }
+                warn!("edit_message_text attempt {} failed: {err}", attempt + 1);
+                if let RequestError::RetryAfter(wait) = err {
+                    tokio::time::sleep(wait.duration()).await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_video_with_retry(
+    bot: &Bot,
+    chat_id: ChatId,
+    video_bytes: &[u8],
+    reply_to: Option<MessageId>,
+) -> Result<Message> {
+    let mut delay = Duration::from_secs_f32(1.5);
+    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+        let input = InputFile::memory(video_bytes.to_vec()).file_name("video.mp4");
+        let mut request = bot.send_video(chat_id, input);
+        if let Some(reply_to) = reply_to {
+            request = request.reply_parameters(ReplyParameters::new(reply_to));
+        }
+        match request.await {
+            Ok(message) => return Ok(message),
+            Err(err) => {
+                if !telegram_retryable_error(&err)
+                    || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS
+                {
+                    return Err(err.into());
+                }
+                warn!("send_video attempt {} failed: {err}", attempt + 1);
+                if let RequestError::RetryAfter(wait) = err {
+                    tokio::time::sleep(wait.duration()).await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+    }
+
+    unreachable!("send_video retry loop exhausted")
 }
 
 async fn prepare_image_request(
@@ -388,28 +496,13 @@ async fn finalize_image_request(
         )
         .await?;
 
-    let image_result = if CONFIG.use_vertex_image {
-        let model_hint = if CONFIG.vertex_image_model.trim().is_empty() {
-            None
-        } else {
-            Some(CONFIG.vertex_image_model.as_str())
-        };
-        generate_image_with_vertex(
-            &prompt,
-            &request.image_urls,
-            model_hint,
-            image_config.clone(),
-        )
-        .await
-    } else {
-        generate_image_with_gemini(
-            &prompt,
-            &request.image_urls,
-            image_config,
-            !CONFIG.cwd_pw_api_key.is_empty(),
-        )
-        .await
-    };
+    let image_result = generate_image_with_gemini(
+        &prompt,
+        &request.image_urls,
+        image_config,
+        !CONFIG.cwd_pw_api_key.is_empty(),
+    )
+    .await;
 
     let model_name = CONFIG.gemini_image_model.as_str();
     let images = match image_result {
@@ -569,23 +662,13 @@ pub async fn img_handler(
         }
     }
 
-    let image_result = if CONFIG.use_vertex_image {
-        let model_hint = if CONFIG.vertex_image_model.trim().is_empty() {
-            None
-        } else {
-            Some(CONFIG.vertex_image_model.as_str())
-        };
-        generate_image_with_vertex(&prompt_text, &context.image_urls, model_hint, None)
-            .await
-    } else {
-        generate_image_with_gemini(
-            &prompt_text,
-            &context.image_urls,
-            None,
-            !CONFIG.cwd_pw_api_key.is_empty(),
-        )
-        .await
-    };
+    let image_result = generate_image_with_gemini(
+        &prompt_text,
+        &context.image_urls,
+        None,
+        !CONFIG.cwd_pw_api_key.is_empty(),
+    )
+    .await;
 
     let model_name = CONFIG.gemini_image_model.as_str();
     let images = match image_result {
@@ -724,7 +807,11 @@ pub async fn image_handler(
     Ok(())
 }
 
-pub async fn vid_handler(bot: Bot, message: Message, prompt: Option<String>) -> Result<()> {
+pub async fn vid_handler(
+    bot: Bot,
+    message: Message,
+    prompt: Option<String>,
+) -> Result<()> {
     if !check_access_control(&bot, &message, "vid").await {
         return Ok(());
     }
@@ -744,24 +831,52 @@ pub async fn vid_handler(bot: Bot, message: Message, prompt: Option<String>) -> 
         return Ok(());
     }
 
-    let prompt_text = prompt.unwrap_or_else(|| {
-        message
-            .text()
-            .map(|value| strip_command_prefix(value, "/vid"))
-            .unwrap_or_default()
-    });
+    let reply_has_image = message
+        .reply_to_message()
+        .map(message_has_image)
+        .unwrap_or(false);
+    if message_has_image(&message) || reply_has_image {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "Image input isn't supported for /vid right now. Please send a text-only prompt.\nUsage: /vid [text prompt]",
+            Some(message.id),
+        )
+        .await?;
+        return Ok(());
+    }
 
-    let processing_message = bot
-        .send_message(message.chat.id, "Generating your video...")
+    let original_message_text = message
+        .text()
+        .map(|value| value.to_string())
+        .or_else(|| message.caption().map(|value| value.to_string()))
+        .unwrap_or_default();
+
+    let prompt_text = prompt.unwrap_or_else(|| strip_command_prefix(&original_message_text, "/vid"));
+    if prompt_text.trim().is_empty() {
+        bot.send_message(
+            message.chat.id,
+            "Please provide a prompt for the video.\nUsage: /vid [text prompt]",
+        )
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
-    let (video_bytes, _mime_type) = generate_video_with_veo(&prompt_text, None).await?;
+        return Ok(());
+    }
+
+    let processing_message = send_message_with_retry(
+        &bot,
+        message.chat.id,
+        "Processing video request... This may take a few minutes.",
+        Some(message.id),
+    )
+    .await?;
+    let (video_bytes, _mime_type) = generate_video_with_veo(&prompt_text).await?;
 
     if let Some(video_bytes) = video_bytes {
-        let input = InputFile::memory(video_bytes).file_name("video.mp4");
-        bot.send_video(message.chat.id, input).await?;
+        send_video_with_retry(&bot, message.chat.id, &video_bytes, Some(message.id)).await?;
     } else {
-        bot.edit_message_text(
+        edit_message_text_with_retry(
+            &bot,
             message.chat.id,
             processing_message.id,
             "Video generation is unavailable right now.",
@@ -1398,18 +1513,8 @@ pub async fn paintme_handler(
         .edit_message_text(message.chat.id, processing_message.id, status_text)
         .await;
 
-    let image_result = if CONFIG.use_vertex_image {
-        let model_hint = if CONFIG.vertex_image_model.trim().is_empty() {
-            None
-        } else {
-            Some(CONFIG.vertex_image_model.as_str())
-        };
-        generate_image_with_vertex(&prompt, &[], model_hint, None)
-            .await
-    } else {
-        generate_image_with_gemini(&prompt, &[], None, !CONFIG.cwd_pw_api_key.is_empty())
-            .await
-    };
+    let image_result =
+        generate_image_with_gemini(&prompt, &[], None, !CONFIG.cwd_pw_api_key.is_empty()).await;
 
     let model_name = CONFIG.gemini_image_model.as_str();
     let images = match image_result {
@@ -1492,8 +1597,7 @@ Or reply to an image with `/img [description]` to edit that image
 Usage: `/image [description]` and pick resolution (2K/4K/1K) and aspect ratio
 
 /vid - Generate a video
-Usage: `/vid [text prompt]` (optionally reply to an image)
-Or: `/vid` (replying to an image with an optional text prompt in the caption or command)
+Usage: `/vid [text prompt]`
 
 /profileme - Generate your user profile based on your chat history in this group.
 Usage: `/profileme`

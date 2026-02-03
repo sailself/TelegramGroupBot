@@ -16,7 +16,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/qq` - Quick Gemini response using the default Gemini model.
 - `/img` - Generate or edit an image with Gemini.
 - `/image` - Generate an image with selectable resolution and aspect ratio.
-- `/vid` - Generate a video (stubbed in this port).
+- `/vid` - Generate a video from text.
 - `/profileme` - Generate a profile based on your chat history.
 - `/paintme` - Create an artistic prompt based on your history.
 - `/portraitme` - Create a portrait prompt based on your history.
@@ -88,7 +88,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `GEMINI_MODEL` - Default Gemini model. Default: `gemini-2.0-flash`.
 - `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-2.5-pro-exp-03-25`.
 - `GEMINI_IMAGE_MODEL` - Image model. Default: `gemini-3-pro-image-preview`.
-- `GEMINI_VIDEO_MODEL` - Video model. Default: `veo-2.0-generate-001`.
+- `GEMINI_VIDEO_MODEL` - Video model. Default: `veo-3.1-generate-preview`.
 - `GEMINI_TEMPERATURE` - Default: `0.7`.
 - `GEMINI_TOP_K` - Default: `40`.
 - `GEMINI_TOP_P` - Default: `0.95`.
@@ -96,14 +96,6 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `GEMINI_THINKING_LEVEL` - Default: `high`.
 - `GEMINI_SAFETY_SETTINGS` - Safety profile: `standard` or `permissive` (`off`/`none` are treated as `permissive`). Default: `permissive`.
   - `standard` maps to `BLOCK_MEDIUM_AND_ABOVE`; `permissive` maps to `OFF` for all Gemini safety categories.
-
-### Vertex AI (optional)
-- `USE_VERTEX_VIDEO` - Enable Vertex AI for video. Default: `false`.
-- `VERTEX_PROJECT_ID` - Google Cloud project ID.
-- `VERTEX_LOCATION` - Vertex region (e.g., `us-central1`).
-- `VERTEX_VIDEO_MODEL` - Vertex video model ID.
-- `USE_VERTEX_IMAGE` - Enable Vertex AI for images. Default: `false`.
-- `VERTEX_IMAGE_MODEL` - Vertex image model ID.
 
 ### OpenRouter (optional)
 - `ENABLE_OPENROUTER` - Enable OpenRouter. Default: `true`.
@@ -183,5 +175,5 @@ DATABASE_URL=sqlite:///bot.db
 
 ## Notes and limitations
 - Webhook mode is not implemented in this port yet; polling only.
-- Video generation is stubbed and returns an unavailable message.
+- Video generation can take a few minutes and returns an MP4 when the Veo operation completes.
 - If `TELEGRAPH_ACCESS_TOKEN` is not set, long messages will be truncated instead of published.

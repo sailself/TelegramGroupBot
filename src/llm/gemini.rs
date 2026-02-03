@@ -7,7 +7,7 @@ use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::CONFIG;
 use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
@@ -101,6 +101,11 @@ struct UploadedFileRef {
 
 const GEMINI_MAX_RETRY_ATTEMPTS: usize = 2;
 const GEMINI_RETRY_BASE_DELAY_MS: u64 = 900;
+const VEO_DEFAULT_RESOLUTION: &str = "1080p";
+const VEO_DEFAULT_DURATION_SECONDS: u32 = 8;
+const VEO_DEFAULT_ASPECT_RATIO: &str = "16:9";
+const VEO_POLL_INTERVAL_SECS: u64 = 20;
+const VEO_MAX_POLL_ATTEMPTS: usize = 30;
 
 fn redact_gemini_api_key(text: &str) -> String {
     let key = CONFIG.gemini_api_key.trim();
@@ -1029,27 +1034,173 @@ pub async fn generate_image_with_gemini(
     Ok(images)
 }
 
-pub async fn generate_image_with_vertex(
-    prompt: &str,
-    image_urls: &[String],
-    _model_hint: Option<&str>,
-    image_config: Option<GeminiImageConfig>,
-) -> Result<Vec<Vec<u8>>, ImageGenerationError> {
-    warn!("Vertex image generation is not implemented; falling back to Gemini image generation.");
-    generate_image_with_gemini(
-        prompt,
-        image_urls,
-        image_config,
-        !CONFIG.cwd_pw_api_key.is_empty(),
-    )
-    .await
-}
-
 pub async fn generate_video_with_veo(
     user_prompt: &str,
-    image_data: Option<Vec<u8>>,
 ) -> Result<(Option<Vec<u8>>, Option<String>), anyhow::Error> {
-    warn!("Video generation via VEO is not implemented in the Rust port.");
-    let _ = (user_prompt, image_data);
+    let prompt = user_prompt.trim();
+    if prompt.is_empty() {
+        return Ok((None, None));
+    }
+
+    let model = CONFIG.gemini_video_model.trim();
+    if model.is_empty() {
+        return Err(anyhow!("GEMINI_VIDEO_MODEL is not configured"));
+    }
+
+    let mut instance = Map::new();
+    instance.insert("prompt".to_string(), json!(prompt));
+
+    let mut parameters = Map::new();
+    parameters.insert("resolution".to_string(), json!(VEO_DEFAULT_RESOLUTION));
+    parameters.insert(
+        "durationSeconds".to_string(),
+        json!(VEO_DEFAULT_DURATION_SECONDS),
+    );
+    parameters.insert("aspectRatio".to_string(), json!(VEO_DEFAULT_ASPECT_RATIO));
+
+    let payload = json!({
+        "instances": [Value::Object(instance)],
+        "parameters": Value::Object(parameters),
+    });
+
+    let client = get_http_client();
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:predictLongRunning",
+        model
+    );
+    let metadata = json!({
+        "resolution": VEO_DEFAULT_RESOLUTION,
+        "duration_seconds": VEO_DEFAULT_DURATION_SECONDS,
+    });
+
+    let operation = log_llm_timing("gemini", model, "veo_predict_long_running", Some(metadata), || async {
+        let response = client
+            .post(&url)
+            .header("x-goog-api-key", &CONFIG.gemini_api_key)
+            .json(&payload)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let (message, body_summary) = summarize_error_body(&body);
+            let detail = message.unwrap_or(body_summary);
+            return Err(anyhow!(
+                "Veo predictLongRunning failed with status {}: {}",
+                status,
+                detail
+            ));
+        }
+
+        decode_json_response::<Value>(response, "Veo predictLongRunning").await
+    })
+    .await?;
+
+    let operation_name = operation
+        .get("name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("Veo operation response missing name"))?
+        .to_string();
+
+    let operation_url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/{}",
+        operation_name
+    );
+
+    let mut current_operation = operation;
+    for attempt in 0..VEO_MAX_POLL_ATTEMPTS {
+        let done = current_operation
+            .get("done")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if done {
+            if let Some(error) = current_operation.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown error");
+                warn!("Veo operation failed: {}", message);
+                return Ok((None, None));
+            }
+
+            let video = current_operation
+                .pointer("/response/generateVideoResponse/generatedSamples/0/video");
+            let video_uri = video
+                .and_then(|value| value.get("uri"))
+                .and_then(|value| value.as_str());
+            let mut mime_type = video
+                .and_then(|value| value.get("mimeType"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+
+            let Some(video_uri) = video_uri else {
+                warn!("Veo operation completed without a video uri");
+                return Ok((None, None));
+            };
+
+            let response = client
+                .get(video_uri)
+                .header("x-goog-api-key", &CONFIG.gemini_api_key)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let (message, body_summary) = summarize_error_body(&body);
+                let detail = message.unwrap_or(body_summary);
+                return Err(anyhow!(
+                    "Veo video download failed with status {}: {}",
+                    status,
+                    detail
+                ));
+            }
+
+            if mime_type.is_none() {
+                mime_type = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string());
+            }
+
+            let bytes = response.bytes().await?;
+            info!(
+                "Veo video download completed (bytes={}, mime={:?})",
+                bytes.len(),
+                mime_type
+            );
+            return Ok((Some(bytes.to_vec()), mime_type));
+        }
+
+        if attempt + 1 < VEO_MAX_POLL_ATTEMPTS {
+            info!(
+                "Polling Veo operation (attempt {}/{})",
+                attempt + 1,
+                VEO_MAX_POLL_ATTEMPTS
+            );
+            tokio::time::sleep(Duration::from_secs(VEO_POLL_INTERVAL_SECS)).await;
+            let response = client
+                .get(&operation_url)
+                .header("x-goog-api-key", &CONFIG.gemini_api_key)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let (message, body_summary) = summarize_error_body(&body);
+                let detail = message.unwrap_or(body_summary);
+                return Err(anyhow!(
+                    "Veo operation poll failed with status {}: {}",
+                    status,
+                    detail
+                ));
+            }
+            current_operation = decode_json_response::<Value>(response, "Veo operation poll")
+                .await?;
+        }
+    }
+
+    warn!("Veo operation timed out after polling");
     Ok((None, None))
 }

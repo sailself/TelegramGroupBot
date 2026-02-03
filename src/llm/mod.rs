@@ -5,7 +5,6 @@ pub mod media;
 pub mod openrouter;
 
 pub use gemini::{
-    call_gemini, generate_image_with_gemini, generate_image_with_vertex, generate_video_with_veo,
-    GeminiImageConfig,
+    call_gemini, generate_image_with_gemini, generate_video_with_veo, GeminiImageConfig,
 };
 pub use openrouter::call_openrouter;
