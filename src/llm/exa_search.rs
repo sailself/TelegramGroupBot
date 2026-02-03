@@ -32,8 +32,9 @@ pub struct ExaResult {
 fn normalise_snippet(value: Option<&str>) -> String {
     let snippet = value.unwrap_or("").replace('\n', " ");
     let snippet = snippet.trim();
-    if snippet.len() > 240 {
-        format!("{}...", &snippet[..240])
+    if snippet.chars().count() > 240 {
+        let truncated: String = snippet.chars().take(240).collect();
+        format!("{truncated}...")
     } else {
         snippet.to_string()
     }
@@ -104,6 +105,7 @@ pub async fn exa_search(
     Ok(extract_results(data))
 }
 
+#[allow(dead_code)]
 pub fn format_results_markdown(query: &str, results: &[(String, String, String)]) -> String {
     if results.is_empty() {
         return format!("No web results found for query: {}", query);
@@ -119,6 +121,7 @@ pub fn format_results_markdown(query: &str, results: &[(String, String, String)]
     lines.join("\n")
 }
 
+#[allow(dead_code)]
 pub async fn exa_search_tool(
     query: &str,
     max_results: Option<usize>,

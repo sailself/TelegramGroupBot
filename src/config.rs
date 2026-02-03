@@ -84,9 +84,14 @@ pub struct Config {
     pub jina_ai_api_key: String,
     pub jina_search_endpoint: String,
     pub jina_reader_endpoint: String,
+    pub enable_brave_search: bool,
+    pub brave_search_api_key: String,
+    pub brave_search_endpoint: String,
     pub enable_exa_search: bool,
     pub exa_api_key: String,
     pub exa_search_endpoint: String,
+    pub web_search_cache_ttl_seconds: u64,
+    pub web_search_providers: Vec<String>,
     pub llama_model: String,
     pub grok_model: String,
     pub qwen_model: String,
@@ -150,6 +155,15 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn env_csv_lowercase(name: &str, default: &str) -> Vec<String> {
+    env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .split(',')
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn normalize_database_url(value: String) -> String {
@@ -391,6 +405,16 @@ impl Config {
             })
             .unwrap_or_default();
 
+        let mut web_search_providers =
+            env_csv_lowercase("WEB_SEARCH_PROVIDERS", "brave,exa,jina");
+        if web_search_providers.is_empty() {
+            web_search_providers = vec![
+                "brave".to_string(),
+                "exa".to_string(),
+                "jina".to_string(),
+            ];
+        }
+
         Ok(Config {
             bot_token,
             log_level: env_string("LOG_LEVEL", "info").to_lowercase(),
@@ -426,9 +450,17 @@ impl Config {
             jina_ai_api_key: env_string("JINA_AI_API_KEY", ""),
             jina_search_endpoint: env_string("JINA_SEARCH_ENDPOINT", "https://s.jina.ai/search"),
             jina_reader_endpoint: env_string("JINA_READER_ENDPOINT", "https://r.jina.ai/"),
+            enable_brave_search: env_bool("ENABLE_BRAVE_SEARCH", true),
+            brave_search_api_key: env_string("BRAVE_SEARCH_API_KEY", ""),
+            brave_search_endpoint: env_string(
+                "BRAVE_SEARCH_ENDPOINT",
+                "https://api.search.brave.com/res/v1/web/search",
+            ),
             enable_exa_search: env_bool("ENABLE_EXA_SEARCH", true),
             exa_api_key: env_string("EXA_API_KEY", ""),
             exa_search_endpoint: env_string("EXA_SEARCH_ENDPOINT", "https://api.exa.ai/search"),
+            web_search_cache_ttl_seconds: env_u64("WEB_SEARCH_CACHE_TTL_SECONDS", 900),
+            web_search_providers,
             llama_model,
             grok_model,
             qwen_model,

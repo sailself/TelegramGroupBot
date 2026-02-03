@@ -132,6 +132,9 @@ Example `openrouter_models.json`:
 ```
 
 ### Search and retrieval (optional)
+- `ENABLE_BRAVE_SEARCH` - Enable Brave Search. Default: `true`.
+- `BRAVE_SEARCH_API_KEY` - Brave Search API key.
+- `BRAVE_SEARCH_ENDPOINT` - Default: `https://api.search.brave.com/res/v1/web/search`.
 - `ENABLE_EXA_SEARCH` - Enable Exa search. Default: `true`.
 - `EXA_API_KEY` - Exa API key.
 - `EXA_SEARCH_ENDPOINT` - Default: `https://api.exa.ai/search`.
@@ -139,6 +142,8 @@ Example `openrouter_models.json`:
 - `JINA_AI_API_KEY` - Jina AI key.
 - `JINA_SEARCH_ENDPOINT` - Default: `https://s.jina.ai/search`.
 - `JINA_READER_ENDPOINT` - Default: `https://r.jina.ai/`.
+- `WEB_SEARCH_PROVIDERS` - Comma-separated provider order. Default: `brave,exa,jina`.
+- `WEB_SEARCH_CACHE_TTL_SECONDS` - Cache TTL for web search results. Default: `900` (15 minutes).
 
 ### Hosting and publishing (optional)
 - `TELEGRAPH_ACCESS_TOKEN` - Required to publish long responses to Telegraph.

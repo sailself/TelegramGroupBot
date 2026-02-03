@@ -4,10 +4,10 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use regex::Regex;
 use serde_json::{json, Value};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::CONFIG;
-use crate::llm::exa_search::exa_search_tool;
+use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::get_http_client;
 use crate::utils::timing::log_llm_timing;
 
@@ -20,6 +20,45 @@ fn truncate_for_log(value: &str, limit: usize) -> String {
     }
     let truncated: String = value.chars().take(limit).collect();
     format!("{truncated}... (truncated)")
+}
+
+fn summarize_payload(payload: &Value) -> String {
+    let model = payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let message_count = payload
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|messages| messages.len())
+        .unwrap_or(0);
+    let tool_names = payload
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let tool_choice = payload
+        .get("tool_choice")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+
+    format!(
+        "model={}, messages={}, tools={}, tool_choice={}, tool_names=[{}]",
+        model,
+        message_count,
+        tool_names.len(),
+        tool_choice,
+        tool_names.join(",")
+    )
 }
 
 fn summarize_error_body(body: &str) -> (Option<String>, String) {
@@ -84,16 +123,56 @@ fn parse_openrouter_response(model_name: &str, content: &str) -> String {
     content.to_string()
 }
 
+fn extract_reasoning_text(message: &Value) -> Option<String> {
+    if let Some(reasoning) = message.get("reasoning").and_then(|v| v.as_str()) {
+        let trimmed = reasoning.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let details = message.get("reasoning_details").and_then(|v| v.as_array())?;
+    let mut parts = Vec::new();
+    for detail in details {
+        let text = detail.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let text = text.trim();
+        if !text.is_empty() {
+            parts.push(text.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn extract_openrouter_content(message: &Value) -> String {
+    let content = message
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if !content.is_empty() {
+        return content;
+    }
+
+    extract_reasoning_text(message).unwrap_or_default()
+}
+
 fn build_function_tools() -> Vec<Value> {
-    if !CONFIG.enable_exa_search || CONFIG.exa_api_key.trim().is_empty() {
+    if !web_search::is_search_enabled() {
         return Vec::new();
     }
 
     vec![json!({
         "type": "function",
         "function": {
-            "name": "exa_web_search",
-            "description": "Search the web using Exa AI and return a concise Markdown summary of the results.",
+            "name": "web_search",
+            "description": "Search the web using the configured providers (Brave, Exa, Jina) and return a concise Markdown summary of the results.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -140,6 +219,8 @@ fn build_message_content(user_content: &str, image_data_list: &[Vec<u8>]) -> Val
 }
 
 async fn call_openrouter_api(payload: &Value) -> Result<Value> {
+    debug!("OpenRouter request: {}", summarize_payload(payload));
+
     let client = get_http_client();
     let response = client
         .post(format!(
@@ -177,12 +258,19 @@ async fn call_openrouter_api(payload: &Value) -> Result<Value> {
     }
 
     let value = response.json::<Value>().await?;
+    debug!(
+        "OpenRouter response received for model={}",
+        payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+    );
     Ok(value)
 }
 
 async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> {
     match name {
-        "exa_web_search" => {
+        "web_search" => {
             let query = arguments
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -191,9 +279,24 @@ async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> 
                 .get("max_results")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
-            exa_search_tool(query, max_results)
-                .await
-                .map_err(|err| anyhow!(err.0))
+            debug!(
+                "Executing tool call web_search: query='{}', max_results={:?}",
+                truncate_for_log(query, 200),
+                max_results
+            );
+            match web_search_tool(query, max_results).await {
+                Ok(result) => {
+                    debug!(
+                        "web_search returned {} chars",
+                        result.chars().count()
+                    );
+                    Ok(result)
+                }
+                Err(err) => {
+                    warn!("web_search tool failed: {}", err);
+                    Err(err)
+                }
+            }
         }
         _ => Ok(String::from("Unsupported tool call")),
     }
@@ -209,6 +312,11 @@ async fn chat_completion_with_tools(
     let tools = build_function_tools();
 
     for iteration in 0..MAX_TOOL_CALL_ITERATIONS {
+        debug!(
+            "OpenRouter tool iteration {}/{}",
+            iteration + 1,
+            MAX_TOOL_CALL_ITERATIONS
+        );
         let payload = json!({
             "model": model_name,
             "messages": messages,
@@ -227,10 +335,7 @@ async fn chat_completion_with_tools(
             .cloned()
             .unwrap_or(Value::Null);
 
-        let content = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let content = extract_openrouter_content(&message);
         let tool_calls = message
             .get("tool_calls")
             .and_then(|v| v.as_array())
@@ -238,7 +343,13 @@ async fn chat_completion_with_tools(
             .unwrap_or_default();
 
         if tool_calls.is_empty() {
-            return Ok(parse_openrouter_response(model_name, content));
+            if content.trim().is_empty() {
+                warn!(
+                    "OpenRouter response had empty content and no tool calls: {}",
+                    truncate_for_log(&response.to_string(), 2000)
+                );
+            }
+            return Ok(parse_openrouter_response(model_name, &content));
         }
 
         messages.push(message.clone());
@@ -258,6 +369,9 @@ async fn chat_completion_with_tools(
             let result = execute_function_tool(tool_name, &args_value)
                 .await
                 .unwrap_or_else(|err| err.to_string());
+            if result.trim().is_empty() {
+                warn!("Tool call '{}' returned empty content", tool_name);
+            }
 
             messages.push(json!({
                 "role": "tool",
@@ -299,7 +413,7 @@ pub async fn call_openrouter(
     let operation = format!("openrouter:{}", response_title);
     let model_name = model_identifier.to_string();
 
-    if supports_tools && CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty() {
+    if supports_tools && web_search::is_search_enabled() {
         return log_llm_timing("openrouter", &model_name, &operation, None, || async {
             chat_completion_with_tools(
                 messages,
