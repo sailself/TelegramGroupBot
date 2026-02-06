@@ -234,13 +234,8 @@ fn decode_file_info_from_value(value: serde_json::Value, context: &str) -> Resul
             )
         })
     } else {
-        serde_json::from_value::<GeminiFileInfo>(value).map_err(|err| {
-            anyhow!(
-                "{} failed to decode file metadata: {}",
-                context,
-                err
-            )
-        })
+        serde_json::from_value::<GeminiFileInfo>(value)
+            .map_err(|err| anyhow!("{} failed to decode file metadata: {}", context, err))
     }
 }
 
@@ -530,8 +525,7 @@ async fn upload_file_bytes(
     }
 
     let payload =
-        decode_json_response::<GeminiFileResponse>(finalize_response, "Gemini file upload")
-            .await?;
+        decode_json_response::<GeminiFileResponse>(finalize_response, "Gemini file upload").await?;
     Ok(payload.file)
 }
 
@@ -617,12 +611,13 @@ async fn upload_media_files(files: &[MediaFile]) -> Result<Vec<UploadedFileRef>>
                 info.name.trim_start_matches("files/")
             )
         } else {
-            warn!("Gemini file upload response missing uri/name for {}", display_name);
+            warn!(
+                "Gemini file upload response missing uri/name for {}",
+                display_name
+            );
             continue;
         };
-        uploaded.push(UploadedFileRef {
-            uri,
-        });
+        uploaded.push(UploadedFileRef { uri });
     }
 
     Ok(uploaded)
@@ -1012,9 +1007,10 @@ pub async fn generate_image_with_gemini(
 
     let images = extract_images_from_response(response);
     if images.is_empty() {
-        return Err(ImageGenerationError(
-            format!("No images returned by Gemini (model: {})", model),
-        ));
+        return Err(ImageGenerationError(format!(
+            "No images returned by Gemini (model: {})",
+            model
+        )));
     }
 
     if upload_to_cwd && !CONFIG.cwd_pw_api_key.trim().is_empty() {
@@ -1073,28 +1069,34 @@ pub async fn generate_video_with_veo(
         "duration_seconds": VEO_DEFAULT_DURATION_SECONDS,
     });
 
-    let operation = log_llm_timing("gemini", model, "veo_predict_long_running", Some(metadata), || async {
-        let response = client
-            .post(&url)
-            .header("x-goog-api-key", &CONFIG.gemini_api_key)
-            .json(&payload)
-            .send()
-            .await?;
+    let operation = log_llm_timing(
+        "gemini",
+        model,
+        "veo_predict_long_running",
+        Some(metadata),
+        || async {
+            let response = client
+                .post(&url)
+                .header("x-goog-api-key", &CONFIG.gemini_api_key)
+                .json(&payload)
+                .send()
+                .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let (message, body_summary) = summarize_error_body(&body);
-            let detail = message.unwrap_or(body_summary);
-            return Err(anyhow!(
-                "Veo predictLongRunning failed with status {}: {}",
-                status,
-                detail
-            ));
-        }
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let (message, body_summary) = summarize_error_body(&body);
+                let detail = message.unwrap_or(body_summary);
+                return Err(anyhow!(
+                    "Veo predictLongRunning failed with status {}: {}",
+                    status,
+                    detail
+                ));
+            }
 
-        decode_json_response::<Value>(response, "Veo predictLongRunning").await
-    })
+            decode_json_response::<Value>(response, "Veo predictLongRunning").await
+        },
+    )
     .await?;
 
     let operation_name = operation
@@ -1196,8 +1198,8 @@ pub async fn generate_video_with_veo(
                     detail
                 ));
             }
-            current_operation = decode_json_response::<Value>(response, "Veo operation poll")
-                .await?;
+            current_operation =
+                decode_json_response::<Value>(response, "Veo operation poll").await?;
         }
     }
 

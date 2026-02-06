@@ -4,3 +4,6 @@ target/
 *.lock
 logs/
 agent_logs/
+feature_plans/
+whitelist.txt
+openrouter_models.json

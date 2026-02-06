@@ -36,11 +36,7 @@ pub struct BraveSearchResult {
 
 fn extract_results(payload: BraveSearchResponse) -> Vec<BraveSearchResult> {
     let mut results = Vec::new();
-    for item in payload
-        .web
-        .and_then(|web| web.results)
-        .unwrap_or_default()
-    {
+    for item in payload.web.and_then(|web| web.results).unwrap_or_default() {
         let url = item.url.unwrap_or_default();
         if url.trim().is_empty() {
             continue;
@@ -48,7 +44,10 @@ fn extract_results(payload: BraveSearchResponse) -> Vec<BraveSearchResult> {
         let title = item.title.unwrap_or_else(|| url.clone());
         let snippet = item
             .description
-            .or_else(|| item.extra_snippets.and_then(|snippets| snippets.into_iter().next()))
+            .or_else(|| {
+                item.extra_snippets
+                    .and_then(|snippets| snippets.into_iter().next())
+            })
             .unwrap_or_default();
         results.push(BraveSearchResult {
             title,

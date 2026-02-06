@@ -131,7 +131,9 @@ fn extract_reasoning_text(message: &Value) -> Option<String> {
         }
     }
 
-    let details = message.get("reasoning_details").and_then(|v| v.as_array())?;
+    let details = message
+        .get("reasoning_details")
+        .and_then(|v| v.as_array())?;
     let mut parts = Vec::new();
     for detail in details {
         let text = detail.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -286,10 +288,7 @@ async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> 
             );
             match web_search_tool(query, max_results).await {
                 Ok(result) => {
-                    debug!(
-                        "web_search returned {} chars",
-                        result.chars().count()
-                    );
+                    debug!("web_search returned {} chars", result.chars().count());
                     Ok(result)
                 }
                 Err(err) => {

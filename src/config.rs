@@ -405,14 +405,9 @@ impl Config {
             })
             .unwrap_or_default();
 
-        let mut web_search_providers =
-            env_csv_lowercase("WEB_SEARCH_PROVIDERS", "brave,exa,jina");
+        let mut web_search_providers = env_csv_lowercase("WEB_SEARCH_PROVIDERS", "brave,exa,jina");
         if web_search_providers.is_empty() {
-            web_search_providers = vec![
-                "brave".to_string(),
-                "exa".to_string(),
-                "jina".to_string(),
-            ];
+            web_search_providers = vec!["brave".to_string(), "exa".to_string(), "jina".to_string()];
         }
 
         Ok(Config {

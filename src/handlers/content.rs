@@ -631,7 +631,14 @@ async fn download_image_with_content_type(url: &str, source: &str) -> Option<(Ve
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
         .filter(|value| !value.is_empty());
 
     let Some(content_type) = content_type else {

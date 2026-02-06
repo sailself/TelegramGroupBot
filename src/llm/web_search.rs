@@ -130,12 +130,19 @@ fn provider_order() -> Vec<WebSearchProvider> {
         if let Some(provider) = WebSearchProvider::from_str(entry) {
             providers.push(provider);
         } else {
-            warn!("Unknown web search provider '{}' in WEB_SEARCH_PROVIDERS", entry);
+            warn!(
+                "Unknown web search provider '{}' in WEB_SEARCH_PROVIDERS",
+                entry
+            );
         }
     }
 
     if providers.is_empty() {
-        providers = vec![WebSearchProvider::Brave, WebSearchProvider::Exa, WebSearchProvider::Jina];
+        providers = vec![
+            WebSearchProvider::Brave,
+            WebSearchProvider::Exa,
+            WebSearchProvider::Jina,
+        ];
     }
 
     providers
@@ -181,7 +188,11 @@ async fn search_with_provider(
             Ok(results
                 .into_iter()
                 .filter_map(|(title, url, snippet)| {
-                    normalize_result(SearchResult { title, url, snippet })
+                    normalize_result(SearchResult {
+                        title,
+                        url,
+                        snippet,
+                    })
                 })
                 .collect())
         }
