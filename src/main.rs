@@ -36,6 +36,8 @@ enum Command {
     Profileme(String),
     Paintme,
     Portraitme,
+    Status,
+    Diagnose,
     Support,
 }
 
@@ -212,6 +214,26 @@ async fn handle_command(
             tokio::spawn(async move {
                 if let Err(err) = commands::paintme_handler(bot, state, message, true).await {
                     error!("portraitme handler failed: {err}");
+                }
+            });
+        }
+        Command::Status => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) = commands::status_handler(bot, state, message).await {
+                    error!("status handler failed: {err}");
+                }
+            });
+        }
+        Command::Diagnose => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) = commands::diagnose_handler(bot, state, message).await {
+                    error!("diagnose handler failed: {err}");
                 }
             });
         }

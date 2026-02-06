@@ -119,3 +119,52 @@ pub async fn check_access_control(bot: &Bot, message: &Message, command: &str) -
 
     true
 }
+
+pub async fn check_admin_access(bot: &Bot, message: &Message, command: &str) -> bool {
+    if !WHITELIST_LOADED.load(Ordering::SeqCst) {
+        load_whitelist();
+    }
+
+    let whitelist = {
+        let cache = WHITELIST_CACHE.lock();
+        cache.clone()
+    };
+
+    let Some(whitelist) = whitelist else {
+        let _ = bot
+            .send_message(
+                message.chat.id,
+                "Admin command is unavailable because no whitelist is configured. Add trusted user/chat IDs to the whitelist file and try again.",
+            )
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await;
+        warn!(
+            "Admin command '{}' denied because whitelist file is unavailable",
+            command
+        );
+        return false;
+    };
+
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+    let chat_id = message.chat.id.0;
+
+    let allowed =
+        whitelist.contains(&user_id.to_string()) || whitelist.contains(&chat_id.to_string());
+
+    if !allowed {
+        let _ = bot
+            .send_message(
+                message.chat.id,
+                "This command is restricted to administrators.",
+            )
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await;
+        return false;
+    }
+
+    true
+}

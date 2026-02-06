@@ -65,6 +65,24 @@ impl Database {
             .map_err(|err| anyhow::anyhow!("Failed to queue message insert: {err}"))
     }
 
+    pub async fn health_check(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub fn queue_max_capacity(&self) -> usize {
+        self.sender.max_capacity()
+    }
+
+    pub fn queue_available_capacity(&self) -> usize {
+        self.sender.capacity()
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queue_max_capacity()
+            .saturating_sub(self.queue_available_capacity())
+    }
+
     pub async fn select_messages(&self, chat_id: i64, limit: i64) -> Result<Vec<MessageRow>> {
         self.get_last_n_text_messages(chat_id, limit, true).await
     }

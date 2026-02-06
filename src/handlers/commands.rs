@@ -1,7 +1,9 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use teloxide::prelude::*;
 use teloxide::types::{
     FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto,
@@ -13,7 +15,7 @@ use crate::config::{
     CONFIG, FACTCHECK_SYSTEM_PROMPT, PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT,
     PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
 };
-use crate::handlers::access::{check_access_control, is_rate_limited};
+use crate::handlers::access::{check_access_control, check_admin_access, is_rate_limited};
 use crate::handlers::content::{
     create_telegraph_page, extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
 };
@@ -22,9 +24,13 @@ use crate::handlers::media::{
 };
 use crate::handlers::responses::send_response;
 use crate::llm::media::detect_mime_type;
-use crate::llm::{call_gemini, generate_image_with_gemini, generate_video_with_veo, GeminiImageConfig};
+use crate::llm::web_search::is_search_enabled;
+use crate::llm::{
+    call_gemini, generate_image_with_gemini, generate_video_with_veo, GeminiImageConfig,
+};
 use crate::state::{AppState, MediaGroupItem, PendingImageRequest};
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
+use crate::utils::logging::read_recent_log_lines;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::{error, warn};
 
@@ -39,6 +45,8 @@ const IMAGE_DEFAULT_ASPECT_RATIO: &str = "4:3";
 const IMAGE_CAPTION_LIMIT: usize = 1000;
 const IMAGE_CAPTION_PROMPT_PREVIEW: usize = 900;
 const VID_TELEGRAM_RETRY_ATTEMPTS: usize = 3;
+const DIAGNOSE_LOG_TAIL_LINES: usize = 12;
+const DIAGNOSE_TEXT_LIMIT: usize = 3900;
 
 #[derive(Debug, Clone)]
 struct ImageRequestContext {
@@ -84,6 +92,174 @@ fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
     let truncated: String = iter.by_ref().take(max_chars).collect();
     let was_truncated = iter.next().is_some();
     (truncated, was_truncated)
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn redact_sensitive_text(text: &str) -> String {
+    let mut redacted = text.to_string();
+    let secrets = [
+        CONFIG.bot_token.as_str(),
+        CONFIG.gemini_api_key.as_str(),
+        CONFIG.openrouter_api_key.as_str(),
+        CONFIG.jina_ai_api_key.as_str(),
+        CONFIG.brave_search_api_key.as_str(),
+        CONFIG.exa_api_key.as_str(),
+        CONFIG.cwd_pw_api_key.as_str(),
+        CONFIG.telegraph_access_token.as_str(),
+    ];
+
+    for secret in secrets {
+        let secret = secret.trim();
+        if !secret.is_empty() {
+            redacted = redacted.replace(secret, "[REDACTED]");
+        }
+    }
+
+    redacted
+}
+
+fn append_log_tail(report: &mut String, base_name: &str, title: &str, max_lines: usize) {
+    report.push_str(&format!("\n{title}\n"));
+    match read_recent_log_lines(base_name, max_lines) {
+        Ok(Some(tail)) => {
+            report.push_str(&format!("source: {}\n", tail.path.display()));
+            if tail.lines.is_empty() {
+                report.push_str("(no lines available)\n");
+            } else {
+                for line in tail.lines {
+                    let line = redact_sensitive_text(&line);
+                    report.push_str(&line);
+                    report.push('\n');
+                }
+            }
+        }
+        Ok(None) => {
+            report.push_str("No matching log files found.\n");
+        }
+        Err(err) => {
+            report.push_str(&format!("Failed to read log tail: {err}\n"));
+        }
+    }
+}
+
+async fn build_status_report(state: &AppState) -> String {
+    let db_result = state.db.health_check().await;
+    let db_status = if db_result.is_ok() { "ok" } else { "error" };
+    let db_detail = db_result.err().map(|err| err.to_string());
+
+    let queue_max = state.db.queue_max_capacity();
+    let queue_pending = state.db.queue_len();
+    let queue_available = state.db.queue_available_capacity();
+
+    let brave_ready = CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty();
+    let exa_ready = CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty();
+    let jina_ready = CONFIG.enable_jina_mcp;
+    let openrouter_ready = CONFIG.enable_openrouter && !CONFIG.openrouter_api_key.trim().is_empty();
+
+    let whitelist_path = Path::new(&CONFIG.whitelist_file_path);
+    let whitelist_ready = whitelist_path.exists();
+    let logs_ready = Path::new("logs").exists();
+
+    let mut report = String::new();
+    report.push_str("Status snapshot\n");
+    report.push_str(&format!("time_utc: {}\n", Utc::now().to_rfc3339()));
+    report.push_str(&format!("db: {db_status}\n"));
+    if let Some(detail) = db_detail {
+        report.push_str(&format!("db_error: {}\n", detail));
+    }
+    report.push_str(&format!(
+        "db_queue: pending={} available={} max={}\n",
+        queue_pending, queue_available, queue_max
+    ));
+    report.push_str(&format!(
+        "gemini_configured: {}\n",
+        bool_label(!CONFIG.gemini_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "openrouter_ready: {}\n",
+        bool_label(openrouter_ready)
+    ));
+    report.push_str(&format!(
+        "web_search_enabled: {}\n",
+        bool_label(is_search_enabled())
+    ));
+    report.push_str(&format!(
+        "web_search_providers_order: {}\n",
+        CONFIG.web_search_providers.join(", ")
+    ));
+    report.push_str(&format!("brave_ready: {}\n", bool_label(brave_ready)));
+    report.push_str(&format!("exa_ready: {}\n", bool_label(exa_ready)));
+    report.push_str(&format!("jina_ready: {}\n", bool_label(jina_ready)));
+    report.push_str(&format!("whitelist_file: {}\n", CONFIG.whitelist_file_path));
+    report.push_str(&format!(
+        "whitelist_present: {}\n",
+        bool_label(whitelist_ready)
+    ));
+    report.push_str(&format!("logs_dir_present: {}\n", bool_label(logs_ready)));
+    report
+}
+
+async fn build_diagnose_report(state: &AppState) -> String {
+    let mut report = String::new();
+    report.push_str("Diagnosis report\n");
+    report.push_str("Use /status for a compact health view.\n\n");
+
+    let status = build_status_report(state).await;
+    report.push_str(&status);
+
+    report.push_str("\n\nConfig checks\n");
+    report.push_str(&format!(
+        "BOT_TOKEN_present: {}\n",
+        bool_label(!CONFIG.bot_token.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "GEMINI_API_KEY_present: {}\n",
+        bool_label(!CONFIG.gemini_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "OPENROUTER_API_KEY_present: {}\n",
+        bool_label(!CONFIG.openrouter_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "JINA_AI_API_KEY_present: {}\n",
+        bool_label(!CONFIG.jina_ai_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "BRAVE_SEARCH_API_KEY_present: {}\n",
+        bool_label(!CONFIG.brave_search_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "EXA_API_KEY_present: {}\n",
+        bool_label(!CONFIG.exa_api_key.trim().is_empty())
+    ));
+
+    append_log_tail(
+        &mut report,
+        "bot.log",
+        "Recent bot log lines",
+        DIAGNOSE_LOG_TAIL_LINES,
+    );
+    append_log_tail(
+        &mut report,
+        "timing.log",
+        "Recent timing log lines",
+        DIAGNOSE_LOG_TAIL_LINES,
+    );
+
+    let report = redact_sensitive_text(&report);
+    let (truncated, was_truncated) = truncate_chars(&report, DIAGNOSE_TEXT_LIMIT);
+    if was_truncated {
+        format!("{truncated}\n\n[truncated to fit Telegram message size]")
+    } else {
+        truncated
+    }
 }
 
 async fn build_image_caption(model_name: &str, prompt: &str) -> String {
@@ -191,9 +367,7 @@ async fn send_message_with_retry(
         match request.await {
             Ok(message) => return Ok(message),
             Err(err) => {
-                if !telegram_retryable_error(&err)
-                    || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS
-                {
+                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
                     return Err(err.into());
                 }
                 warn!("send_message attempt {} failed: {err}", attempt + 1);
@@ -224,9 +398,7 @@ async fn edit_message_text_with_retry(
         {
             Ok(_) => return Ok(()),
             Err(err) => {
-                if !telegram_retryable_error(&err)
-                    || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS
-                {
+                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
                     return Err(err.into());
                 }
                 warn!("edit_message_text attempt {} failed: {err}", attempt + 1);
@@ -259,9 +431,7 @@ async fn send_video_with_retry(
         match request.await {
             Ok(message) => return Ok(message),
             Err(err) => {
-                if !telegram_retryable_error(&err)
-                    || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS
-                {
+                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
                     return Err(err.into());
                 }
                 warn!("send_video attempt {} failed: {err}", attempt + 1);
@@ -807,11 +977,7 @@ pub async fn image_handler(
     Ok(())
 }
 
-pub async fn vid_handler(
-    bot: Bot,
-    message: Message,
-    prompt: Option<String>,
-) -> Result<()> {
+pub async fn vid_handler(bot: Bot, message: Message, prompt: Option<String>) -> Result<()> {
     if !check_access_control(&bot, &message, "vid").await {
         return Ok(());
     }
@@ -852,7 +1018,8 @@ pub async fn vid_handler(
         .or_else(|| message.caption().map(|value| value.to_string()))
         .unwrap_or_default();
 
-    let prompt_text = prompt.unwrap_or_else(|| strip_command_prefix(&original_message_text, "/vid"));
+    let prompt_text =
+        prompt.unwrap_or_else(|| strip_command_prefix(&original_message_text, "/vid"));
     if prompt_text.trim().is_empty() {
         bot.send_message(
             message.chat.id,
@@ -1609,6 +1776,12 @@ Usage: `/paintme`
 /portraitme - Generate a portrait of you based on your chat history in this group.
 Usage: `/portraitme`
 
+/status - Show bot health snapshot (admin-only)
+Usage: `/status`
+
+/diagnose - Show extended diagnostics with recent log tails (admin-only)
+Usage: `/diagnose`
+
 /support - Show support information and Ko-fi link
 Usage: `/support`
 
@@ -1618,6 +1791,30 @@ Usage: `/support`
     bot.send_message(message.chat.id, help_text)
         .reply_parameters(ReplyParameters::new(message.id))
         .parse_mode(ParseMode::Markdown)
+        .await?;
+    Ok(())
+}
+
+pub async fn status_handler(bot: Bot, state: AppState, message: Message) -> Result<()> {
+    if !check_admin_access(&bot, &message, "status").await {
+        return Ok(());
+    }
+
+    let report = build_status_report(&state).await;
+    bot.send_message(message.chat.id, report)
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+    Ok(())
+}
+
+pub async fn diagnose_handler(bot: Bot, state: AppState, message: Message) -> Result<()> {
+    if !check_admin_access(&bot, &message, "diagnose").await {
+        return Ok(());
+    }
+
+    let report = build_diagnose_report(&state).await;
+    bot.send_message(message.chat.id, report)
+        .reply_parameters(ReplyParameters::new(message.id))
         .await?;
     Ok(())
 }

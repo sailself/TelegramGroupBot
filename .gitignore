@@ -3,3 +3,4 @@ target/
 *.db
 *.lock
 logs/
+agent_logs/

@@ -7,7 +7,8 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - Provides group-friendly commands for summaries, fact checks, Q and A, and media generation.
 - Uses Gemini by default with optional OpenRouter and search integrations.
 - Extracts content from Telegraph and Twitter links and can upload images to CWD.PW.
-- Writes logs to `logs/bot.log` and `logs/timing.log`.
+- Writes text logs to `logs/bot.log` and `logs/timing.log`.
+- Writes structured JSON logs to `logs/bot.jsonl` and `logs/timing.jsonl`.
 
 ## Commands
 - `/tldr` - Summarize recent chat history in the thread.
@@ -20,6 +21,8 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/profileme` - Generate a profile based on your chat history.
 - `/paintme` - Create an artistic prompt based on your history.
 - `/portraitme` - Create a portrait prompt based on your history.
+- `/status` - Show a health snapshot (admin-only via whitelist).
+- `/diagnose` - Show extended diagnostics and recent log tails (admin-only via whitelist).
 - `/support` - Show support message and link.
 - `/help` - Show command help.
 
@@ -81,6 +84,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 ### Access control
 - `WHITELIST_FILE_PATH` - Path to whitelist file. Default: `allowed_chat.txt`.
   - File contents: one user ID or chat ID per line. Empty or missing file means no restrictions.
+  - `/status` and `/diagnose` require this whitelist file to be present and include your user ID or chat ID.
 - `ACCESS_CONTROLLED_COMMANDS` - Comma-separated list of commands requiring whitelist access.
   - Example: `/tldr,/factcheck,/profileme`
 
