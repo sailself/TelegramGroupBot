@@ -4,22 +4,12 @@ use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ParseMode};
 use tracing::{error, warn};
-use whatlang::detect;
 
 use crate::config::CONFIG;
 use crate::db::database::build_message_insert;
 use crate::handlers::content::create_telegraph_page;
 use crate::state::AppState;
-
-const MIN_LANGUAGE_CONFIDENCE: f64 = 0.6;
-
-fn detect_language_name(text: &str) -> Option<String> {
-    let info = detect(text.trim())?;
-    if !info.is_reliable() || info.confidence() < MIN_LANGUAGE_CONFIDENCE {
-        return None;
-    }
-    Some(info.lang().eng_name().to_string())
-}
+use crate::utils::language::detect_language_or_fallback;
 
 async fn edit_text_with_retry(
     bot: &Bot,
@@ -110,7 +100,11 @@ pub async fn log_message(state: &AppState, message: &Message) {
         return;
     };
 
-    let language = detect_language_name(&text).unwrap_or_else(|| "unknown".to_string());
+    let user_language_code = message
+        .from
+        .as_ref()
+        .and_then(|user| user.language_code.as_deref());
+    let language = detect_language_or_fallback(&[&text], user_language_code, "Chinese");
 
     let username = if let Some(user) = message.from.as_ref() {
         if !user.full_name().is_empty() {

@@ -7,7 +7,6 @@ use teloxide::types::{
     ReplyParameters,
 };
 use teloxide::RequestError;
-use whatlang::detect;
 
 use crate::config::{CONFIG, Q_SYSTEM_PROMPT};
 use crate::db::database::build_message_insert;
@@ -23,12 +22,12 @@ use crate::handlers::responses::send_response;
 use crate::llm::media::MediaKind;
 use crate::llm::{call_gemini, call_openrouter};
 use crate::state::{AppState, PendingQRequest};
+use crate::utils::language::detect_language_or_fallback;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::warn;
 
 pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 pub const MODEL_GEMINI: &str = "gemini";
-const MIN_LANGUAGE_CONFIDENCE: f64 = 0.6;
 const SEND_MESSAGE_RETRY_ATTEMPTS: usize = 3;
 const USER_ERROR_DETAIL_LIMIT: usize = 400;
 
@@ -45,14 +44,6 @@ fn message_entities_for_text(message: &Message) -> Option<Vec<MessageEntityRef<'
     } else {
         message.parse_caption_entities()
     }
-}
-
-fn detect_language_name(text: &str) -> Option<String> {
-    let info = detect(text.trim())?;
-    if !info.is_reliable() || info.confidence() < MIN_LANGUAGE_CONFIDENCE {
-        return None;
-    }
-    Some(info.lang().eng_name().to_string())
 }
 
 fn truncate_for_user(text: &str, limit: usize) -> String {
@@ -507,9 +498,15 @@ pub async fn q_handler(
 
     let (query_text, youtube_urls) = extract_youtube_urls(&query_base, 10);
 
-    let language = detect_language_name(&original_query)
-        .or_else(|| detect_language_name(&query_text))
-        .unwrap_or_else(|| "English".to_string());
+    let user_language_code = message
+        .from
+        .as_ref()
+        .and_then(|user| user.language_code.as_deref());
+    let language = detect_language_or_fallback(
+        &[&original_query, &query_text, &reply_text],
+        user_language_code,
+        "Chinese",
+    );
 
     let username = message
         .from
