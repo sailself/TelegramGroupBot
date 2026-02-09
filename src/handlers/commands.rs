@@ -6,8 +6,8 @@ use anyhow::Result;
 use chrono::Utc;
 use teloxide::prelude::*;
 use teloxide::types::{
-    FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto,
-    MessageEntityRef, MessageId, ParseMode, ReplyParameters,
+    ChatAction, FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia,
+    InputMediaPhoto, MessageEntityRef, MessageId, ParseMode, ReplyParameters,
 };
 use teloxide::RequestError;
 
@@ -31,6 +31,7 @@ use crate::llm::{
 use crate::state::{AppState, MediaGroupItem, PendingImageRequest};
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::utils::logging::read_recent_log_lines;
+use crate::utils::telegram::start_chat_action_heartbeat;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::{error, warn};
 
@@ -665,6 +666,11 @@ async fn finalize_image_request(
             ),
         )
         .await?;
+    let _chat_action = start_chat_action_heartbeat(
+        bot.clone(),
+        ChatId(request.chat_id),
+        ChatAction::UploadPhoto,
+    );
 
     let image_result = generate_image_with_gemini(
         &prompt,
@@ -831,6 +837,8 @@ pub async fn img_handler(
             prompt_text.push('\n');
         }
     }
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
 
     let image_result = generate_image_with_gemini(
         &prompt_text,
@@ -1037,6 +1045,8 @@ pub async fn vid_handler(bot: Bot, message: Message, prompt: Option<String>) -> 
         Some(message.id),
     )
     .await?;
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
     let (video_bytes, _mime_type) = generate_video_with_veo(&prompt_text).await?;
 
     if let Some(video_bytes) = video_bytes {
@@ -1085,6 +1095,8 @@ pub async fn tldr_handler(
         .send_message(message.chat.id, "Summarizing recent messages...")
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
 
     let messages = if let Some(reply) = message.reply_to_message() {
         state
@@ -1460,6 +1472,8 @@ pub async fn factcheck_handler(
         .send_message(message.chat.id, processing_message_text)
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let system_prompt = FACTCHECK_SYSTEM_PROMPT.replace("{current_datetime}", &now);
     let response = call_gemini(
@@ -1520,6 +1534,8 @@ pub async fn profileme_handler(
         .send_message(message.chat.id, "Generating your profile...")
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
     let history = state
         .db
         .select_messages_by_user(
@@ -1618,6 +1634,8 @@ pub async fn paintme_handler(
         .send_message(message.chat.id, "Creating your image prompt...")
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
+    let typing_chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
     let history = state
         .db
         .select_messages_by_user(
@@ -1670,6 +1688,7 @@ pub async fn paintme_handler(
         }),
     )
     .await?;
+    drop(typing_chat_action);
 
     let status_text = if portrait {
         "Generating your portrait..."
@@ -1679,6 +1698,8 @@ pub async fn paintme_handler(
     let _ = bot
         .edit_message_text(message.chat.id, processing_message.id, status_text)
         .await;
+    let _photo_chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
 
     let image_result =
         generate_image_with_gemini(&prompt, &[], None, !CONFIG.cwd_pw_api_key.is_empty()).await;
