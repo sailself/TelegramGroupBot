@@ -21,6 +21,7 @@ use crate::handlers::media::{
 use crate::handlers::responses::send_response;
 use crate::llm::media::MediaKind;
 use crate::llm::{call_gemini, call_openrouter};
+use crate::rag::client as rag_client;
 use crate::state::{AppState, PendingQRequest};
 use crate::utils::language::detect_language_or_fallback;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
@@ -729,6 +730,176 @@ pub async fn qq_handler(
     query: Option<String>,
 ) -> Result<()> {
     q_handler(bot, state, message, query, true, "qq").await
+}
+
+#[allow(deprecated)]
+pub async fn ragq_handler(
+    bot: Bot,
+    _state: AppState,
+    message: Message,
+    query: Option<String>,
+) -> Result<()> {
+    if !check_access_control(&bot, &message, "ragq").await {
+        return Ok(());
+    }
+
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+    if is_rate_limited(user_id) {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "You're sending commands too quickly. Please wait a moment before trying again.",
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if !rag_client::is_rag_enabled() {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "RAG is not enabled. Set ENABLE_RAG=true and RAG_SERVICE_URL first.",
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let query_text_raw = query.unwrap_or_default();
+    let reply_text = message
+        .reply_to_message()
+        .and_then(|msg| msg.text().or_else(|| msg.caption()))
+        .unwrap_or("")
+        .to_string();
+
+    let query_text = if query_text_raw.trim().is_empty() {
+        reply_text.clone()
+    } else if reply_text.trim().is_empty() {
+        query_text_raw.clone()
+    } else {
+        format!(
+            "Context from replied message: \"{}\"\n\nQuestion: {}",
+            reply_text, query_text_raw
+        )
+    };
+
+    if query_text.trim().is_empty() {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "Please provide a question or reply to a message with /ragq.",
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let user_language_code = message
+        .from
+        .as_ref()
+        .and_then(|user| user.language_code.as_deref());
+    let language = detect_language_or_fallback(
+        &[&query_text_raw, &reply_text, &query_text],
+        user_language_code,
+        "Chinese",
+    );
+
+    let processing_message = send_message_with_retry(
+        &bot,
+        message.chat.id,
+        "Retrieving relevant chat history and generating answer...",
+        Some(message.id),
+        None,
+        None,
+    )
+    .await?;
+    let mut timer = start_command_timer("ragq", &message);
+
+    let retrieval =
+        rag_client::retrieve(message.chat.id.0, &query_text, Some(CONFIG.rag_query_top_k)).await;
+    let hits = match retrieval {
+        Ok(hits) => hits,
+        Err(err) => {
+            warn!("RAG retrieval failed: {err}");
+            Vec::new()
+        }
+    };
+
+    let mut query_with_context = String::from(
+        "Use the following retrieved chat history snippets as the primary context. \
+If snippets conflict, prefer more recent entries and be explicit about uncertainty.\n\n",
+    );
+    if hits.is_empty() {
+        query_with_context.push_str("No relevant history snippets were retrieved.\n\n");
+    } else {
+        for (idx, hit) in hits.iter().enumerate() {
+            let date = hit.date.as_deref().unwrap_or("unknown_time");
+            let username = hit.username.as_deref().unwrap_or("Unknown");
+            query_with_context.push_str(&format!(
+                "[{}] score={:.4} date={} user={}\n{}\n\n",
+                idx + 1,
+                hit.score,
+                date,
+                username,
+                hit.text
+            ));
+        }
+    }
+    query_with_context.push_str("User question:\n");
+    query_with_context.push_str(&query_text);
+
+    let response = call_gemini(
+        &build_system_prompt(&language),
+        &query_with_context,
+        Some(&language),
+        true,
+        false,
+        Some(&CONFIG.gemini_thinking_level),
+        None,
+        false,
+        None,
+        None,
+        Some("Q_SYSTEM_PROMPT_RAG"),
+    )
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            let message = format_llm_error_message(MODEL_GEMINI, &err);
+            bot.edit_message_text(processing_message.chat.id, processing_message.id, message)
+                .await?;
+            complete_command_timer(
+                &mut timer,
+                "error",
+                Some("rag_generation_failed".to_string()),
+            );
+            return Err(err);
+        }
+    };
+
+    send_response(
+        &bot,
+        processing_message.chat.id,
+        processing_message.id,
+        &response,
+        "Answer to Your Question",
+        ParseMode::Markdown,
+    )
+    .await?;
+    complete_command_timer(&mut timer, "success", None);
+
+    Ok(())
 }
 
 pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String) {

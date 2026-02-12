@@ -105,6 +105,13 @@ pub struct Config {
     pub telegraph_author_name: String,
     pub telegraph_author_url: String,
     pub user_history_message_count: i64,
+    pub enable_rag: bool,
+    pub rag_service_url: String,
+    pub rag_service_api_key: String,
+    pub rag_ingest_batch_size: usize,
+    pub rag_http_timeout_ms: u64,
+    pub rag_query_top_k: usize,
+    pub rag_import_resume_dir: String,
     pub cwd_pw_api_key: String,
     pub support_message: String,
     pub support_link: String,
@@ -359,9 +366,6 @@ struct LegacyOpenRouterEnv {
 impl Config {
     pub fn load() -> Result<Self> {
         let bot_token = env::var("BOT_TOKEN").unwrap_or_default();
-        if bot_token.trim().is_empty() {
-            return Err(anyhow::anyhow!("BOT_TOKEN is required"));
-        }
 
         let legacy_env = LegacyOpenRouterEnv {
             llama_model: env_string("LLAMA_MODEL", ""),
@@ -469,6 +473,13 @@ impl Config {
             telegraph_author_name: env_string("TELEGRAPH_AUTHOR_NAME", ""),
             telegraph_author_url: env_string("TELEGRAPH_AUTHOR_URL", ""),
             user_history_message_count: env_u64("USER_HISTORY_MESSAGE_COUNT", 200) as i64,
+            enable_rag: env_bool("ENABLE_RAG", false),
+            rag_service_url: env_string("RAG_SERVICE_URL", ""),
+            rag_service_api_key: env_string("RAG_SERVICE_API_KEY", ""),
+            rag_ingest_batch_size: env_usize("RAG_INGEST_BATCH_SIZE", 128),
+            rag_http_timeout_ms: env_u64("RAG_HTTP_TIMEOUT_MS", 3000),
+            rag_query_top_k: env_usize("RAGQ_TOP_K", 8),
+            rag_import_resume_dir: env_string("RAG_IMPORT_RESUME_DIR", "data"),
             cwd_pw_api_key: env_string("CWD_PW_API_KEY", ""),
             support_message: env_string(
                 "SUPPORT_MESSAGE",

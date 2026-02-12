@@ -15,6 +15,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/factcheck` - Fact-check a statement (text or reply).
 - `/q` - Ask a question (uses model selection when OpenRouter models are configured).
 - `/qq` - Quick Gemini response using the default Gemini model.
+- `/ragq` - Ask using retrieved local chat-history context from an external RAG service.
 - `/img` - Generate or edit an image with Gemini.
 - `/image` - Generate an image with selectable resolution and aspect ratio.
 - `/vid` - Generate a video from text.
@@ -46,6 +47,11 @@ cargo build
 cargo run
 ```
 
+One-shot history import before starting the bot:
+```bash
+cargo run -- import-history --file ./exports/group-history.json --chat-id -1001234567890 --batch-size 128 --resume
+```
+
 Release build:
 ```bash
 cargo build --release
@@ -59,6 +65,85 @@ docker run --env-file .env -v ./data:/app/data -v ./logs:/app/logs telegram-grou
 ```
 
 The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` to persist the database.
+
+## Setup OCI Autonomous AI Database (Always Free) for RAG
+Use this when you run embeddings/retrieval on a separate service and want Oracle to store vectors.
+
+1. Choose a supported region for Always Free 26ai.
+   - As of February 7, 2026, Oracle docs list `PHX`, `IAD`, `LHR`, `CDG`, `SYD`, `BOM`, `SIN`, and `NRT`.
+   - If your region is not in that list, 26ai vector features may not be available in Always Free.
+2. Create the database instance.
+   - OCI Console -> `Oracle Database` -> `Autonomous Database` -> `Create Autonomous Database`.
+   - Enable `Always Free`.
+   - Select a 26ai-enabled Autonomous type.
+   - Set an admin password and database display name.
+3. Configure secure network access.
+   - Recommended: use a `Private Endpoint` in the same VCN as your RAG VM.
+   - Alternative: `Public Endpoint` with access control list restricted to your RAG VM egress IP(s).
+4. Open `Database Actions` and create an app schema user.
+   - Connect as `ADMIN`.
+   - Create a dedicated user for RAG reads/writes.
+```sql
+CREATE USER rag_app IDENTIFIED BY "ChangeMe_UseStrongPassword";
+GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW, CREATE PROCEDURE TO rag_app;
+GRANT UNLIMITED TABLESPACE TO rag_app;
+```
+5. Create message and embedding tables.
+   - Connect as `rag_app` in Database Actions SQL Worksheet.
+```sql
+CREATE TABLE chat_messages (
+  chat_id NUMBER NOT NULL,
+  message_id NUMBER NOT NULL,
+  user_id NUMBER NULL,
+  username VARCHAR2(256) NULL,
+  msg_time TIMESTAMP NOT NULL,
+  reply_to_message_id NUMBER NULL,
+  text CLOB,
+  CONSTRAINT chat_messages_pk PRIMARY KEY (chat_id, message_id)
+);
+
+CREATE TABLE chat_embeddings (
+  chat_id NUMBER NOT NULL,
+  message_id NUMBER NOT NULL,
+  embed_model VARCHAR2(64) NOT NULL,
+  embed_dim NUMBER NOT NULL,
+  embedding VECTOR(768, FLOAT32) NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  CONSTRAINT chat_embeddings_pk PRIMARY KEY (chat_id, message_id),
+  CONSTRAINT chat_embeddings_fk
+    FOREIGN KEY (chat_id, message_id)
+    REFERENCES chat_messages (chat_id, message_id)
+);
+```
+6. Add indexing for scale.
+   - Add metadata index:
+```sql
+CREATE INDEX chat_messages_time_idx ON chat_messages (chat_id, msg_time);
+```
+   - Add a vector index (recommended for large datasets). Use Oracle Vector Index syntax from docs for your target distance metric (`COSINE` is typical for embedding retrieval).
+7. Configure client connectivity from your RAG service VM.
+   - In the Autonomous DB details page, open `Database connection`.
+   - Choose connection mode (mTLS wallet or TLS as appropriate to your network/security setup).
+   - Store secrets outside source control and pass them as environment variables to the RAG service.
+8. Validate before backfill.
+   - Run a small insert/query smoke test from your RAG service.
+   - Then run this bot’s historical import:
+```bash
+cargo run -- import-history --file ./exports/group-history.json --chat-id -1001234567890 --batch-size 128 --resume
+```
+9. Enable bot-side RAG integration.
+```bash
+ENABLE_RAG=true
+RAG_SERVICE_URL=http://<your-rag-service-host>:<port>
+RAG_SERVICE_API_KEY=<optional-token>
+RAGQ_TOP_K=8
+```
+
+Official references:
+- Always Free resource reference: https://docs.oracle.com/iaas/Content/FreeTier/resourceref.htm
+- Autonomous Always Free details and limits: https://docs.oracle.com/en/cloud/paas/autonomous-database/serverless/adbsb/autonomous-always-free.html
+- Provision Autonomous Database: https://docs.oracle.com/en/cloud/paas/autonomous-database/serverless/adbsb/provision-autonomous-instance.html
+- Oracle AI Vector Search docs: https://docs.oracle.com/en/database/oracle/oracle-database/26/vecse/
 
 ## Environment variables
 
@@ -80,6 +165,15 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `TELEGRAM_MAX_LENGTH` - Max message length before truncation or Telegraph. Default: `4000`.
 - `USER_HISTORY_MESSAGE_COUNT` - Messages to retain for user history. Default: `200`.
 - `LOG_LEVEL` - Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info`.
+
+### Local RAG integration (optional)
+- `ENABLE_RAG` - Enable RAG service integration for live ingest and `/ragq`. Default: `false`.
+- `RAG_SERVICE_URL` - Base URL of the external RAG service (example: `http://10.0.0.12:8080`).
+- `RAG_SERVICE_API_KEY` - Optional API key sent as both `Authorization: Bearer` and `X-API-Key`.
+- `RAG_INGEST_BATCH_SIZE` - Batch size for import backfill ingestion. Default: `128`.
+- `RAG_HTTP_TIMEOUT_MS` - HTTP timeout for RAG requests. Default: `3000`.
+- `RAGQ_TOP_K` - Number of retrieved snippets for `/ragq`. Default: `8`.
+- `RAG_IMPORT_RESUME_DIR` - Directory for import checkpoint files. Default: `data`.
 
 ### Access control
 - `WHITELIST_FILE_PATH` - Path to whitelist file. Default: `allowed_chat.txt`.

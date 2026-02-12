@@ -8,6 +8,7 @@ use tracing::{error, warn};
 use crate::config::CONFIG;
 use crate::db::database::build_message_insert;
 use crate::handlers::content::create_telegraph_page;
+use crate::rag::client::{build_ingest_item, ingest_messages, is_rag_enabled};
 use crate::state::AppState;
 use crate::utils::language::detect_language_or_fallback;
 
@@ -123,9 +124,9 @@ pub async fn log_message(state: &AppState, message: &Message) {
             .from
             .as_ref()
             .and_then(|user| i64::try_from(user.id.0).ok()),
-        Some(username),
-        Some(text),
-        Some(language),
+        Some(username.clone()),
+        Some(text.clone()),
+        Some(language.clone()),
         message.date,
         message.reply_to_message().map(|msg| msg.id.0 as i64),
         Some(message.chat.id.0),
@@ -134,5 +135,28 @@ pub async fn log_message(state: &AppState, message: &Message) {
 
     if let Err(err) = state.db.queue_message_insert(insert).await {
         error!("Failed to queue message insert: {err}");
+    }
+
+    if !is_rag_enabled() {
+        return;
+    }
+
+    if let Some(item) = build_ingest_item(
+        message.id.0 as i64,
+        message
+            .from
+            .as_ref()
+            .and_then(|user| i64::try_from(user.id.0).ok()),
+        Some(username),
+        message.date,
+        message.reply_to_message().map(|msg| msg.id.0 as i64),
+        &text,
+    ) {
+        let chat_id = message.chat.id.0;
+        tokio::spawn(async move {
+            if let Err(err) = ingest_messages(chat_id, vec![item]).await {
+                warn!("Failed to ingest live message into RAG service: {err}");
+            }
+        });
     }
 }

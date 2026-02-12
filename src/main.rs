@@ -1,5 +1,7 @@
 use std::error::Error;
+use std::path::PathBuf;
 
+use anyhow::anyhow;
 use dotenvy::dotenv;
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
@@ -9,7 +11,9 @@ use tracing::{error, info};
 mod config;
 mod db;
 mod handlers;
+mod importer;
 mod llm;
+mod rag;
 mod state;
 mod tools;
 mod utils;
@@ -18,6 +22,7 @@ use config::CONFIG;
 use db::database::Database;
 use handlers::qa::MODEL_CALLBACK_PREFIX;
 use handlers::{commands, qa};
+use importer::history::{parse_filter_datetime, run_import_history, ImportHistoryArgs};
 use state::AppState;
 use utils::logging::init_logging;
 
@@ -30,6 +35,7 @@ enum Command {
     Factcheck(String),
     Q(String),
     Qq(String),
+    Ragq(String),
     Img(String),
     Image(String),
     Vid(String),
@@ -43,10 +49,130 @@ enum Command {
 
 type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
+fn import_history_usage() -> &'static str {
+    "Usage: cargo run -- import-history --file <path> --chat-id <id> [--batch-size <n>] [--dry-run] [--resume|--no-resume] [--from-date <YYYY-MM-DD|ISO8601>] [--to-date <YYYY-MM-DD|ISO8601>]"
+}
+
+fn parse_import_history_args(args: &[String]) -> anyhow::Result<Option<ImportHistoryArgs>> {
+    if args.get(1).map(|value| value.as_str()) != Some("import-history") {
+        return Ok(None);
+    }
+
+    let mut file_path: Option<PathBuf> = None;
+    let mut chat_id: Option<i64> = None;
+    let mut batch_size = CONFIG.rag_ingest_batch_size.max(1);
+    let mut dry_run = false;
+    let mut resume = true;
+    let mut from_date = None;
+    let mut to_date = None;
+
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--file" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("Missing value for --file"))?;
+                file_path = Some(PathBuf::from(value));
+            }
+            "--chat-id" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("Missing value for --chat-id"))?;
+                chat_id = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| anyhow!("Invalid --chat-id value: {value}"))?,
+                );
+            }
+            "--batch-size" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("Missing value for --batch-size"))?;
+                batch_size = value
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("Invalid --batch-size value: {value}"))?
+                    .max(1);
+            }
+            "--dry-run" => {
+                dry_run = true;
+            }
+            "--resume" => {
+                resume = true;
+            }
+            "--no-resume" => {
+                resume = false;
+            }
+            "--from-date" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("Missing value for --from-date"))?;
+                from_date = Some(parse_filter_datetime(value, false)?);
+            }
+            "--to-date" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("Missing value for --to-date"))?;
+                to_date = Some(parse_filter_datetime(value, true)?);
+            }
+            "--help" | "-h" => {
+                return Err(anyhow!(import_history_usage()));
+            }
+            other => {
+                return Err(anyhow!(
+                    "Unknown import-history argument: {other}\n{}",
+                    import_history_usage()
+                ));
+            }
+        }
+        index += 1;
+    }
+
+    let file_path = file_path.ok_or_else(|| anyhow!("--file is required"))?;
+    let chat_id = chat_id.ok_or_else(|| anyhow!("--chat-id is required"))?;
+
+    Ok(Some(ImportHistoryArgs {
+        file_path,
+        chat_id,
+        batch_size,
+        dry_run,
+        resume,
+        from_date,
+        to_date,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> HandlerResult {
     dotenv().ok();
     let _guards = init_logging();
+
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(import_args) = parse_import_history_args(&args)? {
+        let summary = run_import_history(import_args).await?;
+        info!(
+            "Import summary: total={} upserts={} invalid={} resume_skips={} date_skips={} rag_candidates={} rag_accepted={} rag_skipped={} rag_failed={}",
+            summary.total_records,
+            summary.db_upserts,
+            summary.invalid_records,
+            summary.skipped_by_resume,
+            summary.skipped_by_date_filter,
+            summary.rag_candidates,
+            summary.rag_accepted,
+            summary.rag_skipped,
+            summary.rag_failed
+        );
+        return Ok(());
+    }
+
+    if CONFIG.bot_token.trim().is_empty() {
+        return Err("BOT_TOKEN is required unless running import-history".into());
+    }
 
     let bot = Bot::new(CONFIG.bot_token.clone());
     info!("Starting TelegramGroupHelperBot (Rust)");
@@ -151,6 +277,17 @@ async fn handle_command(
             tokio::spawn(async move {
                 if let Err(err) = qa::qq_handler(bot, state, message, arg).await {
                     error!("qq handler failed: {err}");
+                }
+            });
+        }
+        Command::Ragq(arg) => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let arg = optional_arg(arg);
+            tokio::spawn(async move {
+                if let Err(err) = qa::ragq_handler(bot, state, message, arg).await {
+                    error!("ragq handler failed: {err}");
                 }
             });
         }

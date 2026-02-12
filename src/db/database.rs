@@ -65,6 +65,11 @@ impl Database {
             .map_err(|err| anyhow::anyhow!("Failed to queue message insert: {err}"))
     }
 
+    pub async fn upsert_message_direct(&self, insert: &MessageInsert) -> Result<()> {
+        upsert_message(&self.pool, insert).await?;
+        Ok(())
+    }
+
     pub async fn health_check(&self) -> Result<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
@@ -177,27 +182,7 @@ impl Database {
 
 async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<MessageInsert>) {
     while let Some(message) = receiver.recv().await {
-        let result = sqlx::query(
-            "INSERT INTO messages (message_id, chat_id, user_id, username, text, language, date, reply_to_message_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(chat_id, message_id) DO UPDATE SET \
-             user_id = excluded.user_id, \
-             username = excluded.username, \
-             text = excluded.text, \
-             language = excluded.language, \
-             date = excluded.date, \
-             reply_to_message_id = excluded.reply_to_message_id",
-        )
-        .bind(message.message_id)
-        .bind(message.chat_id)
-        .bind(message.user_id)
-        .bind(message.username)
-        .bind(message.text)
-        .bind(message.language)
-        .bind(message.date)
-        .bind(message.reply_to_message_id)
-        .execute(&pool)
-        .await;
+        let result = upsert_message(&pool, &message).await;
 
         if let Err(err) = result {
             warn!("Error in db_writer: {err}");
@@ -206,6 +191,32 @@ async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<MessageInsert>
 
     let _ = pool.close().await;
     info!("Database writer task stopped");
+}
+
+async fn upsert_message(pool: &SqlitePool, message: &MessageInsert) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO messages (message_id, chat_id, user_id, username, text, language, date, reply_to_message_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(chat_id, message_id) DO UPDATE SET \
+         user_id = excluded.user_id, \
+         username = excluded.username, \
+         text = excluded.text, \
+         language = excluded.language, \
+         date = excluded.date, \
+         reply_to_message_id = excluded.reply_to_message_id",
+    )
+    .bind(message.message_id)
+    .bind(message.chat_id)
+    .bind(message.user_id)
+    .bind(message.username.as_deref())
+    .bind(message.text.as_deref())
+    .bind(message.language.as_deref())
+    .bind(message.date)
+    .bind(message.reply_to_message_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 pub fn build_message_insert(

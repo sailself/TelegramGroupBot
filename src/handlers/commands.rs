@@ -1756,6 +1756,9 @@ Usage: `/q [your question]`
 /qq - Quick Gemini answer using the default Gemini model
 Usage: `/qq [your quick question]`
 
+/ragq - Ask with local RAG context from this group's chat history
+Usage: `/ragq [your question]`
+
 /img - Generate or edit an image using Gemini
 Usage: `/img [description]` for generating a new image
 Or reply to an image with `/img [description]` to edit that image
