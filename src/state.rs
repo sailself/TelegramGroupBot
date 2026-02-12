@@ -53,15 +53,19 @@ pub struct MediaGroupItem {
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
+    pub bot_user_id: i64,
+    pub bot_username_lower: String,
     pub pending_q_requests: Arc<Mutex<HashMap<String, PendingQRequest>>>,
     pub pending_image_requests: Arc<Mutex<HashMap<String, PendingImageRequest>>>,
     pub media_groups: Arc<Mutex<HashMap<MediaGroupId, Vec<MediaGroupItem>>>>,
 }
 
 impl AppState {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db: Database, bot_user_id: i64, bot_username_lower: String) -> Self {
         AppState {
             db,
+            bot_user_id,
+            bot_username_lower,
             pending_q_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_image_requests: Arc::new(Mutex::new(HashMap::new())),
             media_groups: Arc::new(Mutex::new(HashMap::new())),

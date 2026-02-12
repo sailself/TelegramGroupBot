@@ -42,3 +42,13 @@
 - Never commit `.env` or secrets. Keep API keys in environment variables only.
 - The SQLite database path comes from `DATABASE_URL`; use `sqlite:///...` for absolute paths.
 - `allowed_chat.txt` controls access; keep it out of version control if it contains private IDs.
+
+## Agent Execution Logging
+- For each substantial implementation or investigation request, create a log file under `agent_logs/`.
+- Name format: `<task-name>_<YYYYMMDD_HHMMSS>.md` using a descriptive task name and timestamp.
+- Each log file must include:
+  - The user prompt/request that triggered the work.
+  - The implementation plan used.
+  - The actions completed (files changed, behavior added/updated).
+  - Validation performed (build/tests/other checks) and outcomes.
+- Do not include secrets, API keys, or sensitive runtime credentials in log content.

@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityRef, MessageId, ParseMode,
-    ReplyParameters,
+    InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef, MessageId,
+    ParseMode, ReplyParameters,
 };
 use teloxide::RequestError;
 
@@ -43,6 +43,132 @@ fn message_entities_for_text(message: &Message) -> Option<Vec<MessageEntityRef<'
         message.parse_entities()
     } else {
         message.parse_caption_entities()
+    }
+}
+
+fn message_text_or_caption(message: &Message) -> Option<&str> {
+    message.text().or_else(|| message.caption())
+}
+
+fn is_bot_mention_entity(
+    entity: &MessageEntityRef<'_>,
+    bot_user_id: i64,
+    bot_username_lower: &str,
+) -> bool {
+    match entity.kind() {
+        MessageEntityKind::Mention => {
+            if bot_username_lower.is_empty() {
+                return false;
+            }
+            entity
+                .text()
+                .trim_start_matches('@')
+                .eq_ignore_ascii_case(bot_username_lower)
+        }
+        MessageEntityKind::TextMention { user } => {
+            i64::try_from(user.id.0).ok() == Some(bot_user_id)
+        }
+        _ => false,
+    }
+}
+
+fn strip_bot_mentions_from_query(
+    text: &str,
+    entities: Option<&[MessageEntityRef<'_>]>,
+    bot_user_id: i64,
+    bot_username_lower: &str,
+) -> String {
+    let Some(entities) = entities else {
+        return text.trim().to_string();
+    };
+
+    let mut ranges = entities
+        .iter()
+        .filter(|entity| is_bot_mention_entity(entity, bot_user_id, bot_username_lower))
+        .map(|entity| entity.start()..entity.end())
+        .collect::<Vec<_>>();
+    if ranges.is_empty() {
+        return text.trim().to_string();
+    }
+
+    ranges.sort_by_key(|range| range.start);
+    let mut stripped = text.to_string();
+    for range in ranges.into_iter().rev() {
+        stripped.replace_range(range, " ");
+    }
+
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn is_reply_to_this_bot(message: &Message, bot_user_id: i64) -> bool {
+    let Some(reply) = message.reply_to_message() else {
+        return false;
+    };
+    let Some(reply_from) = reply.from.as_ref() else {
+        return false;
+    };
+    if !reply_from.is_bot {
+        return false;
+    }
+    i64::try_from(reply_from.id.0).ok() == Some(bot_user_id)
+}
+
+pub fn is_mentioning_this_bot(
+    message: &Message,
+    bot_user_id: i64,
+    bot_username_lower: &str,
+) -> bool {
+    let Some(entities) = message_entities_for_text(message) else {
+        return false;
+    };
+
+    entities
+        .iter()
+        .any(|entity| is_bot_mention_entity(entity, bot_user_id, bot_username_lower))
+}
+
+pub fn should_auto_q_trigger(
+    message: &Message,
+    bot_user_id: i64,
+    bot_username_lower: &str,
+) -> bool {
+    if message
+        .from
+        .as_ref()
+        .map(|user| user.is_bot)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let Some(text) = message_text_or_caption(message) else {
+        return false;
+    };
+    if text.trim_start().starts_with('/') {
+        return false;
+    }
+
+    is_mentioning_this_bot(message, bot_user_id, bot_username_lower)
+        || is_reply_to_this_bot(message, bot_user_id)
+}
+
+pub fn build_auto_q_query(
+    message: &Message,
+    bot_user_id: i64,
+    bot_username_lower: &str,
+) -> Option<String> {
+    let text = message_text_or_caption(message)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let entities = message_entities_for_text(message);
+    let stripped =
+        strip_bot_mentions_from_query(text, entities.as_deref(), bot_user_id, bot_username_lower);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped)
     }
 }
 

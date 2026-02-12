@@ -14,6 +14,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/tldr` - Summarize recent chat history in the thread.
 - `/factcheck` - Fact-check a statement (text or reply).
 - `/q` - Ask a question (uses model selection when OpenRouter models are configured).
+- Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically.
 - `/qq` - Quick Gemini response using the default Gemini model.
 - `/img` - Generate or edit an image with Gemini.
 - `/image` - Generate an image with selectable resolution and aspect ratio.

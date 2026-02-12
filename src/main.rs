@@ -49,10 +49,17 @@ async fn main() -> HandlerResult {
     let _guards = init_logging();
 
     let bot = Bot::new(CONFIG.bot_token.clone());
+    let me = bot.get_me().await?;
+    let bot_user_id = i64::try_from(me.id.0).unwrap_or_default();
+    let bot_username_lower = me
+        .username
+        .as_ref()
+        .map(|username| username.to_lowercase())
+        .unwrap_or_default();
     info!("Starting TelegramGroupHelperBot (Rust)");
 
     let db = Database::init(&CONFIG.database_url).await?;
-    let state = AppState::new(db);
+    let state = AppState::new(db, bot_user_id, bot_username_lower);
 
     handlers::access::load_whitelist();
 
@@ -68,7 +75,7 @@ async fn main() -> HandlerResult {
         )
         .branch(
             dptree::filter(|msg: Message| msg.text().is_some() || msg.caption().is_some())
-                .endpoint(handle_log_message),
+                .endpoint(handle_text_message),
         )
         .endpoint(ignore_message);
 
@@ -273,12 +280,26 @@ async fn handle_media_group(state: AppState, message: Message) -> HandlerResult 
     Ok(())
 }
 
-async fn handle_log_message(state: AppState, message: Message) -> HandlerResult {
+async fn handle_text_message(bot: Bot, state: AppState, message: Message) -> HandlerResult {
     if let Some(text) = message.text().or_else(|| message.caption()) {
         if text.trim_start().starts_with('/') {
             return Ok(());
         }
     }
+
+    if qa::should_auto_q_trigger(&message, state.bot_user_id, &state.bot_username_lower) {
+        let query = qa::build_auto_q_query(&message, state.bot_user_id, &state.bot_username_lower);
+        let bot = bot.clone();
+        let state = state.clone();
+        let message = message.clone();
+        tokio::spawn(async move {
+            if let Err(err) = qa::q_handler(bot, state, message, query, false, "q").await {
+                error!("auto q handler failed: {err}");
+            }
+        });
+        return Ok(());
+    }
+
     handlers::responses::log_message(&state, &message).await;
     Ok(())
 }
