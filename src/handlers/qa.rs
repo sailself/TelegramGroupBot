@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef, MessageId,
+    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef, MessageId,
     ParseMode, ReplyParameters,
 };
 use teloxide::RequestError;
@@ -23,6 +23,7 @@ use crate::llm::media::MediaKind;
 use crate::llm::{call_gemini, call_openrouter};
 use crate::state::{AppState, PendingQRequest};
 use crate::utils::language::detect_language_or_fallback;
+use crate::utils::telegram::start_chat_action_heartbeat;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::warn;
 
@@ -438,6 +439,9 @@ async fn process_request(
             .unwrap_or(false)
     };
 
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), ChatId(request.chat_id), ChatAction::Typing);
+
     let response = if model_name == MODEL_GEMINI {
         let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
         call_gemini(
@@ -726,6 +730,8 @@ pub async fn q_handler(
         )
         .await?;
         let mut timer = start_command_timer(command_name, &message);
+        let _chat_action =
+            start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
         let use_pro = if command_name == "qq" {
             false
         } else {
