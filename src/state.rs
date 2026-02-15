@@ -4,6 +4,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use teloxide::types::{FileId, MediaGroupId};
 
+use crate::agent::types::PendingAgentAction;
 use crate::db::database::Database;
 use crate::llm::media::MediaFile;
 use crate::utils::timing::CommandTimer;
@@ -57,6 +58,7 @@ pub struct AppState {
     pub bot_username_lower: String,
     pub pending_q_requests: Arc<Mutex<HashMap<String, PendingQRequest>>>,
     pub pending_image_requests: Arc<Mutex<HashMap<String, PendingImageRequest>>>,
+    pub pending_agent_actions: Arc<Mutex<HashMap<String, PendingAgentAction>>>,
     pub media_groups: Arc<Mutex<HashMap<MediaGroupId, Vec<MediaGroupItem>>>>,
 }
 
@@ -68,6 +70,7 @@ impl AppState {
             bot_username_lower,
             pending_q_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_image_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_agent_actions: Arc::new(Mutex::new(HashMap::new())),
             media_groups: Arc::new(Mutex::new(HashMap::new())),
         }
     }

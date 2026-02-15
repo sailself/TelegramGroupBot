@@ -16,6 +16,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/q` - Ask a question (uses model selection when OpenRouter models are configured).
 - Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically.
 - `/qq` - Quick Gemini response using the default Gemini model.
+- `/agent` - Run the skills-first agent with multi-step tool use.
 - `/img` - Generate or edit an image with Gemini.
 - `/image` - Generate an image with selectable resolution and aspect ratio.
 - `/vid` - Generate a video from text.
@@ -112,6 +113,23 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OPENROUTER_TOP_P` - Default: `0.95`.
 - `OPENROUTER_MODELS_CONFIG_PATH` - Path to model config JSON.
   - Defaults to `openrouter_models.json` or `bot/openrouter_models.json` if present.
+
+### Agent runtime
+- `AGENT_PROVIDER` - Agent runtime provider: `gemini` or `openrouter`. Default: `gemini`.
+- `SKILLS_DIR` - Directory containing Markdown skills with YAML frontmatter. Default: `skills`.
+- `AGENT_MODEL` - Optional provider-specific model ID for `/agent`.
+  - For `gemini`: defaults to `GEMINI_PRO_MODEL`, then `GEMINI_MODEL`.
+  - For `openrouter`: defaults to `GPT_MODEL`, then first tools-capable OpenRouter model.
+- `AGENT_MAX_TOOL_ITERATIONS` - Max tool loop iterations per run. Default: `4`.
+- `AGENT_MAX_ACTIVE_SKILLS` - Max selected skills loaded per run (excluding always-active core skill). Default: `3`.
+- `AGENT_SKILL_CANDIDATE_LIMIT` - Candidate skills considered before final selection. Default: `8`.
+- `AGENT_EXEC_TIMEOUT_SECONDS` - Shell command timeout for `exec` tool. Default: `60`.
+- `AGENT_EXEC_MAX_OUTPUT_CHARS` - Output truncation limit for `exec`. Default: `10000`.
+- `AGENT_EXEC_RESTRICT_TO_WORKSPACE` - Restrict shell and paths to current workspace. Default: `true`.
+- `AGENT_EXEC_DENY_PATTERNS` - Extra comma-separated regex deny patterns for shell guardrails.
+- `AGENT_REQUIRE_CONFIRMATION_FOR_WRITE` - Require user confirmation before `write_file`. Default: `true`.
+- `AGENT_REQUIRE_CONFIRMATION_FOR_EDIT` - Require user confirmation before `edit_file`. Default: `true`.
+- `AGENT_REQUIRE_CONFIRMATION_FOR_EXEC` - Require user confirmation before `exec`. Default: `true`.
 
 Legacy OpenRouter model variables (used if JSON is missing):
 - `LLAMA_MODEL`

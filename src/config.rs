@@ -110,6 +110,19 @@ pub struct Config {
     pub support_link: String,
     pub whitelist_file_path: String,
     pub access_controlled_commands: Vec<String>,
+    pub agent_provider: String,
+    pub skills_dir: String,
+    pub agent_model: String,
+    pub agent_max_tool_iterations: usize,
+    pub agent_max_active_skills: usize,
+    pub agent_skill_candidate_limit: usize,
+    pub agent_exec_timeout_seconds: u64,
+    pub agent_exec_max_output_chars: usize,
+    pub agent_exec_restrict_to_workspace: bool,
+    pub agent_exec_deny_patterns: Vec<String>,
+    pub agent_require_confirmation_for_write: bool,
+    pub agent_require_confirmation_for_edit: bool,
+    pub agent_require_confirmation_for_exec: bool,
     pub openrouter_models_config_path: PathBuf,
     pub openrouter_models: Vec<OpenRouterModelConfig>,
     pub openrouter_models_by_model: HashMap<String, OpenRouterModelConfig>,
@@ -162,6 +175,15 @@ fn env_csv_lowercase(name: &str, default: &str) -> Vec<String> {
         .unwrap_or_else(|_| default.to_string())
         .split(',')
         .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn env_csv(name: &str, default: &str) -> Vec<String> {
+    env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .split(',')
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect()
 }
@@ -410,6 +432,8 @@ impl Config {
             web_search_providers = vec!["brave".to_string(), "exa".to_string(), "jina".to_string()];
         }
 
+        let agent_exec_deny_patterns = env_csv("AGENT_EXEC_DENY_PATTERNS", "");
+
         Ok(Config {
             bot_token,
             log_level: env_string("LOG_LEVEL", "info").to_lowercase(),
@@ -477,6 +501,28 @@ impl Config {
             support_link: env_string("SUPPORT_LINK", ""),
             whitelist_file_path: env_string("WHITELIST_FILE_PATH", "allowed_chat.txt"),
             access_controlled_commands,
+            agent_provider: env_string("AGENT_PROVIDER", "gemini").to_lowercase(),
+            skills_dir: env_string("SKILLS_DIR", "skills"),
+            agent_model: env_string("AGENT_MODEL", ""),
+            agent_max_tool_iterations: env_usize("AGENT_MAX_TOOL_ITERATIONS", 4),
+            agent_max_active_skills: env_usize("AGENT_MAX_ACTIVE_SKILLS", 3),
+            agent_skill_candidate_limit: env_usize("AGENT_SKILL_CANDIDATE_LIMIT", 8),
+            agent_exec_timeout_seconds: env_u64("AGENT_EXEC_TIMEOUT_SECONDS", 60),
+            agent_exec_max_output_chars: env_usize("AGENT_EXEC_MAX_OUTPUT_CHARS", 10000),
+            agent_exec_restrict_to_workspace: env_bool("AGENT_EXEC_RESTRICT_TO_WORKSPACE", true),
+            agent_exec_deny_patterns,
+            agent_require_confirmation_for_write: env_bool(
+                "AGENT_REQUIRE_CONFIRMATION_FOR_WRITE",
+                true,
+            ),
+            agent_require_confirmation_for_edit: env_bool(
+                "AGENT_REQUIRE_CONFIRMATION_FOR_EDIT",
+                true,
+            ),
+            agent_require_confirmation_for_exec: env_bool(
+                "AGENT_REQUIRE_CONFIRMATION_FOR_EXEC",
+                true,
+            ),
             openrouter_models_config_path,
             openrouter_models,
             openrouter_models_by_model,

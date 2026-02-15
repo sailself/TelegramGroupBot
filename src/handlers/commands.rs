@@ -1777,6 +1777,10 @@ Usage: `/q [your question]`
 /qq - Quick Gemini answer using the default Gemini model
 Usage: `/qq [your quick question]`
 
+/agent - Run the AI-native agent with multi-step reasoning and tools
+Usage: `/agent [your task]`
+Or reply to a message with `/agent`
+
 /img - Generate or edit an image using Gemini
 Usage: `/img [description]` for generating a new image
 Or reply to an image with `/img [description]` to edit that image

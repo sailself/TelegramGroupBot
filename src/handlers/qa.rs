@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef, MessageId,
-    ParseMode, ReplyParameters,
+    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef,
+    MessageId, ParseMode, ReplyParameters,
 };
 use teloxide::RequestError;
 

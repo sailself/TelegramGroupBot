@@ -6,18 +6,21 @@ use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
 use tracing::{error, info};
 
+mod agent;
 mod config;
 mod db;
 mod handlers;
 mod llm;
+mod skills;
 mod state;
 mod tools;
 mod utils;
 
 use config::CONFIG;
 use db::database::Database;
+use handlers::agent::{AGENT_CANCEL_CALLBACK_PREFIX, AGENT_CONFIRM_CALLBACK_PREFIX};
 use handlers::qa::MODEL_CALLBACK_PREFIX;
-use handlers::{commands, qa};
+use handlers::{agent as agent_handlers, commands, qa};
 use state::AppState;
 use utils::logging::init_logging;
 
@@ -36,6 +39,7 @@ enum Command {
     Profileme(String),
     Paintme,
     Portraitme,
+    Agent(String),
     Status,
     Diagnose,
     Support,
@@ -224,6 +228,17 @@ async fn handle_command(
                 }
             });
         }
+        Command::Agent(arg) => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let arg = optional_arg(arg);
+            tokio::spawn(async move {
+                if let Err(err) = agent_handlers::agent_handler(bot, state, message, arg).await {
+                    error!("agent handler failed: {err}");
+                }
+            });
+        }
         Command::Status => {
             let bot = bot.clone();
             let state = state.clone();
@@ -269,6 +284,18 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
         tokio::spawn(async move {
             if let Err(err) = commands::image_selection_callback(bot, state, query).await {
                 error!("image selection callback failed: {err}");
+            }
+        });
+        return Ok(());
+    }
+    if data.starts_with(AGENT_CONFIRM_CALLBACK_PREFIX)
+        || data.starts_with(AGENT_CANCEL_CALLBACK_PREFIX)
+    {
+        let bot = bot.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = agent_handlers::agent_confirmation_callback(bot, state, query).await {
+                error!("agent confirmation callback failed: {err}");
             }
         });
     }

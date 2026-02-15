@@ -1,5 +1,6 @@
-﻿use crate::db::models::{MessageInsert, MessageRow};
+use crate::db::models::{MessageInsert, MessageRow};
 use anyhow::Result;
+use serde_json::Value;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;
@@ -44,6 +45,92 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);")
             .execute(&pool)
             .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_sessions (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                chat_id INTEGER NOT NULL,\
+                user_id INTEGER NOT NULL,\
+                model_name TEXT NOT NULL,\
+                prompt TEXT NOT NULL,\
+                selected_skills_json TEXT,\
+                status TEXT NOT NULL DEFAULT 'running',\
+                final_response TEXT,\
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\
+            );",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_steps (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                session_id INTEGER NOT NULL,\
+                role TEXT NOT NULL,\
+                content TEXT,\
+                raw_json TEXT NOT NULL,\
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                FOREIGN KEY(session_id) REFERENCES agent_sessions(id)\
+            );",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_tool_calls (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                session_id INTEGER NOT NULL,\
+                step_id INTEGER NOT NULL,\
+                tool_call_id TEXT NOT NULL,\
+                tool_name TEXT NOT NULL,\
+                args_json TEXT NOT NULL,\
+                status TEXT NOT NULL,\
+                requires_confirmation INTEGER NOT NULL DEFAULT 0,\
+                confirmed_by INTEGER,\
+                result_json TEXT,\
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                completed_at TEXT,\
+                FOREIGN KEY(session_id) REFERENCES agent_sessions(id),\
+                FOREIGN KEY(step_id) REFERENCES agent_steps(id)\
+            );",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_session_skills (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                session_id INTEGER NOT NULL,\
+                selected_skills_json TEXT NOT NULL,\
+                selection_reason TEXT,\
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+                FOREIGN KEY(session_id) REFERENCES agent_sessions(id)\
+            );",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_sessions_chat_user ON agent_sessions(chat_id, user_id);",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_steps_session_id ON agent_steps(session_id);",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_session_id ON agent_tool_calls(session_id);",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_session_skills_session_id ON agent_session_skills(session_id);",
+        )
+        .execute(&pool)
+        .await?;
 
         info!("Database tables created successfully");
 
@@ -167,6 +254,133 @@ impl Database {
             .await?;
 
         Ok(rows.into_iter().rev().collect())
+    }
+
+    pub async fn create_agent_session(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        model_name: &str,
+        prompt: &str,
+        selected_skills_json: &str,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO agent_sessions (chat_id, user_id, model_name, prompt, selected_skills_json, status) \
+             VALUES (?, ?, ?, ?, ?, 'running')",
+        )
+        .bind(chat_id)
+        .bind(user_id)
+        .bind(model_name)
+        .bind(prompt)
+        .bind(selected_skills_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn complete_agent_session(
+        &self,
+        session_id: i64,
+        status: &str,
+        final_response: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE agent_sessions \
+             SET status = ?, final_response = COALESCE(?, final_response), updated_at = CURRENT_TIMESTAMP \
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(final_response)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn insert_agent_step(
+        &self,
+        session_id: i64,
+        role: &str,
+        content: &str,
+        raw_json: &Value,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO agent_steps (session_id, role, content, raw_json) VALUES (?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(role)
+        .bind(content)
+        .bind(raw_json.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn insert_agent_tool_call(
+        &self,
+        session_id: i64,
+        step_id: i64,
+        tool_call_id: &str,
+        tool_name: &str,
+        args_json: &Value,
+        status: &str,
+        requires_confirmation: bool,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO agent_tool_calls \
+             (session_id, step_id, tool_call_id, tool_name, args_json, status, requires_confirmation) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(step_id)
+        .bind(tool_call_id)
+        .bind(tool_name)
+        .bind(args_json.to_string())
+        .bind(status)
+        .bind(if requires_confirmation { 1 } else { 0 })
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn update_agent_tool_call_status(
+        &self,
+        tool_call_row_id: i64,
+        status: &str,
+        result_json: Option<&Value>,
+        confirmed_by: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE agent_tool_calls \
+             SET status = ?, result_json = COALESCE(?, result_json), confirmed_by = COALESCE(?, confirmed_by), completed_at = CURRENT_TIMESTAMP \
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(result_json.map(|value| value.to_string()))
+        .bind(confirmed_by)
+        .bind(tool_call_row_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn record_agent_session_skills(
+        &self,
+        session_id: i64,
+        selected_skills: &[String],
+        selection_reason: &str,
+    ) -> Result<()> {
+        let selected_skills_json = serde_json::to_string(selected_skills)?;
+        sqlx::query(
+            "INSERT INTO agent_session_skills (session_id, selected_skills_json, selection_reason) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(selected_skills_json)
+        .bind(selection_reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     #[allow(dead_code)]

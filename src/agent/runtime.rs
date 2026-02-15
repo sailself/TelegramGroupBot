@@ -1,0 +1,954 @@
+use std::env;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Result};
+use serde_json::{json, Value};
+use tracing::{debug, info, warn};
+
+use crate::agent::tools::{
+    build_gemini_tool_definitions, build_openrouter_tool_definitions, execute_tool,
+    is_tool_allowed, requires_confirmation,
+};
+use crate::agent::types::{AgentProvider, AgentRunOutcome, PendingAgentAction};
+use crate::config::CONFIG;
+use crate::skills::index::{build_selected_skill_context, build_skill_index};
+use crate::skills::loader::load_skills;
+use crate::skills::select::select_active_skills;
+use crate::state::AppState;
+use crate::utils::http::get_http_client;
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn resolve_agent_provider() -> AgentProvider {
+    AgentProvider::from_str(&CONFIG.agent_provider)
+}
+
+fn resolve_openrouter_model() -> Result<String> {
+    if !CONFIG.agent_model.trim().is_empty() {
+        return Ok(CONFIG.agent_model.clone());
+    }
+    if !CONFIG.gpt_model.trim().is_empty() {
+        return Ok(CONFIG.gpt_model.clone());
+    }
+    if let Some(model) = CONFIG
+        .iter_openrouter_models()
+        .iter()
+        .find(|model| model.tools)
+        .map(|model| model.model.clone())
+    {
+        return Ok(model);
+    }
+
+    Err(anyhow!(
+        "No OpenRouter agent model configured. Set AGENT_MODEL or configure OpenRouter models."
+    ))
+}
+
+fn resolve_gemini_model() -> Result<String> {
+    if !CONFIG.agent_model.trim().is_empty() {
+        return Ok(CONFIG.agent_model.clone());
+    }
+    if !CONFIG.gemini_pro_model.trim().is_empty() {
+        return Ok(CONFIG.gemini_pro_model.clone());
+    }
+    if !CONFIG.gemini_model.trim().is_empty() {
+        return Ok(CONFIG.gemini_model.clone());
+    }
+
+    Err(anyhow!(
+        "No Gemini agent model configured. Set AGENT_MODEL or GEMINI_MODEL."
+    ))
+}
+
+fn resolve_agent_runtime() -> Result<(AgentProvider, String)> {
+    let provider = resolve_agent_provider();
+    let model = match provider {
+        AgentProvider::OpenRouter => resolve_openrouter_model()?,
+        AgentProvider::Gemini => resolve_gemini_model()?,
+    };
+    Ok((provider, model))
+}
+
+fn summarize_error_body(raw: &str) -> String {
+    if let Ok(json) = serde_json::from_str::<Value>(raw) {
+        if let Some(message) = json
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .or_else(|| json.get("message").and_then(|value| value.as_str()))
+        {
+            return message.to_string();
+        }
+        return json.to_string();
+    }
+    if raw.trim().is_empty() {
+        "empty response body".to_string()
+    } else {
+        raw.trim().to_string()
+    }
+}
+
+fn extract_assistant_content(message: &Value) -> String {
+    let content = message
+        .get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !content.is_empty() {
+        return content;
+    }
+
+    if let Some(reasoning) = message.get("reasoning").and_then(|value| value.as_str()) {
+        let trimmed = reasoning.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    if let Some(details) = message
+        .get("reasoning_details")
+        .and_then(|value| value.as_array())
+    {
+        let mut parts = Vec::new();
+        for detail in details {
+            if let Some(text) = detail.get("text").and_then(|value| value.as_str()) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
+    }
+
+    String::new()
+}
+
+async fn call_openrouter_chat(model: &str, messages: &[Value], tools: &[Value]) -> Result<Value> {
+    if !CONFIG.enable_openrouter || CONFIG.openrouter_api_key.trim().is_empty() {
+        return Err(anyhow!(
+            "OpenRouter is not configured. Enable OPENROUTER and set OPENROUTER_API_KEY."
+        ));
+    }
+
+    let mut payload = json!({
+        "model": model,
+        "messages": messages,
+        "temperature": CONFIG.openrouter_temperature,
+        "top_p": CONFIG.openrouter_top_p,
+        "top_k": CONFIG.openrouter_top_k,
+    });
+    if !tools.is_empty() {
+        payload["tools"] = Value::Array(tools.to_vec());
+        payload["tool_choice"] = Value::String("auto".to_string());
+    }
+
+    let client = get_http_client();
+    let response = client
+        .post(format!(
+            "{}/chat/completions",
+            CONFIG.openrouter_base_url.trim_end_matches('/')
+        ))
+        .header(
+            "Authorization",
+            format!("Bearer {}", CONFIG.openrouter_api_key),
+        )
+        .header(
+            "HTTP-Referer",
+            "https://github.com/sailself/TelegramGroupHelperBot",
+        )
+        .header("X-Title", "TelegramGroupHelperBot")
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let detail = summarize_error_body(&body);
+        return Err(anyhow!(
+            "OpenRouter request failed with status {}: {}",
+            status,
+            detail
+        ));
+    }
+
+    let json = response
+        .json::<Value>()
+        .await
+        .map_err(|err| anyhow!("Failed to decode OpenRouter response: {}", err))?;
+    Ok(json)
+}
+
+async fn call_gemini_chat(
+    model: &str,
+    system_prompt: &str,
+    contents: &[Value],
+    tools: &[Value],
+) -> Result<Value> {
+    if CONFIG.gemini_api_key.trim().is_empty() {
+        return Err(anyhow!(
+            "Gemini is not configured. Set GEMINI_API_KEY to use AGENT_PROVIDER=gemini."
+        ));
+    }
+
+    let mut payload = json!({
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "contents": contents,
+        "generationConfig": {
+            "temperature": CONFIG.gemini_temperature,
+            "topK": CONFIG.gemini_top_k,
+            "topP": CONFIG.gemini_top_p,
+            "maxOutputTokens": CONFIG.gemini_max_output_tokens,
+        },
+    });
+
+    if !tools.is_empty() {
+        payload["tools"] = Value::Array(tools.to_vec());
+    }
+
+    let client = get_http_client();
+    let response = client
+        .post(format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            model, CONFIG.gemini_api_key
+        ))
+        .timeout(std::time::Duration::from_secs(90))
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let detail = summarize_error_body(&body);
+        return Err(anyhow!(
+            "Gemini request failed with status {}: {}",
+            status,
+            detail
+        ));
+    }
+
+    response
+        .json::<Value>()
+        .await
+        .map_err(|err| anyhow!("Failed to decode Gemini response: {}", err))
+}
+
+fn parse_gemini_assistant_parts(
+    response: &Value,
+) -> Result<(Vec<Value>, String, Vec<(String, String, Value)>)> {
+    let parts = response
+        .get("candidates")
+        .and_then(|value| value.get(0))
+        .and_then(|value| value.get("content"))
+        .and_then(|value| value.get("parts"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .ok_or_else(|| anyhow!("Gemini response is missing candidates[0].content.parts"))?;
+
+    let mut text_parts = Vec::new();
+    let mut function_calls = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                text_parts.push(trimmed.to_string());
+            }
+        }
+
+        if let Some(call) = part.get("functionCall") {
+            let name = call
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+            let call_id = call
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| format!("gemini_call_{}_{}", index, now_nanos()));
+            function_calls.push((call_id, name, args));
+        }
+    }
+
+    Ok((parts, text_parts.join("\n"), function_calls))
+}
+
+fn build_gemini_function_response_message(tool_name: &str, payload: &Value) -> Value {
+    json!({
+        "role": "user",
+        "parts": [{
+            "functionResponse": {
+                "name": tool_name,
+                "response": {
+                    "name": tool_name,
+                    "content": payload
+                }
+            }
+        }]
+    })
+}
+
+fn build_system_prompt(skill_index: &str, selected_skill_context: &str) -> String {
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+    format!(
+        "You are an AI-native Telegram assistant that can reason in multiple steps and use tools.\n\
+         Current time: {now}\n\
+         Work strictly inside the workspace and avoid unsafe side effects.\n\
+         If you call side-effectful tools (write_file/edit_file/exec), execution may require confirmation.\n\
+         Use the selected skills as operating procedures.\n\n\
+         {skill_index}\n\n\
+         Active skill instructions:\n{selected_skill_context}"
+    )
+}
+
+fn new_confirmation_key(session_id: i64, tool_name: &str) -> String {
+    format!(
+        "s{}_{}_{}",
+        session_id,
+        tool_name.replace([':', '|', ' '], "_"),
+        now_nanos()
+    )
+}
+
+async fn append_step(
+    state: &AppState,
+    session_id: i64,
+    role: &str,
+    content: &str,
+    raw_json: &Value,
+) -> Result<i64> {
+    state
+        .db
+        .insert_agent_step(session_id, role, content, raw_json)
+        .await
+}
+
+async fn run_openrouter_loop(
+    state: &AppState,
+    session_id: i64,
+    user_id: i64,
+    chat_id: i64,
+    processing_message_id: i64,
+    model: &str,
+    selected_skill_names: &[String],
+    allowed_tools: &[String],
+    mut messages: Vec<Value>,
+) -> Result<AgentRunOutcome> {
+    let workspace_root =
+        env::current_dir().map_err(|err| anyhow!("Failed to read CWD: {}", err))?;
+    let tool_defs = build_openrouter_tool_definitions(allowed_tools);
+
+    for _iteration in 0..CONFIG.agent_max_tool_iterations {
+        let response = call_openrouter_chat(model, &messages, &tool_defs).await?;
+        let assistant_message = response
+            .get("choices")
+            .and_then(|value| value.get(0))
+            .and_then(|value| value.get("message"))
+            .cloned()
+            .ok_or_else(|| anyhow!("OpenRouter response is missing assistant message"))?;
+
+        let assistant_content = extract_assistant_content(&assistant_message);
+        let tool_calls = assistant_message
+            .get("tool_calls")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let assistant_json = if tool_calls.is_empty() {
+            json!({
+                "role": "assistant",
+                "content": assistant_content
+            })
+        } else {
+            json!({
+                "role": "assistant",
+                "content": assistant_content,
+                "tool_calls": tool_calls,
+            })
+        };
+        messages.push(assistant_json.clone());
+        let assistant_step_id = append_step(
+            state,
+            session_id,
+            "assistant",
+            &assistant_content,
+            &assistant_json,
+        )
+        .await?;
+
+        if tool_calls.is_empty() {
+            state
+                .db
+                .complete_agent_session(session_id, "completed", Some(&assistant_content))
+                .await?;
+            return Ok(AgentRunOutcome::Completed {
+                session_id,
+                response_text: assistant_content,
+                selected_skills: selected_skill_names.to_vec(),
+            });
+        }
+
+        for tool_call in tool_calls {
+            let tool_call_id = tool_call
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_name = tool_call
+                .get("function")
+                .and_then(|value| value.get("name"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args_raw = tool_call
+                .get("function")
+                .and_then(|value| value.get("arguments"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("{}")
+                .to_string();
+            let args_value = serde_json::from_str::<Value>(&args_raw)
+                .unwrap_or_else(|_| json!({ "_raw": args_raw }));
+
+            let requires_user_confirmation = requires_confirmation(&tool_name);
+            let mut tool_call_status = "requested".to_string();
+            if requires_user_confirmation {
+                tool_call_status = "awaiting_confirmation".to_string();
+            }
+            let tool_call_record_id = state
+                .db
+                .insert_agent_tool_call(
+                    session_id,
+                    assistant_step_id,
+                    &tool_call_id,
+                    &tool_name,
+                    &args_value,
+                    &tool_call_status,
+                    requires_user_confirmation,
+                )
+                .await?;
+
+            if !is_tool_allowed(&tool_name, allowed_tools) {
+                let result = format!("Tool '{}' is not allowed by active skills.", tool_name);
+                state
+                    .db
+                    .update_agent_tool_call_status(
+                        tool_call_record_id,
+                        "rejected",
+                        Some(&json!({ "error": result })),
+                        None,
+                    )
+                    .await?;
+                let tool_msg = json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result
+                });
+                messages.push(tool_msg.clone());
+                append_step(state, session_id, "tool", &result, &tool_msg).await?;
+                continue;
+            }
+
+            if requires_user_confirmation {
+                let confirmation_key = new_confirmation_key(session_id, &tool_name);
+                let pending = PendingAgentAction {
+                    provider: AgentProvider::OpenRouter,
+                    system_prompt: String::new(),
+                    user_id,
+                    chat_id,
+                    session_id,
+                    processing_message_id,
+                    tool_call_record_id,
+                    tool_call_id,
+                    tool_name: tool_name.clone(),
+                    tool_args: args_value.clone(),
+                    model_name: model.to_string(),
+                    allowed_tools: allowed_tools.to_vec(),
+                    selected_skills: selected_skill_names.to_vec(),
+                    messages,
+                };
+                state
+                    .pending_agent_actions
+                    .lock()
+                    .insert(confirmation_key.clone(), pending);
+                state
+                    .db
+                    .complete_agent_session(
+                        session_id,
+                        "awaiting_confirmation",
+                        Some("Awaiting side-effect tool confirmation"),
+                    )
+                    .await?;
+
+                let notice_text = format!(
+                    "Tool `{}` is ready to run and requires confirmation.\nArguments:\n```json\n{}\n```",
+                    tool_name,
+                    serde_json::to_string_pretty(&args_value).unwrap_or_else(|_| "{}".to_string())
+                );
+
+                return Ok(AgentRunOutcome::AwaitingConfirmation {
+                    confirmation_key,
+                    notice_text,
+                });
+            }
+
+            let execution_result = execute_tool(&tool_name, &args_value, &workspace_root).await;
+            let tool_result = match execution_result {
+                Ok(content) => {
+                    state
+                        .db
+                        .update_agent_tool_call_status(
+                            tool_call_record_id,
+                            "completed",
+                            Some(&json!({ "output": content })),
+                            None,
+                        )
+                        .await?;
+                    content
+                }
+                Err(err) => {
+                    let err_text = format!("Tool '{}' failed: {}", tool_name, err);
+                    state
+                        .db
+                        .update_agent_tool_call_status(
+                            tool_call_record_id,
+                            "failed",
+                            Some(&json!({ "error": err_text })),
+                            None,
+                        )
+                        .await?;
+                    err_text
+                }
+            };
+
+            let tool_message = json!({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": tool_result
+            });
+            messages.push(tool_message.clone());
+            append_step(state, session_id, "tool", &tool_result, &tool_message).await?;
+        }
+    }
+
+    let final_text =
+        "Tool call limit reached. Please refine your request or confirm required actions.";
+    state
+        .db
+        .complete_agent_session(session_id, "limit_reached", Some(final_text))
+        .await?;
+    Ok(AgentRunOutcome::Completed {
+        session_id,
+        response_text: final_text.to_string(),
+        selected_skills: selected_skill_names.to_vec(),
+    })
+}
+
+async fn run_gemini_loop(
+    state: &AppState,
+    session_id: i64,
+    user_id: i64,
+    chat_id: i64,
+    processing_message_id: i64,
+    model: &str,
+    system_prompt: &str,
+    selected_skill_names: &[String],
+    allowed_tools: &[String],
+    mut messages: Vec<Value>,
+) -> Result<AgentRunOutcome> {
+    let workspace_root =
+        env::current_dir().map_err(|err| anyhow!("Failed to read CWD: {}", err))?;
+    let tool_defs = build_gemini_tool_definitions(allowed_tools);
+
+    for _iteration in 0..CONFIG.agent_max_tool_iterations {
+        let response = call_gemini_chat(model, system_prompt, &messages, &tool_defs).await?;
+        let (parts, assistant_content, function_calls) = parse_gemini_assistant_parts(&response)?;
+
+        let model_message = json!({
+            "role": "model",
+            "parts": parts,
+        });
+        messages.push(model_message.clone());
+        let assistant_step_id = append_step(
+            state,
+            session_id,
+            "assistant",
+            &assistant_content,
+            &model_message,
+        )
+        .await?;
+
+        if function_calls.is_empty() {
+            let final_text = if assistant_content.trim().is_empty() {
+                "No response content returned by Gemini.".to_string()
+            } else {
+                assistant_content
+            };
+            state
+                .db
+                .complete_agent_session(session_id, "completed", Some(&final_text))
+                .await?;
+            return Ok(AgentRunOutcome::Completed {
+                session_id,
+                response_text: final_text,
+                selected_skills: selected_skill_names.to_vec(),
+            });
+        }
+
+        for (tool_call_id, tool_name, args_value) in function_calls {
+            let requires_user_confirmation = requires_confirmation(&tool_name);
+            let mut tool_call_status = "requested".to_string();
+            if requires_user_confirmation {
+                tool_call_status = "awaiting_confirmation".to_string();
+            }
+            let tool_call_record_id = state
+                .db
+                .insert_agent_tool_call(
+                    session_id,
+                    assistant_step_id,
+                    &tool_call_id,
+                    &tool_name,
+                    &args_value,
+                    &tool_call_status,
+                    requires_user_confirmation,
+                )
+                .await?;
+
+            if !is_tool_allowed(&tool_name, allowed_tools) {
+                let result = format!("Tool '{}' is not allowed by active skills.", tool_name);
+                state
+                    .db
+                    .update_agent_tool_call_status(
+                        tool_call_record_id,
+                        "rejected",
+                        Some(&json!({ "error": result })),
+                        None,
+                    )
+                    .await?;
+                let tool_payload = json!({ "error": result.clone() });
+                let function_response =
+                    build_gemini_function_response_message(&tool_name, &tool_payload);
+                messages.push(function_response.clone());
+                append_step(state, session_id, "tool", &result, &function_response).await?;
+                continue;
+            }
+
+            if requires_user_confirmation {
+                let confirmation_key = new_confirmation_key(session_id, &tool_name);
+                let pending = PendingAgentAction {
+                    provider: AgentProvider::Gemini,
+                    system_prompt: system_prompt.to_string(),
+                    user_id,
+                    chat_id,
+                    session_id,
+                    processing_message_id,
+                    tool_call_record_id,
+                    tool_call_id,
+                    tool_name: tool_name.clone(),
+                    tool_args: args_value.clone(),
+                    model_name: model.to_string(),
+                    allowed_tools: allowed_tools.to_vec(),
+                    selected_skills: selected_skill_names.to_vec(),
+                    messages,
+                };
+                state
+                    .pending_agent_actions
+                    .lock()
+                    .insert(confirmation_key.clone(), pending);
+                state
+                    .db
+                    .complete_agent_session(
+                        session_id,
+                        "awaiting_confirmation",
+                        Some("Awaiting side-effect tool confirmation"),
+                    )
+                    .await?;
+
+                let notice_text = format!(
+                    "Tool `{}` is ready to run and requires confirmation.\nArguments:\n```json\n{}\n```",
+                    tool_name,
+                    serde_json::to_string_pretty(&args_value).unwrap_or_else(|_| "{}".to_string())
+                );
+
+                return Ok(AgentRunOutcome::AwaitingConfirmation {
+                    confirmation_key,
+                    notice_text,
+                });
+            }
+
+            let execution_result = execute_tool(&tool_name, &args_value, &workspace_root).await;
+            let (tool_payload, tool_result_text, status) = match execution_result {
+                Ok(content) => (json!({ "output": content.clone() }), content, "completed"),
+                Err(err) => {
+                    let err_text = format!("Tool '{}' failed: {}", tool_name, err);
+                    (json!({ "error": err_text.clone() }), err_text, "failed")
+                }
+            };
+
+            state
+                .db
+                .update_agent_tool_call_status(
+                    tool_call_record_id,
+                    status,
+                    Some(&tool_payload),
+                    None,
+                )
+                .await?;
+
+            let function_response =
+                build_gemini_function_response_message(&tool_name, &tool_payload);
+            messages.push(function_response.clone());
+            append_step(
+                state,
+                session_id,
+                "tool",
+                &tool_result_text,
+                &function_response,
+            )
+            .await?;
+        }
+    }
+
+    let final_text =
+        "Tool call limit reached. Please refine your request or confirm required actions.";
+    state
+        .db
+        .complete_agent_session(session_id, "limit_reached", Some(final_text))
+        .await?;
+    Ok(AgentRunOutcome::Completed {
+        session_id,
+        response_text: final_text.to_string(),
+        selected_skills: selected_skill_names.to_vec(),
+    })
+}
+
+pub async fn start_agent_run(
+    state: &AppState,
+    user_id: i64,
+    chat_id: i64,
+    processing_message_id: i64,
+    prompt: &str,
+) -> Result<AgentRunOutcome> {
+    let (provider, model) = resolve_agent_runtime()?;
+    let skills_dir = std::path::Path::new(&CONFIG.skills_dir);
+    let loaded_skills = load_skills(skills_dir);
+    let active_skills = select_active_skills(
+        prompt,
+        &loaded_skills,
+        CONFIG.agent_skill_candidate_limit,
+        CONFIG.agent_max_active_skills,
+    )
+    .await;
+
+    let skill_index = build_skill_index(&loaded_skills);
+    let selected_skill_context = build_selected_skill_context(&active_skills.selected);
+    let system_prompt = build_system_prompt(&skill_index, &selected_skill_context);
+    let selected_skills_json =
+        serde_json::to_string(&active_skills.selected_names).unwrap_or_else(|_| "[]".to_string());
+
+    let session_model = format!("{}:{}", provider.as_str(), model);
+    let session_id = state
+        .db
+        .create_agent_session(
+            chat_id,
+            user_id,
+            &session_model,
+            prompt,
+            &selected_skills_json,
+        )
+        .await?;
+    state
+        .db
+        .record_agent_session_skills(
+            session_id,
+            &active_skills.selected_names,
+            "heuristic_then_llm",
+        )
+        .await?;
+
+    let system_msg = json!({ "role": "system", "content": system_prompt });
+    append_step(
+        state,
+        session_id,
+        "system",
+        system_prompt.as_str(),
+        &system_msg,
+    )
+    .await?;
+
+    info!(
+        "Starting agent session {} with provider='{}' model='{}' and skills [{}]",
+        session_id,
+        provider.as_str(),
+        model,
+        active_skills.selected_names.join(", ")
+    );
+
+    match provider {
+        AgentProvider::OpenRouter => {
+            let mut messages = Vec::new();
+            messages.push(system_msg);
+            let user_msg = json!({ "role": "user", "content": prompt });
+            messages.push(user_msg.clone());
+            append_step(state, session_id, "user", prompt, &user_msg).await?;
+            run_openrouter_loop(
+                state,
+                session_id,
+                user_id,
+                chat_id,
+                processing_message_id,
+                &model,
+                &active_skills.selected_names,
+                &active_skills.allowed_tools,
+                messages,
+            )
+            .await
+        }
+        AgentProvider::Gemini => {
+            let mut messages = Vec::new();
+            let user_msg = json!({ "role": "user", "parts": [{ "text": prompt }] });
+            messages.push(user_msg.clone());
+            append_step(state, session_id, "user", prompt, &user_msg).await?;
+            run_gemini_loop(
+                state,
+                session_id,
+                user_id,
+                chat_id,
+                processing_message_id,
+                &model,
+                &system_prompt,
+                &active_skills.selected_names,
+                &active_skills.allowed_tools,
+                messages,
+            )
+            .await
+        }
+    }
+}
+
+pub async fn continue_after_confirmation(
+    state: &AppState,
+    pending: PendingAgentAction,
+    confirmed_by: i64,
+) -> Result<AgentRunOutcome> {
+    let workspace_root =
+        env::current_dir().map_err(|err| anyhow!("Failed to read CWD: {}", err))?;
+    let execution_result =
+        execute_tool(&pending.tool_name, &pending.tool_args, &workspace_root).await;
+
+    let (tool_payload, tool_result, status) = match execution_result {
+        Ok(content) => (json!({ "output": content.clone() }), content, "completed"),
+        Err(err) => {
+            let err_text = format!("Tool '{}' failed: {}", pending.tool_name, err);
+            (json!({ "error": err_text.clone() }), err_text, "failed")
+        }
+    };
+
+    state
+        .db
+        .update_agent_tool_call_status(
+            pending.tool_call_record_id,
+            status,
+            Some(&tool_payload),
+            Some(confirmed_by),
+        )
+        .await?;
+
+    let mut messages = pending.messages.clone();
+    let tool_message = match pending.provider {
+        AgentProvider::OpenRouter => json!({
+            "role": "tool",
+            "tool_call_id": pending.tool_call_id,
+            "content": tool_result
+        }),
+        AgentProvider::Gemini => {
+            build_gemini_function_response_message(&pending.tool_name, &tool_payload)
+        }
+    };
+    messages.push(tool_message.clone());
+    append_step(
+        state,
+        pending.session_id,
+        "tool",
+        &tool_result,
+        &tool_message,
+    )
+    .await?;
+
+    debug!(
+        "Continuing agent session {} after confirming tool '{}'",
+        pending.session_id, pending.tool_name
+    );
+
+    match pending.provider {
+        AgentProvider::OpenRouter => {
+            run_openrouter_loop(
+                state,
+                pending.session_id,
+                pending.user_id,
+                pending.chat_id,
+                pending.processing_message_id,
+                &pending.model_name,
+                &pending.selected_skills,
+                &pending.allowed_tools,
+                messages,
+            )
+            .await
+        }
+        AgentProvider::Gemini => {
+            run_gemini_loop(
+                state,
+                pending.session_id,
+                pending.user_id,
+                pending.chat_id,
+                pending.processing_message_id,
+                &pending.model_name,
+                &pending.system_prompt,
+                &pending.selected_skills,
+                &pending.allowed_tools,
+                messages,
+            )
+            .await
+        }
+    }
+}
+
+pub async fn cancel_pending_action(state: &AppState, pending: &PendingAgentAction) -> Result<()> {
+    state
+        .db
+        .update_agent_tool_call_status(
+            pending.tool_call_record_id,
+            "cancelled",
+            Some(&json!({ "status": "cancelled_by_user" })),
+            None,
+        )
+        .await?;
+    state
+        .db
+        .complete_agent_session(
+            pending.session_id,
+            "cancelled",
+            Some("User cancelled side-effect tool execution."),
+        )
+        .await?;
+    warn!(
+        "Agent session {} cancelled pending tool '{}'",
+        pending.session_id, pending.tool_name
+    );
+    Ok(())
+}
