@@ -1781,6 +1781,15 @@ Usage: `/qq [your quick question]`
 Usage: `/agent [your task]`
 Or reply to a message with `/agent`
 
+/agent_status - Show recent agent sessions for this chat/user
+Usage: `/agent_status`
+
+/agent_resume - Start a new run using context from a previous session
+Usage: `/agent_resume [session_id] [optional new instruction]`
+
+/agent_new - Reset pending/active agent lane for this chat/user
+Usage: `/agent_new`
+
 /img - Generate or edit an image using Gemini
 Usage: `/img [description]` for generating a new image
 Or reply to an image with `/img [description]` to edit that image

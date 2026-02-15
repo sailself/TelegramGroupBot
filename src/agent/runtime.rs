@@ -1,16 +1,20 @@
-use std::env;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
+use crate::agent::policy::evaluate_agent_tool_call;
+use crate::agent::prompt_scaffold::build_agent_system_prompt;
 use crate::agent::tools::{
-    build_gemini_tool_definitions, build_openrouter_tool_definitions, execute_tool,
-    is_tool_allowed, requires_confirmation,
+    build_gemini_tool_definitions, build_openrouter_tool_definitions, execute_memory_tool,
+    execute_tool, is_memory_tool, requires_confirmation,
 };
 use crate::agent::types::{AgentProvider, AgentRunOutcome, PendingAgentAction};
+use crate::agent::workspace::ensure_chat_workspace;
 use crate::config::CONFIG;
+use crate::db::models::{AgentMemoryInsert, AgentMemorySearchRow};
 use crate::skills::index::{build_selected_skill_context, build_skill_index};
 use crate::skills::loader::load_skills;
 use crate::skills::select::select_active_skills;
@@ -302,19 +306,155 @@ fn build_gemini_function_response_message(tool_name: &str, payload: &Value) -> V
     })
 }
 
-fn build_system_prompt(skill_index: &str, selected_skill_context: &str) -> String {
-    let now = chrono::Utc::now()
-        .format("%Y-%m-%d %H:%M:%S UTC")
-        .to_string();
-    format!(
-        "You are an AI-native Telegram assistant that can reason in multiple steps and use tools.\n\
-         Current time: {now}\n\
-         Work strictly inside the workspace and avoid unsafe side effects.\n\
-         If you call side-effectful tools (write_file/edit_file/exec), execution may require confirmation.\n\
-         Use the selected skills as operating procedures.\n\n\
-         {skill_index}\n\n\
-         Active skill instructions:\n{selected_skill_context}"
-    )
+fn trim_to_chars(value: &str, max_chars: usize) -> String {
+    let mut trimmed = String::new();
+    for ch in value.chars().take(max_chars) {
+        trimmed.push(ch);
+    }
+    trimmed
+}
+
+fn summarize_for_memory(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= CONFIG.agent_memory_save_summary_chars {
+        return normalized;
+    }
+    let mut summary = trim_to_chars(&normalized, CONFIG.agent_memory_save_summary_chars);
+    summary.push_str("...");
+    summary
+}
+
+async fn save_memory_entry(
+    state: &AppState,
+    chat_id: i64,
+    user_id: Option<i64>,
+    session_id: i64,
+    source_role: &str,
+    category: &str,
+    content: &str,
+    importance: f64,
+) {
+    if !CONFIG.agent_memory_enabled {
+        return;
+    }
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let summary = summarize_for_memory(trimmed);
+    if let Err(err) = state
+        .db
+        .insert_agent_memory(AgentMemoryInsert {
+            chat_id,
+            user_id,
+            session_id: Some(session_id),
+            source_role,
+            category,
+            content: trimmed,
+            summary: Some(summary.as_str()),
+            importance,
+        })
+        .await
+    {
+        warn!(
+            "Failed to save agent memory for session {} (role={}): {}",
+            session_id, source_role, err
+        );
+    }
+}
+
+fn build_memory_context_block(rows: Vec<AgentMemorySearchRow>) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let mut scored = Vec::new();
+    for row in rows {
+        // bm25 scores are lower-is-better; convert to an inverse relevance score.
+        let lexical = 1.0 / (1.0 + row.lexical_score.max(0.0));
+        let recency = 1.0 / (1.0 + row.recency_days.max(0.0));
+        let score = 0.75 * lexical + 0.25 * recency;
+        if score >= CONFIG.agent_memory_min_relevance {
+            scored.push((score, row));
+        }
+    }
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    if scored.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec!["[Memory context]".to_string()];
+    let mut used_chars = lines[0].chars().count();
+    for (index, (_score, row)) in scored
+        .into_iter()
+        .take(CONFIG.agent_memory_recall_limit)
+        .enumerate()
+    {
+        let source = row.memory.source_role;
+        let summary = row
+            .memory
+            .summary
+            .unwrap_or_else(|| summarize_for_memory(&row.memory.content));
+        let line = format!("{}. [{}] {}", index + 1, source, summary);
+        let next_len = used_chars + 1 + line.chars().count();
+        if next_len > CONFIG.agent_memory_max_context_chars {
+            break;
+        }
+        used_chars = next_len;
+        lines.push(line);
+    }
+
+    if lines.len() == 1 {
+        return String::new();
+    }
+    lines.join("\n")
+}
+
+async fn build_augmented_prompt(
+    state: &AppState,
+    chat_id: i64,
+    prompt: &str,
+) -> Result<(String, String)> {
+    if !CONFIG.agent_memory_enabled {
+        return Ok((prompt.to_string(), String::new()));
+    }
+
+    let mut recalls = state
+        .db
+        .search_agent_memories(
+            chat_id,
+            prompt,
+            CONFIG.agent_memory_recall_limit.saturating_mul(3),
+        )
+        .await
+        .unwrap_or_default();
+
+    if recalls.is_empty() {
+        let recent = state
+            .db
+            .recent_agent_memories(chat_id, CONFIG.agent_memory_recall_limit)
+            .await
+            .unwrap_or_default();
+        recalls = recent
+            .into_iter()
+            .map(|memory| AgentMemorySearchRow {
+                memory,
+                lexical_score: 0.0,
+                recency_days: 0.0,
+            })
+            .collect();
+    }
+
+    let memory_block = build_memory_context_block(recalls);
+    if memory_block.is_empty() {
+        return Ok((prompt.to_string(), String::new()));
+    }
+
+    let augmented = format!("{}\n\nUser request:\n{}", memory_block, prompt);
+    Ok((augmented, memory_block))
 }
 
 fn new_confirmation_key(session_id: i64, tool_name: &str) -> String {
@@ -339,19 +479,37 @@ async fn append_step(
         .await
 }
 
+async fn execute_runtime_tool(
+    state: &AppState,
+    workspace_root: &Path,
+    session_id: i64,
+    chat_id: i64,
+    user_id: i64,
+    tool_name: &str,
+    args_value: &Value,
+) -> Result<String> {
+    if is_memory_tool(tool_name) {
+        execute_memory_tool(
+            &state.db, session_id, chat_id, user_id, tool_name, args_value,
+        )
+        .await
+    } else {
+        execute_tool(tool_name, args_value, workspace_root).await
+    }
+}
+
 async fn run_openrouter_loop(
     state: &AppState,
     session_id: i64,
     user_id: i64,
     chat_id: i64,
     processing_message_id: i64,
+    workspace_root: &Path,
     model: &str,
     selected_skill_names: &[String],
     allowed_tools: &[String],
     mut messages: Vec<Value>,
 ) -> Result<AgentRunOutcome> {
-    let workspace_root =
-        env::current_dir().map_err(|err| anyhow!("Failed to read CWD: {}", err))?;
     let tool_defs = build_openrouter_tool_definitions(allowed_tools);
 
     for _iteration in 0..CONFIG.agent_max_tool_iterations {
@@ -393,6 +551,17 @@ async fn run_openrouter_loop(
         .await?;
 
         if tool_calls.is_empty() {
+            save_memory_entry(
+                state,
+                chat_id,
+                Some(user_id),
+                session_id,
+                "assistant",
+                "conversation",
+                &assistant_content,
+                0.6,
+            )
+            .await;
             state
                 .db
                 .complete_agent_session(session_id, "completed", Some(&assistant_content))
@@ -443,24 +612,27 @@ async fn run_openrouter_loop(
                 )
                 .await?;
 
-            if !is_tool_allowed(&tool_name, allowed_tools) {
-                let result = format!("Tool '{}' is not allowed by active skills.", tool_name);
+            if let Err(reason) = evaluate_agent_tool_call(&tool_name, &args_value, allowed_tools) {
+                warn!(
+                    "Denied tool call in session {}: tool='{}' reason='{}'",
+                    session_id, tool_name, reason
+                );
                 state
                     .db
                     .update_agent_tool_call_status(
                         tool_call_record_id,
-                        "rejected",
-                        Some(&json!({ "error": result })),
+                        "denied",
+                        Some(&json!({ "error": reason })),
                         None,
                     )
                     .await?;
                 let tool_msg = json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": result
+                    "content": reason
                 });
                 messages.push(tool_msg.clone());
-                append_step(state, session_id, "tool", &result, &tool_msg).await?;
+                append_step(state, session_id, "tool", &reason, &tool_msg).await?;
                 continue;
             }
 
@@ -477,6 +649,7 @@ async fn run_openrouter_loop(
                     tool_call_id,
                     tool_name: tool_name.clone(),
                     tool_args: args_value.clone(),
+                    workspace_root: workspace_root.to_path_buf(),
                     model_name: model.to_string(),
                     allowed_tools: allowed_tools.to_vec(),
                     selected_skills: selected_skill_names.to_vec(),
@@ -507,7 +680,16 @@ async fn run_openrouter_loop(
                 });
             }
 
-            let execution_result = execute_tool(&tool_name, &args_value, &workspace_root).await;
+            let execution_result = execute_runtime_tool(
+                state,
+                &workspace_root,
+                session_id,
+                chat_id,
+                user_id,
+                &tool_name,
+                &args_value,
+            )
+            .await;
             let tool_result = match execution_result {
                 Ok(content) => {
                     state
@@ -548,6 +730,17 @@ async fn run_openrouter_loop(
 
     let final_text =
         "Tool call limit reached. Please refine your request or confirm required actions.";
+    save_memory_entry(
+        state,
+        chat_id,
+        Some(user_id),
+        session_id,
+        "assistant",
+        "conversation",
+        final_text,
+        0.4,
+    )
+    .await;
     state
         .db
         .complete_agent_session(session_id, "limit_reached", Some(final_text))
@@ -565,14 +758,13 @@ async fn run_gemini_loop(
     user_id: i64,
     chat_id: i64,
     processing_message_id: i64,
+    workspace_root: &Path,
     model: &str,
     system_prompt: &str,
     selected_skill_names: &[String],
     allowed_tools: &[String],
     mut messages: Vec<Value>,
 ) -> Result<AgentRunOutcome> {
-    let workspace_root =
-        env::current_dir().map_err(|err| anyhow!("Failed to read CWD: {}", err))?;
     let tool_defs = build_gemini_tool_definitions(allowed_tools);
 
     for _iteration in 0..CONFIG.agent_max_tool_iterations {
@@ -599,6 +791,17 @@ async fn run_gemini_loop(
             } else {
                 assistant_content
             };
+            save_memory_entry(
+                state,
+                chat_id,
+                Some(user_id),
+                session_id,
+                "assistant",
+                "conversation",
+                &final_text,
+                0.6,
+            )
+            .await;
             state
                 .db
                 .complete_agent_session(session_id, "completed", Some(&final_text))
@@ -629,22 +832,25 @@ async fn run_gemini_loop(
                 )
                 .await?;
 
-            if !is_tool_allowed(&tool_name, allowed_tools) {
-                let result = format!("Tool '{}' is not allowed by active skills.", tool_name);
+            if let Err(reason) = evaluate_agent_tool_call(&tool_name, &args_value, allowed_tools) {
+                warn!(
+                    "Denied tool call in session {}: tool='{}' reason='{}'",
+                    session_id, tool_name, reason
+                );
                 state
                     .db
                     .update_agent_tool_call_status(
                         tool_call_record_id,
-                        "rejected",
-                        Some(&json!({ "error": result })),
+                        "denied",
+                        Some(&json!({ "error": reason })),
                         None,
                     )
                     .await?;
-                let tool_payload = json!({ "error": result.clone() });
+                let tool_payload = json!({ "error": reason.clone() });
                 let function_response =
                     build_gemini_function_response_message(&tool_name, &tool_payload);
                 messages.push(function_response.clone());
-                append_step(state, session_id, "tool", &result, &function_response).await?;
+                append_step(state, session_id, "tool", &reason, &function_response).await?;
                 continue;
             }
 
@@ -661,6 +867,7 @@ async fn run_gemini_loop(
                     tool_call_id,
                     tool_name: tool_name.clone(),
                     tool_args: args_value.clone(),
+                    workspace_root: workspace_root.to_path_buf(),
                     model_name: model.to_string(),
                     allowed_tools: allowed_tools.to_vec(),
                     selected_skills: selected_skill_names.to_vec(),
@@ -691,7 +898,16 @@ async fn run_gemini_loop(
                 });
             }
 
-            let execution_result = execute_tool(&tool_name, &args_value, &workspace_root).await;
+            let execution_result = execute_runtime_tool(
+                state,
+                &workspace_root,
+                session_id,
+                chat_id,
+                user_id,
+                &tool_name,
+                &args_value,
+            )
+            .await;
             let (tool_payload, tool_result_text, status) = match execution_result {
                 Ok(content) => (json!({ "output": content.clone() }), content, "completed"),
                 Err(err) => {
@@ -726,6 +942,17 @@ async fn run_gemini_loop(
 
     let final_text =
         "Tool call limit reached. Please refine your request or confirm required actions.";
+    save_memory_entry(
+        state,
+        chat_id,
+        Some(user_id),
+        session_id,
+        "assistant",
+        "conversation",
+        final_text,
+        0.4,
+    )
+    .await;
     state
         .db
         .complete_agent_session(session_id, "limit_reached", Some(final_text))
@@ -745,6 +972,8 @@ pub async fn start_agent_run(
     prompt: &str,
 ) -> Result<AgentRunOutcome> {
     let (provider, model) = resolve_agent_runtime()?;
+    let workspace_root = ensure_chat_workspace(chat_id)
+        .map_err(|err| anyhow!("Failed to initialize agent workspace: {}", err))?;
     let skills_dir = std::path::Path::new(&CONFIG.skills_dir);
     let loaded_skills = load_skills(skills_dir);
     let active_skills = select_active_skills(
@@ -757,7 +986,8 @@ pub async fn start_agent_run(
 
     let skill_index = build_skill_index(&loaded_skills);
     let selected_skill_context = build_selected_skill_context(&active_skills.selected);
-    let system_prompt = build_system_prompt(&skill_index, &selected_skill_context);
+    let system_prompt =
+        build_agent_system_prompt(&workspace_root, &skill_index, &selected_skill_context);
     let selected_skills_json =
         serde_json::to_string(&active_skills.selected_names).unwrap_or_else(|_| "[]".to_string());
 
@@ -781,6 +1011,21 @@ pub async fn start_agent_run(
         )
         .await?;
 
+    let (model_prompt, recalled_memory_context) =
+        build_augmented_prompt(state, chat_id, prompt).await?;
+
+    save_memory_entry(
+        state,
+        chat_id,
+        Some(user_id),
+        session_id,
+        "user",
+        "conversation",
+        prompt,
+        0.7,
+    )
+    .await;
+
     let system_msg = json!({ "role": "system", "content": system_prompt });
     append_step(
         state,
@@ -792,26 +1037,35 @@ pub async fn start_agent_run(
     .await?;
 
     info!(
-        "Starting agent session {} with provider='{}' model='{}' and skills [{}]",
+        "Starting agent session {} with provider='{}' model='{}' skills [{}] workspace='{}'",
         session_id,
         provider.as_str(),
         model,
-        active_skills.selected_names.join(", ")
+        active_skills.selected_names.join(", "),
+        workspace_root.display()
     );
+    if !recalled_memory_context.is_empty() {
+        debug!(
+            "Session {} recalled memory context ({} chars)",
+            session_id,
+            recalled_memory_context.chars().count()
+        );
+    }
 
     match provider {
         AgentProvider::OpenRouter => {
             let mut messages = Vec::new();
             messages.push(system_msg);
-            let user_msg = json!({ "role": "user", "content": prompt });
+            let user_msg = json!({ "role": "user", "content": model_prompt.clone() });
             messages.push(user_msg.clone());
-            append_step(state, session_id, "user", prompt, &user_msg).await?;
+            append_step(state, session_id, "user", &model_prompt, &user_msg).await?;
             run_openrouter_loop(
                 state,
                 session_id,
                 user_id,
                 chat_id,
                 processing_message_id,
+                &workspace_root,
                 &model,
                 &active_skills.selected_names,
                 &active_skills.allowed_tools,
@@ -821,15 +1075,16 @@ pub async fn start_agent_run(
         }
         AgentProvider::Gemini => {
             let mut messages = Vec::new();
-            let user_msg = json!({ "role": "user", "parts": [{ "text": prompt }] });
+            let user_msg = json!({ "role": "user", "parts": [{ "text": model_prompt.clone() }] });
             messages.push(user_msg.clone());
-            append_step(state, session_id, "user", prompt, &user_msg).await?;
+            append_step(state, session_id, "user", &model_prompt, &user_msg).await?;
             run_gemini_loop(
                 state,
                 session_id,
                 user_id,
                 chat_id,
                 processing_message_id,
+                &workspace_root,
                 &model,
                 &system_prompt,
                 &active_skills.selected_names,
@@ -846,10 +1101,60 @@ pub async fn continue_after_confirmation(
     pending: PendingAgentAction,
     confirmed_by: i64,
 ) -> Result<AgentRunOutcome> {
-    let workspace_root =
-        env::current_dir().map_err(|err| anyhow!("Failed to read CWD: {}", err))?;
-    let execution_result =
-        execute_tool(&pending.tool_name, &pending.tool_args, &workspace_root).await;
+    if let Err(reason) = evaluate_agent_tool_call(
+        &pending.tool_name,
+        &pending.tool_args,
+        &pending.allowed_tools,
+    ) {
+        warn!(
+            "Denied confirmed tool call in session {}: tool='{}' reason='{}'",
+            pending.session_id, pending.tool_name, reason
+        );
+        state
+            .db
+            .update_agent_tool_call_status(
+                pending.tool_call_record_id,
+                "denied",
+                Some(&json!({ "error": reason })),
+                Some(confirmed_by),
+            )
+            .await?;
+        state
+            .db
+            .complete_agent_session(
+                pending.session_id,
+                "denied",
+                Some("Tool execution denied by policy."),
+            )
+            .await?;
+        save_memory_entry(
+            state,
+            pending.chat_id,
+            Some(pending.user_id),
+            pending.session_id,
+            "assistant",
+            "conversation",
+            "Tool execution denied by policy.",
+            0.5,
+        )
+        .await;
+        return Ok(AgentRunOutcome::Completed {
+            session_id: pending.session_id,
+            response_text: "Tool execution denied by policy.".to_string(),
+            selected_skills: pending.selected_skills,
+        });
+    }
+
+    let execution_result = execute_runtime_tool(
+        state,
+        &pending.workspace_root,
+        pending.session_id,
+        pending.chat_id,
+        pending.user_id,
+        &pending.tool_name,
+        &pending.tool_args,
+    )
+    .await;
 
     let (tool_payload, tool_result, status) = match execution_result {
         Ok(content) => (json!({ "output": content.clone() }), content, "completed"),
@@ -903,6 +1208,7 @@ pub async fn continue_after_confirmation(
                 pending.user_id,
                 pending.chat_id,
                 pending.processing_message_id,
+                &pending.workspace_root,
                 &pending.model_name,
                 &pending.selected_skills,
                 &pending.allowed_tools,
@@ -917,6 +1223,7 @@ pub async fn continue_after_confirmation(
                 pending.user_id,
                 pending.chat_id,
                 pending.processing_message_id,
+                &pending.workspace_root,
                 &pending.model_name,
                 &pending.system_prompt,
                 &pending.selected_skills,

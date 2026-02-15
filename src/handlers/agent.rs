@@ -1,18 +1,29 @@
 use anyhow::Result;
+use serde_json::from_str;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ReplyParameters,
+    InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityRef, MessageId, ParseMode,
+    ReplyParameters,
 };
 use tracing::{error, warn};
 
 use crate::agent::runtime::{cancel_pending_action, continue_after_confirmation, start_agent_run};
 use crate::agent::types::AgentRunOutcome;
 use crate::handlers::access::{check_access_control, is_rate_limited};
+use crate::handlers::content::{
+    extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
+};
 use crate::handlers::responses::send_response;
 use crate::state::AppState;
 
 pub const AGENT_CONFIRM_CALLBACK_PREFIX: &str = "agent_confirm:";
 pub const AGENT_CANCEL_CALLBACK_PREFIX: &str = "agent_cancel:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentPromptSource {
+    Provided,
+    Reply,
+}
 
 fn build_confirmation_keyboard(key: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![vec![
@@ -27,10 +38,21 @@ fn build_confirmation_keyboard(key: &str) -> InlineKeyboardMarkup {
     ]])
 }
 
-fn build_prompt_from_message(message: &Message, provided_prompt: Option<String>) -> Option<String> {
+fn message_entities_for_text(message: &Message) -> Option<Vec<MessageEntityRef<'_>>> {
+    if message.text().is_some() {
+        message.parse_entities()
+    } else {
+        message.parse_caption_entities()
+    }
+}
+
+fn build_prompt_from_message(
+    message: &Message,
+    provided_prompt: Option<String>,
+) -> Option<(String, AgentPromptSource)> {
     let provided = provided_prompt.unwrap_or_default().trim().to_string();
     if !provided.is_empty() {
-        return Some(provided);
+        return Some((provided, AgentPromptSource::Provided));
     }
 
     let reply = message.reply_to_message()?;
@@ -43,8 +65,177 @@ fn build_prompt_from_message(message: &Message, provided_prompt: Option<String>)
     if text.is_empty() {
         None
     } else {
-        Some(text)
+        Some((text, AgentPromptSource::Reply))
     }
+}
+
+async fn preprocess_agent_prompt(
+    message: &Message,
+    prompt_text: &str,
+    source: AgentPromptSource,
+) -> String {
+    let mut prompt_processed = prompt_text.to_string();
+
+    match source {
+        AgentPromptSource::Provided => {
+            let query_entities = message_entities_for_text(message);
+            let (query_processed, query_telegraph) =
+                extract_telegraph_urls_and_content(&prompt_processed, query_entities.as_deref(), 5)
+                    .await;
+            let (query_processed, query_twitter) =
+                extract_twitter_urls_and_content(&query_processed, query_entities.as_deref(), 5)
+                    .await;
+            prompt_processed = query_processed;
+            let _ = query_telegraph;
+            let _ = query_twitter;
+
+            if let Some(reply) = message.reply_to_message() {
+                let reply_raw = reply
+                    .text()
+                    .or_else(|| reply.caption())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !reply_raw.is_empty() {
+                    let reply_entities = message_entities_for_text(reply);
+                    let (reply_processed, reply_telegraph) = extract_telegraph_urls_and_content(
+                        &reply_raw,
+                        reply_entities.as_deref(),
+                        5,
+                    )
+                    .await;
+                    let (reply_processed, reply_twitter) = extract_twitter_urls_and_content(
+                        &reply_processed,
+                        reply_entities.as_deref(),
+                        5,
+                    )
+                    .await;
+                    let _ = reply_telegraph;
+                    let _ = reply_twitter;
+                    prompt_processed = format!(
+                        "Context from replied message: \"{}\"\n\nTask: {}",
+                        reply_processed, prompt_processed
+                    );
+                }
+            }
+        }
+        AgentPromptSource::Reply => {
+            if let Some(reply) = message.reply_to_message() {
+                let reply_entities = message_entities_for_text(reply);
+                let (reply_processed, reply_telegraph) = extract_telegraph_urls_and_content(
+                    &prompt_processed,
+                    reply_entities.as_deref(),
+                    5,
+                )
+                .await;
+                let (reply_processed, reply_twitter) = extract_twitter_urls_and_content(
+                    &reply_processed,
+                    reply_entities.as_deref(),
+                    5,
+                )
+                .await;
+                prompt_processed = reply_processed;
+                let _ = reply_telegraph;
+                let _ = reply_twitter;
+            } else {
+                let query_entities = message_entities_for_text(message);
+                let (query_processed, query_telegraph) = extract_telegraph_urls_and_content(
+                    &prompt_processed,
+                    query_entities.as_deref(),
+                    5,
+                )
+                .await;
+                let (query_processed, query_twitter) = extract_twitter_urls_and_content(
+                    &query_processed,
+                    query_entities.as_deref(),
+                    5,
+                )
+                .await;
+                prompt_processed = query_processed;
+                let _ = query_telegraph;
+                let _ = query_twitter;
+            }
+        }
+    }
+
+    prompt_processed
+}
+
+fn parse_resume_argument(raw: &str) -> Option<(i64, Option<String>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (session_part, tail) = match trimmed.find(char::is_whitespace) {
+        Some(index) => (&trimmed[..index], Some(trimmed[index..].trim().to_string())),
+        None => (trimmed, None),
+    };
+    let session_id = session_part.parse::<i64>().ok()?;
+    if session_id <= 0 {
+        return None;
+    }
+    let instruction = tail.filter(|value| !value.is_empty());
+    Some((session_id, instruction))
+}
+
+fn summarize_text(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut out = String::new();
+    for ch in normalized.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn build_resume_prompt(
+    session_id: i64,
+    original_prompt: &str,
+    steps: &[crate::db::models::AgentStepRow],
+    instruction: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Resume context from previous session #{}.",
+        session_id
+    ));
+    lines.push(format!(
+        "Original task: {}",
+        summarize_text(original_prompt, 400)
+    ));
+    lines.push("Recent transcript:".to_string());
+
+    if steps.is_empty() {
+        lines.push("- (no recorded steps)".to_string());
+    } else {
+        for step in steps {
+            let content = step
+                .content
+                .as_deref()
+                .map(|value| summarize_text(value, 320))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "(empty)".to_string());
+            lines.push(format!("- [{}] {}", step.role, content));
+        }
+    }
+
+    if let Some(instruction) = instruction {
+        lines.push(format!(
+            "New instruction: {}",
+            summarize_text(instruction, 600)
+        ));
+    } else {
+        lines.push(
+            "New instruction: Continue from this context and produce the next best response."
+                .to_string(),
+        );
+    }
+
+    lines.join("\n")
 }
 
 async fn edit_processing_message(bot: &Bot, chat_id: ChatId, message_id: i64, text: &str) {
@@ -151,7 +342,7 @@ pub async fn agent_handler(
         return Ok(());
     }
 
-    let Some(prompt_text) = build_prompt_from_message(&message, prompt) else {
+    let Some((prompt_text_raw, prompt_source)) = build_prompt_from_message(&message, prompt) else {
         bot.send_message(
             message.chat.id,
             "Usage: /agent <prompt>\nOr reply to a text message with /agent",
@@ -160,6 +351,17 @@ pub async fn agent_handler(
         .await?;
         return Ok(());
     };
+
+    let prompt_text = preprocess_agent_prompt(&message, &prompt_text_raw, prompt_source).await;
+    if prompt_text.trim().is_empty() {
+        bot.send_message(
+            message.chat.id,
+            "Please provide a task or reply to a text message with /agent.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
 
     let processing_message = bot
         .send_message(message.chat.id, "Running agent...")
@@ -200,6 +402,229 @@ pub async fn agent_handler(
         }
     }
 
+    Ok(())
+}
+
+pub async fn agent_status_handler(bot: Bot, state: AppState, message: Message) -> Result<()> {
+    if !check_access_control(&bot, &message, "agent").await {
+        return Ok(());
+    }
+
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+
+    let sessions = state
+        .db
+        .list_recent_agent_sessions_for_user(message.chat.id.0, user_id, 5)
+        .await?;
+    let pending_count = {
+        state
+            .pending_agent_actions
+            .lock()
+            .values()
+            .filter(|pending| pending.chat_id == message.chat.id.0 && pending.user_id == user_id)
+            .count()
+    };
+
+    let mut lines = Vec::new();
+    lines.push("Agent session status".to_string());
+    lines.push(format!("pending_confirmations: {}", pending_count));
+
+    if sessions.is_empty() {
+        lines.push("No previous sessions found for this chat/user.".to_string());
+        lines.push("Start with: /agent <task>".to_string());
+    } else {
+        lines.push("Recent sessions:".to_string());
+        for session in sessions {
+            let skills = session
+                .selected_skills_json
+                .as_deref()
+                .and_then(|raw| from_str::<Vec<String>>(raw).ok())
+                .unwrap_or_default();
+            let skill_text = if skills.is_empty() {
+                "-".to_string()
+            } else {
+                summarize_text(&skills.join(", "), 80)
+            };
+            lines.push(format!(
+                "- #{} [{}] model={} updated={} skills={}",
+                session.id, session.status, session.model_name, session.updated_at, skill_text
+            ));
+        }
+    }
+
+    bot.send_message(message.chat.id, lines.join("\n"))
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+    Ok(())
+}
+
+pub async fn agent_resume_handler(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    arg: Option<String>,
+) -> Result<()> {
+    if !check_access_control(&bot, &message, "agent").await {
+        return Ok(());
+    }
+
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+    if is_rate_limited(user_id) {
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
+
+    let Some(raw_arg) = arg else {
+        bot.send_message(
+            message.chat.id,
+            "Usage: /agent_resume <session_id> [new instruction]",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    };
+
+    let Some((session_id, instruction)) = parse_resume_argument(&raw_arg) else {
+        bot.send_message(
+            message.chat.id,
+            "Usage: /agent_resume <session_id> [new instruction]",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    };
+
+    let Some(session) = state
+        .db
+        .get_agent_session_for_user(session_id, message.chat.id.0, user_id)
+        .await?
+    else {
+        bot.send_message(
+            message.chat.id,
+            format!(
+                "Session #{} was not found in this chat for your account.",
+                session_id
+            ),
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    };
+
+    let steps = state.db.list_agent_steps(session_id, 12).await?;
+    let resumed_prompt =
+        build_resume_prompt(session_id, &session.prompt, &steps, instruction.as_deref());
+
+    let processing_message = bot
+        .send_message(
+            message.chat.id,
+            format!("Resuming session #{}...", session_id),
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+
+    let outcome = start_agent_run(
+        &state,
+        user_id,
+        message.chat.id.0,
+        processing_message.id.0 as i64,
+        &resumed_prompt,
+    )
+    .await;
+
+    match outcome {
+        Ok(result) => {
+            handle_agent_outcome(
+                &bot,
+                &state,
+                message.chat.id,
+                message.id,
+                processing_message.id,
+                result,
+            )
+            .await?;
+        }
+        Err(err) => {
+            let error_text = format!("Agent resume failed: {}", err);
+            error!("{}", error_text);
+            edit_processing_message(
+                &bot,
+                message.chat.id,
+                processing_message.id.0 as i64,
+                &error_text,
+            )
+            .await;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn agent_new_handler(bot: Bot, state: AppState, message: Message) -> Result<()> {
+    if !check_access_control(&bot, &message, "agent").await {
+        return Ok(());
+    }
+
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+
+    let pending_to_cancel = {
+        let mut pending_map = state.pending_agent_actions.lock();
+        let keys = pending_map
+            .iter()
+            .filter(|(_, pending)| {
+                pending.chat_id == message.chat.id.0 && pending.user_id == user_id
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+
+        let mut removed = Vec::new();
+        for key in keys {
+            if let Some(pending) = pending_map.remove(&key) {
+                removed.push(pending);
+            }
+        }
+        removed
+    };
+
+    for pending in &pending_to_cancel {
+        if let Err(err) = cancel_pending_action(&state, pending).await {
+            warn!(
+                "Failed to cancel pending action for session {}: {}",
+                pending.session_id, err
+            );
+        }
+    }
+
+    let superseded = state
+        .db
+        .supersede_active_agent_sessions(message.chat.id.0, user_id)
+        .await?;
+
+    let text = format!(
+        "Started a fresh agent lane.\nCancelled pending confirmations: {}\nSuperseded active sessions: {}\nUse /agent <task> to begin.",
+        pending_to_cancel.len(),
+        superseded
+    );
+    bot.send_message(message.chat.id, text)
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
     Ok(())
 }
 

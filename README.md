@@ -17,6 +17,9 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically.
 - `/qq` - Quick Gemini response using the default Gemini model.
 - `/agent` - Run the skills-first agent with multi-step tool use.
+- `/agent_status` - Show recent agent sessions for your user in this chat.
+- `/agent_resume` - Start a new run seeded from a previous session context.
+- `/agent_new` - Reset pending/active agent lane for your user in this chat.
 - `/img` - Generate or edit an image with Gemini.
 - `/image` - Generate an image with selectable resolution and aspect ratio.
 - `/vid` - Generate a video from text.
@@ -117,12 +120,31 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 ### Agent runtime
 - `AGENT_PROVIDER` - Agent runtime provider: `gemini` or `openrouter`. Default: `gemini`.
 - `SKILLS_DIR` - Directory containing Markdown skills with YAML frontmatter. Default: `skills`.
+- `AGENT_WORKSPACE_ROOT` - Base directory for agent workspace files (`AGENTS.md`, `MEMORY.md`, tool-created files). Default: `agent_workspace`.
+- `AGENT_WORKSPACE_SEPARATE_BY_CHAT` - Create per-chat workspaces under the base root (`chat_<id>` folders). Default: `true`.
 - `AGENT_MODEL` - Optional provider-specific model ID for `/agent`.
   - For `gemini`: defaults to `GEMINI_PRO_MODEL`, then `GEMINI_MODEL`.
   - For `openrouter`: defaults to `GPT_MODEL`, then first tools-capable OpenRouter model.
 - `AGENT_MAX_TOOL_ITERATIONS` - Max tool loop iterations per run. Default: `4`.
 - `AGENT_MAX_ACTIVE_SKILLS` - Max selected skills loaded per run (excluding always-active core skill). Default: `3`.
 - `AGENT_SKILL_CANDIDATE_LIMIT` - Candidate skills considered before final selection. Default: `8`.
+- `AGENT_MEMORY_ENABLED` - Enable agent memory recall/save loop. Default: `true`.
+- `AGENT_MEMORY_RECALL_LIMIT` - Maximum recalled memories prepended per run. Default: `5`.
+- `AGENT_MEMORY_MAX_CONTEXT_CHARS` - Character budget for `[Memory context]` block. Default: `2500`.
+- `AGENT_MEMORY_MIN_RELEVANCE` - Recall threshold after lexical/recency blending. Default: `0.15`.
+- `AGENT_MEMORY_SAVE_SUMMARY_CHARS` - Summary length per saved memory entry. Default: `240`.
+- `AGENT_HYGIENE_ENABLED` - Enable periodic retention cleanup for agent memory/session tables. Default: `true`.
+- `AGENT_HYGIENE_INTERVAL_SECONDS` - Interval for cleanup loop. Default: `43200` (12 hours).
+- `AGENT_MEMORY_RETENTION_DAYS` - Retention window for `agent_memories`. Default: `90`.
+- `AGENT_SESSION_RETENTION_DAYS` - Retention window for completed/cancelled agent sessions and related rows. Default: `30`.
+- `AGENT_PROMPT_MAX_FILE_CHARS` - Truncation limit for scaffold files (`AGENTS.md`, `MEMORY.md`). Default: `20000`.
+- `AGENT_PROMPT_INCLUDE_AGENTS` - Include `AGENTS.md` in `/agent` system prompt. Default: `true`.
+- `AGENT_PROMPT_INCLUDE_MEMORY_MD` - Include `MEMORY.md` in `/agent` system prompt. Default: `true`.
+- `AGENT_PROMPT_INCLUDE_SKILLS_INDEX` - Include skill catalog in `/agent` system prompt. Default: `true`.
+- `AGENT_TOOL_POLICY_ENFORCED` - Enable centralized policy checks for `/agent` tool calls. Default: `true`.
+- `AGENT_TOOL_ALLOWLIST` - Comma-separated global tool allowlist for `/agent`. Default includes `read_file,write_file,edit_file,exec,web_search,memory_store,memory_recall,memory_forget`.
+- `AGENT_TOOL_DENYLIST` - Comma-separated global tool denylist for `/agent`.
+- `AGENT_EXEC_ALLOWLIST_REGEX` - Comma-separated regex allowlist for `exec` commands (if set, command must match one regex).
 - `AGENT_EXEC_TIMEOUT_SECONDS` - Shell command timeout for `exec` tool. Default: `60`.
 - `AGENT_EXEC_MAX_OUTPUT_CHARS` - Output truncation limit for `exec`. Default: `10000`.
 - `AGENT_EXEC_RESTRICT_TO_WORKSPACE` - Restrict shell and paths to current workspace. Default: `true`.

@@ -112,10 +112,29 @@ pub struct Config {
     pub access_controlled_commands: Vec<String>,
     pub agent_provider: String,
     pub skills_dir: String,
+    pub agent_workspace_root: PathBuf,
+    pub agent_workspace_separate_by_chat: bool,
     pub agent_model: String,
     pub agent_max_tool_iterations: usize,
     pub agent_max_active_skills: usize,
     pub agent_skill_candidate_limit: usize,
+    pub agent_memory_enabled: bool,
+    pub agent_memory_recall_limit: usize,
+    pub agent_memory_max_context_chars: usize,
+    pub agent_memory_min_relevance: f64,
+    pub agent_memory_save_summary_chars: usize,
+    pub agent_hygiene_enabled: bool,
+    pub agent_hygiene_interval_seconds: u64,
+    pub agent_memory_retention_days: u64,
+    pub agent_session_retention_days: u64,
+    pub agent_prompt_max_file_chars: usize,
+    pub agent_prompt_include_agents: bool,
+    pub agent_prompt_include_memory_md: bool,
+    pub agent_prompt_include_skills_index: bool,
+    pub agent_tool_policy_enforced: bool,
+    pub agent_tool_allowlist: Vec<String>,
+    pub agent_tool_denylist: Vec<String>,
+    pub agent_exec_allowlist_regex: Vec<String>,
     pub agent_exec_timeout_seconds: u64,
     pub agent_exec_max_output_chars: usize,
     pub agent_exec_restrict_to_workspace: bool,
@@ -153,6 +172,13 @@ fn env_i32(name: &str, default: i32) -> i32 {
     env::var(name)
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(default)
 }
 
@@ -432,6 +458,12 @@ impl Config {
             web_search_providers = vec!["brave".to_string(), "exa".to_string(), "jina".to_string()];
         }
 
+        let agent_tool_allowlist = env_csv_lowercase(
+            "AGENT_TOOL_ALLOWLIST",
+            "read_file,write_file,edit_file,exec,web_search,memory_store,memory_recall,memory_forget",
+        );
+        let agent_tool_denylist = env_csv_lowercase("AGENT_TOOL_DENYLIST", "");
+        let agent_exec_allowlist_regex = env_csv("AGENT_EXEC_ALLOWLIST_REGEX", "");
         let agent_exec_deny_patterns = env_csv("AGENT_EXEC_DENY_PATTERNS", "");
 
         Ok(Config {
@@ -503,10 +535,32 @@ impl Config {
             access_controlled_commands,
             agent_provider: env_string("AGENT_PROVIDER", "gemini").to_lowercase(),
             skills_dir: env_string("SKILLS_DIR", "skills"),
+            agent_workspace_root: PathBuf::from(env_string(
+                "AGENT_WORKSPACE_ROOT",
+                "agent_workspace",
+            )),
+            agent_workspace_separate_by_chat: env_bool("AGENT_WORKSPACE_SEPARATE_BY_CHAT", true),
             agent_model: env_string("AGENT_MODEL", ""),
             agent_max_tool_iterations: env_usize("AGENT_MAX_TOOL_ITERATIONS", 4),
             agent_max_active_skills: env_usize("AGENT_MAX_ACTIVE_SKILLS", 3),
             agent_skill_candidate_limit: env_usize("AGENT_SKILL_CANDIDATE_LIMIT", 8),
+            agent_memory_enabled: env_bool("AGENT_MEMORY_ENABLED", true),
+            agent_memory_recall_limit: env_usize("AGENT_MEMORY_RECALL_LIMIT", 5),
+            agent_memory_max_context_chars: env_usize("AGENT_MEMORY_MAX_CONTEXT_CHARS", 2500),
+            agent_memory_min_relevance: env_f64("AGENT_MEMORY_MIN_RELEVANCE", 0.15),
+            agent_memory_save_summary_chars: env_usize("AGENT_MEMORY_SAVE_SUMMARY_CHARS", 240),
+            agent_hygiene_enabled: env_bool("AGENT_HYGIENE_ENABLED", true),
+            agent_hygiene_interval_seconds: env_u64("AGENT_HYGIENE_INTERVAL_SECONDS", 43200),
+            agent_memory_retention_days: env_u64("AGENT_MEMORY_RETENTION_DAYS", 90),
+            agent_session_retention_days: env_u64("AGENT_SESSION_RETENTION_DAYS", 30),
+            agent_prompt_max_file_chars: env_usize("AGENT_PROMPT_MAX_FILE_CHARS", 20000),
+            agent_prompt_include_agents: env_bool("AGENT_PROMPT_INCLUDE_AGENTS", true),
+            agent_prompt_include_memory_md: env_bool("AGENT_PROMPT_INCLUDE_MEMORY_MD", true),
+            agent_prompt_include_skills_index: env_bool("AGENT_PROMPT_INCLUDE_SKILLS_INDEX", true),
+            agent_tool_policy_enforced: env_bool("AGENT_TOOL_POLICY_ENFORCED", true),
+            agent_tool_allowlist,
+            agent_tool_denylist,
+            agent_exec_allowlist_regex,
             agent_exec_timeout_seconds: env_u64("AGENT_EXEC_TIMEOUT_SECONDS", 60),
             agent_exec_max_output_chars: env_usize("AGENT_EXEC_MAX_OUTPUT_CHARS", 10000),
             agent_exec_restrict_to_workspace: env_bool("AGENT_EXEC_RESTRICT_TO_WORKSPACE", true),

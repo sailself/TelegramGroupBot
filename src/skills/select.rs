@@ -51,6 +51,10 @@ fn pick_heuristic_candidates(
     skills: &[SkillDoc],
     candidate_limit: usize,
 ) -> Vec<SkillDoc> {
+    if candidate_limit == 0 {
+        return Vec::new();
+    }
+
     let prompt_tokens = tokenize(prompt);
     let mut scored = skills
         .iter()
@@ -65,12 +69,19 @@ fn pick_heuristic_candidates(
             .then_with(|| a.1.meta.name.cmp(&b.1.meta.name))
     });
 
+    let has_positive_score = scored.iter().any(|(score, _)| *score > 0);
+    if !has_positive_score {
+        // If heuristics cannot discriminate, provide a broader candidate pool instead
+        // of returning a single arbitrary top item.
+        return skills.iter().take(candidate_limit).cloned().collect();
+    }
+
     let mut selected = Vec::new();
     for (score, skill) in scored {
         if selected.len() >= candidate_limit {
             break;
         }
-        if score <= 0 && !selected.is_empty() {
+        if score <= 0 {
             break;
         }
         selected.push(skill);
@@ -229,5 +240,63 @@ pub async fn select_active_skills(
         selected,
         selected_names,
         allowed_tools,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::types::{SkillDoc, SkillMeta};
+
+    fn build_skill(name: &str, description: &str, triggers: &[&str], tags: &[&str]) -> SkillDoc {
+        SkillDoc {
+            meta: SkillMeta {
+                name: name.to_string(),
+                description: description.to_string(),
+                tags: tags.iter().map(|value| value.to_string()).collect(),
+                triggers: triggers.iter().map(|value| value.to_string()).collect(),
+                allowed_tools: vec!["read_file".to_string()],
+                risk_level: "safe_read".to_string(),
+                version: None,
+                enabled: true,
+            },
+            body: String::new(),
+            source_path: None,
+            always_active: false,
+        }
+    }
+
+    #[test]
+    fn zero_score_prompt_returns_broader_candidate_pool() {
+        let skills = vec![
+            build_skill("images-search", "image search", &["image"], &["image"]),
+            build_skill("news-search", "news search", &["news"], &["news"]),
+            build_skill("answers", "short answers", &["answer"], &["qa"]),
+        ];
+
+        let selected = pick_heuristic_candidates("新闻中说的是谁？", &skills, 3);
+        let names = selected
+            .iter()
+            .map(|skill| skill.meta.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["images-search", "news-search", "answers"]);
+    }
+
+    #[test]
+    fn positive_scores_stop_before_zero_scores() {
+        let skills = vec![
+            build_skill("images-search", "image search", &["image"], &["image"]),
+            build_skill("news-search", "news search", &["news"], &["news"]),
+            build_skill("answers", "short answers", &["answer"], &["qa"]),
+        ];
+
+        let selected = pick_heuristic_candidates("image", &skills, 3);
+        let names = selected
+            .iter()
+            .map(|skill| skill.meta.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["images-search"]);
     }
 }

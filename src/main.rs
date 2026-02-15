@@ -40,6 +40,12 @@ enum Command {
     Paintme,
     Portraitme,
     Agent(String),
+    #[command(rename = "agent_status")]
+    AgentStatus,
+    #[command(rename = "agent_resume")]
+    AgentResume(String),
+    #[command(rename = "agent_new")]
+    AgentNew,
     Status,
     Diagnose,
     Support,
@@ -64,6 +70,8 @@ async fn main() -> HandlerResult {
 
     let db = Database::init(&CONFIG.database_url).await?;
     let state = AppState::new(db, bot_user_id, bot_username_lower);
+    agent::workspace::bootstrap_workspace_on_startup()?;
+    agent::hygiene::spawn_agent_hygiene_task(state.clone());
 
     handlers::access::load_whitelist();
 
@@ -236,6 +244,39 @@ async fn handle_command(
             tokio::spawn(async move {
                 if let Err(err) = agent_handlers::agent_handler(bot, state, message, arg).await {
                     error!("agent handler failed: {err}");
+                }
+            });
+        }
+        Command::AgentStatus => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) = agent_handlers::agent_status_handler(bot, state, message).await {
+                    error!("agent status handler failed: {err}");
+                }
+            });
+        }
+        Command::AgentResume(arg) => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let arg = optional_arg(arg);
+            tokio::spawn(async move {
+                if let Err(err) =
+                    agent_handlers::agent_resume_handler(bot, state, message, arg).await
+                {
+                    error!("agent resume handler failed: {err}");
+                }
+            });
+        }
+        Command::AgentNew => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) = agent_handlers::agent_new_handler(bot, state, message).await {
+                    error!("agent new handler failed: {err}");
                 }
             });
         }

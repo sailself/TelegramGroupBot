@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,7 @@ pub struct PendingAgentAction {
     pub tool_call_id: String,
     pub tool_name: String,
     pub tool_args: Value,
+    pub workspace_root: PathBuf,
     pub model_name: String,
     pub allowed_tools: Vec<String>,
     pub selected_skills: Vec<String>,
