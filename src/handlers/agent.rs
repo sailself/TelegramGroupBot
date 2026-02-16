@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::from_str;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityRef, MessageId, ParseMode,
+    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityRef, MessageId, ParseMode,
     ReplyParameters,
 };
 use tracing::{error, warn};
@@ -18,6 +18,7 @@ use crate::handlers::media::{
 };
 use crate::handlers::responses::send_response;
 use crate::state::AppState;
+use crate::utils::telegram::start_chat_action_heartbeat;
 
 pub const AGENT_CONFIRM_CALLBACK_PREFIX: &str = "agent_confirm:";
 pub const AGENT_CANCEL_CALLBACK_PREFIX: &str = "agent_cancel:";
@@ -399,6 +400,8 @@ pub async fn agent_handler(
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
 
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
     let outcome = start_agent_run(
         &state,
         user_id,
@@ -568,6 +571,8 @@ pub async fn agent_resume_handler(
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
 
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
     let outcome = start_agent_run(
         &state,
         user_id,
@@ -725,6 +730,8 @@ pub async fn agent_confirmation_callback(
 
     delete_confirmation_message(&bot, &query).await;
 
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), ChatId(pending.chat_id), ChatAction::Typing);
     let outcome = continue_after_confirmation(&state, pending.clone(), query_user_id).await;
     match outcome {
         Ok(result) => {
