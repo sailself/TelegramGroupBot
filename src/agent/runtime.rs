@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
@@ -15,6 +16,8 @@ use crate::agent::types::{AgentProvider, AgentRunOutcome, PendingAgentAction};
 use crate::agent::workspace::ensure_chat_workspace;
 use crate::config::CONFIG;
 use crate::db::models::{AgentMemoryInsert, AgentMemorySearchRow};
+use crate::llm::gemini::build_gemini_user_parts_with_media;
+use crate::llm::media::{detect_mime_type, MediaFile, MediaKind};
 use crate::skills::index::{build_selected_skill_context, build_skill_index};
 use crate::skills::loader::load_skills;
 use crate::skills::select::select_active_skills;
@@ -76,6 +79,106 @@ fn resolve_agent_runtime() -> Result<(AgentProvider, String)> {
         AgentProvider::Gemini => resolve_gemini_model()?,
     };
     Ok((provider, model))
+}
+
+fn resolve_agent_runtime_for_media(media_files: &[MediaFile]) -> Result<(AgentProvider, String)> {
+    let (provider, model) = resolve_agent_runtime()?;
+    if media_files.is_empty() || provider != AgentProvider::OpenRouter {
+        return Ok((provider, model));
+    }
+
+    if CONFIG.gemini_api_key.trim().is_empty() {
+        warn!(
+            "Agent received media attachments but GEMINI_API_KEY is not set; keeping OpenRouter with image-only media support"
+        );
+        return Ok((provider, model));
+    }
+
+    match resolve_gemini_model() {
+        Ok(gemini_model) => {
+            info!("Agent received media attachments; switching provider from OpenRouter to Gemini");
+            Ok((AgentProvider::Gemini, gemini_model))
+        }
+        Err(err) => {
+            warn!(
+                "Agent received media attachments but Gemini model resolution failed ({}); keeping OpenRouter with image-only media support",
+                err
+            );
+            Ok((provider, model))
+        }
+    }
+}
+
+fn build_openrouter_user_content(prompt: &str, media_files: &[MediaFile]) -> Value {
+    if media_files.is_empty() {
+        return Value::String(prompt.to_string());
+    }
+
+    let mut parts = Vec::new();
+    let non_image_count = media_files
+        .iter()
+        .filter(|file| file.kind != MediaKind::Image)
+        .count();
+    let text = if non_image_count > 0 {
+        format!(
+            "{prompt}\n\n[Note: {non_image_count} non-image attachment(s) were omitted because OpenRouter in this runtime only accepts inline images.]"
+        )
+    } else {
+        prompt.to_string()
+    };
+    parts.push(json!({
+        "type": "text",
+        "text": text,
+    }));
+
+    for file in media_files {
+        if file.kind != MediaKind::Image || file.bytes.is_empty() {
+            continue;
+        }
+        let mime_type = detect_mime_type(&file.bytes)
+            .or_else(|| {
+                let mime = file.mime_type.trim();
+                if mime.is_empty() {
+                    None
+                } else {
+                    Some(mime.to_string())
+                }
+            })
+            .unwrap_or_else(|| "image/png".to_string());
+        let encoded = general_purpose::STANDARD.encode(&file.bytes);
+        let data_url = format!("data:{};base64,{}", mime_type, encoded);
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": { "url": data_url },
+        }));
+    }
+
+    Value::Array(parts)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MediaKindSummary {
+    total: usize,
+    images: usize,
+    videos: usize,
+    audios: usize,
+    documents: usize,
+}
+
+fn summarize_media_kinds(media_files: &[MediaFile]) -> MediaKindSummary {
+    let mut summary = MediaKindSummary {
+        total: media_files.len(),
+        ..MediaKindSummary::default()
+    };
+    for file in media_files {
+        match file.kind {
+            MediaKind::Image => summary.images += 1,
+            MediaKind::Video => summary.videos += 1,
+            MediaKind::Audio => summary.audios += 1,
+            MediaKind::Document => summary.documents += 1,
+        }
+    }
+    summary
 }
 
 fn summarize_error_body(raw: &str) -> String {
@@ -970,8 +1073,9 @@ pub async fn start_agent_run(
     chat_id: i64,
     processing_message_id: i64,
     prompt: &str,
+    initial_media_files: Vec<MediaFile>,
 ) -> Result<AgentRunOutcome> {
-    let (provider, model) = resolve_agent_runtime()?;
+    let (provider, model) = resolve_agent_runtime_for_media(&initial_media_files)?;
     let workspace_root = ensure_chat_workspace(chat_id)
         .map_err(|err| anyhow!("Failed to initialize agent workspace: {}", err))?;
     let skills_dir = std::path::Path::new(&CONFIG.skills_dir);
@@ -1037,13 +1141,26 @@ pub async fn start_agent_run(
     .await?;
 
     info!(
-        "Starting agent session {} with provider='{}' model='{}' skills [{}] workspace='{}'",
+        "Starting agent session {} with provider='{}' model='{}' skills [{}] workspace='{}' media_files={}",
         session_id,
         provider.as_str(),
         model,
         active_skills.selected_names.join(", "),
-        workspace_root.display()
+        workspace_root.display(),
+        initial_media_files.len()
     );
+    let input_media_summary = summarize_media_kinds(&initial_media_files);
+    if input_media_summary.total > 0 {
+        debug!(
+            "Session {} input media summary: total={}, images={}, videos={}, audios={}, documents={}",
+            session_id,
+            input_media_summary.total,
+            input_media_summary.images,
+            input_media_summary.videos,
+            input_media_summary.audios,
+            input_media_summary.documents
+        );
+    }
     if !recalled_memory_context.is_empty() {
         debug!(
             "Session {} recalled memory context ({} chars)",
@@ -1056,7 +1173,25 @@ pub async fn start_agent_run(
         AgentProvider::OpenRouter => {
             let mut messages = Vec::new();
             messages.push(system_msg);
-            let user_msg = json!({ "role": "user", "content": model_prompt.clone() });
+            if input_media_summary.total > 0 {
+                let sent_images = initial_media_files
+                    .iter()
+                    .filter(|file| file.kind == MediaKind::Image && !file.bytes.is_empty())
+                    .count();
+                let omitted_empty_images = input_media_summary.images.saturating_sub(sent_images);
+                let omitted_non_images = input_media_summary.videos
+                    + input_media_summary.audios
+                    + input_media_summary.documents;
+                debug!(
+                    "Session {} OpenRouter media dispatch: sent_images={}, omitted_non_images={}, omitted_empty_images={}",
+                    session_id,
+                    sent_images,
+                    omitted_non_images,
+                    omitted_empty_images
+                );
+            }
+            let user_content = build_openrouter_user_content(&model_prompt, &initial_media_files);
+            let user_msg = json!({ "role": "user", "content": user_content });
             messages.push(user_msg.clone());
             append_step(state, session_id, "user", &model_prompt, &user_msg).await?;
             run_openrouter_loop(
@@ -1075,7 +1210,24 @@ pub async fn start_agent_run(
         }
         AgentProvider::Gemini => {
             let mut messages = Vec::new();
-            let user_msg = json!({ "role": "user", "parts": [{ "text": model_prompt.clone() }] });
+            let (user_parts, media_dispatch) =
+                build_gemini_user_parts_with_media(&model_prompt, &initial_media_files).await?;
+            if input_media_summary.total > 0 {
+                let dropped = input_media_summary
+                    .total
+                    .saturating_sub(media_dispatch.uploaded_total);
+                debug!(
+                    "Session {} Gemini media dispatch: uploaded_total={}, uploaded_images={}, uploaded_videos={}, uploaded_audios={}, uploaded_documents={}, dropped={}",
+                    session_id,
+                    media_dispatch.uploaded_total,
+                    media_dispatch.uploaded_images,
+                    media_dispatch.uploaded_videos,
+                    media_dispatch.uploaded_audios,
+                    media_dispatch.uploaded_documents,
+                    dropped
+                );
+            }
+            let user_msg = json!({ "role": "user", "parts": user_parts });
             messages.push(user_msg.clone());
             append_step(state, session_id, "user", &model_prompt, &user_msg).await?;
             run_gemini_loop(

@@ -13,6 +13,9 @@ use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::content::{
     extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
 };
+use crate::handlers::media::{
+    collect_message_media, summarize_media_files, MediaCollectionOptions,
+};
 use crate::handlers::responses::send_response;
 use crate::state::AppState;
 
@@ -342,7 +345,12 @@ pub async fn agent_handler(
         return Ok(());
     }
 
-    let Some((prompt_text_raw, prompt_source)) = build_prompt_from_message(&message, prompt) else {
+    let prompt_context = build_prompt_from_message(&message, prompt);
+    let media =
+        collect_message_media(&bot, &state, &message, MediaCollectionOptions::for_qa()).await;
+    let media_files = media.files;
+
+    if prompt_context.is_none() && media_files.is_empty() {
         bot.send_message(
             message.chat.id,
             "Usage: /agent <prompt>\nOr reply to a text message with /agent",
@@ -350,9 +358,19 @@ pub async fn agent_handler(
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
         return Ok(());
-    };
+    }
 
-    let prompt_text = preprocess_agent_prompt(&message, &prompt_text_raw, prompt_source).await;
+    let (prompt_text_raw, prompt_source) =
+        prompt_context.unwrap_or_else(|| (String::new(), AgentPromptSource::Provided));
+    let mut prompt_text = if prompt_text_raw.trim().is_empty() {
+        String::new()
+    } else {
+        preprocess_agent_prompt(&message, &prompt_text_raw, prompt_source).await
+    };
+    if prompt_text.trim().is_empty() && !media_files.is_empty() {
+        prompt_text = "Analyze the attached media and answer the user request. If no specific question was provided, give a concise summary of the media.".to_string();
+    }
+
     if prompt_text.trim().is_empty() {
         bot.send_message(
             message.chat.id,
@@ -363,8 +381,21 @@ pub async fn agent_handler(
         return Ok(());
     }
 
+    let media_summary = summarize_media_files(&media_files);
+    let processing_text = if media_summary.total > 0 {
+        format!(
+            "Running agent with {} attachment(s) (images: {}, videos: {}, audio: {}, documents: {})...",
+            media_summary.total,
+            media_summary.images,
+            media_summary.videos,
+            media_summary.audios,
+            media_summary.documents
+        )
+    } else {
+        "Running agent...".to_string()
+    };
     let processing_message = bot
-        .send_message(message.chat.id, "Running agent...")
+        .send_message(message.chat.id, processing_text)
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
 
@@ -374,6 +405,7 @@ pub async fn agent_handler(
         message.chat.id.0,
         processing_message.id.0 as i64,
         &prompt_text,
+        media_files,
     )
     .await;
 
@@ -542,6 +574,7 @@ pub async fn agent_resume_handler(
         message.chat.id.0,
         processing_message.id.0 as i64,
         &resumed_prompt,
+        Vec::new(),
     )
     .await;
 

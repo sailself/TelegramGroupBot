@@ -97,6 +97,16 @@ struct GeminiFileResponse {
 #[derive(Debug, Clone)]
 struct UploadedFileRef {
     uri: String,
+    kind: MediaKind,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GeminiMediaDispatchSummary {
+    pub uploaded_total: usize,
+    pub uploaded_images: usize,
+    pub uploaded_videos: usize,
+    pub uploaded_audios: usize,
+    pub uploaded_documents: usize,
 }
 
 const GEMINI_MAX_RETRY_ATTEMPTS: usize = 2;
@@ -617,7 +627,10 @@ async fn upload_media_files(files: &[MediaFile]) -> Result<Vec<UploadedFileRef>>
             );
             continue;
         };
-        uploaded.push(UploadedFileRef { uri });
+        uploaded.push(UploadedFileRef {
+            uri,
+            kind: file.kind,
+        });
     }
 
     Ok(uploaded)
@@ -720,6 +733,35 @@ fn build_gemini_file_parts(
     }
 
     parts
+}
+
+pub async fn build_gemini_user_parts_with_media(
+    user_content: &str,
+    media_files: &[MediaFile],
+) -> Result<(Vec<Value>, GeminiMediaDispatchSummary)> {
+    if media_files.is_empty() {
+        return Ok((
+            vec![json!({ "text": user_content })],
+            GeminiMediaDispatchSummary::default(),
+        ));
+    }
+
+    let uploaded_files = upload_media_files(media_files).await?;
+    let mut summary = GeminiMediaDispatchSummary::default();
+    summary.uploaded_total = uploaded_files.len();
+    for file in &uploaded_files {
+        match file.kind {
+            MediaKind::Image => summary.uploaded_images += 1,
+            MediaKind::Video => summary.uploaded_videos += 1,
+            MediaKind::Audio => summary.uploaded_audios += 1,
+            MediaKind::Document => summary.uploaded_documents += 1,
+        }
+    }
+    let text_after_media = !uploaded_files.is_empty();
+    Ok((
+        build_gemini_file_parts(user_content, &uploaded_files, &[], text_after_media),
+        summary,
+    ))
 }
 
 fn extract_text_from_response(response: GeminiResponse) -> String {
