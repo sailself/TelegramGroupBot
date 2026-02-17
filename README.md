@@ -26,8 +26,9 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/profileme` - Generate a profile based on your chat history.
 - `/paintme` - Create an artistic prompt based on your history.
 - `/portraitme` - Create a portrait prompt based on your history.
-- `/status` - Show a health snapshot (admin-only via whitelist).
-- `/diagnose` - Show extended diagnostics and recent log tails (admin-only via whitelist).
+- `/status` - Show a health snapshot (ACL-controlled).
+- `/diagnose` - Show extended diagnostics and recent log tails (ACL-controlled).
+- `/acl_reload` - Force reload of `acl.json` (owner-only).
 - `/support` - Show support message and link.
 - `/help` - Show command help.
 
@@ -42,7 +43,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 ## Setup (local)
 1. Install Rust (1.78+ recommended).
 2. Create a `.env` file in the project root (see below).
-3. Optional: create `allowed_chat.txt` if you want to restrict access.
+3. Create `acl.json` for command/tool access control (see ACL section below).
 4. Run the bot.
 
 ## Run the bot (local)
@@ -86,12 +87,37 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `USER_HISTORY_MESSAGE_COUNT` - Messages to retain for user history. Default: `200`.
 - `LOG_LEVEL` - Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info`.
 
-### Access control
-- `WHITELIST_FILE_PATH` - Path to whitelist file. Default: `allowed_chat.txt`.
-  - File contents: one user ID or chat ID per line. Empty or missing file means no restrictions.
-  - `/status` and `/diagnose` require this whitelist file to be present and include your user ID or chat ID.
-- `ACCESS_CONTROLLED_COMMANDS` - Comma-separated list of commands requiring whitelist access.
-  - Example: `/tldr,/factcheck,/profileme`
+### Access control (ACL)
+- `ACL_FILE_PATH` - Path to ACL file. Default: `acl.json`.
+- `ACL_RELOAD_TTL_SECONDS` - Metadata recheck interval for hot reload. Default: `2`.
+- `ACL_ENFORCED` - Enable ACL checks for commands and `/agent` tool calls. Default: `true`.
+
+`acl.json` schema:
+```json
+{
+  "version": 1,
+  "owner_user_ids": [123456789],
+  "full_access_chat_ids": [-1001234567890],
+  "global": {
+    "allow_commands": ["help", "q", "agent", "status", "diagnose"],
+    "allow_tools": ["read_file", "write_file", "edit_file", "exec", "web_search", "memory_store", "memory_recall", "memory_forget"]
+  },
+  "chats": {
+    "-1001234567890": {
+      "full_access": false,
+      "allow_commands": ["img", "image", "vid"],
+      "deny_commands": ["diagnose"],
+      "allow_tools": ["web_search"],
+      "deny_tools": ["exec"]
+    }
+  }
+}
+```
+
+Permission rule:
+- Effective allow list = `(global allow ∪ chat allow) - chat deny`.
+- `owner_user_ids` bypass ACL checks globally.
+- `full_access_chat_ids` or per-chat `full_access=true` bypass ACL checks for that chat.
 
 ### Gemini settings
 - `GEMINI_MODEL` - Default Gemini model. Default: `gemini-2.0-flash`.
@@ -141,9 +167,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `AGENT_PROMPT_INCLUDE_AGENTS` - Include `AGENTS.md` in `/agent` system prompt. Default: `true`.
 - `AGENT_PROMPT_INCLUDE_MEMORY_MD` - Include `MEMORY.md` in `/agent` system prompt. Default: `true`.
 - `AGENT_PROMPT_INCLUDE_SKILLS_INDEX` - Include skill catalog in `/agent` system prompt. Default: `true`.
-- `AGENT_TOOL_POLICY_ENFORCED` - Enable centralized policy checks for `/agent` tool calls. Default: `true`.
-- `AGENT_TOOL_ALLOWLIST` - Comma-separated global tool allowlist for `/agent`. Default includes `read_file,write_file,edit_file,exec,web_search,memory_store,memory_recall,memory_forget`.
-- `AGENT_TOOL_DENYLIST` - Comma-separated global tool denylist for `/agent`.
+- `/agent` tool authorization now uses `acl.json` (`global.allow_tools`, `chats.<id>.allow_tools`, `chats.<id>.deny_tools`).
 - `AGENT_EXEC_ALLOWLIST_REGEX` - Comma-separated regex allowlist for `exec` commands (if set, command must match one regex).
 - `AGENT_EXEC_TIMEOUT_SECONDS` - Shell command timeout for `exec` tool. Default: `60`.
 - `AGENT_EXEC_MAX_OUTPUT_CHARS` - Output truncation limit for `exec`. Default: `10000`.

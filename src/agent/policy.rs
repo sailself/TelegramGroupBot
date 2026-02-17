@@ -2,12 +2,9 @@ use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::acl::acl_manager;
 use crate::agent::tools::is_tool_allowed;
 use crate::config::CONFIG;
-
-fn contains_case_insensitive(values: &[String], item: &str) -> bool {
-    values.iter().any(|value| value.eq_ignore_ascii_case(item))
-}
 
 fn command_matches_allowlist(command: &str, patterns: &[String]) -> Result<bool> {
     for pattern in patterns {
@@ -24,38 +21,34 @@ fn command_matches_allowlist(command: &str, patterns: &[String]) -> Result<bool>
 }
 
 pub fn evaluate_agent_tool_call(
+    chat_id: i64,
+    user_id: i64,
     tool_name: &str,
     args: &Value,
-    skill_allowed_tools: &[String],
+    declared_tools: &[String],
 ) -> Result<(), String> {
-    if !CONFIG.agent_tool_policy_enforced {
-        return Ok(());
+    let normalized_tool = tool_name.trim().to_ascii_lowercase();
+    if normalized_tool.is_empty() {
+        return Err("Tool name is required.".to_string());
     }
 
-    if !is_tool_allowed(tool_name, skill_allowed_tools) {
+    if !is_tool_allowed(&normalized_tool, declared_tools) {
         return Err(format!(
-            "Tool '{}' is not allowed by active skills.",
-            tool_name
+            "Tool '{}' is not declared for this run.",
+            normalized_tool
         ));
     }
 
-    if contains_case_insensitive(&CONFIG.agent_tool_denylist, tool_name) {
+    let decision = acl_manager().authorize_tool(chat_id, user_id, &normalized_tool);
+    if !decision.allowed {
         return Err(format!(
-            "Tool '{}' is denied by AGENT_TOOL_DENYLIST.",
-            tool_name
+            "Tool '{}' is denied by ACL ({}).",
+            normalized_tool, decision.reason
         ));
     }
 
-    if !CONFIG.agent_tool_allowlist.is_empty()
-        && !contains_case_insensitive(&CONFIG.agent_tool_allowlist, tool_name)
+    if normalized_tool.eq_ignore_ascii_case("exec") && !CONFIG.agent_exec_allowlist_regex.is_empty()
     {
-        return Err(format!(
-            "Tool '{}' is not in AGENT_TOOL_ALLOWLIST.",
-            tool_name
-        ));
-    }
-
-    if tool_name.eq_ignore_ascii_case("exec") && !CONFIG.agent_exec_allowlist_regex.is_empty() {
         let Some(command) = args.get("command").and_then(|value| value.as_str()) else {
             return Err("Tool 'exec' requires a string 'command' field.".to_string());
         };

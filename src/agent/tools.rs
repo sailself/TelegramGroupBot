@@ -251,6 +251,16 @@ pub fn all_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+pub fn all_tool_names() -> Vec<String> {
+    let mut names = all_tool_specs()
+        .into_iter()
+        .map(|spec| spec.name.to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 pub fn build_openrouter_tool_definitions(allowed_tools: &[String]) -> Vec<Value> {
     let allowed = allowed_tools
         .iter()

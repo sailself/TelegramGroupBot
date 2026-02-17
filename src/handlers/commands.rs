@@ -11,11 +11,14 @@ use teloxide::types::{
 };
 use teloxide::RequestError;
 
+use crate::acl::acl_manager;
 use crate::config::{
     CONFIG, FACTCHECK_SYSTEM_PROMPT, PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT,
     PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
 };
-use crate::handlers::access::{check_access_control, check_admin_access, is_rate_limited};
+use crate::handlers::access::{
+    check_access_control, check_admin_access, is_owner, is_rate_limited,
+};
 use crate::handlers::content::{
     create_telegraph_page, extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
 };
@@ -103,6 +106,13 @@ fn bool_label(value: bool) -> &'static str {
     }
 }
 
+fn format_timestamp_millis(value: Option<i64>) -> String {
+    match value.and_then(chrono::DateTime::<Utc>::from_timestamp_millis) {
+        Some(timestamp) => timestamp.to_rfc3339(),
+        None => "-".to_string(),
+    }
+}
+
 fn redact_sensitive_text(text: &str) -> String {
     let mut redacted = text.to_string();
     let secrets = [
@@ -164,8 +174,7 @@ async fn build_status_report(state: &AppState) -> String {
     let jina_ready = CONFIG.enable_jina_mcp;
     let openrouter_ready = CONFIG.enable_openrouter && !CONFIG.openrouter_api_key.trim().is_empty();
 
-    let whitelist_path = Path::new(&CONFIG.whitelist_file_path);
-    let whitelist_ready = whitelist_path.exists();
+    let acl_meta = acl_manager().snapshot_meta();
     let logs_ready = Path::new("logs").exists();
 
     let mut report = String::new();
@@ -198,11 +207,48 @@ async fn build_status_report(state: &AppState) -> String {
     report.push_str(&format!("brave_ready: {}\n", bool_label(brave_ready)));
     report.push_str(&format!("exa_ready: {}\n", bool_label(exa_ready)));
     report.push_str(&format!("jina_ready: {}\n", bool_label(jina_ready)));
-    report.push_str(&format!("whitelist_file: {}\n", CONFIG.whitelist_file_path));
     report.push_str(&format!(
-        "whitelist_present: {}\n",
-        bool_label(whitelist_ready)
+        "acl_enforced: {}\n",
+        bool_label(CONFIG.acl_enforced)
     ));
+    report.push_str(&format!("acl_file: {}\n", acl_meta.path));
+    report.push_str(&format!("acl_loaded: {}\n", bool_label(acl_meta.loaded)));
+    report.push_str(&format!("acl_version: {}\n", acl_meta.version));
+    report.push_str(&format!(
+        "acl_owner_user_count: {}\n",
+        acl_meta.owner_user_count
+    ));
+    report.push_str(&format!(
+        "acl_full_access_chat_count: {}\n",
+        acl_meta.full_access_chat_count
+    ));
+    report.push_str(&format!(
+        "acl_chat_rule_count: {}\n",
+        acl_meta.chat_rule_count
+    ));
+    report.push_str(&format!(
+        "acl_global_allow_commands: {}\n",
+        acl_meta.global_allow_command_count
+    ));
+    report.push_str(&format!(
+        "acl_global_allow_tools: {}\n",
+        acl_meta.global_allow_tool_count
+    ));
+    report.push_str(&format!(
+        "acl_last_loaded_at: {}\n",
+        format_timestamp_millis(acl_meta.last_loaded_unix_ms)
+    ));
+    report.push_str(&format!(
+        "acl_file_mtime: {}\n",
+        format_timestamp_millis(acl_meta.file_mtime_unix_ms)
+    ));
+    report.push_str(&format!(
+        "acl_source_exists: {}\n",
+        bool_label(acl_meta.source_exists)
+    ));
+    if let Some(last_error) = acl_meta.last_error.as_deref() {
+        report.push_str(&format!("acl_last_error: {}\n", last_error));
+    }
     report.push_str(&format!("logs_dir_present: {}\n", bool_label(logs_ready)));
     report
 }
@@ -1810,11 +1856,14 @@ Usage: `/paintme`
 /portraitme - Generate a portrait of you based on your chat history in this group.
 Usage: `/portraitme`
 
-/status - Show bot health snapshot (admin-only)
+/status - Show bot health snapshot (ACL-controlled)
 Usage: `/status`
 
-/diagnose - Show extended diagnostics with recent log tails (admin-only)
+/diagnose - Show extended diagnostics with recent log tails (ACL-controlled)
 Usage: `/diagnose`
+
+/acl_reload - Force reload acl.json (owner-only)
+Usage: `/acl_reload`
 
 /support - Show support information and Ko-fi link
 Usage: `/support`
@@ -1838,6 +1887,39 @@ pub async fn status_handler(bot: Bot, state: AppState, message: Message) -> Resu
     bot.send_message(message.chat.id, report)
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
+    Ok(())
+}
+
+pub async fn acl_reload_handler(bot: Bot, message: Message) -> Result<()> {
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+    if !is_owner(user_id) {
+        bot.send_message(message.chat.id, "Only ACL owners can run /acl_reload.")
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await?;
+        return Ok(());
+    }
+
+    match acl_manager().reload_now() {
+        Ok(meta) => {
+            let text = format!(
+                "ACL reloaded.\nfile: {}\nversion: {}\nchats: {}\nowners: {}",
+                meta.path, meta.version, meta.chat_rule_count, meta.owner_user_count
+            );
+            bot.send_message(message.chat.id, text)
+                .reply_parameters(ReplyParameters::new(message.id))
+                .await?;
+        }
+        Err(err) => {
+            let text = format!("ACL reload failed: {}", err);
+            bot.send_message(message.chat.id, text)
+                .reply_parameters(ReplyParameters::new(message.id))
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -1884,6 +1966,10 @@ pub async fn support_handler(bot: Bot, message: Message) -> Result<()> {
 }
 
 pub async fn start_handler(bot: Bot, message: Message) -> Result<()> {
+    if !check_access_control(&bot, &message, "start").await {
+        return Ok(());
+    }
+
     bot.send_message(
         message.chat.id,
         "Hello! I am TelegramGroupHelperBot. Use /help to see commands.",

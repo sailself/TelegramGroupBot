@@ -3,14 +3,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
+use chrono::{DateTime, Utc};
+use reqwest::header::RETRY_AFTER;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
+use crate::acl::acl_manager;
 use crate::agent::policy::evaluate_agent_tool_call;
 use crate::agent::prompt_scaffold::build_agent_system_prompt;
 use crate::agent::tools::{
-    build_gemini_tool_definitions, build_openrouter_tool_definitions, execute_memory_tool,
-    execute_tool, is_memory_tool, requires_confirmation,
+    all_tool_names, build_gemini_tool_definitions, build_openrouter_tool_definitions,
+    execute_memory_tool, execute_tool, is_memory_tool, requires_confirmation,
 };
 use crate::agent::types::{AgentProvider, AgentRunOutcome, PendingAgentAction};
 use crate::agent::workspace::ensure_chat_workspace;
@@ -199,6 +202,38 @@ fn summarize_error_body(raw: &str) -> String {
     }
 }
 
+const AGENT_API_MAX_ATTEMPTS: usize = 5;
+const AGENT_API_RETRY_DELAY_MAX_SECS: u64 = 120;
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+}
+
+fn fallback_retry_delay_seconds(attempt: usize) -> u64 {
+    let shift = attempt.min(6) as u32;
+    let secs = 1u64 << shift;
+    secs.min(AGENT_API_RETRY_DELAY_MAX_SECS).max(1)
+}
+
+fn retry_after_delay_seconds(value: Option<&reqwest::header::HeaderValue>, attempt: usize) -> u64 {
+    if let Some(raw_header) = value.and_then(|header| header.to_str().ok()) {
+        let raw = raw_header.trim();
+        if let Ok(seconds) = raw.parse::<u64>() {
+            return seconds.max(1).min(AGENT_API_RETRY_DELAY_MAX_SECS);
+        }
+        if let Ok(retry_at) = DateTime::parse_from_rfc2822(raw) {
+            let target = retry_at.with_timezone(&Utc);
+            let now = Utc::now();
+            let seconds = target.signed_duration_since(now).num_seconds();
+            if seconds > 0 {
+                return (seconds as u64).max(1).min(AGENT_API_RETRY_DELAY_MAX_SECS);
+            }
+        }
+    }
+    fallback_retry_delay_seconds(attempt)
+}
+
 fn extract_assistant_content(message: &Value) -> String {
     let content = message
         .get("content")
@@ -258,28 +293,47 @@ async fn call_openrouter_chat(model: &str, messages: &[Value], tools: &[Value]) 
     }
 
     let client = get_http_client();
-    let response = client
-        .post(format!(
-            "{}/chat/completions",
-            CONFIG.openrouter_base_url.trim_end_matches('/')
-        ))
-        .header(
-            "Authorization",
-            format!("Bearer {}", CONFIG.openrouter_api_key),
-        )
-        .header(
-            "HTTP-Referer",
-            "https://github.com/sailself/TelegramGroupHelperBot",
-        )
-        .header("X-Title", "TelegramGroupHelperBot")
-        .json(&payload)
-        .send()
-        .await?;
+    for attempt in 1..=AGENT_API_MAX_ATTEMPTS {
+        let response = client
+            .post(format!(
+                "{}/chat/completions",
+                CONFIG.openrouter_base_url.trim_end_matches('/')
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", CONFIG.openrouter_api_key),
+            )
+            .header(
+                "HTTP-Referer",
+                "https://github.com/sailself/TelegramGroupHelperBot",
+            )
+            .header("X-Title", "TelegramGroupHelperBot")
+            .json(&payload)
+            .send()
+            .await?;
 
-    if !response.status().is_success() {
+        if response.status().is_success() {
+            let json = response
+                .json::<Value>()
+                .await
+                .map_err(|err| anyhow!("Failed to decode OpenRouter response: {}", err))?;
+            return Ok(json);
+        }
+
         let status = response.status();
+        let retry_delay_secs =
+            retry_after_delay_seconds(response.headers().get(RETRY_AFTER), attempt);
         let body = response.text().await.unwrap_or_default();
         let detail = summarize_error_body(&body);
+        if is_retryable_status(status) && attempt < AGENT_API_MAX_ATTEMPTS {
+            warn!(
+                "OpenRouter request retrying after status {} (attempt {}/{}; wait={}s): {}",
+                status, attempt, AGENT_API_MAX_ATTEMPTS, retry_delay_secs, detail
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
+            continue;
+        }
+
         return Err(anyhow!(
             "OpenRouter request failed with status {}: {}",
             status,
@@ -287,11 +341,10 @@ async fn call_openrouter_chat(model: &str, messages: &[Value], tools: &[Value]) 
         ));
     }
 
-    let json = response
-        .json::<Value>()
-        .await
-        .map_err(|err| anyhow!("Failed to decode OpenRouter response: {}", err))?;
-    Ok(json)
+    Err(anyhow!(
+        "OpenRouter request failed after {} attempts",
+        AGENT_API_MAX_ATTEMPTS
+    ))
 }
 
 async fn call_gemini_chat(
@@ -322,20 +375,38 @@ async fn call_gemini_chat(
     }
 
     let client = get_http_client();
-    let response = client
-        .post(format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model, CONFIG.gemini_api_key
-        ))
-        .timeout(std::time::Duration::from_secs(90))
-        .json(&payload)
-        .send()
-        .await?;
+    for attempt in 1..=AGENT_API_MAX_ATTEMPTS {
+        let response = client
+            .post(format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                model, CONFIG.gemini_api_key
+            ))
+            .timeout(std::time::Duration::from_secs(90))
+            .json(&payload)
+            .send()
+            .await?;
 
-    if !response.status().is_success() {
+        if response.status().is_success() {
+            return response
+                .json::<Value>()
+                .await
+                .map_err(|err| anyhow!("Failed to decode Gemini response: {}", err));
+        }
+
         let status = response.status();
+        let retry_delay_secs =
+            retry_after_delay_seconds(response.headers().get(RETRY_AFTER), attempt);
         let body = response.text().await.unwrap_or_default();
         let detail = summarize_error_body(&body);
+        if is_retryable_status(status) && attempt < AGENT_API_MAX_ATTEMPTS {
+            warn!(
+                "Gemini request retrying after status {} (attempt {}/{}; wait={}s): {}",
+                status, attempt, AGENT_API_MAX_ATTEMPTS, retry_delay_secs, detail
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
+            continue;
+        }
+
         return Err(anyhow!(
             "Gemini request failed with status {}: {}",
             status,
@@ -343,10 +414,10 @@ async fn call_gemini_chat(
         ));
     }
 
-    response
-        .json::<Value>()
-        .await
-        .map_err(|err| anyhow!("Failed to decode Gemini response: {}", err))
+    Err(anyhow!(
+        "Gemini request failed after {} attempts",
+        AGENT_API_MAX_ATTEMPTS
+    ))
 }
 
 fn parse_gemini_assistant_parts(
@@ -715,7 +786,9 @@ async fn run_openrouter_loop(
                 )
                 .await?;
 
-            if let Err(reason) = evaluate_agent_tool_call(&tool_name, &args_value, allowed_tools) {
+            if let Err(reason) =
+                evaluate_agent_tool_call(chat_id, user_id, &tool_name, &args_value, allowed_tools)
+            {
                 warn!(
                     "Denied tool call in session {}: tool='{}' reason='{}'",
                     session_id, tool_name, reason
@@ -935,7 +1008,9 @@ async fn run_gemini_loop(
                 )
                 .await?;
 
-            if let Err(reason) = evaluate_agent_tool_call(&tool_name, &args_value, allowed_tools) {
+            if let Err(reason) =
+                evaluate_agent_tool_call(chat_id, user_id, &tool_name, &args_value, allowed_tools)
+            {
                 warn!(
                     "Denied tool call in session {}: tool='{}' reason='{}'",
                     session_id, tool_name, reason
@@ -1094,6 +1169,7 @@ pub async fn start_agent_run(
         build_agent_system_prompt(&workspace_root, &skill_index, &selected_skill_context);
     let selected_skills_json =
         serde_json::to_string(&active_skills.selected_names).unwrap_or_else(|_| "[]".to_string());
+    let acl_allowed_tools = acl_manager().filter_allowed_tools(chat_id, user_id, &all_tool_names());
 
     let session_model = format!("{}:{}", provider.as_str(), model);
     let session_id = state
@@ -1141,13 +1217,15 @@ pub async fn start_agent_run(
     .await?;
 
     info!(
-        "Starting agent session {} with provider='{}' model='{}' skills [{}] workspace='{}' media_files={}",
+        "Starting agent session {} with provider='{}' model='{}' skills [{}] skill_tools=[{}] workspace='{}' media_files={} acl_allowed_tools={}",
         session_id,
         provider.as_str(),
         model,
         active_skills.selected_names.join(", "),
+        active_skills.allowed_tools.join(", "),
         workspace_root.display(),
-        initial_media_files.len()
+        initial_media_files.len(),
+        acl_allowed_tools.join(", ")
     );
     let input_media_summary = summarize_media_kinds(&initial_media_files);
     if input_media_summary.total > 0 {
@@ -1203,7 +1281,7 @@ pub async fn start_agent_run(
                 &workspace_root,
                 &model,
                 &active_skills.selected_names,
-                &active_skills.allowed_tools,
+                &acl_allowed_tools,
                 messages,
             )
             .await
@@ -1240,7 +1318,7 @@ pub async fn start_agent_run(
                 &model,
                 &system_prompt,
                 &active_skills.selected_names,
-                &active_skills.allowed_tools,
+                &acl_allowed_tools,
                 messages,
             )
             .await
@@ -1254,6 +1332,8 @@ pub async fn continue_after_confirmation(
     confirmed_by: i64,
 ) -> Result<AgentRunOutcome> {
     if let Err(reason) = evaluate_agent_tool_call(
+        pending.chat_id,
+        pending.user_id,
         &pending.tool_name,
         &pending.tool_args,
         &pending.allowed_tools,

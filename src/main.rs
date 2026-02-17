@@ -6,6 +6,7 @@ use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
 use tracing::{error, info};
 
+mod acl;
 mod agent;
 mod config;
 mod db;
@@ -49,6 +50,8 @@ enum Command {
     Status,
     Diagnose,
     Support,
+    #[command(rename = "acl_reload")]
+    AclReload,
 }
 
 type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
@@ -73,7 +76,7 @@ async fn main() -> HandlerResult {
     agent::workspace::bootstrap_workspace_on_startup()?;
     agent::hygiene::spawn_agent_hygiene_task(state.clone());
 
-    handlers::access::load_whitelist();
+    handlers::access::initialize_access_control();
 
     let command_handler = dptree::entry()
         .filter_command::<Command>()
@@ -301,6 +304,15 @@ async fn handle_command(
             });
         }
         Command::Support => commands::support_handler(bot, message).await?,
+        Command::AclReload => {
+            let bot = bot.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) = commands::acl_reload_handler(bot, message).await {
+                    error!("acl_reload handler failed: {err}");
+                }
+            });
+        }
     }
     Ok(())
 }
