@@ -24,12 +24,27 @@ impl AgentProvider {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentOutputMediaKind {
+    Image,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentOutputMedia {
+    pub kind: AgentOutputMediaKind,
+    pub source_url: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+    pub title: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentRunOutcome {
     Completed {
         session_id: i64,
         response_text: String,
         selected_skills: Vec<String>,
+        media: Vec<AgentOutputMedia>,
     },
     AwaitingConfirmation {
         confirmation_key: String,
@@ -53,5 +68,6 @@ pub struct PendingAgentAction {
     pub model_name: String,
     pub allowed_tools: Vec<String>,
     pub selected_skills: Vec<String>,
+    pub output_media: Vec<AgentOutputMedia>,
     pub messages: Vec<Value>,
 }

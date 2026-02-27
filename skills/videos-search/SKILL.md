@@ -1,6 +1,8 @@
 ---
 name: videos-search
 description: USE FOR video search. Returns videos with title, URL, thumbnail, duration, view count, creator. Supports freshness filters, SafeSearch, pagination.
+allowed_tools:
+  - web_search
 ---
 
 # Videos Search

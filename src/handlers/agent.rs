@@ -2,13 +2,14 @@ use anyhow::Result;
 use serde_json::from_str;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityRef, MessageId, ParseMode,
-    ReplyParameters,
+    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageEntityRef, MessageId,
+    ParseMode, ReplyParameters,
 };
 use tracing::{error, warn};
 
 use crate::agent::runtime::{cancel_pending_action, continue_after_confirmation, start_agent_run};
-use crate::agent::types::AgentRunOutcome;
+use crate::agent::types::{AgentOutputMedia, AgentOutputMediaKind, AgentRunOutcome};
+use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::content::{
     extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
@@ -259,6 +260,89 @@ async fn delete_confirmation_message(bot: &Bot, query: &CallbackQuery) {
     }
 }
 
+fn should_use_telegraph(response: &str) -> bool {
+    response.lines().count() > 22 || response.len() > CONFIG.telegram_max_length
+}
+
+fn append_agent_image_markdown(response: &mut String, media: &[AgentOutputMedia]) {
+    let mut any = false;
+    for (index, item) in media
+        .iter()
+        .filter(|item| item.kind == AgentOutputMediaKind::Image)
+        .take(CONFIG.agent_image_response_max_photos.max(1))
+        .enumerate()
+    {
+        if !any {
+            response.push_str("\n\n## Images\n");
+            any = true;
+        }
+        let alt = item
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .replace(['[', ']', '(', ')'], " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "image".to_string());
+        response.push_str(&format!("![{} {}]({})\n", alt, index + 1, item.source_url));
+    }
+}
+
+async fn send_agent_media_photos(
+    bot: &Bot,
+    chat_id: ChatId,
+    request_message_id: MessageId,
+    media: &[AgentOutputMedia],
+) -> Result<()> {
+    let mut sent = 0usize;
+    for item in media
+        .iter()
+        .filter(|item| item.kind == AgentOutputMediaKind::Image)
+        .take(CONFIG.agent_image_response_max_photos.max(1))
+    {
+        if item.bytes.is_empty() {
+            continue;
+        }
+        let extension = if item.mime_type.eq_ignore_ascii_case("image/png") {
+            "png"
+        } else if item.mime_type.eq_ignore_ascii_case("image/webp") {
+            "webp"
+        } else {
+            "jpg"
+        };
+        let file_name = format!("agent_image_{}.{}", sent + 1, extension);
+        let input = InputFile::memory(item.bytes.clone()).file_name(file_name);
+
+        let mut request = bot
+            .send_photo(chat_id, input)
+            .reply_parameters(ReplyParameters::new(request_message_id));
+        if sent == 0 {
+            if let Some(title) = item
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                request = request.caption(format!("Image result: {}", title));
+            } else {
+                request = request.caption("Image result");
+            }
+        }
+        if let Err(err) = request.await {
+            warn!("Failed to send agent image '{}': {}", item.source_url, err);
+            continue;
+        }
+        sent += 1;
+    }
+    Ok(())
+}
+
 async fn handle_agent_outcome(
     bot: &Bot,
     state: &AppState,
@@ -272,6 +356,7 @@ async fn handle_agent_outcome(
             session_id,
             response_text,
             selected_skills,
+            media,
         } => {
             let mut response = response_text;
             if !selected_skills.is_empty() {
@@ -279,6 +364,12 @@ async fn handle_agent_outcome(
                 response.push_str(&selected_skills.join(", "));
             }
             response.push_str(&format!("\nSession: {}", session_id));
+
+            let use_telegraph = should_use_telegraph(&response);
+            if use_telegraph {
+                append_agent_image_markdown(&mut response, &media);
+            }
+
             send_response(
                 bot,
                 chat_id,
@@ -288,6 +379,10 @@ async fn handle_agent_outcome(
                 ParseMode::MarkdownV2,
             )
             .await?;
+
+            if !use_telegraph && !media.is_empty() {
+                send_agent_media_photos(bot, chat_id, request_message_id, &media).await?;
+            }
         }
         AgentRunOutcome::AwaitingConfirmation {
             confirmation_key,

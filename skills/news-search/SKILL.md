@@ -1,6 +1,8 @@
 ---
 name: news-search
 description: USE FOR news search. Returns news articles with title, URL, description, age, thumbnail. Supports freshness and date range filtering, SafeSearch filter and Goggles for custom ranking.
+allowed_tools:
+  - web_search
 ---
 
 # News Search

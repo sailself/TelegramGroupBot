@@ -145,6 +145,11 @@ pub struct Config {
     pub agent_require_confirmation_for_write: bool,
     pub agent_require_confirmation_for_edit: bool,
     pub agent_require_confirmation_for_exec: bool,
+    pub agent_image_response_max_photos: usize,
+    pub agent_image_search_max_results: usize,
+    pub agent_image_search_default_safesearch: String,
+    pub agent_image_download_max_bytes: usize,
+    pub agent_image_download_timeout_seconds: u64,
     pub openrouter_models_config_path: PathBuf,
     pub openrouter_models: Vec<OpenRouterModelConfig>,
     pub openrouter_models_by_model: HashMap<String, OpenRouterModelConfig>,
@@ -463,7 +468,7 @@ impl Config {
 
         let agent_tool_allowlist = env_csv_lowercase(
             "AGENT_TOOL_ALLOWLIST",
-            "read_file,write_file,edit_file,exec,web_search,memory_store,memory_recall,memory_forget",
+            "read_file,write_file,edit_file,exec,web_search,image_search,memory_store,memory_recall,memory_forget",
         );
         let agent_tool_denylist = env_csv_lowercase("AGENT_TOOL_DENYLIST", "");
         let agent_exec_allowlist_regex = env_csv("AGENT_EXEC_ALLOWLIST_REGEX", "");
@@ -582,6 +587,18 @@ impl Config {
             agent_require_confirmation_for_exec: env_bool(
                 "AGENT_REQUIRE_CONFIRMATION_FOR_EXEC",
                 true,
+            ),
+            agent_image_response_max_photos: env_usize("AGENT_IMAGE_RESPONSE_MAX_PHOTOS", 6),
+            agent_image_search_max_results: env_usize("AGENT_IMAGE_SEARCH_MAX_RESULTS", 20),
+            agent_image_search_default_safesearch: env_string(
+                "AGENT_IMAGE_SEARCH_DEFAULT_SAFESEARCH",
+                "off",
+            )
+            .to_lowercase(),
+            agent_image_download_max_bytes: env_usize("AGENT_IMAGE_DOWNLOAD_MAX_BYTES", 8_000_000),
+            agent_image_download_timeout_seconds: env_u64(
+                "AGENT_IMAGE_DOWNLOAD_TIMEOUT_SECONDS",
+                20,
             ),
             openrouter_models_config_path,
             openrouter_models,

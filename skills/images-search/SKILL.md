@@ -1,6 +1,8 @@
 ---
 name: images-search
 description: USE FOR image search. Returns images with title, source URL, thumbnail. Supports SafeSearch filter. Up to 200 results.
+allowed_tools:
+  - image_search
 ---
 
 # Images Search

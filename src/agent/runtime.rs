@@ -1,10 +1,11 @@
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Utc};
 use reqwest::header::RETRY_AFTER;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
@@ -13,9 +14,11 @@ use crate::agent::policy::evaluate_agent_tool_call;
 use crate::agent::prompt_scaffold::build_agent_system_prompt;
 use crate::agent::tools::{
     all_tool_names, build_gemini_tool_definitions, build_openrouter_tool_definitions,
-    execute_memory_tool, execute_tool, is_memory_tool, requires_confirmation,
+    execute_memory_tool, execute_tool, is_memory_tool, requires_confirmation, IMAGE_SEARCH_TOOL,
 };
-use crate::agent::types::{AgentProvider, AgentRunOutcome, PendingAgentAction};
+use crate::agent::types::{
+    AgentOutputMedia, AgentOutputMediaKind, AgentProvider, AgentRunOutcome, PendingAgentAction,
+};
 use crate::agent::workspace::ensure_chat_workspace;
 use crate::config::CONFIG;
 use crate::db::models::{AgentMemoryInsert, AgentMemorySearchRow};
@@ -182,6 +185,152 @@ fn summarize_media_kinds(media_files: &[MediaFile]) -> MediaKindSummary {
         }
     }
     summary
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageSearchToolOutput {
+    #[serde(default)]
+    items: Vec<ImageSearchToolItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageSearchToolItem {
+    image_url: String,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+fn intersect_allowed_tools(acl_allowed: &[String], skill_allowed: &[String]) -> Vec<String> {
+    let acl = acl_allowed
+        .iter()
+        .map(|tool| tool.trim().to_ascii_lowercase())
+        .filter(|tool| !tool.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    let mut combined = skill_allowed
+        .iter()
+        .map(|tool| tool.trim().to_ascii_lowercase())
+        .filter(|tool| !tool.is_empty())
+        .filter(|tool| acl.contains(tool))
+        .collect::<Vec<_>>();
+    combined.sort();
+    combined.dedup();
+    combined
+}
+
+fn is_supported_remote_image_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("https://") || trimmed.starts_with("http://")
+}
+
+fn normalize_optional_title(value: Option<String>) -> Option<String> {
+    value
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty())
+}
+
+async fn download_image_output_media(url: &str) -> Option<(Vec<u8>, String)> {
+    if !is_supported_remote_image_url(url) {
+        return None;
+    }
+
+    let response = get_http_client()
+        .get(url)
+        .timeout(Duration::from_secs(
+            CONFIG.agent_image_download_timeout_seconds.max(1),
+        ))
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|value| !value.is_empty());
+
+    let bytes = response.bytes().await.ok()?.to_vec();
+    if bytes.is_empty() {
+        return None;
+    }
+    if bytes.len() > CONFIG.agent_image_download_max_bytes.max(1) {
+        return None;
+    }
+
+    let mime_type = detect_mime_type(&bytes)
+        .or(content_type)
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    if !mime_type.starts_with("image/") {
+        return None;
+    }
+
+    Some((bytes, mime_type))
+}
+
+async fn collect_tool_output_media(
+    tool_name: &str,
+    tool_result: &str,
+    output_media: &mut Vec<AgentOutputMedia>,
+) {
+    if !tool_name.eq_ignore_ascii_case(IMAGE_SEARCH_TOOL) {
+        return;
+    }
+
+    let max_media = CONFIG.agent_image_response_max_photos.max(1);
+    if output_media.len() >= max_media {
+        return;
+    }
+
+    let parsed = match serde_json::from_str::<ImageSearchToolOutput>(tool_result) {
+        Ok(value) => value,
+        Err(err) => {
+            debug!(
+                "Skipping image output extraction: invalid JSON from image_search: {}",
+                err
+            );
+            return;
+        }
+    };
+
+    for item in parsed.items {
+        if output_media.len() >= max_media {
+            break;
+        }
+        let source_url = item.image_url.trim().to_string();
+        if source_url.is_empty() || !is_supported_remote_image_url(&source_url) {
+            continue;
+        }
+        if output_media
+            .iter()
+            .any(|media| media.source_url.eq_ignore_ascii_case(&source_url))
+        {
+            continue;
+        }
+
+        let Some((bytes, mime_type)) = download_image_output_media(&source_url).await else {
+            debug!("Failed downloading agent output image '{}'", source_url);
+            continue;
+        };
+
+        output_media.push(AgentOutputMedia {
+            kind: AgentOutputMediaKind::Image,
+            source_url,
+            mime_type,
+            bytes,
+            title: normalize_optional_title(item.title),
+        });
+    }
 }
 
 fn summarize_error_body(raw: &str) -> String {
@@ -683,6 +832,7 @@ async fn run_openrouter_loop(
     selected_skill_names: &[String],
     allowed_tools: &[String],
     mut messages: Vec<Value>,
+    mut output_media: Vec<AgentOutputMedia>,
 ) -> Result<AgentRunOutcome> {
     let tool_defs = build_openrouter_tool_definitions(allowed_tools);
 
@@ -744,6 +894,7 @@ async fn run_openrouter_loop(
                 session_id,
                 response_text: assistant_content,
                 selected_skills: selected_skill_names.to_vec(),
+                media: output_media,
             });
         }
 
@@ -829,6 +980,7 @@ async fn run_openrouter_loop(
                     model_name: model.to_string(),
                     allowed_tools: allowed_tools.to_vec(),
                     selected_skills: selected_skill_names.to_vec(),
+                    output_media,
                     messages,
                 };
                 state
@@ -868,6 +1020,7 @@ async fn run_openrouter_loop(
             .await;
             let tool_result = match execution_result {
                 Ok(content) => {
+                    collect_tool_output_media(&tool_name, &content, &mut output_media).await;
                     state
                         .db
                         .update_agent_tool_call_status(
@@ -925,6 +1078,7 @@ async fn run_openrouter_loop(
         session_id,
         response_text: final_text.to_string(),
         selected_skills: selected_skill_names.to_vec(),
+        media: output_media,
     })
 }
 
@@ -940,6 +1094,7 @@ async fn run_gemini_loop(
     selected_skill_names: &[String],
     allowed_tools: &[String],
     mut messages: Vec<Value>,
+    mut output_media: Vec<AgentOutputMedia>,
 ) -> Result<AgentRunOutcome> {
     let tool_defs = build_gemini_tool_definitions(allowed_tools);
 
@@ -986,6 +1141,7 @@ async fn run_gemini_loop(
                 session_id,
                 response_text: final_text,
                 selected_skills: selected_skill_names.to_vec(),
+                media: output_media,
             });
         }
 
@@ -1049,6 +1205,7 @@ async fn run_gemini_loop(
                     model_name: model.to_string(),
                     allowed_tools: allowed_tools.to_vec(),
                     selected_skills: selected_skill_names.to_vec(),
+                    output_media,
                     messages,
                 };
                 state
@@ -1087,7 +1244,10 @@ async fn run_gemini_loop(
             )
             .await;
             let (tool_payload, tool_result_text, status) = match execution_result {
-                Ok(content) => (json!({ "output": content.clone() }), content, "completed"),
+                Ok(content) => {
+                    collect_tool_output_media(&tool_name, &content, &mut output_media).await;
+                    (json!({ "output": content.clone() }), content, "completed")
+                }
                 Err(err) => {
                     let err_text = format!("Tool '{}' failed: {}", tool_name, err);
                     (json!({ "error": err_text.clone() }), err_text, "failed")
@@ -1139,6 +1299,7 @@ async fn run_gemini_loop(
         session_id,
         response_text: final_text.to_string(),
         selected_skills: selected_skill_names.to_vec(),
+        media: output_media,
     })
 }
 
@@ -1169,7 +1330,13 @@ pub async fn start_agent_run(
         build_agent_system_prompt(&workspace_root, &skill_index, &selected_skill_context);
     let selected_skills_json =
         serde_json::to_string(&active_skills.selected_names).unwrap_or_else(|_| "[]".to_string());
-    let acl_allowed_tools = acl_manager().filter_allowed_tools(chat_id, user_id, &all_tool_names());
+    let discovered_tools = all_tool_names();
+    let acl_allowed_tools = acl_manager().filter_allowed_tools(chat_id, user_id, &discovered_tools);
+    let mut skill_allowed_tools = active_skills.allowed_tools.clone();
+    if skill_allowed_tools.is_empty() {
+        skill_allowed_tools = discovered_tools;
+    }
+    let effective_allowed_tools = intersect_allowed_tools(&acl_allowed_tools, &skill_allowed_tools);
 
     let session_model = format!("{}:{}", provider.as_str(), model);
     let session_id = state
@@ -1217,7 +1384,7 @@ pub async fn start_agent_run(
     .await?;
 
     info!(
-        "Starting agent session {} with provider='{}' model='{}' skills [{}] skill_tools=[{}] workspace='{}' media_files={} acl_allowed_tools={}",
+        "Starting agent session {} with provider='{}' model='{}' skills [{}] skill_tools=[{}] workspace='{}' media_files={} acl_allowed_tools={} effective_allowed_tools={}",
         session_id,
         provider.as_str(),
         model,
@@ -1225,7 +1392,8 @@ pub async fn start_agent_run(
         active_skills.allowed_tools.join(", "),
         workspace_root.display(),
         initial_media_files.len(),
-        acl_allowed_tools.join(", ")
+        acl_allowed_tools.join(", "),
+        effective_allowed_tools.join(", ")
     );
     let input_media_summary = summarize_media_kinds(&initial_media_files);
     if input_media_summary.total > 0 {
@@ -1281,8 +1449,9 @@ pub async fn start_agent_run(
                 &workspace_root,
                 &model,
                 &active_skills.selected_names,
-                &acl_allowed_tools,
+                &effective_allowed_tools,
                 messages,
+                Vec::new(),
             )
             .await
         }
@@ -1318,8 +1487,9 @@ pub async fn start_agent_run(
                 &model,
                 &system_prompt,
                 &active_skills.selected_names,
-                &acl_allowed_tools,
+                &effective_allowed_tools,
                 messages,
+                Vec::new(),
             )
             .await
         }
@@ -1331,6 +1501,8 @@ pub async fn continue_after_confirmation(
     pending: PendingAgentAction,
     confirmed_by: i64,
 ) -> Result<AgentRunOutcome> {
+    let mut output_media = pending.output_media.clone();
+
     if let Err(reason) = evaluate_agent_tool_call(
         pending.chat_id,
         pending.user_id,
@@ -1374,6 +1546,7 @@ pub async fn continue_after_confirmation(
             session_id: pending.session_id,
             response_text: "Tool execution denied by policy.".to_string(),
             selected_skills: pending.selected_skills,
+            media: output_media,
         });
     }
 
@@ -1389,7 +1562,10 @@ pub async fn continue_after_confirmation(
     .await;
 
     let (tool_payload, tool_result, status) = match execution_result {
-        Ok(content) => (json!({ "output": content.clone() }), content, "completed"),
+        Ok(content) => {
+            collect_tool_output_media(&pending.tool_name, &content, &mut output_media).await;
+            (json!({ "output": content.clone() }), content, "completed")
+        }
         Err(err) => {
             let err_text = format!("Tool '{}' failed: {}", pending.tool_name, err);
             (json!({ "error": err_text.clone() }), err_text, "failed")
@@ -1445,6 +1621,7 @@ pub async fn continue_after_confirmation(
                 &pending.selected_skills,
                 &pending.allowed_tools,
                 messages,
+                output_media,
             )
             .await
         }
@@ -1461,6 +1638,7 @@ pub async fn continue_after_confirmation(
                 &pending.selected_skills,
                 &pending.allowed_tools,
                 messages,
+                output_media,
             )
             .await
         }

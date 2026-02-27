@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use crate::config::CONFIG;
 use crate::db::database::Database;
 use crate::db::models::AgentMemoryInsert;
+use crate::llm::brave_image_search::brave_image_search;
 use crate::llm::web_search::web_search_tool;
 use crate::tools::core_filesystem;
 use crate::tools::core_shell;
@@ -24,6 +25,7 @@ pub const WRITE_FILE_TOOL: &str = "write_file";
 pub const EDIT_FILE_TOOL: &str = "edit_file";
 pub const EXEC_TOOL: &str = "exec";
 pub const WEB_SEARCH_TOOL: &str = "web_search";
+pub const IMAGE_SEARCH_TOOL: &str = "image_search";
 pub const MEMORY_STORE_TOOL: &str = "memory_store";
 pub const MEMORY_RECALL_TOOL: &str = "memory_recall";
 pub const MEMORY_FORGET_TOOL: &str = "memory_forget";
@@ -58,6 +60,24 @@ fn normalize_memory_category(raw: Option<&str>) -> String {
     match category.as_str() {
         "conversation" | "preference" | "task" | "fact" | "note" => category,
         _ => "note".to_string(),
+    }
+}
+
+fn normalize_image_safesearch(raw: Option<&str>) -> String {
+    if let Some(value) = raw {
+        if value.trim().eq_ignore_ascii_case("off") {
+            return "off".to_string();
+        }
+        return "strict".to_string();
+    }
+    if CONFIG
+        .agent_image_search_default_safesearch
+        .trim()
+        .eq_ignore_ascii_case("off")
+    {
+        "off".to_string()
+    } else {
+        "strict".to_string()
     }
 }
 
@@ -158,6 +178,33 @@ pub fn all_tool_specs() -> Vec<ToolSpec> {
                         "minimum": 1,
                         "maximum": 10,
                         "description": "Maximum number of results (default 5)."
+                    }
+                },
+                "required": ["query"]
+            }),
+            side_effect: false,
+        },
+        ToolSpec {
+            name: IMAGE_SEARCH_TOOL,
+            description:
+                "Search web images and return structured image candidates with source URLs.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Image search query."
+                    },
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Maximum number of image results to return (default 6)."
+                    },
+                    "safesearch": {
+                        "type": "string",
+                        "enum": ["off", "strict"],
+                        "description": "SafeSearch mode. Use 'off' for broader results."
                     }
                 },
                 "required": ["query"]
@@ -567,6 +614,29 @@ pub async fn execute_tool(tool_name: &str, args: &Value, workspace_root: &Path) 
                 .and_then(|value| value.as_u64())
                 .map(|value| value as usize);
             web_search_tool(query, max_results).await
+        }
+        IMAGE_SEARCH_TOOL => {
+            let query = args
+                .get("query")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow!("image_search requires string field 'query'"))?;
+            let count = args
+                .get("count")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize)
+                .unwrap_or(6)
+                .clamp(1, CONFIG.agent_image_search_max_results.max(1).min(20));
+            let safesearch =
+                normalize_image_safesearch(args.get("safesearch").and_then(|value| value.as_str()));
+            let items = brave_image_search(query, count, &safesearch).await?;
+            let payload = json!({
+                "query": query.trim(),
+                "count": count,
+                "safesearch": safesearch,
+                "items": items,
+            });
+            serde_json::to_string(&payload)
+                .map_err(|err| anyhow!("Failed to serialize image_search payload: {}", err))
         }
         other => Err(anyhow!("Unknown tool '{}'", other)),
     }

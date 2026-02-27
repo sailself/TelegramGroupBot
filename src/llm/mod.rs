@@ -1,4 +1,5 @@
-﻿pub mod brave_search;
+pub mod brave_image_search;
+pub mod brave_search;
 pub mod exa_search;
 pub mod gemini;
 pub mod jina_search;
