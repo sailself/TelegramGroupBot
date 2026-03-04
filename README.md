@@ -91,6 +91,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 
 ### Gemini settings
 - `GEMINI_MODEL` - Default Gemini model. Default: `gemini-2.0-flash`.
+- `GEMINI_LITE_MODEL` - Lite fallback model after `GEMINI_MODEL` failures. Default: `gemini-2.0-flash-lite`.
 - `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-2.5-pro-exp-03-25`.
 - `GEMINI_IMAGE_MODEL` - Image model. Default: `gemini-3-pro-image-preview`.
 - `GEMINI_VIDEO_MODEL` - Video model. Default: `veo-3.1-generate-preview`.

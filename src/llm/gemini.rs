@@ -106,6 +106,7 @@ struct UploadedFileRef {
 }
 
 const GEMINI_MAX_RETRY_ATTEMPTS: usize = 2;
+const GEMINI_LITE_FALLBACK_MAX_ATTEMPTS: usize = 3;
 const GEMINI_RETRY_BASE_DELAY_MS: u64 = 900;
 const VEO_DEFAULT_RESOLUTION: &str = "1080p";
 const VEO_DEFAULT_DURATION_SECONDS: u32 = 8;
@@ -879,6 +880,84 @@ async fn call_gemini_api(
     }
 }
 
+async fn call_gemini_lite_fallback(
+    payload: &serde_json::Value,
+    system_prompt_label: Option<&str>,
+    previous_model: &str,
+    previous_err: &anyhow::Error,
+) -> Result<GeminiCallResult> {
+    let lite_model = CONFIG.gemini_lite_model.trim();
+    if lite_model.is_empty() {
+        return Err(anyhow!(
+            "Gemini request failed on model '{}' and GEMINI_LITE_MODEL is not configured. Previous error: {}",
+            previous_model,
+            previous_err
+        ));
+    }
+
+    if lite_model.eq_ignore_ascii_case(previous_model) {
+        return Err(anyhow!(
+            "Gemini request failed on model '{}' and GEMINI_LITE_MODEL points to the same model. Previous error: {}",
+            previous_model,
+            previous_err
+        ));
+    }
+
+    warn!(
+        "Gemini model '{}' failed after retries; trying lite fallback model '{}' for up to {} attempts: {}",
+        previous_model,
+        lite_model,
+        GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
+        previous_err
+    );
+
+    let mut last_lite_err = None;
+    for attempt in 1..=GEMINI_LITE_FALLBACK_MAX_ATTEMPTS {
+        let result = log_llm_timing(
+            "gemini",
+            lite_model,
+            "call_gemini_lite_fallback",
+            Some(json!({
+                "attempt": attempt,
+                "max_attempts": GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
+                "after_model": previous_model,
+            })),
+            || async {
+                let response =
+                    call_gemini_api(lite_model, payload.clone(), system_prompt_label).await?;
+                Ok(extract_text_from_response(response))
+            },
+        )
+        .await;
+
+        match result {
+            Ok(text) => {
+                return Ok(GeminiCallResult {
+                    text,
+                    model_used: lite_model.to_string(),
+                });
+            }
+            Err(err) => {
+                warn!(
+                    "Gemini lite fallback attempt {}/{} failed on model '{}': {}",
+                    attempt, GEMINI_LITE_FALLBACK_MAX_ATTEMPTS, lite_model, err
+                );
+                last_lite_err = Some(err);
+            }
+        }
+    }
+
+    let lite_err = last_lite_err.unwrap_or_else(|| anyhow!("Unknown Gemini lite fallback failure"));
+    Err(anyhow!(
+        "Gemini request failed on model '{}' and lite fallback model '{}' after {} attempts. Previous error: {}. Lite fallback error: {}",
+        previous_model,
+        lite_model,
+        GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
+        previous_err,
+        lite_err
+    ))
+}
+
 pub async fn call_gemini(
     system_prompt: &str,
     user_content: &str,
@@ -976,7 +1055,13 @@ pub async fn call_gemini(
         }),
         Err(primary_err) => {
             if !use_pro_model {
-                return Err(primary_err);
+                return call_gemini_lite_fallback(
+                    &payload,
+                    system_prompt_label,
+                    primary_model,
+                    &primary_err,
+                )
+                .await;
             }
 
             let fallback_model = CONFIG.gemini_model.as_str();
@@ -992,21 +1077,36 @@ pub async fn call_gemini(
                 None,
                 || async {
                     let response =
-                        call_gemini_api(fallback_model, payload, system_prompt_label).await?;
+                        call_gemini_api(fallback_model, payload.clone(), system_prompt_label)
+                            .await?;
                     Ok(extract_text_from_response(response))
                 },
             )
-            .await
-            .map_err(|fallback_err| {
-                anyhow!(
-                    "Gemini request failed on primary model '{}' and fallback model '{}'. \
-Primary error: {}. Fallback error: {}",
-                    primary_model,
-                    fallback_model,
-                    primary_err,
-                    fallback_err
-                )
-            })?;
+            .await;
+
+            let fallback_text = match fallback_text {
+                Ok(text) => text,
+                Err(fallback_err) => {
+                    return call_gemini_lite_fallback(
+                        &payload,
+                        system_prompt_label,
+                        fallback_model,
+                        &fallback_err,
+                    )
+                    .await
+                    .map_err(|lite_err| {
+                        anyhow!(
+                            "Gemini request failed on primary model '{}' and fallback model '{}'. \
+Primary error: {}. Fallback error: {}. Lite fallback error: {}",
+                            primary_model,
+                            fallback_model,
+                            primary_err,
+                            fallback_err,
+                            lite_err
+                        )
+                    });
+                }
+            };
 
             Ok(GeminiCallResult {
                 text: fallback_text,

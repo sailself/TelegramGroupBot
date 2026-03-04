@@ -1,4 +1,4 @@
-﻿use std::collections::HashSet;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -37,7 +37,8 @@ use tracing::{error, warn};
 
 const IMAGE_RESOLUTION_OPTIONS: [&str; 3] = ["2K", "4K", "1K"];
 const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 14] = [
-    "4:3", "3:4", "16:9", "9:16", "1:1", "21:9", "3:2", "2:3", "5:4", "4:5", "4:1", "1:4", "8:1", "1:8",
+    "4:3", "3:4", "16:9", "9:16", "1:1", "21:9", "3:2", "2:3", "5:4", "4:5", "4:1", "1:4", "8:1",
+    "1:8",
 ];
 const IMAGE_RESOLUTION_CALLBACK_PREFIX: &str = "image_res:";
 const IMAGE_ASPECT_RATIO_CALLBACK_PREFIX: &str = "image_aspect:";
