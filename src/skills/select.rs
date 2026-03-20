@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
 use crate::config::CONFIG;
-use crate::llm::call_gemini;
+use crate::llm::call_gemini_lite;
 use crate::skills::types::{ActiveSkillSet, SkillDoc};
 
 fn tokenize(text: &str) -> HashSet<String> {
@@ -130,15 +130,13 @@ async fn llm_select_skills(
     );
     let system_prompt = "You select the best skills for a coding agent. Return only valid JSON array like [\"skill-a\", \"skill-b\"].";
 
-    let response = call_gemini(
+    let response = call_gemini_lite(
         system_prompt,
         &selection_prompt,
-        None,
         false,
         false,
         None,
         None,
-        false,
         None,
         None,
         Some("agent_skill_selection"),
@@ -146,7 +144,7 @@ async fn llm_select_skills(
     .await;
 
     match response {
-        Ok(text) => parse_json_array_from_text(&text),
+        Ok(result) => parse_json_array_from_text(&result.text),
         Err(err) => {
             warn!("Skill selection model call failed: {}", err);
             None
@@ -172,12 +170,26 @@ pub async fn select_active_skills(
         .collect::<Vec<_>>();
 
     let heuristic_candidates = pick_heuristic_candidates(prompt, &selectable, candidate_limit);
-    let llm_selected_names = llm_select_skills(prompt, &heuristic_candidates, max_active_skills)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|name| name.trim().to_lowercase())
-        .collect::<Vec<_>>();
+    let llm_selected_names = if max_active_skills == 0 {
+        Vec::new()
+    } else if heuristic_candidates.len() <= max_active_skills {
+        debug!(
+            "Skipping LLM skill selection because heuristic candidates ({}) fit within max_active_skills ({})",
+            heuristic_candidates.len(),
+            max_active_skills
+        );
+        heuristic_candidates
+            .iter()
+            .map(|skill| skill.meta.name.to_lowercase())
+            .collect::<Vec<_>>()
+    } else {
+        llm_select_skills(prompt, &heuristic_candidates, max_active_skills)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| name.trim().to_lowercase())
+            .collect::<Vec<_>>()
+    };
 
     let candidate_map = heuristic_candidates
         .iter()

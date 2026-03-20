@@ -639,7 +639,8 @@ async fn download_image_with_content_type(url: &str, source: &str) -> Option<(Ve
                 .trim()
                 .to_ascii_lowercase()
         })
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .or_else(|| image_mime_from_url(url).map(str::to_string));
 
     let Some(content_type) = content_type else {
         warn!(
@@ -647,7 +648,7 @@ async fn download_image_with_content_type(url: &str, source: &str) -> Option<(Ve
             source = source,
             media_url = %url,
             reason = "missing_content_type",
-            "Skipping image without Content-Type"
+            "Skipping image without Content-Type or recognizable image extension"
         );
         return None;
     };

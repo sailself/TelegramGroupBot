@@ -24,6 +24,12 @@ pub struct GeminiImageConfig {
     pub image_size: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GeminiCallResult {
+    pub text: String,
+    pub model_used: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct GeminiResponse {
     candidates: Option<Vec<GeminiCandidate>>,
@@ -70,14 +76,16 @@ struct GeminiInlineData {
 #[serde(rename_all = "camelCase")]
 struct GeminiExecutableCode {
     code: Option<String>,
-    language: Option<String>,
+    #[serde(rename = "language")]
+    _language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiCodeExecutionResult {
     output: Option<String>,
-    outcome: Option<String>,
+    #[serde(rename = "outcome")]
+    _outcome: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,7 +93,8 @@ struct GeminiCodeExecutionResult {
 struct GeminiFileInfo {
     name: String,
     uri: String,
-    mime_type: Option<String>,
+    #[serde(rename = "mimeType")]
+    _mime_type: Option<String>,
     state: Option<String>,
 }
 
@@ -110,6 +119,7 @@ pub struct GeminiMediaDispatchSummary {
 }
 
 const GEMINI_MAX_RETRY_ATTEMPTS: usize = 2;
+const GEMINI_LITE_FALLBACK_MAX_ATTEMPTS: usize = 3;
 const GEMINI_RETRY_BASE_DELAY_MS: u64 = 900;
 const VEO_DEFAULT_RESOLUTION: &str = "1080p";
 const VEO_DEFAULT_DURATION_SECONDS: u32 = 8;
@@ -915,10 +925,100 @@ async fn call_gemini_api(
     }
 }
 
+async fn call_gemini_lite_fallback(
+    payload: &serde_json::Value,
+    system_prompt_label: Option<&str>,
+    previous_model: &str,
+    previous_err: &anyhow::Error,
+) -> Result<GeminiCallResult> {
+    let lite_model = CONFIG.gemini_lite_model.trim();
+    if lite_model.is_empty() {
+        return Err(anyhow!(
+            "Gemini request failed on model '{}' and GEMINI_LITE_MODEL is not configured. Previous error: {}",
+            previous_model,
+            previous_err
+        ));
+    }
+
+    if lite_model.eq_ignore_ascii_case(previous_model) {
+        return Err(anyhow!(
+            "Gemini request failed on model '{}' and GEMINI_LITE_MODEL points to the same model. Previous error: {}",
+            previous_model,
+            previous_err
+        ));
+    }
+
+    warn!(
+        "Gemini model '{}' failed after retries; trying lite fallback model '{}' for up to {} attempts: {}",
+        previous_model,
+        lite_model,
+        GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
+        previous_err
+    );
+
+    let mut last_lite_err = None;
+    for attempt in 1..=GEMINI_LITE_FALLBACK_MAX_ATTEMPTS {
+        let result = log_llm_timing(
+            "gemini",
+            lite_model,
+            "call_gemini_lite_fallback",
+            Some(json!({
+                "attempt": attempt,
+                "max_attempts": GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
+                "after_model": previous_model,
+            })),
+            || async {
+                let response =
+                    call_gemini_api(lite_model, payload.clone(), system_prompt_label).await?;
+                Ok(extract_text_from_response(response))
+            },
+        )
+        .await;
+
+        match result {
+            Ok(text) => {
+                return Ok(GeminiCallResult {
+                    text,
+                    model_used: lite_model.to_string(),
+                });
+            }
+            Err(err) => {
+                warn!(
+                    "Gemini lite fallback attempt {}/{} failed on model '{}': {}",
+                    attempt, GEMINI_LITE_FALLBACK_MAX_ATTEMPTS, lite_model, err
+                );
+                last_lite_err = Some(err);
+            }
+        }
+    }
+
+    let lite_err = last_lite_err.unwrap_or_else(|| anyhow!("Unknown Gemini lite fallback failure"));
+    Err(anyhow!(
+        "Gemini request failed on model '{}' and lite fallback model '{}' after {} attempts. Previous error: {}. Lite fallback error: {}",
+        previous_model,
+        lite_model,
+        GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
+        previous_err,
+        lite_err
+    ))
+}
+
+async fn run_gemini_text_request(
+    model: &str,
+    operation: &str,
+    payload: &serde_json::Value,
+    system_prompt_label: Option<&str>,
+) -> Result<String> {
+    log_llm_timing("gemini", model, operation, None, || async {
+        let response = call_gemini_api(model, payload.clone(), system_prompt_label).await?;
+        Ok(extract_text_from_response(response))
+    })
+    .await
+}
+
 pub async fn call_gemini(
     system_prompt: &str,
     user_content: &str,
-    response_language: Option<&str>,
     use_search_grounding: bool,
     _use_url_context: bool,
     _thinking_level: Option<&str>,
@@ -927,11 +1027,8 @@ pub async fn call_gemini(
     media_files: Option<Vec<MediaFile>>,
     youtube_urls: Option<Vec<String>>,
     system_prompt_label: Option<&str>,
-) -> Result<String> {
-    let mut content = user_content.to_string();
-    if let Some(lang) = response_language {
-        content.push_str(&format!("\n\nPlease reply in {}.", lang));
-    }
+) -> Result<GeminiCallResult> {
+    let content = user_content.to_string();
 
     let youtube_urls = youtube_urls.unwrap_or_default();
 
@@ -986,22 +1083,208 @@ pub async fn call_gemini(
         "tools": tools,
     });
 
-    let model = if use_pro_model {
+    let primary_model = if use_pro_model {
         &CONFIG.gemini_pro_model
     } else {
         &CONFIG.gemini_model
     };
-    let operation = if use_pro_model {
+    let primary_operation = if use_pro_model {
         "call_gemini_pro"
     } else {
         "call_gemini"
     };
 
-    log_llm_timing("gemini", model, operation, None, || async {
-        let response = call_gemini_api(model, payload, system_prompt_label).await?;
-        Ok(extract_text_from_response(response))
-    })
-    .await
+    let primary_attempt = run_gemini_text_request(
+        primary_model,
+        primary_operation,
+        &payload,
+        system_prompt_label,
+    )
+    .await;
+
+    match primary_attempt {
+        Ok(text) => Ok(GeminiCallResult {
+            text,
+            model_used: primary_model.to_string(),
+        }),
+        Err(primary_err) => {
+            if !use_pro_model {
+                return call_gemini_lite_fallback(
+                    &payload,
+                    system_prompt_label,
+                    primary_model,
+                    &primary_err,
+                )
+                .await;
+            }
+
+            let fallback_model = CONFIG.gemini_model.as_str();
+            warn!(
+                "Gemini Pro model '{}' failed after retries; falling back to default model '{}': {}",
+                primary_model, fallback_model, primary_err
+            );
+
+            let fallback_text = run_gemini_text_request(
+                fallback_model,
+                "call_gemini_fallback",
+                &payload,
+                system_prompt_label,
+            )
+            .await;
+
+            let fallback_text = match fallback_text {
+                Ok(text) => text,
+                Err(fallback_err) => {
+                    return call_gemini_lite_fallback(
+                        &payload,
+                        system_prompt_label,
+                        fallback_model,
+                        &fallback_err,
+                    )
+                    .await
+                    .map_err(|lite_err| {
+                        anyhow!(
+                            "Gemini request failed on primary model '{}' and fallback model '{}'. \
+Primary error: {}. Fallback error: {}. Lite fallback error: {}",
+                            primary_model,
+                            fallback_model,
+                            primary_err,
+                            fallback_err,
+                            lite_err
+                        )
+                    });
+                }
+            };
+
+            Ok(GeminiCallResult {
+                text: fallback_text,
+                model_used: fallback_model.to_string(),
+            })
+        }
+    }
+}
+
+pub async fn call_gemini_lite(
+    system_prompt: &str,
+    user_content: &str,
+    use_search_grounding: bool,
+    _use_url_context: bool,
+    _thinking_level: Option<&str>,
+    image_url: Option<&str>,
+    media_files: Option<Vec<MediaFile>>,
+    youtube_urls: Option<Vec<String>>,
+    system_prompt_label: Option<&str>,
+) -> Result<GeminiCallResult> {
+    let content = user_content.to_string();
+
+    let youtube_urls = youtube_urls.unwrap_or_default();
+
+    let mut files = media_files.unwrap_or_default();
+    if files.is_empty() {
+        if let Some(url) = image_url {
+            if let Some(data) = download_media(url).await {
+                let mime_type = detect_mime_type(&data).unwrap_or_else(|| "image/png".to_string());
+                files.push(MediaFile::new(
+                    data,
+                    mime_type.clone(),
+                    kind_for_mime(&mime_type),
+                    None,
+                ));
+            }
+        }
+    }
+
+    let has_video_or_audio = files
+        .iter()
+        .any(|file| matches!(file.kind, MediaKind::Video | MediaKind::Audio));
+
+    let uploaded_files = if files.is_empty() {
+        Vec::new()
+    } else {
+        upload_media_files(&files).await?
+    };
+
+    let text_after_media = !uploaded_files.is_empty() || !youtube_urls.is_empty();
+    let parts = build_gemini_file_parts(&content, &uploaded_files, &youtube_urls, text_after_media);
+    let tools = {
+        let mut tools = Vec::new();
+        if !has_video_or_audio && youtube_urls.is_empty() {
+            tools.push(json!({ "code_execution": {} }));
+        }
+        if use_search_grounding {
+            tools.push(json!({ "google_search": {} }));
+        }
+        tools
+    };
+
+    let payload = json!({
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "contents": [{ "role": "user", "parts": parts }],
+        "generationConfig": {
+            "temperature": CONFIG.gemini_temperature,
+            "topK": CONFIG.gemini_top_k,
+            "topP": CONFIG.gemini_top_p,
+            "maxOutputTokens": CONFIG.gemini_max_output_tokens,
+        },
+        "safetySettings": build_safety_settings(),
+        "tools": tools,
+    });
+
+    let lite_model = CONFIG.gemini_lite_model.trim();
+    let primary_model = if lite_model.is_empty() {
+        warn!("GEMINI_LITE_MODEL is empty; using GEMINI_MODEL for lite request");
+        CONFIG.gemini_model.as_str()
+    } else {
+        lite_model
+    };
+
+    let primary_attempt = run_gemini_text_request(
+        primary_model,
+        "call_gemini_lite",
+        &payload,
+        system_prompt_label,
+    )
+    .await;
+
+    match primary_attempt {
+        Ok(text) => Ok(GeminiCallResult {
+            text,
+            model_used: primary_model.to_string(),
+        }),
+        Err(primary_err) => {
+            let fallback_model = CONFIG.gemini_model.trim();
+            if fallback_model.is_empty() || fallback_model.eq_ignore_ascii_case(primary_model) {
+                return Err(primary_err);
+            }
+
+            warn!(
+                "Gemini Lite model '{}' failed after retries; falling back to default model '{}': {}",
+                primary_model, fallback_model, primary_err
+            );
+
+            let fallback_text = run_gemini_text_request(
+                fallback_model,
+                "call_gemini_lite_fallback_default",
+                &payload,
+                system_prompt_label,
+            )
+            .await
+            .map_err(|fallback_err| {
+                anyhow!(
+                    "Gemini Lite request failed on primary model '{}' and fallback model '{}'. Primary error: {}. Fallback error: {}",
+                    primary_model,
+                    fallback_model,
+                    primary_err,
+                    fallback_err
+                )
+            })?;
+
+            Ok(GeminiCallResult {
+                text: fallback_text,
+                model_used: fallback_model.to_string(),
+            })
+        }
+    }
 }
 
 pub async fn generate_image_with_gemini(
@@ -1026,7 +1309,7 @@ pub async fn generate_image_with_gemini(
     let system_instruction = base_instruction.to_string();
     let parts = build_gemini_parts(prompt, &images, None, None, &[], false);
     let mut generation_config = json!({
-        "responseModalities": ["TEXT", "IMAGE"]
+        "responseModalities": ["IMAGE"]
     });
     if let Some(image_config) = build_image_config(image_config.as_ref()) {
         if let Some(config_object) = generation_config.as_object_mut() {
@@ -1039,7 +1322,7 @@ pub async fn generate_image_with_gemini(
         "contents": [{ "role": "user", "parts": parts }],
         "generationConfig": generation_config,
         "safetySettings": build_safety_settings(),
-        "tools": [{ "google_search": {} }],
+        "tools": [{ "google_search": {"searchTypes": {"webSearch": {}, "imageSearch": {}}} }],
     });
 
     let model = &CONFIG.gemini_image_model;

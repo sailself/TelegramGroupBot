@@ -20,7 +20,7 @@ use crate::agent::types::{
     AgentOutputMedia, AgentOutputMediaKind, AgentProvider, AgentRunOutcome, PendingAgentAction,
 };
 use crate::agent::workspace::ensure_chat_workspace;
-use crate::config::CONFIG;
+use crate::config::{parse_third_party_model_id, ThirdPartyProvider, CONFIG};
 use crate::db::models::{AgentMemoryInsert, AgentMemorySearchRow};
 use crate::llm::gemini::build_gemini_user_parts_with_media;
 use crate::llm::media::{detect_mime_type, MediaFile, MediaKind};
@@ -41,17 +41,36 @@ fn resolve_agent_provider() -> AgentProvider {
     AgentProvider::from_str(&CONFIG.agent_provider)
 }
 
-fn resolve_openrouter_model() -> Result<String> {
-    if !CONFIG.agent_model.trim().is_empty() {
-        return Ok(CONFIG.agent_model.clone());
+fn normalize_openrouter_model(model: &str, source: &str) -> Result<Option<String>> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
     }
-    if !CONFIG.gpt_model.trim().is_empty() {
-        return Ok(CONFIG.gpt_model.clone());
+
+    if let Some((provider, raw_model)) = parse_third_party_model_id(trimmed) {
+        if provider != ThirdPartyProvider::OpenRouter {
+            return Err(anyhow!(
+                "{} must reference an OpenRouter model when AGENT_PROVIDER=openrouter",
+                source
+            ));
+        }
+        return Ok(Some(raw_model.to_string()));
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+fn resolve_openrouter_model() -> Result<String> {
+    if let Some(model) = normalize_openrouter_model(&CONFIG.agent_model, "AGENT_MODEL")? {
+        return Ok(model);
+    }
+    if let Some(model) = normalize_openrouter_model(&CONFIG.gpt_model, "GPT_MODEL")? {
+        return Ok(model);
     }
     if let Some(model) = CONFIG
-        .iter_openrouter_models()
+        .iter_third_party_models()
         .iter()
-        .find(|model| model.tools)
+        .find(|model| model.provider == ThirdPartyProvider::OpenRouter && model.tools)
         .map(|model| model.model.clone())
     {
         return Ok(model);
@@ -1668,4 +1687,25 @@ pub async fn cancel_pending_action(state: &AppState, pending: &PendingAgentActio
         pending.session_id, pending.tool_name
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_openrouter_model;
+
+    #[test]
+    fn normalize_openrouter_model_accepts_provider_qualified_ids() {
+        let resolved = normalize_openrouter_model("openrouter:openai/gpt-5", "AGENT_MODEL")
+            .expect("provider-qualified OpenRouter model should resolve");
+        assert_eq!(resolved.as_deref(), Some("openai/gpt-5"));
+    }
+
+    #[test]
+    fn normalize_openrouter_model_rejects_non_openrouter_provider_ids() {
+        let error = normalize_openrouter_model("nvidia:google/gemma-3n-e4b-it", "GPT_MODEL")
+            .expect_err("non-OpenRouter provider should be rejected");
+        assert!(error
+            .to_string()
+            .contains("GPT_MODEL must reference an OpenRouter model"));
+    }
 }

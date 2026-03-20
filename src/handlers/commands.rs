@@ -24,6 +24,7 @@ use crate::handlers::content::{
 };
 use crate::handlers::media::{
     collect_message_media, get_file_url, summarize_media_files, MediaCollectionOptions,
+    MediaSummary,
 };
 use crate::handlers::responses::send_response;
 use crate::llm::media::detect_mime_type;
@@ -39,8 +40,9 @@ use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::{error, warn};
 
 const IMAGE_RESOLUTION_OPTIONS: [&str; 3] = ["2K", "4K", "1K"];
-const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 10] = [
-    "4:3", "3:4", "16:9", "9:16", "1:1", "21:9", "3:2", "2:3", "5:4", "4:5",
+const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 14] = [
+    "4:3", "3:4", "16:9", "9:16", "1:1", "21:9", "3:2", "2:3", "5:4", "4:5", "4:1", "1:4", "8:1",
+    "1:8",
 ];
 const IMAGE_RESOLUTION_CALLBACK_PREFIX: &str = "image_res:";
 const IMAGE_ASPECT_RATIO_CALLBACK_PREFIX: &str = "image_aspect:";
@@ -74,6 +76,55 @@ fn message_entities_for_text(message: &Message) -> Option<Vec<MessageEntityRef<'
     } else {
         message.parse_caption_entities()
     }
+}
+
+fn build_factcheck_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    FACTCHECK_SYSTEM_PROMPT
+        .replace("{current_datetime}", &now)
+        .replace(
+            "{telegram_user_language_hint}",
+            telegram_user_language_hint.unwrap_or("unknown"),
+        )
+}
+
+fn build_factcheck_statement(
+    query_text: &str,
+    reply_text: &str,
+    media_summary: &MediaSummary,
+) -> String {
+    let query_text = query_text.trim();
+    let reply_text = reply_text.trim();
+
+    if !query_text.is_empty() && !reply_text.is_empty() {
+        return format!(
+            "<reply_context>\n{}\n</reply_context>\n\n<factcheck_target>\n{}\n</factcheck_target>",
+            reply_text, query_text
+        );
+    }
+
+    if !query_text.is_empty() {
+        return format!("<factcheck_target>\n{}\n</factcheck_target>", query_text);
+    }
+
+    if !reply_text.is_empty() {
+        return format!("<factcheck_target>\n{}\n</factcheck_target>", reply_text);
+    }
+
+    if media_summary.videos > 0 {
+        return "<auto_factcheck_target source=\"media_only\" kind=\"video\" />".to_string();
+    }
+    if media_summary.audios > 0 {
+        return "<auto_factcheck_target source=\"media_only\" kind=\"audio\" />".to_string();
+    }
+    if media_summary.images > 0 {
+        return "<auto_factcheck_target source=\"media_only\" kind=\"image\" />".to_string();
+    }
+    if media_summary.documents > 0 {
+        return "<auto_factcheck_target source=\"media_only\" kind=\"document\" />".to_string();
+    }
+
+    String::new()
 }
 
 fn escape_html(text: &str) -> String {
@@ -119,6 +170,7 @@ fn redact_sensitive_text(text: &str) -> String {
         CONFIG.bot_token.as_str(),
         CONFIG.gemini_api_key.as_str(),
         CONFIG.openrouter_api_key.as_str(),
+        CONFIG.nvidia_api_key.as_str(),
         CONFIG.jina_ai_api_key.as_str(),
         CONFIG.brave_search_api_key.as_str(),
         CONFIG.exa_api_key.as_str(),
@@ -172,7 +224,10 @@ async fn build_status_report(state: &AppState) -> String {
     let brave_ready = CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty();
     let exa_ready = CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty();
     let jina_ready = CONFIG.enable_jina_mcp;
-    let openrouter_ready = CONFIG.enable_openrouter && !CONFIG.openrouter_api_key.trim().is_empty();
+    let openrouter_ready =
+        CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenRouter);
+    let nvidia_ready =
+        CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::Nvidia);
 
     let acl_meta = acl_manager().snapshot_meta();
     let logs_ready = Path::new("logs").exists();
@@ -195,6 +250,15 @@ async fn build_status_report(state: &AppState) -> String {
     report.push_str(&format!(
         "openrouter_ready: {}\n",
         bool_label(openrouter_ready)
+    ));
+    report.push_str(&format!("nvidia_ready: {}\n", bool_label(nvidia_ready)));
+    report.push_str(&format!(
+        "third_party_models_config_path: {}\n",
+        CONFIG.third_party_models_config_path.display()
+    ));
+    report.push_str(&format!(
+        "third_party_models_count: {}\n",
+        CONFIG.iter_third_party_models().len()
     ));
     report.push_str(&format!(
         "web_search_enabled: {}\n",
@@ -273,6 +337,10 @@ async fn build_diagnose_report(state: &AppState) -> String {
     report.push_str(&format!(
         "OPENROUTER_API_KEY_present: {}\n",
         bool_label(!CONFIG.openrouter_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "NVIDIA_API_KEY_present: {}\n",
+        bool_label(!CONFIG.nvidia_api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "JINA_AI_API_KEY_present: {}\n",
@@ -1177,10 +1245,9 @@ pub async fn tldr_handler(
     }
 
     let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph_author_name);
-    let response = call_gemini(
+    let response = match call_gemini(
         &system_prompt,
         &chat_content,
-        None,
         true,
         false,
         Some(&CONFIG.gemini_thinking_level),
@@ -1190,9 +1257,27 @@ pub async fn tldr_handler(
         None,
         Some("TLDR_SYSTEM_PROMPT"),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            error!("TLDR summary generation failed: {}", err);
+            bot.edit_message_text(
+                processing_message.chat.id,
+                processing_message.id,
+                "Failed to generate a summary. Please try again later.",
+            )
+            .await?;
+            complete_command_timer(
+                &mut timer,
+                "error",
+                Some("summary_generation_failed".to_string()),
+            );
+            return Ok(());
+        }
+    };
 
-    if response.trim().is_empty() {
+    if response.text.trim().is_empty() {
         bot.edit_message_text(
             processing_message.chat.id,
             processing_message.id,
@@ -1203,8 +1288,9 @@ pub async fn tldr_handler(
         return Ok(());
     }
 
-    let summary_text = response;
-    let summary_with_model = format!("{}\n\n_Model: {}_", summary_text, CONFIG.gemini_pro_model);
+    let summary_text = response.text;
+    let summary_model = response.model_used;
+    let summary_with_model = format!("{}\n\nModel: {}", summary_text, summary_model);
 
     let _ = bot
         .edit_message_text(
@@ -1225,7 +1311,7 @@ Use the same language as the summary text for any labels.\
     let mut infographic_url = None;
     let infographic_config = Some(GeminiImageConfig {
         aspect_ratio: Some("16:9".to_string()),
-        image_size: Some("2K".to_string()),
+        image_size: Some("4K".to_string()),
     });
     match generate_image_with_gemini(&infographic_prompt, &[], infographic_config, false).await {
         Ok(images) => {
@@ -1259,15 +1345,18 @@ Use the same language as the summary text for any labels.\
     let mut telegraph_url = None;
     if let Some(url) = &infographic_url {
         let telegraph_content = format!(
-            "![Infographic]({})\n\n{}\n\n_Model: {}_",
-            url, summary_text, CONFIG.gemini_pro_model
+            "![Infographic]({})\n\n{}\n\nModel: {}",
+            url, summary_text, summary_model
         );
         telegraph_url =
             create_telegraph_page("Message Summary with Infographic", &telegraph_content).await;
     }
 
     let final_message = if let Some(url) = telegraph_url {
-        format!("Chat summary with infographic: [View it here]({})", url)
+        format!(
+            "Chat summary with infographic: [View it here]({})\n\nModel: {}",
+            url, summary_model
+        )
     } else if let Some(url) = infographic_url {
         format!("{}\n\nInfographic: {}", summary_with_model, url)
     } else {
@@ -1325,6 +1414,10 @@ pub async fn factcheck_handler(
     let reply_message = message.reply_to_message();
     let mut query_text = query.unwrap_or_default();
     let query_entities = message_entities_for_text(&message);
+    let user_language_code = message
+        .from
+        .as_ref()
+        .and_then(|user| user.language_code.as_deref());
     let mut telegraph_contents = Vec::new();
     let mut twitter_contents = Vec::new();
 
@@ -1362,17 +1455,6 @@ pub async fn factcheck_handler(
         query_text = query_text_processed;
     }
 
-    let mut statement = if query_text.trim().is_empty() {
-        reply_text.clone()
-    } else if reply_text.trim().is_empty() {
-        query_text
-    } else {
-        format!(
-            "Context from replied message: \"{}\"\n\nStatement: {}",
-            reply_text, query_text
-        )
-    };
-
     let mut media_options = MediaCollectionOptions::for_commands();
     media_options.include_reply = true;
     let max_files = media_options.max_files;
@@ -1395,29 +1477,13 @@ pub async fn factcheck_handler(
     }
 
     let media_summary = summarize_media_files(&media_files);
+    let statement = build_factcheck_statement(&query_text, &reply_text, &media_summary);
 
     if statement.trim().is_empty() {
-        if media_summary.videos > 0 {
-            statement =
-                "Please analyze this video and fact-check any claims or content shown in it."
-                    .to_string();
-        } else if media_summary.audios > 0 {
-            statement =
-                "Please analyze this audio and fact-check any claims or content shown in it."
-                    .to_string();
-        } else if media_summary.images > 0 {
-            statement =
-                "Please analyze these images and fact-check any claims or content shown in them."
-                    .to_string();
-        } else if media_summary.documents > 0 {
-            statement = "Please analyze these documents and fact-check any claims or content shown in them."
-                .to_string();
-        } else {
-            bot.send_message(message.chat.id, "Please reply to a message to fact-check.")
-                .reply_parameters(ReplyParameters::new(message.id))
-                .await?;
-            return Ok(());
-        }
+        bot.send_message(message.chat.id, "Please reply to a message to fact-check.")
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await?;
+        return Ok(());
     }
 
     let mut processing_message_text = if media_summary.videos > 0 {
@@ -1520,12 +1586,10 @@ pub async fn factcheck_handler(
         .await?;
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let system_prompt = FACTCHECK_SYSTEM_PROMPT.replace("{current_datetime}", &now);
-    let response = call_gemini(
+    let system_prompt = build_factcheck_system_prompt(user_language_code);
+    let response = match call_gemini(
         &system_prompt,
         &statement,
-        None,
         true,
         false,
         Some(&CONFIG.gemini_thinking_level),
@@ -1535,13 +1599,28 @@ pub async fn factcheck_handler(
         None,
         Some("FACTCHECK_SYSTEM_PROMPT"),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            error!("Fact-check generation failed: {}", err);
+            bot.edit_message_text(
+                processing_message.chat.id,
+                processing_message.id,
+                "Failed to fact-check this message. Please try again later.",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let response_with_model = format!("{}\n\nModel: {}", response.text, response.model_used);
 
     send_response(
         &bot,
         processing_message.chat.id,
         processing_message.id,
-        &response,
+        &response_with_model,
         "Fact Check",
         ParseMode::Markdown,
     )
@@ -1626,7 +1705,6 @@ pub async fn profileme_handler(
     let response = call_gemini(
         &system_prompt,
         &formatted_history,
-        None,
         false,
         false,
         Some(&CONFIG.gemini_thinking_level),
@@ -1642,7 +1720,7 @@ pub async fn profileme_handler(
         &bot,
         processing_message.chat.id,
         processing_message.id,
-        &response,
+        &response.text,
         "Your User Profile",
         ParseMode::Markdown,
     )
@@ -1719,7 +1797,6 @@ pub async fn paintme_handler(
     let prompt = call_gemini(
         prompt_system,
         &formatted_history,
-        None,
         false,
         false,
         Some(&CONFIG.gemini_thinking_level),
@@ -1733,7 +1810,8 @@ pub async fn paintme_handler(
             "PAINTME_SYSTEM_PROMPT"
         }),
     )
-    .await?;
+    .await?
+    .text;
     drop(typing_chat_action);
 
     let status_text = if portrait {

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::CONFIG;
 
@@ -28,6 +28,15 @@ fn section(title: &str, body: &str) -> String {
     format!("{}\n{}\n", title, body)
 }
 
+fn load_optional_file_from_candidates(paths: &[PathBuf]) -> Option<(PathBuf, String)> {
+    for path in paths {
+        if let Some(content) = load_optional_file(path) {
+            return Some((path.clone(), content));
+        }
+    }
+    None
+}
+
 pub fn build_agent_system_prompt(
     workspace_root: &Path,
     skill_index: &str,
@@ -52,6 +61,21 @@ pub fn build_agent_system_prompt(
         let body = load_optional_file(&path)
             .unwrap_or_else(|| "AGENTS.md not found in workspace root.".to_string());
         sections.push(section("Workspace agent guidelines (AGENTS.md):", &body));
+    }
+
+    let program_candidates = [
+        workspace_root.join("program.md"),
+        workspace_root.join("PROGRAM.md"),
+    ];
+    if let Some((path, body)) = load_optional_file_from_candidates(&program_candidates) {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("program.md");
+        sections.push(section(
+            &format!("Workspace runbook ({}):", file_name),
+            &body,
+        ));
     }
 
     if CONFIG.agent_prompt_include_memory_md {

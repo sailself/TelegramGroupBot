@@ -8,7 +8,9 @@ use teloxide::types::{
 };
 use teloxide::RequestError;
 
-use crate::config::{CONFIG, Q_SYSTEM_PROMPT};
+use crate::config::{
+    parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG, Q_SYSTEM_PROMPT,
+};
 use crate::db::database::build_message_insert;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::content::{
@@ -20,9 +22,8 @@ use crate::handlers::media::{
 };
 use crate::handlers::responses::send_response;
 use crate::llm::media::MediaKind;
-use crate::llm::{call_gemini, call_openrouter};
+use crate::llm::{call_gemini, call_third_party};
 use crate::state::{AppState, PendingQRequest};
-use crate::utils::language::detect_language_or_fallback;
 use crate::utils::telegram::start_chat_action_heartbeat;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::warn;
@@ -181,28 +182,57 @@ fn truncate_for_user(text: &str, limit: usize) -> String {
     format!("{truncated}...")
 }
 
-fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
-    let display_model = if model_name == MODEL_GEMINI {
-        "Gemini"
+fn third_party_provider_label(provider: ThirdPartyProvider) -> &'static str {
+    match provider {
+        ThirdPartyProvider::OpenRouter => "OpenRouter",
+        ThirdPartyProvider::Nvidia => "NVIDIA",
+    }
+}
+
+fn configured_model_display_name(model_name: &str) -> String {
+    if model_name == MODEL_GEMINI {
+        "Gemini".to_string()
     } else {
-        model_name
-    };
+        CONFIG
+            .get_third_party_model_config(model_name)
+            .map(|config| config.name.clone())
+            .unwrap_or_else(|| model_name.to_string())
+    }
+}
+
+fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
+    let display_model = configured_model_display_name(model_name);
+    let provider = CONFIG
+        .get_third_party_model_config(model_name)
+        .map(|config| third_party_provider_label(config.provider));
     let err_text = err.to_string();
 
-    let friendly = if err_text.contains("OpenRouter request failed") {
-        if err_text.contains("status 404") || err_text.contains("404 Not Found") {
-            format!(
-                "Sorry, {display_model} is unavailable on OpenRouter right now. Please pick another model or try again later."
-            )
-        } else {
-            format!(
-                "Sorry, {display_model} returned an OpenRouter error. Please try again later or choose another model."
-            )
+    let friendly = match provider {
+        Some("OpenRouter") if err_text.contains("OpenRouter request failed") => {
+            if err_text.contains("status 404") || err_text.contains("404 Not Found") {
+                format!(
+                    "Sorry, {display_model} is unavailable on OpenRouter right now. Please pick another model or try again later."
+                )
+            } else {
+                format!(
+                    "Sorry, {display_model} returned an OpenRouter error. Please try again later or choose another model."
+                )
+            }
         }
-    } else {
-        format!(
+        Some("NVIDIA") if err_text.contains("NVIDIA request failed") => {
+            if err_text.contains("status 404") || err_text.contains("404 Not Found") {
+                format!(
+                    "Sorry, {display_model} is unavailable on NVIDIA right now. Please pick another model or try again later."
+                )
+            } else {
+                format!(
+                    "Sorry, {display_model} returned an NVIDIA error. Please try again later or choose another model."
+                )
+            }
+        }
+        _ => format!(
             "Sorry, I couldn't process your request with {display_model}. Please try again later."
-        )
+        ),
     };
 
     let detail = truncate_for_user(&err_text, USER_ERROR_DETAIL_LIMIT);
@@ -259,8 +289,48 @@ async fn send_message_with_retry(
     Err(last_err.expect("send_message retry exhausted").into())
 }
 
-fn resolve_alias_to_model_id(alias: &str) -> Option<String> {
-    let alias = alias.trim().to_lowercase();
+fn resolve_exact_model_identifier_with_models(
+    identifier: &str,
+    models: &[ThirdPartyModelConfig],
+) -> Option<String> {
+    let trimmed = identifier.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.eq_ignore_ascii_case(MODEL_GEMINI) {
+        return Some(MODEL_GEMINI.to_string());
+    }
+
+    if let Some((provider, model)) = parse_third_party_model_id(trimmed) {
+        let qualified = format!("{}:{}", provider.as_str(), model);
+        return models
+            .iter()
+            .any(|config| config.id == qualified)
+            .then_some(qualified);
+    }
+
+    let exact_matches = models
+        .iter()
+        .filter(|config| config.model == trimmed)
+        .collect::<Vec<_>>();
+    if exact_matches.len() == 1 {
+        return Some(exact_matches[0].id.clone());
+    }
+
+    None
+}
+
+fn resolve_alias_to_model_id_with_models(
+    identifier: &str,
+    models: &[ThirdPartyModelConfig],
+    alias_map: &[(&str, &str)],
+) -> Option<String> {
+    if let Some(exact) = resolve_exact_model_identifier_with_models(identifier, models) {
+        return Some(exact);
+    }
+
+    let alias = identifier.trim().to_lowercase();
     if alias.is_empty() {
         return None;
     }
@@ -268,31 +338,37 @@ fn resolve_alias_to_model_id(alias: &str) -> Option<String> {
         return Some(MODEL_GEMINI.to_string());
     }
 
-    let mapping = [
-        ("llama", &CONFIG.llama_model),
-        ("grok", &CONFIG.grok_model),
-        ("qwen", &CONFIG.qwen_model),
-        ("deepseek", &CONFIG.deepseek_model),
-        ("gpt", &CONFIG.gpt_model),
-    ];
-
-    for (token, model) in mapping {
-        if alias == token && !model.trim().is_empty() {
-            return Some(model.clone());
+    for (token, model) in alias_map {
+        if alias == *token && !model.trim().is_empty() {
+            return Some((*model).to_string());
         }
     }
 
-    for config in CONFIG.iter_openrouter_models() {
-        let haystack = format!("{} {}", config.name, config.model).to_lowercase();
-        if haystack.contains(&alias) {
-            return Some(config.model.clone());
-        }
+    let fuzzy_matches = models
+        .iter()
+        .filter(|config| {
+            let haystack = format!(
+                "{} {} {}",
+                config.provider.as_str(),
+                config.name,
+                config.model
+            )
+            .to_lowercase();
+            haystack.contains(&alias)
+        })
+        .collect::<Vec<_>>();
+    if fuzzy_matches.len() == 1 {
+        return Some(fuzzy_matches[0].id.clone());
     }
 
     None
 }
 
-fn normalize_model_identifier(identifier: &str) -> String {
+fn normalize_model_identifier_with_models(
+    identifier: &str,
+    models: &[ThirdPartyModelConfig],
+    alias_map: &[(&str, &str)],
+) -> String {
     let stripped = identifier.trim();
     if stripped.is_empty() {
         return MODEL_GEMINI.to_string();
@@ -301,19 +377,30 @@ fn normalize_model_identifier(identifier: &str) -> String {
         return MODEL_GEMINI.to_string();
     }
 
-    if let Some(resolved) = resolve_alias_to_model_id(stripped) {
-        return resolved;
-    }
-
-    if CONFIG.get_openrouter_model_config(stripped).is_some() {
-        return stripped.to_string();
-    }
-
-    stripped.to_string()
+    resolve_alias_to_model_id_with_models(stripped, models, alias_map)
+        .unwrap_or_else(|| stripped.to_string())
 }
 
-fn is_openrouter_available() -> bool {
-    CONFIG.enable_openrouter && !CONFIG.openrouter_api_key.trim().is_empty()
+fn normalize_model_identifier(identifier: &str) -> String {
+    let mapping = [
+        ("llama", CONFIG.llama_model.as_str()),
+        ("grok", CONFIG.grok_model.as_str()),
+        ("qwen", CONFIG.qwen_model.as_str()),
+        ("deepseek", CONFIG.deepseek_model.as_str()),
+        ("gpt", CONFIG.gpt_model.as_str()),
+    ];
+    normalize_model_identifier_with_models(identifier, CONFIG.iter_third_party_models(), &mapping)
+}
+
+fn is_third_party_model_available(config: &ThirdPartyModelConfig) -> bool {
+    CONFIG.is_third_party_provider_ready(config.provider)
+}
+
+fn has_available_third_party_models() -> bool {
+    CONFIG
+        .iter_third_party_models()
+        .iter()
+        .any(is_third_party_model_available)
 }
 
 fn is_model_configured(model_key: &str) -> bool {
@@ -321,7 +408,7 @@ fn is_model_configured(model_key: &str) -> bool {
     if normalized == MODEL_GEMINI {
         return true;
     }
-    CONFIG.get_openrouter_model_config(&normalized).is_some()
+    CONFIG.get_third_party_model_config(&normalized).is_some()
 }
 
 fn model_supports_media(
@@ -338,9 +425,12 @@ fn model_supports_media(
         return false;
     }
 
-    let Some(config) = CONFIG.get_openrouter_model_config(model_name) else {
+    let Some(config) = CONFIG.get_third_party_model_config(model_name) else {
         return false;
     };
+    if !is_third_party_model_available(config) {
+        return false;
+    }
     if has_images && !config.image {
         return false;
     }
@@ -366,9 +456,12 @@ pub fn create_model_selection_keyboard(
     );
 
     let mut first_row = vec![gemini_button];
-    let mut openrouter_buttons = Vec::new();
+    let mut third_party_buttons = Vec::new();
 
-    for config in CONFIG.iter_openrouter_models() {
+    for config in CONFIG.iter_third_party_models() {
+        if !is_third_party_model_available(config) {
+            continue;
+        }
         if has_documents {
             continue;
         }
@@ -382,33 +475,34 @@ pub fn create_model_selection_keyboard(
             continue;
         }
 
-        let model_identifier = config.model.trim();
+        let model_identifier = config.id.trim();
         if model_identifier.is_empty() {
             continue;
         }
-        openrouter_buttons.push(InlineKeyboardButton::callback(
+        third_party_buttons.push(InlineKeyboardButton::callback(
             config.name.clone(),
             format!("{}{}", MODEL_CALLBACK_PREFIX, model_identifier),
         ));
     }
 
-    if !openrouter_buttons.is_empty() {
-        first_row.push(openrouter_buttons.remove(0));
+    if !third_party_buttons.is_empty() {
+        first_row.push(third_party_buttons.remove(0));
     }
     keyboard.push(first_row);
 
-    for chunk in openrouter_buttons.chunks(2) {
+    for chunk in third_party_buttons.chunks(2) {
         keyboard.push(chunk.to_vec());
     }
 
     InlineKeyboardMarkup::new(keyboard)
 }
 
-fn build_system_prompt(language: &str) -> String {
+fn build_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    Q_SYSTEM_PROMPT
-        .replace("{current_datetime}", &now)
-        .replace("{language}", language)
+    Q_SYSTEM_PROMPT.replace("{current_datetime}", &now).replace(
+        "{telegram_user_language_hint}",
+        telegram_user_language_hint.unwrap_or("unknown"),
+    )
 }
 
 #[allow(deprecated)]
@@ -418,7 +512,7 @@ async fn process_request(
     request: PendingQRequest,
     model_name: &str,
 ) -> Result<()> {
-    let system_prompt = build_system_prompt(&request.language);
+    let system_prompt = build_system_prompt(request.telegram_language_code.as_deref());
 
     let mut query = request.query.clone();
     for content in &request.telegraph_contents {
@@ -434,7 +528,7 @@ async fn process_request(
         true
     } else {
         CONFIG
-            .get_openrouter_model_config(model_name)
+            .get_third_party_model_config(model_name)
             .map(|config| config.tools)
             .unwrap_or(false)
     };
@@ -447,7 +541,6 @@ async fn process_request(
         call_gemini(
             &system_prompt,
             &query,
-            Some(&request.language),
             true,
             false,
             Some(&CONFIG.gemini_thinking_level),
@@ -458,6 +551,7 @@ async fn process_request(
             Some("Q_SYSTEM_PROMPT"),
         )
         .await
+        .map(|result| (result.text, Some(result.model_used)))
     } else {
         let image_data_list: Vec<Vec<u8>> = request
             .media_files
@@ -465,7 +559,7 @@ async fn process_request(
             .filter(|file| file.kind == MediaKind::Image)
             .map(|file| file.bytes.clone())
             .collect();
-        call_openrouter(
+        call_third_party(
             &system_prompt,
             &query,
             model_name,
@@ -474,8 +568,9 @@ async fn process_request(
             supports_tools,
         )
         .await
+        .map(|result| (result, None))
     };
-    let response = match response {
+    let (response, gemini_model_used) = match response {
         Ok(response) => response,
         Err(err) => {
             let message = format_llm_error_message(model_name, &err);
@@ -498,13 +593,14 @@ async fn process_request(
     let mut response_text = response;
     if !model_name.is_empty() {
         let display_model = if model_name == MODEL_GEMINI {
-            if !request.media_files.is_empty() || !request.youtube_urls.is_empty() {
-                CONFIG.gemini_pro_model.as_str()
-            } else {
-                CONFIG.gemini_model.as_str()
-            }
+            gemini_model_used
+                .as_deref()
+                .unwrap_or(CONFIG.gemini_model.as_str())
+                .to_string()
+        } else if let Some(config) = CONFIG.get_third_party_model_config(model_name) {
+            config.model.clone()
         } else {
-            model_name
+            model_name.to_string()
         };
         response_text.push_str(&format!("\n\nModel: {}", display_model));
     }
@@ -520,6 +616,84 @@ async fn process_request(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPartyModelConfig {
+        ThirdPartyModelConfig {
+            id: format!("{}:{}", provider.as_str(), raw_model),
+            provider,
+            name: name.to_string(),
+            model: raw_model.to_string(),
+            image: false,
+            video: false,
+            audio: false,
+            tools: true,
+        }
+    }
+
+    #[test]
+    fn normalize_model_identifier_prefers_alias_mapping() {
+        let models = vec![
+            model(
+                ThirdPartyProvider::OpenRouter,
+                "Qwen 3",
+                "qwen/qwen3-next-80b-a3b-instruct:free",
+            ),
+            model(
+                ThirdPartyProvider::Nvidia,
+                "Gemma 3n",
+                "google/gemma-3n-e4b-it",
+            ),
+        ];
+        let aliases = [
+            ("llama", ""),
+            ("grok", ""),
+            ("qwen", "openrouter:qwen/qwen3-next-80b-a3b-instruct:free"),
+            ("deepseek", ""),
+            ("gpt", ""),
+        ];
+
+        assert_eq!(
+            normalize_model_identifier_with_models("qwen", &models, &aliases),
+            "openrouter:qwen/qwen3-next-80b-a3b-instruct:free"
+        );
+        assert_eq!(
+            normalize_model_identifier_with_models("google/gemma-3n-e4b-it", &models, &aliases),
+            "nvidia:google/gemma-3n-e4b-it"
+        );
+    }
+
+    #[test]
+    fn normalize_model_identifier_keeps_ambiguous_raw_model_ids_unqualified() {
+        let models = vec![
+            model(ThirdPartyProvider::OpenRouter, "Shared OR", "shared/model"),
+            model(ThirdPartyProvider::Nvidia, "Shared NV", "shared/model"),
+        ];
+        let aliases = [
+            ("llama", ""),
+            ("grok", ""),
+            ("qwen", ""),
+            ("deepseek", ""),
+            ("gpt", ""),
+        ];
+
+        assert_eq!(
+            normalize_model_identifier_with_models("shared/model", &models, &aliases),
+            "shared/model"
+        );
+        assert_eq!(
+            normalize_model_identifier_with_models("nvidia:shared/model", &models, &aliases),
+            "nvidia:shared/model"
+        );
+        assert_eq!(
+            normalize_model_identifier_with_models("openrouter:shared/model", &models, &aliases),
+            "openrouter:shared/model"
+        );
+    }
 }
 
 #[allow(deprecated)]
@@ -632,11 +806,6 @@ pub async fn q_handler(
         .from
         .as_ref()
         .and_then(|user| user.language_code.as_deref());
-    let language = detect_language_or_fallback(
-        &[&original_query, &query_text, &reply_text],
-        user_language_code,
-        "Chinese",
-    );
 
     let username = message
         .from
@@ -690,8 +859,8 @@ pub async fn q_handler(
         || has_audio
         || has_documents
         || !youtube_urls.is_empty()
-        || !is_openrouter_available()
-        || CONFIG.iter_openrouter_models().is_empty();
+        || !has_available_third_party_models()
+        || CONFIG.iter_third_party_models().is_empty();
     if must_use_gemini {
         let processing_message_text = if has_video {
             "Analyzing video and processing your question...".to_string()
@@ -738,9 +907,8 @@ pub async fn q_handler(
             media_summary.total > 0 || !youtube_urls.is_empty()
         };
         let response = call_gemini(
-            &build_system_prompt(&language),
+            &build_system_prompt(user_language_code),
             &query_text,
-            Some(&language),
             true,
             false,
             Some(&CONFIG.gemini_thinking_level),
@@ -752,7 +920,7 @@ pub async fn q_handler(
         )
         .await;
         let response = match response {
-            Ok(response) => response,
+            Ok(response) => response.text,
             Err(err) => {
                 let message = format_llm_error_message(MODEL_GEMINI, &err);
                 bot.edit_message_text(processing_message.chat.id, processing_message.id, message)
@@ -800,7 +968,7 @@ pub async fn q_handler(
         query: query_text.clone(),
         original_query: original_query.clone(),
         db_query_text: db_query_text.clone(),
-        language: language.clone(),
+        telegram_language_code: user_language_code.map(str::to_string),
         media_files,
         youtube_urls,
         telegraph_contents: telegraph_contents
@@ -843,7 +1011,7 @@ pub async fn q_handler(
             },
             db_query_text
         )),
-        Some(language),
+        None,
         message.date,
         message.reply_to_message().map(|msg| msg.id.0 as i64),
         Some(message.chat.id.0),
