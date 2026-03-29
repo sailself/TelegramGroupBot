@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Group Helper Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/opt/telegram_chat_bot
+ExecStart=/opt/telegram_chat_bot/target/release/telegram_group_helper_bot
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

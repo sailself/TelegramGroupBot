@@ -3,6 +3,7 @@ target/
 *.db
 *.lock
 logs/
+run/
 agent_logs/
 feature_plans/
 whitelist.txt

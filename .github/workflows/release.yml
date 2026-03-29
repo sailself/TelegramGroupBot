@@ -1,0 +1,144 @@
+name: Release Artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  BINARY_NAME: telegram_group_helper_bot
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  RUSTFLAGS: -C debuginfo=0
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_name: telegram_group_helper_bot-linux-x86_64.tar.gz
+            artifact_name: telegram_group_helper_bot-linux-x86_64
+            deploy_archive_name: telegram_group_helper_bot-linux-x86_64-deploy.tar.gz
+            deploy_artifact_name: telegram_group_helper_bot-linux-x86_64-deploy
+            deploy_dir_name: telegram_group_helper_bot-linux-x86_64-deploy
+          - label: Windows x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_name: telegram_group_helper_bot-windows-x86_64.zip
+            artifact_name: telegram_group_helper_bot-windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-release-
+            ${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package Linux bundle
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          install -m 755 "target/${{ matrix.target }}/release/${BINARY_NAME}" "dist/package/${BINARY_NAME}"
+          cp README.md dist/package/
+          cp .env.example dist/package/
+          cp deploy/telegram_group_helper_bot.service dist/package/
+          tar -czf "dist/${{ matrix.archive_name }}" -C dist/package .
+          sha256sum "dist/${{ matrix.archive_name }}" > "dist/${{ matrix.archive_name }}.sha256"
+
+      - name: Package Linux deploy bundle
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root="dist/${{ matrix.deploy_dir_name }}"
+          mkdir -p "${bundle_root}/target/release" "${bundle_root}/deploy"
+          install -m 755 "target/${{ matrix.target }}/release/${BINARY_NAME}" "${bundle_root}/target/release/${BINARY_NAME}"
+          cp README.md "${bundle_root}/"
+          cp .env.example "${bundle_root}/"
+          cp deploy/telegram_group_helper_bot.service "${bundle_root}/deploy/"
+          install -m 755 deploy/install_release_bundle.sh "${bundle_root}/deploy/install_release_bundle.sh"
+          tar -czf "dist/${{ matrix.deploy_archive_name }}" -C dist "${{ matrix.deploy_dir_name }}"
+          sha256sum "dist/${{ matrix.deploy_archive_name }}" > "dist/${{ matrix.deploy_archive_name }}.sha256"
+
+      - name: Package Windows bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist/package -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" dist/package/
+          Copy-Item README.md dist/package/
+          Copy-Item .env.example dist/package/
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/${{ matrix.archive_name }}" -Force
+          $hash = (Get-FileHash "dist/${{ matrix.archive_name }}" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "dist/${{ matrix.archive_name }}.sha256" -Value "$hash  ${{ matrix.archive_name }}"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            dist/${{ matrix.archive_name }}
+            dist/${{ matrix.archive_name }}.sha256
+          if-no-files-found: error
+
+      - name: Upload Linux deploy bundle artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.deploy_artifact_name }}
+          path: |
+            dist/${{ matrix.deploy_archive_name }}
+            dist/${{ matrix.deploy_archive_name }}.sha256
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: telegram_group_helper_bot-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256

@@ -60,6 +60,90 @@ cargo build --release
 ./target/release/telegram_group_helper_bot
 ```
 
+## Deploy on a Linux server
+If you still deploy from source on the server, use the bundled helper instead of typing the full sequence each time:
+
+```bash
+chmod +x scripts/deploy_release.sh
+./scripts/deploy_release.sh
+```
+
+What it does:
+- runs `git pull --ff-only` on the current branch when `.git/` is present
+- builds with `CARGO_BUILD_JOBS=1` by default
+- sets `RUSTFLAGS="-C debuginfo=0"` unless you already exported `RUSTFLAGS`
+- stops the previous bot process using `run/telegram_group_helper_bot.pid`
+- starts the new release binary with `nohup` and appends stdout/stderr to `logs/nohup.bot.log`
+
+Useful overrides:
+
+```bash
+SKIP_GIT_PULL=1 ./scripts/deploy_release.sh
+SKIP_BUILD=1 ./scripts/deploy_release.sh
+SKIP_RESTART=1 ./scripts/deploy_release.sh
+CARGO_BUILD_JOBS=2 ./scripts/deploy_release.sh
+```
+
+The script assumes the bot runs from the repo root so relative paths like `.env`, `logs/`, and SQLite files keep working.
+
+### Recommended: run it with systemd
+`nohup` works, but `systemd` is the safer production default because it handles restart policy, boot startup, and process supervision correctly.
+
+Use the template at `deploy/telegram_group_helper_bot.service` and adjust:
+- `User`
+- `WorkingDirectory`
+- `ExecStart`
+
+Example install flow:
+
+```bash
+sudo cp deploy/telegram_group_helper_bot.service /etc/systemd/system/telegram_group_helper_bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable telegram_group_helper_bot
+sudo systemctl start telegram_group_helper_bot
+sudo systemctl status telegram_group_helper_bot
+```
+
+### GitHub Actions release artifacts
+The repo now includes a release workflow at `.github/workflows/release.yml`.
+
+How it works:
+- `workflow_dispatch` builds downloadable GitHub Actions artifacts
+- pushing a tag like `v0.1.0` builds artifacts and publishes them to a GitHub Release
+- both Linux and Windows bundles are produced
+
+Artifact contents:
+- Linux: `telegram_group_helper_bot`, `README.md`, `.env.example`, `deploy/telegram_group_helper_bot.service`
+- Linux deploy bundle: full release layout with `target/release/telegram_group_helper_bot`, `deploy/install_release_bundle.sh`, and the systemd template
+- Windows: `telegram_group_helper_bot.exe`, `README.md`, `.env.example`
+
+The generated asset names are:
+- `telegram_group_helper_bot-linux-x86_64.tar.gz`
+- `telegram_group_helper_bot-linux-x86_64-deploy.tar.gz`
+- `telegram_group_helper_bot-windows-x86_64.zip`
+- matching `.sha256` checksum files for each archive
+
+Example server install from the deploy bundle:
+
+```bash
+tar -xzf telegram_group_helper_bot-linux-x86_64-deploy.tar.gz
+cd telegram_group_helper_bot-linux-x86_64-deploy
+sudo SERVICE_USER=telegrambot APP_DIR=/opt/telegram_chat_bot ./deploy/install_release_bundle.sh
+if [ ! -f /opt/telegram_chat_bot/.env ]; then sudo cp /opt/telegram_chat_bot/.env.example /opt/telegram_chat_bot/.env; fi
+sudo editor /opt/telegram_chat_bot/.env
+sudo systemctl restart telegram_group_helper_bot
+sudo systemctl status telegram_group_helper_bot
+```
+
+On upgrades, keep the existing `.env` and just rerun the installer against the new extracted bundle.
+
+Example release flow:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Run the bot (Docker)
 ```bash
 docker build -t telegram-group-helper-bot .
