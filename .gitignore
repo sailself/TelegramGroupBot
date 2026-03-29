@@ -2,6 +2,7 @@ target/
 .env
 *.db
 *.lock
+!Cargo.lock
 logs/
 run/
 agent_logs/
