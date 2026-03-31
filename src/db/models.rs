@@ -55,3 +55,69 @@ pub struct ChatSearchHit {
     pub is_synthetic_record: bool,
     pub match_stage: SearchMatchStage,
 }
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct LlmInvocationRow {
+    pub id: i64,
+    pub trigger_kind: String,
+    pub trigger_name: String,
+    pub chat_id: i64,
+    pub user_id: Option<i64>,
+    pub username: Option<String>,
+    pub message_id: i64,
+    pub reply_to_message_id: Option<i64>,
+    pub message_text: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmInvocationInsert {
+    pub trigger_kind: String,
+    pub trigger_name: String,
+    pub chat_id: i64,
+    pub user_id: Option<i64>,
+    pub username: Option<String>,
+    pub message_id: i64,
+    pub reply_to_message_id: Option<i64>,
+    pub message_text: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct LlmRequestRow {
+    pub id: i64,
+    pub invocation_id: i64,
+    pub provider: String,
+    pub model: String,
+    pub operation: String,
+    pub response_id: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub duration_ms: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub raw_usage_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmRequestInsert {
+    pub invocation_id: i64,
+    pub provider: String,
+    pub model: String,
+    pub operation: String,
+    pub response_id: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub duration_ms: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub raw_usage_json: Option<String>,
+}

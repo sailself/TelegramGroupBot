@@ -23,6 +23,10 @@ use crate::handlers::media::{
     collect_message_media, summarize_media_files, MediaCollectionOptions,
 };
 use crate::handlers::responses::send_response;
+use crate::llm::audit::{
+    audit_context_from_id, create_audit_context_from_message, LlmAuditContext,
+    LLM_TRIGGER_KIND_AUTO_Q, LLM_TRIGGER_KIND_COMMAND,
+};
 use crate::llm::media::MediaKind;
 use crate::llm::runtime_models::{
     codex_selected_model_label, is_runtime_provider_ready, resolve_runtime_model_identifier,
@@ -196,6 +200,23 @@ fn truncate_for_user(text: &str, limit: usize) -> String {
     }
     let truncated: String = text.chars().take(limit).collect();
     format!("{truncated}...")
+}
+
+async fn create_q_audit_context(
+    state: &AppState,
+    message: &Message,
+    command_name: &str,
+) -> Option<LlmAuditContext> {
+    let trigger_kind = if message_text_or_caption(message)
+        .map(|text| text.trim_start().starts_with('/'))
+        .unwrap_or(false)
+    {
+        LLM_TRIGGER_KIND_COMMAND
+    } else {
+        LLM_TRIGGER_KIND_AUTO_Q
+    };
+
+    create_audit_context_from_message(&state.db, trigger_kind, command_name, message).await
 }
 
 fn third_party_provider_label(provider: ThirdPartyProvider) -> &'static str {
@@ -823,6 +844,7 @@ async fn process_request(
     request: PendingQRequest,
     model_name: &str,
 ) -> Result<()> {
+    let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
     if request.mode == QaCommandMode::ChatContext && !state.db.is_search_ready() {
         bot.edit_message_text(
             ChatId(request.chat_id),
@@ -903,6 +925,7 @@ async fn process_request(
                     Some(request.media_files.clone()),
                     Some(request.youtube_urls.clone()),
                     Some("Q_SYSTEM_PROMPT"),
+                    audit_context.as_ref(),
                 )
                 .await
                 .map(|result| (result.text, Some(result.model_used)))
@@ -920,6 +943,7 @@ async fn process_request(
                     "Answer to Your Question",
                     &image_data_list,
                     supports_tools,
+                    audit_context.as_ref(),
                 )
                 .await
                 .map(|result| (result, None))
@@ -938,6 +962,7 @@ async fn process_request(
                     Some(request.youtube_urls.clone()),
                     Some("QC_SYSTEM_PROMPT"),
                     None,
+                    audit_context.as_ref(),
                 )
                 .await
                 .map(|result| (result.text, Some(result.model_used)))
@@ -955,6 +980,7 @@ async fn process_request(
                     "Answer about Chat",
                     &image_data_list,
                     &mut runtime,
+                    audit_context.as_ref(),
                 )
                 .await
                 .map(|result| (result, None))
@@ -1336,6 +1362,7 @@ async fn q_handler_internal(
         let twitter_files = download_twitter_media(&twitter_contents, remaining).await;
         media_files.extend(twitter_files);
     }
+    let audit_context = create_q_audit_context(&state, &message, command_name).await;
 
     let media_summary = summarize_media_files(&media_files);
     let has_images = media_summary.images > 0;
@@ -1417,6 +1444,7 @@ async fn q_handler_internal(
                 Some(youtube_urls.clone()),
                 Some("QC_SYSTEM_PROMPT"),
                 None,
+                audit_context.as_ref(),
             )
             .await
         } else {
@@ -1431,6 +1459,7 @@ async fn q_handler_internal(
                 Some(media_files.clone()),
                 Some(youtube_urls.clone()),
                 Some("Q_SYSTEM_PROMPT"),
+                audit_context.as_ref(),
             )
             .await
         };
@@ -1509,6 +1538,7 @@ async fn q_handler_internal(
         selection_message_id: selection_message.id.0 as i64,
         original_user_id: user_id,
         reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
+        llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
         timestamp: now_unix_seconds(),
         command_timer: Some(timer),
         mode,
@@ -1651,6 +1681,7 @@ pub async fn s_handler(
         .await?;
         return Ok(());
     }
+    let audit_context = create_q_audit_context(&state, &message, "s").await;
 
     let mut timer = start_command_timer("s", &message);
     let processing_message = send_message_with_retry(
@@ -1679,6 +1710,7 @@ pub async fn s_handler(
         None,
         Some("CHAT_SEARCH_SYSTEM_PROMPT"),
         Some(chat_search_response_schema()),
+        audit_context.as_ref(),
     )
     .await;
     let response = match response {

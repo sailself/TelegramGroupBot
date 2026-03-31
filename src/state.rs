@@ -40,6 +40,7 @@ pub struct PendingQRequest {
     pub selection_message_id: i64,
     pub original_user_id: i64,
     pub reply_to_message_id: Option<i64>,
+    pub llm_invocation_id: Option<i64>,
     pub timestamp: i64,
     pub command_timer: Option<CommandTimer>,
     pub mode: QaCommandMode,
@@ -56,6 +57,7 @@ pub struct PendingImageRequest {
     pub telegraph_contents: Vec<String>,
     pub original_message_text: String,
     pub selection_message_id: i64,
+    pub llm_invocation_id: Option<i64>,
     pub resolution: Option<String>,
     pub aspect_ratio: Option<String>,
 }

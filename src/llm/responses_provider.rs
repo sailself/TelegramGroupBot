@@ -9,12 +9,14 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
+use crate::llm::audit::{
+    log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
+};
 use crate::llm::openai_codex;
 use crate::llm::runtime_models::selected_codex_model_record;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::{get_http_client, get_http_client_no_compression};
-use crate::utils::timing::log_llm_timing;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const RESPONSES_MAX_ATTEMPTS: usize = 3;
@@ -440,8 +442,14 @@ async fn build_request_details(
 fn parse_sse_responses_body(body: &str) -> Result<Value> {
     let mut output_items: Vec<Value> = Vec::new();
     let mut current_data_lines: Vec<String> = Vec::new();
+    let mut response_id: Option<String> = None;
+    let mut usage: Option<Value> = None;
 
-    let flush_event = |lines: &mut Vec<String>, output_items: &mut Vec<Value>| -> Result<()> {
+    let flush_event = |lines: &mut Vec<String>,
+                       output_items: &mut Vec<Value>,
+                       response_id: &mut Option<String>,
+                       usage: &mut Option<Value>|
+     -> Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
@@ -464,6 +472,15 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
                 }
             }
             Some("response.completed") => {
+                if response_id.is_none() {
+                    *response_id = value
+                        .pointer("/response/id")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string());
+                }
+                if usage.is_none() {
+                    *usage = value.pointer("/response/usage").cloned();
+                }
                 if output_items.is_empty() {
                     if let Some(items) = value
                         .get("response")
@@ -494,24 +511,54 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
 
     for line in body.lines() {
         if line.trim().is_empty() {
-            flush_event(&mut current_data_lines, &mut output_items)?;
+            flush_event(
+                &mut current_data_lines,
+                &mut output_items,
+                &mut response_id,
+                &mut usage,
+            )?;
             continue;
         }
         if let Some(data) = line.strip_prefix("data:") {
             current_data_lines.push(data.trim_start().to_string());
         }
     }
-    flush_event(&mut current_data_lines, &mut output_items)?;
+    flush_event(
+        &mut current_data_lines,
+        &mut output_items,
+        &mut response_id,
+        &mut usage,
+    )?;
 
-    Ok(json!({ "output": output_items }))
+    Ok(json!({
+        "id": response_id,
+        "output": output_items,
+        "usage": usage,
+    }))
 }
 
-async fn call_provider_api(details: &ResponsesRequestDetails) -> Result<Value> {
+async fn call_provider_api(
+    details: &ResponsesRequestDetails,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
+) -> Result<Value> {
     let model = details
         .payload
         .get("model")
         .and_then(|value| value.as_str())
         .unwrap_or("unknown");
+    let started_at = chrono::Utc::now();
+    let metadata = json!({
+        "request_summary": summarize_responses_payload(&details.payload),
+        "streaming_sse": details.streaming_sse
+    });
+    log_llm_request_started(
+        details.provider.as_str(),
+        model,
+        operation,
+        started_at,
+        Some(&metadata),
+    );
     info!(
         "{} responses request starting: {}",
         details.display_name,
@@ -714,6 +761,17 @@ async fn call_provider_api(details: &ResponsesRequestDetails) -> Result<Value> {
             model,
             truncate_for_log(&value.to_string(), 2000)
         );
+        let usage = extract_responses_usage(&value);
+        record_llm_request_success(
+            audit_context,
+            details.provider.as_str(),
+            model,
+            operation,
+            started_at,
+            chrono::Utc::now(),
+            usage,
+        )
+        .await;
         return Ok(value);
     }
 
@@ -726,6 +784,47 @@ fn extract_response_output_items(response: &Value) -> Vec<Value> {
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default()
+}
+
+fn extract_responses_usage(response: &Value) -> LlmUsageRecord {
+    let usage_value = response.get("usage").cloned();
+    let input_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(|value| value.as_i64());
+    let output_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(|value| value.as_i64());
+    let total_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.get("total_tokens"))
+        .and_then(|value| value.as_i64())
+        .or_else(|| match (input_tokens, output_tokens) {
+            (Some(input_tokens), Some(output_tokens)) => Some(input_tokens + output_tokens),
+            _ => None,
+        });
+    let reasoning_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.pointer("/output_tokens_details/reasoning_tokens"))
+        .and_then(|value| value.as_i64());
+    let cached_input_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(|value| value.as_i64());
+
+    LlmUsageRecord {
+        response_id: response
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        reasoning_tokens,
+        cached_input_tokens,
+        raw_usage_json: usage_value.map(|usage| usage.to_string()),
+    }
 }
 
 fn extract_response_text(output_items: &[Value]) -> String {
@@ -830,6 +929,8 @@ async fn responses_completion_with_tools(
     instructions: &str,
     mut input_items: Vec<Value>,
     model_config: &ThirdPartyModelConfig,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
 ) -> Result<String> {
     let tools = build_responses_function_tools();
     let session_id = generate_session_id();
@@ -857,7 +958,7 @@ async fn responses_completion_with_tools(
             &session_id,
         )
         .await?;
-        let response = call_provider_api(&details).await?;
+        let response = call_provider_api(&details, audit_context, operation).await?;
         let output_items = extract_response_output_items(&response);
         let tool_calls = extract_response_tool_calls(&output_items);
         let content = extract_response_text(&output_items);
@@ -900,7 +1001,7 @@ async fn responses_completion_with_tools(
                 &session_id,
             )
             .await?;
-            let response = call_provider_api(&details).await?;
+            let response = call_provider_api(&details, audit_context, operation).await?;
             return Ok(extract_response_text(&extract_response_output_items(
                 &response,
             )));
@@ -916,6 +1017,8 @@ async fn responses_completion_with_tool_runtime(
     model_config: &ThirdPartyModelConfig,
     runtime: &mut ToolRuntime,
     native_codex_web_search_tool: Option<Value>,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
 ) -> Result<String> {
     let mut tools =
         convert_openai_function_tools_to_responses(runtime.build_openai_function_tools());
@@ -955,7 +1058,7 @@ async fn responses_completion_with_tool_runtime(
             &session_id,
         )
         .await?;
-        let response = call_provider_api(&details).await?;
+        let response = call_provider_api(&details, audit_context, operation).await?;
         let output_items = extract_response_output_items(&response);
         let tool_calls = if tools_enabled {
             extract_response_tool_calls(&output_items)
@@ -1003,7 +1106,7 @@ async fn responses_completion_with_tool_runtime(
         &session_id,
     )
     .await?;
-    let response = call_provider_api(&details).await?;
+    let response = call_provider_api(&details, audit_context, operation).await?;
     Ok(extract_response_text(&extract_response_output_items(
         &response,
     )))
@@ -1016,6 +1119,7 @@ pub async fn call_responses_provider(
     response_title: &str,
     image_data_list: &[Vec<u8>],
     supports_tools: bool,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<String> {
     let native_codex_web_search_tool = supports_tools
         .then(|| build_native_codex_web_search_tool(model_config))
@@ -1036,19 +1140,13 @@ pub async fn call_responses_provider(
     let instructions = build_responses_system_prompt(system_prompt, custom_tools_enabled);
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
-    let timing_model = debug_model_label(model_config).to_string();
-
     if custom_tools_enabled {
-        return log_llm_timing(
-            model_config.provider.as_str(),
-            &timing_model,
+        return responses_completion_with_tools(
+            &instructions,
+            input_items,
+            model_config,
+            audit_context,
             &operation,
-            None,
-            || async {
-                responses_completion_with_tools(&instructions, input_items, model_config)
-                    .await
-                    .map_err(|err| anyhow!(err))
-            },
         )
         .await;
     }
@@ -1062,19 +1160,10 @@ pub async fn call_responses_provider(
         &session_id,
     )
     .await?;
-    log_llm_timing(
-        model_config.provider.as_str(),
-        &timing_model,
-        &operation,
-        None,
-        || async {
-            let response = call_provider_api(&details).await?;
-            Ok(extract_response_text(&extract_response_output_items(
-                &response,
-            )))
-        },
-    )
-    .await
+    let response = call_provider_api(&details, audit_context, &operation).await?;
+    Ok(extract_response_text(&extract_response_output_items(
+        &response,
+    )))
 }
 
 pub async fn call_responses_provider_with_tool_runtime(
@@ -1084,13 +1173,13 @@ pub async fn call_responses_provider_with_tool_runtime(
     response_title: &str,
     image_data_list: &[Vec<u8>],
     runtime: &mut ToolRuntime,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<String> {
     let instructions = format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance());
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
     let native_codex_web_search_tool = build_native_codex_web_search_tool(model_config);
     let model_label = debug_model_label(model_config);
-    let timing_model = model_label.to_string();
     debug!(
         "Responses provider runtime selected: provider={}, model={}, response_title={}, native_codex_web_search={}, image_count={}",
         model_config.provider.as_str(),
@@ -1100,22 +1189,14 @@ pub async fn call_responses_provider_with_tool_runtime(
         image_data_list.len()
     );
 
-    log_llm_timing(
-        model_config.provider.as_str(),
-        &timing_model,
+    responses_completion_with_tool_runtime(
+        &instructions,
+        input_items,
+        model_config,
+        runtime,
+        native_codex_web_search_tool.clone(),
+        audit_context,
         &operation,
-        None,
-        || async {
-            responses_completion_with_tool_runtime(
-                &instructions,
-                input_items,
-                model_config,
-                runtime,
-                native_codex_web_search_tool.clone(),
-            )
-            .await
-            .map_err(|err| anyhow!(err))
-        },
     )
     .await
 }
@@ -1167,6 +1248,32 @@ mod tests {
     }
 
     #[test]
+    fn extract_responses_usage_reads_token_counts_and_reasoning_details() {
+        let response = json!({
+            "id": "resp_123",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "input_tokens_details": {
+                    "cached_tokens": 3
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": 7
+                }
+            }
+        });
+
+        let usage = extract_responses_usage(&response);
+
+        assert_eq!(usage.response_id.as_deref(), Some("resp_123"));
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.total_tokens, Some(30));
+        assert_eq!(usage.reasoning_tokens, Some(7));
+        assert_eq!(usage.cached_input_tokens, Some(3));
+    }
+
+    #[test]
     fn parse_sse_responses_body_collects_output_items() {
         let body = r#"event: response.created
 data: {"type":"response.created","response":{"id":"resp1"}}
@@ -1178,7 +1285,7 @@ event: response.output_item.done
 data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"web_search","arguments":"{}"}}
 
 event: response.completed
-data: {"type":"response.completed","response":{"id":"resp1","output":[]}}
+data: {"type":"response.completed","response":{"id":"resp1","output":[],"usage":{"input_tokens":12,"output_tokens":8}}}
 "#;
 
         let parsed = parse_sse_responses_body(body).expect("SSE body should parse");
@@ -1190,5 +1297,10 @@ data: {"type":"response.completed","response":{"id":"resp1","output":[]}}
         assert_eq!(output.len(), 2);
         assert_eq!(output[0]["type"], "message");
         assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(parsed.get("id").and_then(|value| value.as_str()), Some("resp1"));
+        assert_eq!(
+            parsed.pointer("/usage/input_tokens").and_then(|value| value.as_i64()),
+            Some(12)
+        );
     }
 }

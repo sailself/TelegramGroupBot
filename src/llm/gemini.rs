@@ -10,10 +10,12 @@ use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 
 use crate::config::CONFIG;
+use crate::llm::audit::{
+    log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
+};
 use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::utils::http::get_http_client;
-use crate::utils::timing::log_llm_timing;
 
 #[derive(Debug, thiserror::Error)]
 #[error("Image generation failed: {0}")]
@@ -43,6 +45,8 @@ pub struct GeminiMusicGenerationResult {
 #[derive(Debug, Deserialize)]
 struct GeminiResponse {
     candidates: Option<Vec<GeminiCandidate>>,
+    #[serde(rename = "usageMetadata")]
+    usage_metadata: Option<GeminiUsageMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +112,16 @@ struct GeminiFileInfo {
 #[derive(Debug, Deserialize)]
 struct GeminiFileResponse {
     file: GeminiFileInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiUsageMetadata {
+    prompt_token_count: Option<i64>,
+    candidates_token_count: Option<i64>,
+    total_token_count: Option<i64>,
+    thoughts_token_count: Option<i64>,
+    cached_content_token_count: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -390,8 +404,28 @@ fn summarize_gemini_response(response: &GeminiResponse) -> Value {
         "candidates": response.candidates.as_ref().map(|candidates| candidates.len()).unwrap_or(0),
         "textParts": text_parts,
         "imageParts": image_parts,
-        "textPreview": text_preview
+        "textPreview": text_preview,
+        "hasUsageMetadata": response.usage_metadata.is_some()
     })
+}
+
+fn extract_gemini_usage(value: &Value) -> LlmUsageRecord {
+    let usage_value = value.get("usageMetadata").cloned();
+    let usage = usage_value
+        .as_ref()
+        .and_then(|usage| serde_json::from_value::<GeminiUsageMetadata>(usage.clone()).ok());
+
+    LlmUsageRecord {
+        response_id: None,
+        input_tokens: usage.as_ref().and_then(|usage| usage.prompt_token_count),
+        output_tokens: usage.as_ref().and_then(|usage| usage.candidates_token_count),
+        total_tokens: usage.as_ref().and_then(|usage| usage.total_token_count),
+        reasoning_tokens: usage.as_ref().and_then(|usage| usage.thoughts_token_count),
+        cached_input_tokens: usage
+            .as_ref()
+            .and_then(|usage| usage.cached_content_token_count),
+        raw_usage_json: usage_value.map(|usage| usage.to_string()),
+    }
 }
 
 fn summarize_error_body(body: &str) -> (Option<String>, String) {
@@ -836,8 +870,11 @@ async fn call_gemini_api(
     model: &str,
     payload: serde_json::Value,
     system_prompt_label: Option<&str>,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
 ) -> Result<GeminiResponse> {
-    let value = call_gemini_api_value(model, payload, system_prompt_label).await?;
+    let value = call_gemini_api_value(model, payload, system_prompt_label, audit_context, operation)
+        .await?;
     let parsed = serde_json::from_value::<GeminiResponse>(value)
         .map_err(|err| anyhow!("Gemini generateContent response decode failed: {}", err))?;
     Ok(parsed)
@@ -848,9 +885,18 @@ async fn call_gemini_api_with_timeout(
     payload: serde_json::Value,
     system_prompt_label: Option<&str>,
     timeout: Duration,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
 ) -> Result<GeminiResponse> {
-    let value =
-        call_gemini_api_value_with_timeout(model, payload, system_prompt_label, timeout).await?;
+    let value = call_gemini_api_value_with_timeout(
+        model,
+        payload,
+        system_prompt_label,
+        timeout,
+        audit_context,
+        operation,
+    )
+    .await?;
     let parsed = serde_json::from_value::<GeminiResponse>(value)
         .map_err(|err| anyhow!("Gemini generateContent response decode failed: {}", err))?;
     Ok(parsed)
@@ -860,12 +906,16 @@ async fn call_gemini_api_value(
     model: &str,
     payload: serde_json::Value,
     system_prompt_label: Option<&str>,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
 ) -> Result<Value> {
     call_gemini_api_value_with_timeout(
         model,
         payload,
         system_prompt_label,
         Duration::from_secs(GEMINI_DEFAULT_TIMEOUT_SECS),
+        audit_context,
+        operation,
     )
     .await
 }
@@ -875,12 +925,20 @@ async fn call_gemini_api_value_with_timeout(
     payload: serde_json::Value,
     system_prompt_label: Option<&str>,
     timeout: Duration,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
 ) -> Result<Value> {
     let client = get_http_client();
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
         model, CONFIG.gemini_api_key
     );
+    let started_at = chrono::Utc::now();
+    let metadata = json!({
+        "system_prompt_label": system_prompt_label.unwrap_or(""),
+        "timeout_secs": timeout.as_secs()
+    });
+    log_llm_request_started("gemini", model, operation, started_at, Some(&metadata));
 
     if tracing::enabled!(tracing::Level::DEBUG) {
         let payload_summary = summarize_gemini_payload(&payload, system_prompt_label);
@@ -962,6 +1020,18 @@ async fn call_gemini_api_value_with_timeout(
                 });
             debug!(target: "llm.gemini", model = model, response = %response_summary);
         }
+
+        let usage = extract_gemini_usage(&value);
+        record_llm_request_success(
+            audit_context,
+            "gemini",
+            model,
+            operation,
+            started_at,
+            chrono::Utc::now(),
+            usage,
+        )
+        .await;
         return Ok(value);
     }
 }
@@ -1181,6 +1251,7 @@ pub async fn call_gemini_with_tool_runtime(
     youtube_urls: Option<Vec<String>>,
     system_prompt_label: Option<&str>,
     final_response_json_schema: Option<Value>,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiCallResult> {
     let content = user_content.to_string();
     let youtube_urls = youtube_urls.unwrap_or_default();
@@ -1213,7 +1284,14 @@ pub async fn call_gemini_with_tool_runtime(
             payload["tools"] = Value::Array(runtime.build_gemini_tools());
         }
 
-        let response = call_gemini_api_value(model, payload, system_prompt_label).await?;
+        let response = call_gemini_api_value(
+            model,
+            payload,
+            system_prompt_label,
+            audit_context,
+            "call_gemini_with_tool_runtime",
+        )
+        .await?;
         let Some(content) = extract_candidate_content(&response) else {
             return Err(anyhow!(
                 "Gemini tool response did not include candidate content"
@@ -1270,7 +1348,14 @@ pub async fn call_gemini_with_tool_runtime(
         ),
         "safetySettings": build_safety_settings(),
     });
-    let final_response = call_gemini_api_value(model, final_payload, system_prompt_label).await?;
+    let final_response = call_gemini_api_value(
+        model,
+        final_payload,
+        system_prompt_label,
+        audit_context,
+        "call_gemini_with_tool_runtime",
+    )
+    .await?;
     Ok(GeminiCallResult {
         text: extract_text_from_response_value(&final_response),
         model_used: model.to_string(),
@@ -1282,6 +1367,7 @@ async fn call_gemini_lite_fallback(
     system_prompt_label: Option<&str>,
     previous_model: &str,
     previous_err: &anyhow::Error,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiCallResult> {
     let lite_model = CONFIG.gemini_lite_model.trim();
     if lite_model.is_empty() {
@@ -1310,21 +1396,17 @@ async fn call_gemini_lite_fallback(
 
     let mut last_lite_err = None;
     for attempt in 1..=GEMINI_LITE_FALLBACK_MAX_ATTEMPTS {
-        let result = log_llm_timing(
-            "gemini",
-            lite_model,
-            "call_gemini_lite_fallback",
-            Some(json!({
-                "attempt": attempt,
-                "max_attempts": GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
-                "after_model": previous_model,
-            })),
-            || async {
-                let response =
-                    call_gemini_api(lite_model, payload.clone(), system_prompt_label).await?;
-                Ok(extract_text_from_response(response))
-            },
-        )
+        let result = async {
+            let response = call_gemini_api(
+                lite_model,
+                payload.clone(),
+                system_prompt_label,
+                audit_context,
+                "call_gemini_lite_fallback",
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(extract_text_from_response(response))
+        }
         .await;
 
         match result {
@@ -1367,6 +1449,7 @@ pub async fn call_gemini(
     media_files: Option<Vec<MediaFile>>,
     youtube_urls: Option<Vec<String>>,
     system_prompt_label: Option<&str>,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiCallResult> {
     let content = user_content.to_string();
 
@@ -1434,13 +1517,18 @@ pub async fn call_gemini(
         "call_gemini"
     };
 
-    let primary_attempt =
-        log_llm_timing("gemini", primary_model, primary_operation, None, || async {
-            let response =
-                call_gemini_api(primary_model, payload.clone(), system_prompt_label).await?;
-            Ok(extract_text_from_response(response))
-        })
-        .await;
+    let primary_attempt = async {
+        let response = call_gemini_api(
+            primary_model,
+            payload.clone(),
+            system_prompt_label,
+            audit_context,
+            primary_operation,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(extract_text_from_response(response))
+    }
+    .await;
 
     match primary_attempt {
         Ok(text) => Ok(GeminiCallResult {
@@ -1454,6 +1542,7 @@ pub async fn call_gemini(
                     system_prompt_label,
                     primary_model,
                     &primary_err,
+                    audit_context,
                 )
                 .await;
             }
@@ -1464,18 +1553,17 @@ pub async fn call_gemini(
                 primary_model, fallback_model, primary_err
             );
 
-            let fallback_text = log_llm_timing(
-                "gemini",
-                fallback_model,
-                "call_gemini_fallback",
-                None,
-                || async {
-                    let response =
-                        call_gemini_api(fallback_model, payload.clone(), system_prompt_label)
-                            .await?;
-                    Ok(extract_text_from_response(response))
-                },
-            )
+            let fallback_text = async {
+                let response = call_gemini_api(
+                    fallback_model,
+                    payload.clone(),
+                    system_prompt_label,
+                    audit_context,
+                    "call_gemini_fallback",
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(extract_text_from_response(response))
+            }
             .await;
 
             let fallback_text = match fallback_text {
@@ -1486,6 +1574,7 @@ pub async fn call_gemini(
                         system_prompt_label,
                         fallback_model,
                         &fallback_err,
+                        audit_context,
                     )
                     .await
                     .map_err(|lite_err| {
@@ -1515,6 +1604,7 @@ pub async fn generate_image_with_gemini(
     image_urls: &[String],
     image_config: Option<GeminiImageConfig>,
     upload_to_cwd: bool,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<Vec<Vec<u8>>, ImageGenerationError> {
     let mut images = Vec::new();
     for url in image_urls {
@@ -1549,7 +1639,13 @@ pub async fn generate_image_with_gemini(
     });
 
     let model = &CONFIG.gemini_image_model;
-    let response = call_gemini_api(model, payload, Some("image_generation_system_prompt"))
+    let response = call_gemini_api(
+        model,
+        payload,
+        Some("image_generation_system_prompt"),
+        audit_context,
+        "generate_image_with_gemini",
+    )
         .await
         .map_err(|err| ImageGenerationError(err.to_string()))?;
 
@@ -1580,6 +1676,7 @@ pub async fn generate_image_with_gemini(
 
 pub async fn generate_music_with_lyria(
     prompt: &str,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiMusicGenerationResult, anyhow::Error> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -1602,22 +1699,13 @@ pub async fn generate_music_with_lyria(
         "safetySettings": build_safety_settings(),
     });
 
-    let response = log_llm_timing(
-        "gemini",
+    let response = call_gemini_api_with_timeout(
         model,
+        payload,
+        Some("lyria_music_generation"),
+        Duration::from_secs(LYRIA_GENERATION_TIMEOUT_SECS),
+        audit_context,
         "lyria_generate_content",
-        Some(json!({
-            "response_modalities": ["AUDIO", "TEXT"]
-        })),
-        || async {
-            call_gemini_api_with_timeout(
-                model,
-                payload.clone(),
-                Some("lyria_music_generation"),
-                Duration::from_secs(LYRIA_GENERATION_TIMEOUT_SECS),
-            )
-            .await
-        },
     )
     .await?;
 
@@ -1626,6 +1714,7 @@ pub async fn generate_music_with_lyria(
 
 pub async fn generate_video_with_veo(
     user_prompt: &str,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<(Option<Vec<u8>>, Option<String>), anyhow::Error> {
     let prompt = user_prompt.trim();
     if prompt.is_empty() {
@@ -1662,36 +1751,51 @@ pub async fn generate_video_with_veo(
         "resolution": VEO_DEFAULT_RESOLUTION,
         "duration_seconds": VEO_DEFAULT_DURATION_SECONDS,
     });
-
-    let operation = log_llm_timing(
+    let started_at = chrono::Utc::now();
+    log_llm_request_started(
         "gemini",
         model,
         "veo_predict_long_running",
-        Some(metadata),
-        || async {
-            let response = client
-                .post(&url)
-                .header("x-goog-api-key", &CONFIG.gemini_api_key)
-                .json(&payload)
-                .send()
-                .await?;
+        started_at,
+        Some(&metadata),
+    );
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let (message, body_summary) = summarize_error_body(&body);
-                let detail = message.unwrap_or(body_summary);
-                return Err(anyhow!(
-                    "Veo predictLongRunning failed with status {}: {}",
-                    status,
-                    detail
-                ));
-            }
+    let response = client
+        .post(&url)
+        .header("x-goog-api-key", &CONFIG.gemini_api_key)
+        .json(&payload)
+        .send()
+        .await?;
 
-            decode_json_response::<Value>(response, "Veo predictLongRunning").await
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let (message, body_summary) = summarize_error_body(&body);
+        let detail = message.unwrap_or(body_summary);
+        return Err(anyhow!(
+            "Veo predictLongRunning failed with status {}: {}",
+            status,
+            detail
+        ));
+    }
+
+    let operation = decode_json_response::<Value>(response, "Veo predictLongRunning").await?;
+    record_llm_request_success(
+        audit_context,
+        "gemini",
+        model,
+        "veo_predict_long_running",
+        started_at,
+        chrono::Utc::now(),
+        LlmUsageRecord {
+            response_id: operation
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string()),
+            ..LlmUsageRecord::default()
         },
     )
-    .await?;
+    .await;
 
     let operation_name = operation
         .get("name")
@@ -1804,6 +1908,32 @@ pub async fn generate_video_with_veo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_gemini_usage_reads_usage_metadata() {
+        let response = json!({
+            "usageMetadata": {
+                "promptTokenCount": 12,
+                "candidatesTokenCount": 34,
+                "totalTokenCount": 46,
+                "thoughtsTokenCount": 5,
+                "cachedContentTokenCount": 3
+            }
+        });
+
+        let usage = extract_gemini_usage(&response);
+
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(34));
+        assert_eq!(usage.total_tokens, Some(46));
+        assert_eq!(usage.reasoning_tokens, Some(5));
+        assert_eq!(usage.cached_input_tokens, Some(3));
+        assert!(usage
+            .raw_usage_json
+            .as_deref()
+            .expect("usage json")
+            .contains("\"promptTokenCount\":12"));
+    }
 
     #[test]
     fn extract_music_generation_result_collects_lyrics_audio_and_notes() {

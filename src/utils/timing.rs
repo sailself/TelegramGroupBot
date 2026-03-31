@@ -103,6 +103,7 @@ pub fn complete_command_timer(timer: &mut CommandTimer, status: &str, detail: Op
     timer.log_completed();
 }
 
+#[allow(dead_code)]
 pub async fn log_llm_timing<T, F, Fut>(
     provider: &str,
     model: &str,

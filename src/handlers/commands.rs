@@ -25,13 +25,15 @@ use crate::handlers::media::{
     MediaSummary,
 };
 use crate::handlers::responses::send_response;
+use crate::llm::audit::LLM_TRIGGER_KIND_COMMAND;
 use crate::llm::media::detect_mime_type;
 use crate::llm::openai_codex;
 use crate::llm::runtime_models::{runtime_model_count, selected_codex_model_record};
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
-    call_gemini, generate_image_with_gemini, generate_music_with_lyria, generate_video_with_veo,
-    GeminiImageConfig,
+    audit_context_from_id, create_audit_context_from_message, call_gemini,
+    generate_image_with_gemini, generate_music_with_lyria, generate_video_with_veo,
+    GeminiImageConfig, LlmAuditContext,
 };
 use crate::state::{AppState, MediaGroupItem, PendingImageRequest};
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
@@ -101,6 +103,15 @@ struct ImageRequestContext {
     image_urls: Vec<String>,
     telegraph_contents: Vec<String>,
     original_message_text: String,
+}
+
+async fn create_command_audit_context(
+    state: &AppState,
+    message: &Message,
+    trigger_name: &str,
+) -> Option<LlmAuditContext> {
+    create_audit_context_from_message(&state.db, LLM_TRIGGER_KIND_COMMAND, trigger_name, message)
+        .await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1156,6 +1167,7 @@ async fn finalize_image_request(
     let Some(request) = request else {
         return Ok(());
     };
+    let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
 
     let (final_resolution, final_aspect) =
         resolve_image_request_settings(&request, resolution, aspect_ratio);
@@ -1204,6 +1216,7 @@ async fn finalize_image_request(
         &request.image_urls,
         image_config,
         !CONFIG.cwd_pw_api_key.is_empty(),
+        audit_context.as_ref(),
     )
     .await;
 
@@ -1350,6 +1363,7 @@ pub async fn img_handler(
         .await?;
         return Ok(());
     }
+    let audit_context = create_command_audit_context(&state, &message, "img").await;
 
     let processing_message = bot
         .send_message(message.chat.id, "Generating your image...")
@@ -1372,6 +1386,7 @@ pub async fn img_handler(
         &context.image_urls,
         None,
         !CONFIG.cwd_pw_api_key.is_empty(),
+        audit_context.as_ref(),
     )
     .await;
 
@@ -1462,6 +1477,7 @@ pub async fn image_handler(
         .await?;
         return Ok(());
     }
+    let audit_context = create_command_audit_context(&state, &message, "image").await;
 
     let request_key = format!("{}_{}", message.chat.id.0, message.id.0);
     let selection_message = bot
@@ -1478,6 +1494,7 @@ pub async fn image_handler(
         telegraph_contents: context.telegraph_contents,
         original_message_text: context.original_message_text,
         selection_message_id: selection_message.id.0 as i64,
+        llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
         resolution: None,
         aspect_ratio: None,
     };
@@ -1512,7 +1529,12 @@ pub async fn image_handler(
     Ok(())
 }
 
-pub async fn vid_handler(bot: Bot, message: Message, prompt: Option<String>) -> Result<()> {
+pub async fn vid_handler(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    prompt: Option<String>,
+) -> Result<()> {
     if !check_access_control(&bot, &message, "vid").await {
         return Ok(());
     }
@@ -1564,6 +1586,7 @@ pub async fn vid_handler(bot: Bot, message: Message, prompt: Option<String>) -> 
         .await?;
         return Ok(());
     }
+    let audit_context = create_command_audit_context(&state, &message, "vid").await;
 
     let processing_message = send_message_with_retry(
         &bot,
@@ -1574,7 +1597,8 @@ pub async fn vid_handler(bot: Bot, message: Message, prompt: Option<String>) -> 
     .await?;
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-    let (video_bytes, _mime_type) = generate_video_with_veo(&prompt_text).await?;
+    let (video_bytes, _mime_type) =
+        generate_video_with_veo(&prompt_text, audit_context.as_ref()).await?;
 
     if let Some(video_bytes) = video_bytes {
         send_video_with_retry(&bot, message.chat.id, &video_bytes, Some(message.id)).await?;
@@ -1648,6 +1672,7 @@ pub async fn tldr_handler(
         complete_command_timer(&mut timer, "error", Some("no_messages".to_string()));
         return Ok(());
     }
+    let audit_context = create_command_audit_context(&state, &message, "tldr").await;
 
     let chat_content = super::format_tldr_chat_content(&messages);
 
@@ -1663,6 +1688,7 @@ pub async fn tldr_handler(
         None,
         None,
         Some("TLDR_SYSTEM_PROMPT"),
+        audit_context.as_ref(),
     )
     .await
     {
@@ -1720,7 +1746,15 @@ Use the same language as the summary text for any labels.\
         aspect_ratio: Some("16:9".to_string()),
         image_size: Some("4K".to_string()),
     });
-    match generate_image_with_gemini(&infographic_prompt, &[], infographic_config, false).await {
+    match generate_image_with_gemini(
+        &infographic_prompt,
+        &[],
+        infographic_config,
+        false,
+        audit_context.as_ref(),
+    )
+    .await
+    {
         Ok(images) => {
             if let Some(image) = images.into_iter().next() {
                 if CONFIG.cwd_pw_api_key.trim().is_empty() {
@@ -1892,6 +1926,7 @@ pub async fn factcheck_handler(
             .await?;
         return Ok(());
     }
+    let audit_context = create_command_audit_context(&state, &message, "factcheck").await;
 
     let mut processing_message_text = if media_summary.videos > 0 {
         "Analyzing video and fact-checking content...".to_string()
@@ -2005,6 +2040,7 @@ pub async fn factcheck_handler(
         Some(media_files),
         None,
         Some("FACTCHECK_SYSTEM_PROMPT"),
+        audit_context.as_ref(),
     )
     .await
     {
@@ -2087,6 +2123,7 @@ pub async fn profileme_handler(
         .await?;
         return Ok(());
     }
+    let audit_context = create_command_audit_context(&state, &message, "profileme").await;
 
     let mut formatted_history =
         String::from("Here is the user's recent chat history in this group:\n\n");
@@ -2120,6 +2157,7 @@ pub async fn profileme_handler(
         None,
         None,
         Some("PROFILEME_SYSTEM_PROMPT"),
+        audit_context.as_ref(),
     )
     .await?;
 
@@ -2196,6 +2234,7 @@ pub async fn mysong_handler(
             complete_command_timer(&mut timer, "error", Some("no_history".to_string()));
             return Ok(());
         }
+        let audit_context = create_command_audit_context(&state, &message, "mysong").await;
 
         let formatted_history = format_user_history_for_persona(&history);
         let language_selection = resolve_mysong_language(note.as_deref());
@@ -2218,6 +2257,7 @@ pub async fn mysong_handler(
                     None,
                     None,
                     Some("MYSONG_SUMMARY_SYSTEM_PROMPT"),
+                    audit_context.as_ref(),
                 )
                 .await
             },
@@ -2255,6 +2295,7 @@ pub async fn mysong_handler(
                     None,
                     None,
                     Some("MYSONG_PROMPT_SYSTEM_PROMPT"),
+                    audit_context.as_ref(),
                 )
                 .await
             },
@@ -2276,7 +2317,7 @@ pub async fn mysong_handler(
             processing_message.id,
             "Lyria song generation",
             "Generating your song failed, retrying ({attempt}/{max})...",
-            || async { generate_music_with_lyria(&lyria_prompt).await },
+            || async { generate_music_with_lyria(&lyria_prompt, audit_context.as_ref()).await },
         )
         .await?;
 
@@ -2392,6 +2433,12 @@ pub async fn paintme_handler(
         .await?;
         return Ok(());
     }
+    let audit_context = create_command_audit_context(&state, &message, if portrait {
+        "portraitme"
+    } else {
+        "paintme"
+    })
+    .await;
 
     let mut formatted_history =
         String::from("Here is the user's recent chat history in this group:\n\n");
@@ -2422,6 +2469,7 @@ pub async fn paintme_handler(
         } else {
             "PAINTME_SYSTEM_PROMPT"
         }),
+        audit_context.as_ref(),
     )
     .await?
     .text;
@@ -2438,8 +2486,14 @@ pub async fn paintme_handler(
     let _photo_chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
 
-    let image_result =
-        generate_image_with_gemini(&prompt, &[], None, !CONFIG.cwd_pw_api_key.is_empty()).await;
+    let image_result = generate_image_with_gemini(
+        &prompt,
+        &[],
+        None,
+        !CONFIG.cwd_pw_api_key.is_empty(),
+        audit_context.as_ref(),
+    )
+    .await;
 
     let model_name = CONFIG.gemini_image_model.as_str();
     let images = match image_result {
@@ -2710,6 +2764,7 @@ mod tests {
             telegraph_contents: Vec::new(),
             original_message_text: "test".to_string(),
             selection_message_id: 4,
+            llm_invocation_id: None,
             resolution: Some("4K".to_string()),
             aspect_ratio: Some("16:9".to_string()),
         };

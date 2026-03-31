@@ -393,10 +393,11 @@ async fn handle_command(
         }
         Command::Vid(arg) => {
             let bot = bot.clone();
+            let state = state.clone();
             let message = message.clone();
             let arg = optional_arg(arg);
             tokio::spawn(async move {
-                if let Err(err) = commands::vid_handler(bot, message, arg).await {
+                if let Err(err) = commands::vid_handler(bot, state, message, arg).await {
                     error!("vid handler failed: {err}");
                 }
             });

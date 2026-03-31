@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
+use crate::llm::audit::{
+    log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
+};
 use crate::llm::responses_provider::{
     call_responses_provider, call_responses_provider_with_tool_runtime,
 };
@@ -15,7 +18,6 @@ use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::get_http_client;
-use crate::utils::timing::log_llm_timing;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const THIRD_PARTY_MAX_ATTEMPTS: usize = 3;
@@ -380,11 +382,31 @@ fn build_request_details(
     ))
 }
 
-async fn call_provider_api(details: &ProviderRequestDetails) -> Result<Value> {
+async fn call_provider_api(
+    details: &ProviderRequestDetails,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
+) -> Result<Value> {
     debug!(
         "{} request: {}",
         details.display_name,
         summarize_payload(&details.payload)
+    );
+    let model = details
+        .payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let started_at = chrono::Utc::now();
+    let metadata = json!({
+        "request_summary": summarize_payload(&details.payload)
+    });
+    log_llm_request_started(
+        details.display_name,
+        model,
+        operation,
+        started_at,
+        Some(&metadata),
     );
 
     let client = get_http_client();
@@ -451,12 +473,19 @@ async fn call_provider_api(details: &ProviderRequestDetails) -> Result<Value> {
         debug!(
             "{} response received for model={}",
             details.display_name,
-            details
-                .payload
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+            model
         );
+        let usage = extract_openai_compatible_usage(&value);
+        record_llm_request_success(
+            audit_context,
+            details.display_name,
+            model,
+            operation,
+            started_at,
+            chrono::Utc::now(),
+            usage,
+        )
+        .await;
         return Ok(value);
     }
 
@@ -480,9 +509,48 @@ fn extract_tool_calls(message: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn extract_openai_compatible_usage(response: &Value) -> LlmUsageRecord {
+    let usage_value = response.get("usage").cloned();
+    let input_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(|value| value.as_i64());
+    let output_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(|value| value.as_i64());
+    let total_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.get("total_tokens"))
+        .and_then(|value| value.as_i64());
+    let reasoning_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+        .and_then(|value| value.as_i64());
+    let cached_input_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(|value| value.as_i64());
+
+    LlmUsageRecord {
+        response_id: response
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        reasoning_tokens,
+        cached_input_tokens,
+        raw_usage_json: usage_value.map(|usage| usage.to_string()),
+    }
+}
+
 async fn request_final_answer_after_tool_limit(
     mut messages: Vec<Value>,
     model_config: &ThirdPartyModelConfig,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
 ) -> Result<String> {
     messages.push(json!({
         "role": "system",
@@ -495,7 +563,7 @@ async fn request_final_answer_after_tool_limit(
     );
 
     let details = build_request_details(model_config, messages, None, None)?;
-    let response = call_provider_api(&details).await?;
+    let response = call_provider_api(&details, audit_context, operation).await?;
     let message = extract_response_message(&response);
     let tool_calls = extract_tool_calls(&message);
     if !tool_calls.is_empty() {
@@ -552,6 +620,8 @@ async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> 
 async fn chat_completion_with_tools(
     mut messages: Vec<Value>,
     model_config: &ThirdPartyModelConfig,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
 ) -> Result<String> {
     let tools = build_function_tools();
 
@@ -568,7 +638,7 @@ async fn chat_completion_with_tools(
             Some(tools.clone()),
             Some("auto"),
         )?;
-        let response = call_provider_api(&details).await?;
+        let response = call_provider_api(&details, audit_context, operation).await?;
         let message = extract_response_message(&response);
 
         let content = extract_message_content(&message);
@@ -614,7 +684,13 @@ async fn chat_completion_with_tools(
         }
 
         if iteration + 1 == MAX_TOOL_CALL_ITERATIONS {
-            return request_final_answer_after_tool_limit(messages, model_config).await;
+            return request_final_answer_after_tool_limit(
+                messages,
+                model_config,
+                audit_context,
+                operation,
+            )
+            .await;
         }
     }
 
@@ -625,6 +701,8 @@ async fn chat_completion_with_tool_runtime(
     mut messages: Vec<Value>,
     model_config: &ThirdPartyModelConfig,
     runtime: &mut ToolRuntime,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
 ) -> Result<String> {
     let tools = runtime.build_openai_function_tools();
     let mut tools_enabled = !tools.is_empty();
@@ -637,7 +715,7 @@ async fn chat_completion_with_tool_runtime(
             tools_enabled.then_some(tools.clone()),
             Some("auto"),
         )?;
-        let response = call_provider_api(&details).await?;
+        let response = call_provider_api(&details, audit_context, operation).await?;
         let message = extract_response_message(&response);
         let content = extract_message_content(&message);
         let tool_calls = if tools_enabled {
@@ -690,7 +768,7 @@ async fn chat_completion_with_tool_runtime(
         }
     }
 
-    request_final_answer_after_tool_limit(messages, model_config).await
+    request_final_answer_after_tool_limit(messages, model_config, audit_context, operation).await
 }
 
 pub async fn call_third_party_with_tool_runtime(
@@ -700,6 +778,7 @@ pub async fn call_third_party_with_tool_runtime(
     response_title: &str,
     image_data_list: &[Vec<u8>],
     runtime: &mut ToolRuntime,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<String> {
     if model_id.trim().is_empty() {
         return Err(anyhow!("Model identifier is required"));
@@ -721,6 +800,7 @@ pub async fn call_third_party_with_tool_runtime(
             response_title,
             image_data_list,
             runtime,
+            audit_context,
         )
         .await;
     }
@@ -732,16 +812,12 @@ pub async fn call_third_party_with_tool_runtime(
     ];
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
 
-    log_llm_timing(
-        model_config.provider.as_str(),
-        &model_config.id,
+    chat_completion_with_tool_runtime(
+        messages,
+        &model_config,
+        runtime,
+        audit_context,
         &operation,
-        None,
-        || async {
-            chat_completion_with_tool_runtime(messages, &model_config, runtime)
-                .await
-                .map_err(|err| anyhow!(err))
-        },
     )
     .await
 }
@@ -753,6 +829,7 @@ pub async fn call_third_party(
     response_title: &str,
     image_data_list: &[Vec<u8>],
     supports_tools: bool,
+    audit_context: Option<&LlmAuditContext>,
 ) -> Result<String> {
     if model_id.trim().is_empty() {
         return Err(anyhow!("Model identifier is required"));
@@ -774,6 +851,7 @@ pub async fn call_third_party(
             response_title,
             image_data_list,
             supports_tools,
+            audit_context,
         )
         .await;
     }
@@ -789,40 +867,19 @@ pub async fn call_third_party(
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
 
     if tools_enabled {
-        return log_llm_timing(
-            model_config.provider.as_str(),
-            &model_config.id,
-            &operation,
-            None,
-            || async {
-                chat_completion_with_tools(messages, &model_config)
-                    .await
-                    .map_err(|err| anyhow!(err))
-            },
-        )
-        .await;
+        return chat_completion_with_tools(messages, &model_config, audit_context, &operation)
+            .await;
     }
 
     let details = build_request_details(&model_config, messages, None, None)?;
-    let model_id = model_config.id.clone();
-    let result = log_llm_timing(
-        model_config.provider.as_str(),
-        &model_id,
-        &operation,
-        None,
-        || async {
-            let response = call_provider_api(&details).await?;
-            let content = response
-                .get("choices")
-                .and_then(|v| v.get(0))
-                .and_then(|v| v.get("message"))
-                .map(extract_message_content)
-                .unwrap_or_default();
-            Ok(parse_third_party_response(&model_config, &content))
-        },
-    )
-    .await;
-    result
+    let response = call_provider_api(&details, audit_context, &operation).await?;
+    let content = response
+        .get("choices")
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.get("message"))
+        .map(extract_message_content)
+        .unwrap_or_default();
+    Ok(parse_third_party_response(&model_config, &content))
 }
 
 #[cfg(test)]
@@ -934,6 +991,33 @@ mod tests {
         assert_eq!(third_party_retry_delay(1), Duration::from_millis(900));
         assert_eq!(third_party_retry_delay(2), Duration::from_millis(1800));
         assert_eq!(third_party_retry_delay(3), Duration::from_millis(2700));
+    }
+
+    #[test]
+    fn extract_openai_compatible_usage_reads_prompt_completion_and_total_tokens() {
+        let response = json!({
+            "id": "chatcmpl_123",
+            "usage": {
+                "prompt_tokens": 21,
+                "completion_tokens": 34,
+                "total_tokens": 55,
+                "prompt_tokens_details": {
+                    "cached_tokens": 8
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": 5
+                }
+            }
+        });
+
+        let usage = extract_openai_compatible_usage(&response);
+
+        assert_eq!(usage.response_id.as_deref(), Some("chatcmpl_123"));
+        assert_eq!(usage.input_tokens, Some(21));
+        assert_eq!(usage.output_tokens, Some(34));
+        assert_eq!(usage.total_tokens, Some(55));
+        assert_eq!(usage.reasoning_tokens, Some(5));
+        assert_eq!(usage.cached_input_tokens, Some(8));
     }
 
     #[test]
