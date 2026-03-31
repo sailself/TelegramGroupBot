@@ -418,7 +418,9 @@ fn extract_gemini_usage(value: &Value) -> LlmUsageRecord {
     LlmUsageRecord {
         response_id: None,
         input_tokens: usage.as_ref().and_then(|usage| usage.prompt_token_count),
-        output_tokens: usage.as_ref().and_then(|usage| usage.candidates_token_count),
+        output_tokens: usage
+            .as_ref()
+            .and_then(|usage| usage.candidates_token_count),
         total_tokens: usage.as_ref().and_then(|usage| usage.total_token_count),
         reasoning_tokens: usage.as_ref().and_then(|usage| usage.thoughts_token_count),
         cached_input_tokens: usage
@@ -873,8 +875,14 @@ async fn call_gemini_api(
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
 ) -> Result<GeminiResponse> {
-    let value = call_gemini_api_value(model, payload, system_prompt_label, audit_context, operation)
-        .await?;
+    let value = call_gemini_api_value(
+        model,
+        payload,
+        system_prompt_label,
+        audit_context,
+        operation,
+    )
+    .await?;
     let parsed = serde_json::from_value::<GeminiResponse>(value)
         .map_err(|err| anyhow!("Gemini generateContent response decode failed: {}", err))?;
     Ok(parsed)
@@ -1646,8 +1654,8 @@ pub async fn generate_image_with_gemini(
         audit_context,
         "generate_image_with_gemini",
     )
-        .await
-        .map_err(|err| ImageGenerationError(err.to_string()))?;
+    .await
+    .map_err(|err| ImageGenerationError(err.to_string()))?;
 
     let images = extract_images_from_response(response);
     if images.is_empty() {

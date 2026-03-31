@@ -472,8 +472,7 @@ async fn call_provider_api(
         let value = response.json::<Value>().await?;
         debug!(
             "{} response received for model={}",
-            details.display_name,
-            model
+            details.display_name, model
         );
         let usage = extract_openai_compatible_usage(&value);
         record_llm_request_success(
@@ -812,14 +811,8 @@ pub async fn call_third_party_with_tool_runtime(
     ];
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
 
-    chat_completion_with_tool_runtime(
-        messages,
-        &model_config,
-        runtime,
-        audit_context,
-        &operation,
-    )
-    .await
+    chat_completion_with_tool_runtime(messages, &model_config, runtime, audit_context, &operation)
+        .await
 }
 
 pub async fn call_third_party(

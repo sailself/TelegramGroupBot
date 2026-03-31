@@ -31,7 +31,7 @@ use crate::llm::openai_codex;
 use crate::llm::runtime_models::{runtime_model_count, selected_codex_model_record};
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
-    audit_context_from_id, create_audit_context_from_message, call_gemini,
+    audit_context_from_id, call_gemini, create_audit_context_from_message,
     generate_image_with_gemini, generate_music_with_lyria, generate_video_with_veo,
     GeminiImageConfig, LlmAuditContext,
 };
@@ -2433,11 +2433,11 @@ pub async fn paintme_handler(
         .await?;
         return Ok(());
     }
-    let audit_context = create_command_audit_context(&state, &message, if portrait {
-        "portraitme"
-    } else {
-        "paintme"
-    })
+    let audit_context = create_command_audit_context(
+        &state,
+        &message,
+        if portrait { "portraitme" } else { "paintme" },
+    )
     .await;
 
     let mut formatted_history =

@@ -1297,9 +1297,14 @@ data: {"type":"response.completed","response":{"id":"resp1","output":[],"usage":
         assert_eq!(output.len(), 2);
         assert_eq!(output[0]["type"], "message");
         assert_eq!(output[1]["type"], "function_call");
-        assert_eq!(parsed.get("id").and_then(|value| value.as_str()), Some("resp1"));
         assert_eq!(
-            parsed.pointer("/usage/input_tokens").and_then(|value| value.as_i64()),
+            parsed.get("id").and_then(|value| value.as_str()),
+            Some("resp1")
+        );
+        assert_eq!(
+            parsed
+                .pointer("/usage/input_tokens")
+                .and_then(|value| value.as_i64()),
             Some(12)
         );
     }

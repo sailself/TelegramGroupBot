@@ -190,7 +190,9 @@ impl Database {
                 if !user.full_name().is_empty() {
                     user.full_name()
                 } else {
-                    user.username.clone().unwrap_or_else(|| "Anonymous".to_string())
+                    user.username
+                        .clone()
+                        .unwrap_or_else(|| "Anonymous".to_string())
                 }
             }),
             message_id: message.id.0 as i64,
@@ -1200,13 +1202,12 @@ mod tests {
         .await
         .expect("request insert should succeed");
 
-        let invocation = sqlx::query_as::<_, LlmInvocationRow>(
-            "SELECT * FROM llm_invocations WHERE id = ?",
-        )
-        .bind(invocation_id)
-        .fetch_one(db.pool())
-        .await
-        .expect("invocation row should exist");
+        let invocation =
+            sqlx::query_as::<_, LlmInvocationRow>("SELECT * FROM llm_invocations WHERE id = ?")
+                .bind(invocation_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("invocation row should exist");
         let request = sqlx::query_as::<_, LlmRequestRow>(
             "SELECT * FROM llm_requests WHERE invocation_id = ?",
         )

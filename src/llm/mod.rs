@@ -11,9 +11,7 @@ pub mod third_party;
 pub mod tool_runtime;
 pub mod web_search;
 
-pub use audit::{
-    audit_context_from_id, create_audit_context_from_message, LlmAuditContext,
-};
+pub use audit::{audit_context_from_id, create_audit_context_from_message, LlmAuditContext};
 pub use gemini::{
     call_gemini, call_gemini_with_tool_runtime, generate_image_with_gemini,
     generate_music_with_lyria, generate_video_with_veo, GeminiImageConfig,
