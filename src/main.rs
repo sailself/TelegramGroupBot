@@ -52,6 +52,16 @@ enum Command {
         description = "Quick Question（快问快答），小喵会用Gemini的低思考级别尽量快捷地回答你的问题"
     )]
     Qq(String),
+    #[command(
+        rename = "burn_baby_burn",
+        description = "show how many tokens you have used in this chat"
+    )]
+    BurnBabyBurn,
+    #[command(
+        rename = "token_devourers",
+        description = "rank the top token consumers in this group"
+    )]
+    TokenDevourers(String),
     #[command(description = "搜索本群聊相关消息，返回命中的消息摘要和直达链接")]
     S(String),
     #[command(
@@ -74,6 +84,11 @@ enum Command {
     Status,
     #[command(description = "查看诊断信息（管理员）")]
     Diagnose,
+    #[command(
+        rename = "token_stats",
+        description = "show bot-wide token statistics (admin)"
+    )]
+    TokenStats(String),
     #[command(description = "投喂AI小喵")]
     #[command(description = "ç™»å½• ChatGPT Codexï¼ˆç®¡ç†å‘˜ï¼‰")]
     Codexlogin,
@@ -233,7 +248,15 @@ async fn main() -> HandlerResult {
 
     handlers::access::load_whitelist();
     if CONFIG.publish_bot_commands {
-        let commands = public_bot_commands();
+        let mut commands = public_bot_commands();
+        commands.push(BotCommand::new(
+            "burn_baby_burn",
+            "show how many tokens you have used in this chat",
+        ));
+        commands.push(BotCommand::new(
+            "token_devourers",
+            "rank the top token consumers in this group",
+        ));
         info!(
             "Publishing {} bot commands to Telegram because PUBLISH_BOT_COMMANDS=true; \
              this replaces the default-scope command list managed by BotFather",
@@ -358,6 +381,28 @@ async fn handle_command(
                 }
             });
         }
+        Command::BurnBabyBurn => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) = commands::burn_baby_burn_handler(bot, state, message).await {
+                    error!("burn_baby_burn handler failed: {err}");
+                }
+            });
+        }
+        Command::TokenDevourers(arg) => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let arg = optional_arg(arg);
+            tokio::spawn(async move {
+                if let Err(err) = commands::token_devourers_handler(bot, state, message, arg).await
+                {
+                    error!("token_devourers handler failed: {err}");
+                }
+            });
+        }
         Command::S(arg) => {
             let bot = bot.clone();
             let state = state.clone();
@@ -461,6 +506,17 @@ async fn handle_command(
             tokio::spawn(async move {
                 if let Err(err) = commands::diagnose_handler(bot, state, message).await {
                     error!("diagnose handler failed: {err}");
+                }
+            });
+        }
+        Command::TokenStats(arg) => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let arg = optional_arg(arg);
+            tokio::spawn(async move {
+                if let Err(err) = commands::token_stats_handler(bot, state, message, arg).await {
+                    error!("token_stats handler failed: {err}");
                 }
             });
         }

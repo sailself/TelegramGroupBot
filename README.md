@@ -17,6 +17,9 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/qc` - Ask a question about this chat using chat-scoped retrieval plus web search when needed.
 - Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically.
 - `/qq` - Quick Gemini response using the default Gemini model.
+- `/burn_baby_burn` - Show how many tokens you have used in the current chat.
+- `/token_devourers [n]` - Show the top token consumers in the current group chat.
+- `/token_stats [model|user]` - Show bot-wide token usage totals (admin-only).
 - `/s` - Search this chat and return relevant message links.
 - `/img` - Generate or edit an image with Gemini.
 - `/image` - Generate an image with selectable resolution and aspect ratio.

@@ -20,7 +20,7 @@ use crate::handlers::content::{
     extract_twitter_urls_and_content, extract_youtube_urls,
 };
 use crate::handlers::media::{
-    collect_message_media, summarize_media_files, MediaCollectionOptions,
+    collect_message_media, summarize_media_files, MediaCollectionOptions, MediaSummary,
 };
 use crate::handlers::responses::send_response;
 use crate::llm::audit::{
@@ -199,6 +199,20 @@ fn truncate_for_user(text: &str, limit: usize) -> String {
     }
     let truncated: String = text.chars().take(limit).collect();
     format!("{truncated}...")
+}
+
+fn build_media_only_qa_prompt(media_summary: &MediaSummary) -> Option<String> {
+    if media_summary.images > 0 {
+        Some("Please analyze the attached image(s).".to_string())
+    } else if media_summary.videos > 0 {
+        Some("Please analyze the attached video(s).".to_string())
+    } else if media_summary.audios > 0 {
+        Some("Please analyze the attached audio file(s).".to_string())
+    } else if media_summary.documents > 0 {
+        Some("Please analyze the attached document(s).".to_string())
+    } else {
+        None
+    }
 }
 
 async fn create_q_audit_context(
@@ -1074,6 +1088,7 @@ async fn process_request(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::handlers::media::MediaSummary;
 
     fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPartyModelConfig {
         ThirdPartyModelConfig {
@@ -1214,6 +1229,27 @@ mod tests {
         record.selected_reasoning_level = Some(String::new());
         assert_eq!(codex_selected_model_label(&record), "gpt-5.4 medium");
     }
+
+    #[test]
+    fn media_only_prompt_prefers_image_analysis() {
+        let summary = MediaSummary {
+            total: 1,
+            images: 1,
+            videos: 0,
+            audios: 0,
+            documents: 0,
+        };
+
+        assert_eq!(
+            build_media_only_qa_prompt(&summary).as_deref(),
+            Some("Please analyze the attached image(s).")
+        );
+    }
+
+    #[test]
+    fn media_only_prompt_returns_none_without_media() {
+        assert_eq!(build_media_only_qa_prompt(&MediaSummary::default()), None);
+    }
 }
 
 #[allow(deprecated)]
@@ -1280,8 +1316,18 @@ async fn q_handler_internal(
         }
     }
 
+    let media_options = MediaCollectionOptions::for_qa();
+    let max_files = media_options.max_files;
+    let media = collect_message_media(&bot, &state, &message, media_options).await;
+    let mut media_files = media.files;
+    let initial_media_summary = summarize_media_files(&media_files);
+
     let original_query = if query_text_raw.trim().is_empty() {
-        reply_text_raw.clone()
+        if reply_text_raw.trim().is_empty() {
+            build_media_only_qa_prompt(&initial_media_summary).unwrap_or_default()
+        } else {
+            reply_text_raw.clone()
+        }
     } else {
         query_text_raw.clone()
     };
@@ -1328,7 +1374,11 @@ async fn q_handler_internal(
     }
 
     let query_base = if query_text.trim().is_empty() {
-        reply_text.clone()
+        if reply_text.trim().is_empty() {
+            original_query.clone()
+        } else {
+            reply_text.clone()
+        }
     } else if reply_text.trim().is_empty() {
         query_text.clone()
     } else {
@@ -1368,11 +1418,6 @@ async fn q_handler_internal(
     } else {
         query_text.clone()
     };
-
-    let media_options = MediaCollectionOptions::for_qa();
-    let max_files = media_options.max_files;
-    let media = collect_message_media(&bot, &state, &message, media_options).await;
-    let mut media_files = media.files;
 
     let mut remaining = max_files.saturating_sub(media_files.len());
     if remaining > 0 {

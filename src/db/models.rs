@@ -121,3 +121,17 @@ pub struct LlmRequestInsert {
     pub cached_input_tokens: Option<i64>,
     pub raw_usage_json: Option<String>,
 }
+
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct TokenUserStat {
+    pub user_id: i64,
+    pub username: Option<String>,
+    pub total_tokens: i64,
+}
+
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct ModelTokenStat {
+    pub provider: String,
+    pub model: String,
+    pub total_tokens: i64,
+}
