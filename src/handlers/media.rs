@@ -1,6 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use teloxide::prelude::*;
 use teloxide::types::FileId;
 
@@ -9,6 +12,17 @@ use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFi
 use crate::state::AppState;
 
 const DEFAULT_MAX_FILES: usize = 10;
+const FILE_URL_CACHE_TTL: Duration = Duration::from_secs(900);
+const FILE_URL_CACHE_MAX_ENTRIES: usize = 512;
+
+#[derive(Debug, Clone)]
+struct FileUrlCacheEntry {
+    stored_at: Instant,
+    url: String,
+}
+
+static FILE_URL_CACHE: Lazy<Mutex<HashMap<String, FileUrlCacheEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Default, Clone)]
 pub struct MediaCollection {
@@ -68,11 +82,51 @@ pub fn summarize_media_files(files: &[MediaFile]) -> MediaSummary {
 }
 
 pub async fn get_file_url(bot: &Bot, file_id: &FileId) -> Result<String> {
+    let key = file_id.to_string();
+    {
+        let mut cache = FILE_URL_CACHE.lock();
+        prune_file_url_cache(&mut cache);
+        if let Some(entry) = cache.get(&key) {
+            if entry.stored_at.elapsed() <= FILE_URL_CACHE_TTL {
+                return Ok(entry.url.clone());
+            }
+        }
+        cache.remove(&key);
+    }
+
     let file = bot.get_file(file_id.clone()).await?;
-    Ok(format!(
+    let url = format!(
         "https://api.telegram.org/file/bot{}/{}",
         CONFIG.bot_token, file.path
-    ))
+    );
+
+    let mut cache = FILE_URL_CACHE.lock();
+    prune_file_url_cache(&mut cache);
+    cache.insert(
+        key,
+        FileUrlCacheEntry {
+            stored_at: Instant::now(),
+            url: url.clone(),
+        },
+    );
+    Ok(url)
+}
+
+fn prune_file_url_cache(cache: &mut HashMap<String, FileUrlCacheEntry>) {
+    cache.retain(|_, entry| entry.stored_at.elapsed() <= FILE_URL_CACHE_TTL);
+    if cache.len() <= FILE_URL_CACHE_MAX_ENTRIES {
+        return;
+    }
+
+    let mut ordered = cache
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.stored_at))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, stored_at)| *stored_at);
+    let remove_count = cache.len().saturating_sub(FILE_URL_CACHE_MAX_ENTRIES);
+    for (key, _) in ordered.into_iter().take(remove_count) {
+        cache.remove(&key);
+    }
 }
 
 fn extension_mime_hint(file_name: &str) -> Option<&'static str> {
@@ -317,12 +371,7 @@ pub async fn collect_message_media(
             if collection.files.len() >= options.max_files {
                 break;
             }
-            let group_items = state
-                .media_groups
-                .lock()
-                .get(&media_group_id)
-                .cloned()
-                .unwrap_or_default();
+            let group_items = state.media_group_items(&media_group_id);
             for item in group_items {
                 if collection.files.len() >= options.max_files {
                     break;

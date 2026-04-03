@@ -1,4 +1,3 @@
-use base64::{engine::general_purpose, Engine as _};
 use image::codecs::jpeg::JpegEncoder;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -11,43 +10,6 @@ struct CwdUploadResponse {
     success: bool,
     #[serde(rename = "imageUrl")]
     image_url: Option<String>,
-}
-
-#[allow(dead_code)]
-pub async fn upload_base64_image_to_cwd(
-    base64_data: &str,
-    api_key: &str,
-    model: Option<&str>,
-    prompt: Option<&str>,
-) -> Option<String> {
-    if !base64_data.starts_with("data:image/") {
-        warn!("Invalid base64 image format - missing data URI prefix");
-        return None;
-    }
-
-    let mut parts = base64_data.splitn(2, ',');
-    let header = parts.next().unwrap_or_default();
-    let payload = parts.next().unwrap_or_default();
-
-    let mime_type = header
-        .trim_start_matches("data:")
-        .split(';')
-        .next()
-        .unwrap_or("");
-    if !mime_type.starts_with("image/") {
-        warn!("Unsupported MIME type: {}", mime_type);
-        return None;
-    }
-
-    let bytes = match general_purpose::STANDARD.decode(payload) {
-        Ok(data) => data,
-        Err(err) => {
-            warn!("Failed to decode base64 data: {err}");
-            return None;
-        }
-    };
-
-    upload_image_bytes_to_cwd(&bytes, api_key, mime_type, model, prompt).await
 }
 
 pub async fn upload_image_bytes_to_cwd(

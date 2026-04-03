@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -7,6 +8,8 @@ use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::config::CONFIG;
@@ -506,7 +509,7 @@ fn gemini_mime_for_file(file: &MediaFile) -> Option<String> {
     if !file.mime_type.trim().is_empty() {
         candidates.push(file.mime_type.clone());
     }
-    if let Some(detected) = detect_mime_type(&file.bytes) {
+    if let Some(detected) = detect_mime_type(file.bytes()) {
         candidates.push(detected);
     }
 
@@ -636,58 +639,74 @@ async fn wait_for_file_active(file: GeminiFileInfo) -> Result<GeminiFileInfo> {
 }
 
 async fn upload_media_files(files: &[MediaFile]) -> Result<Vec<UploadedFileRef>> {
-    let mut uploaded = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(CONFIG.gemini_upload_fanout));
+    let mut join_set = JoinSet::new();
 
-    for (index, file) in files.iter().enumerate() {
-        let display_name = file
-            .display_name
-            .clone()
-            .unwrap_or_else(|| format!("{}-{}", kind_label(file.kind), index + 1));
-        if file.bytes.is_empty() {
-            warn!("Skipping empty media file {}", display_name);
-            continue;
-        }
-        let Some(mime_type) = gemini_mime_for_file(file) else {
-            warn!(
-                "Skipping unsupported Gemini media {} (kind={}, mime={})",
-                display_name,
-                kind_label(file.kind),
-                file.mime_type
-            );
-            continue;
-        };
-        let info = upload_file_bytes(&display_name, &mime_type, &file.bytes).await?;
-        let info = wait_for_file_active(info).await?;
-        if let Some(uploaded_mime_type) = info
-            .mime_type
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            debug!(
-                display_name = %display_name,
-                mime_type = %uploaded_mime_type,
-                "Gemini file upload became active"
-            );
-        }
-        let uri = if !info.uri.trim().is_empty() {
-            info.uri
-        } else if !info.name.trim().is_empty() {
-            format!(
-                "https://generativelanguage.googleapis.com/files/{}",
-                info.name.trim_start_matches("files/")
-            )
-        } else {
-            warn!(
-                "Gemini file upload response missing uri/name for {}",
-                display_name
-            );
-            continue;
-        };
-        uploaded.push(UploadedFileRef { uri });
+    for (index, file) in files.iter().cloned().enumerate() {
+        let semaphore = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("gemini upload semaphore should remain open");
+            let display_name = file
+                .display_name
+                .clone()
+                .unwrap_or_else(|| format!("{}-{}", kind_label(file.kind), index + 1));
+            if file.bytes().is_empty() {
+                warn!("Skipping empty media file {}", display_name);
+                return Ok::<_, anyhow::Error>((index, None));
+            }
+            let Some(mime_type) = gemini_mime_for_file(&file) else {
+                warn!(
+                    "Skipping unsupported Gemini media {} (kind={}, mime={})",
+                    display_name,
+                    kind_label(file.kind),
+                    file.mime_type
+                );
+                return Ok((index, None));
+            };
+            let info = upload_file_bytes(&display_name, &mime_type, file.bytes()).await?;
+            let info = wait_for_file_active(info).await?;
+            if let Some(uploaded_mime_type) = info
+                .mime_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                debug!(
+                    display_name = %display_name,
+                    mime_type = %uploaded_mime_type,
+                    "Gemini file upload became active"
+                );
+            }
+            let uri = if !info.uri.trim().is_empty() {
+                info.uri
+            } else if !info.name.trim().is_empty() {
+                format!(
+                    "https://generativelanguage.googleapis.com/files/{}",
+                    info.name.trim_start_matches("files/")
+                )
+            } else {
+                warn!(
+                    "Gemini file upload response missing uri/name for {}",
+                    display_name
+                );
+                return Ok((index, None));
+            };
+            Ok((index, Some(UploadedFileRef { uri })))
+        });
     }
 
-    Ok(uploaded)
+    let mut uploaded = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        let (index, file_ref) = result??;
+        if let Some(file_ref) = file_ref {
+            uploaded.push((index, file_ref));
+        }
+    }
+    uploaded.sort_by_key(|(index, _)| *index);
+    Ok(uploaded.into_iter().map(|(_, file_ref)| file_ref).collect())
 }
 
 fn build_gemini_parts(

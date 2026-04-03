@@ -1,7 +1,6 @@
-﻿use std::time::Instant;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use serde_json::Value as JsonValue;
 use teloxide::types::Message;
 use tracing::info;
 
@@ -101,55 +100,4 @@ pub fn start_command_timer(command: &str, message: &Message) -> CommandTimer {
 pub fn complete_command_timer(timer: &mut CommandTimer, status: &str, detail: Option<String>) {
     timer.mark_status(status, detail);
     timer.log_completed();
-}
-
-#[allow(dead_code)]
-pub async fn log_llm_timing<T, F, Fut>(
-    provider: &str,
-    model: &str,
-    operation: &str,
-    metadata: Option<JsonValue>,
-    call: F,
-) -> Result<T, anyhow::Error>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, anyhow::Error>>,
-{
-    let started_at = Utc::now();
-    let started_perf = Instant::now();
-    let metadata_text = metadata
-        .as_ref()
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "{}".to_string());
-    info!(
-        target: "bot.timing",
-        "event=llm_request provider={} model={} operation={} started_at={} metadata={}",
-        provider,
-        model,
-        operation,
-        started_at.to_rfc3339(),
-        metadata_text
-    );
-
-    let mut status = "success";
-    let result = call().await;
-    if result.is_err() {
-        status = "error";
-    }
-
-    let completed_at = Utc::now();
-    let duration = started_perf.elapsed().as_secs_f64();
-    info!(
-        target: "bot.timing",
-        "event=llm_response provider={} model={} operation={} completed_at={} duration_s={:.3} status={} metadata={}",
-        provider,
-        model,
-        operation,
-        completed_at.to_rfc3339(),
-        duration,
-        status,
-        metadata_text
-    );
-
-    result
 }

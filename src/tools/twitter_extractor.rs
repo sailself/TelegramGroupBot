@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use tracing::{debug, info};
 use url::Url;
@@ -21,6 +22,20 @@ pub struct TwitterContent {
 const REQUEST_TIMEOUT: u64 = 20;
 const USER_AGENT: &str =
     "TelegramGroupHelperBot/0.1 (+https://github.com/sailself/TelegramGroupHelperBot)";
+
+static TIMESTAMP_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\d{1,2}:\d{2}\s?[AP]M").expect("valid timestamp regex"));
+static MEDIA_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"!\[[^\]]*?\]\((https?://[^\)]+)\)").expect("valid twitter media regex")
+});
+static LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\[([^\]]*?)\]\((https?://[^\)]+)\)").expect("valid twitter link regex")
+});
+static EMPTY_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\[\s*\]\((https?://[^\)]+)\)").expect("valid twitter empty link regex")
+});
+static WHITESPACE_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\s+").expect("valid whitespace regex"));
 
 fn is_supported_host(host: &str) -> bool {
     let mut host = host.to_lowercase();
@@ -101,8 +116,7 @@ fn normalize_media_url(url: &str) -> String {
 }
 
 fn looks_like_timestamp(text: &str) -> bool {
-    let timestamp_pattern = Regex::new(r"\d{1,2}:\d{2}\s?[AP]M").unwrap();
-    if timestamp_pattern.is_match(text) {
+    if TIMESTAMP_REGEX.is_match(text) {
         return true;
     }
     let lowered = text.to_lowercase();
@@ -230,10 +244,6 @@ fn collect_relevant_lines(markdown_block: &str) -> Vec<String> {
 }
 
 fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let media_pattern = Regex::new(r"!\[[^\]]*?\]\((https?://[^\)]+)\)").unwrap();
-    let link_pattern = Regex::new(r"\[([^\]]*?)\]\((https?://[^\)]+)\)").unwrap();
-    let empty_link_pattern = Regex::new(r"\[\s*\]\((https?://[^\)]+)\)").unwrap();
-
     let mut cleaned: Vec<String> = Vec::new();
     let mut image_urls = Vec::new();
     let mut video_urls = Vec::new();
@@ -247,11 +257,9 @@ fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<Str
     ];
     let video_extensions = [".mp4", ".m3u8", ".mpd"];
     let punct_prefixes = [".", ",", ";", ":", ")", "]", "}", "!", "?"];
-    let whitespace_pattern = Regex::new(r"\s+").unwrap();
-
     for line in lines {
         let mut working = line.clone();
-        for caps in media_pattern.captures_iter(&working) {
+        for caps in MEDIA_REGEX.captures_iter(&working) {
             let media_url = normalize_media_url(&caps[1]);
             debug!(
                 target: "content.extract",
@@ -331,15 +339,15 @@ fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<Str
                 );
             }
         }
-        working = media_pattern.replace_all(&working, "").to_string();
-        working = empty_link_pattern.replace_all(&working, "").to_string();
+        working = MEDIA_REGEX.replace_all(&working, "").to_string();
+        working = EMPTY_LINK_REGEX.replace_all(&working, "").to_string();
 
-        working = link_pattern
+        working = LINK_REGEX
             .replace_all(&working, |caps: &regex::Captures| {
                 caps[1].trim().to_string()
             })
             .to_string();
-        working = whitespace_pattern
+        working = WHITESPACE_REGEX
             .replace_all(&working, " ")
             .trim()
             .to_string();

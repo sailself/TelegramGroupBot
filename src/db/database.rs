@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::config::CONFIG;
 use crate::db::models::{
     ChatSearchHit, LlmInvocationInsert, LlmRequestInsert, MessageInsert, MessageRow,
 };
@@ -113,17 +114,33 @@ fn build_snippet(text: &str, terms: &[String]) -> String {
 impl Database {
     pub async fn init(database_url: &str) -> Result<Self> {
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(CONFIG.db_max_connections)
             .connect(database_url)
             .await?;
         let search_ready = Arc::new(AtomicBool::new(false));
 
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous = NORMAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout = 5000")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA cache_size = -65536")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA mmap_size = 134217728")
+            .execute(&pool)
+            .await?;
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(&pool)
             .await?;
         ensure_messages_schema(&pool).await?;
         ensure_search_support_schema(&pool).await?;
         ensure_llm_audit_schema(&pool).await?;
+        sqlx::query("PRAGMA optimize").execute(&pool).await?;
 
         let schema_version = current_search_schema_version(&pool).await?;
         if schema_version != CURRENT_SEARCH_SCHEMA_VERSION {
@@ -135,7 +152,7 @@ impl Database {
 
         info!("Database tables created successfully");
 
-        let (sender, receiver) = mpsc::channel(1000);
+        let (sender, receiver) = mpsc::channel(CONFIG.db_queue_capacity);
         let writer_pool = pool.clone();
         tokio::spawn(async move {
             db_writer(writer_pool, receiver).await;
@@ -992,7 +1009,41 @@ async fn count_pending_search_rows(pool: &SqlitePool) -> Result<i64> {
 }
 
 async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<MessageInsert>) {
-    while let Some(message) = receiver.recv().await {
+    let flush_deadline = Duration::from_millis(CONFIG.db_write_flush_ms);
+    let batch_size = CONFIG.db_write_batch_size.max(1);
+    let mut buffer = Vec::with_capacity(batch_size);
+
+    loop {
+        let Some(message) = receiver.recv().await else {
+            break;
+        };
+        buffer.push(message);
+        let flush_at = tokio::time::Instant::now() + flush_deadline;
+
+        while buffer.len() < batch_size {
+            match tokio::time::timeout_at(flush_at, receiver.recv()).await {
+                Ok(Some(message)) => buffer.push(message),
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        if let Err(err) = write_message_batch(&pool, &buffer).await {
+            warn!("Error in db_writer batch: {err}");
+        }
+        buffer.clear();
+    }
+
+    let _ = pool.close().await;
+    info!("Database writer task stopped");
+}
+
+async fn write_message_batch(pool: &SqlitePool, batch: &[MessageInsert]) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    for message in batch {
         let explicit = SearchProvenance {
             asks_ai: message.asks_ai,
             ai_command: message.ai_command.clone(),
@@ -1004,7 +1055,7 @@ async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<MessageInsert>
             message.search_source_text.as_deref(),
             &explicit,
         );
-        let result = sqlx::query(
+        sqlx::query(
             "INSERT INTO messages (\
                  message_id, \
                  chat_id, \
@@ -1040,28 +1091,23 @@ async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<MessageInsert>
         .bind(message.message_id)
         .bind(message.chat_id)
         .bind(message.user_id)
-        .bind(message.username)
-        .bind(message.text)
+        .bind(message.username.clone())
+        .bind(message.text.clone())
         .bind(document.search_text)
         .bind(document.search_tags)
         .bind(CURRENT_SEARCH_SCHEMA_VERSION)
-        .bind(message.language)
+        .bind(message.language.clone())
         .bind(message.date)
         .bind(message.reply_to_message_id)
         .bind(document.provenance.is_command)
         .bind(document.provenance.asks_ai)
         .bind(document.provenance.ai_command)
         .bind(document.provenance.is_synthetic_record)
-        .execute(&pool)
-        .await;
-
-        if let Err(err) = result {
-            warn!("Error in db_writer: {err}");
-        }
+        .execute(&mut *tx)
+        .await?;
     }
-
-    let _ = pool.close().await;
-    info!("Database writer task stopped");
+    tx.commit().await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

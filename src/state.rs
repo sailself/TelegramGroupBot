@@ -1,10 +1,13 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use teloxide::types::{FileId, MediaGroupId};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::config::CONFIG;
 use crate::db::database::Database;
 use crate::llm::media::MediaFile;
 use crate::llm::openai_codex::{CodexReasoningEffortOption, CodexRemoteModel};
@@ -99,6 +102,12 @@ pub struct MediaGroupItem {
     pub file_id: FileId,
 }
 
+#[derive(Debug, Clone)]
+pub struct MediaGroupState {
+    pub items: Vec<MediaGroupItem>,
+    pub last_updated: Instant,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
@@ -109,7 +118,9 @@ pub struct AppState {
     pub pending_codex_model_requests: Arc<Mutex<HashMap<String, PendingCodexModelRequest>>>,
     pub pending_codex_reasoning_requests: Arc<Mutex<HashMap<String, PendingCodexReasoningRequest>>>,
     pub active_codex_login: Arc<Mutex<Option<ActiveCodexLogin>>>,
-    pub media_groups: Arc<Mutex<HashMap<MediaGroupId, Vec<MediaGroupItem>>>>,
+    pub media_groups: Arc<Mutex<HashMap<MediaGroupId, MediaGroupState>>>,
+    pub heavy_command_semaphore: Arc<Semaphore>,
+    pub heavy_command_waiters: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -124,6 +135,79 @@ impl AppState {
             pending_codex_reasoning_requests: Arc::new(Mutex::new(HashMap::new())),
             active_codex_login: Arc::new(Mutex::new(None)),
             media_groups: Arc::new(Mutex::new(HashMap::new())),
+            heavy_command_semaphore: Arc::new(Semaphore::new(CONFIG.heavy_command_max_concurrency)),
+            heavy_command_waiters: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub async fn acquire_heavy_command_permit(&self) -> OwnedSemaphorePermit {
+        self.heavy_command_waiters.fetch_add(1, Ordering::Relaxed);
+        let permit = self
+            .heavy_command_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("heavy command semaphore should remain open");
+        self.heavy_command_waiters.fetch_sub(1, Ordering::Relaxed);
+        permit
+    }
+
+    pub fn heavy_command_active(&self) -> usize {
+        CONFIG
+            .heavy_command_max_concurrency
+            .saturating_sub(self.heavy_command_semaphore.available_permits())
+    }
+
+    pub fn heavy_command_waiting(&self) -> usize {
+        self.heavy_command_waiters.load(Ordering::Relaxed)
+    }
+
+    pub fn store_media_group_item(&self, media_group_id: &MediaGroupId, item: MediaGroupItem) {
+        let mut groups = self.media_groups.lock();
+        prune_media_groups(&mut groups);
+        let entry = groups
+            .entry(media_group_id.clone())
+            .or_insert_with(|| MediaGroupState {
+                items: Vec::new(),
+                last_updated: Instant::now(),
+            });
+        entry.last_updated = Instant::now();
+        entry.items.push(item);
+    }
+
+    pub fn media_group_items(&self, media_group_id: &MediaGroupId) -> Vec<MediaGroupItem> {
+        let mut groups = self.media_groups.lock();
+        prune_media_groups(&mut groups);
+        groups
+            .get_mut(media_group_id)
+            .map(|group| {
+                group.last_updated = Instant::now();
+                group.items.clone()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn media_group_count(&self) -> usize {
+        let mut groups = self.media_groups.lock();
+        prune_media_groups(&mut groups);
+        groups.len()
+    }
+}
+
+fn prune_media_groups(groups: &mut HashMap<MediaGroupId, MediaGroupState>) {
+    let max_items = CONFIG.media_group_max_items;
+    if groups.len() <= max_items {
+        return;
+    }
+
+    let mut ordered = groups
+        .iter()
+        .map(|(group_id, group)| (group_id.clone(), group.last_updated))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, last_updated)| *last_updated);
+
+    let remove_count = groups.len().saturating_sub(max_items);
+    for (group_id, _) in ordered.into_iter().take(remove_count) {
+        groups.remove(&group_id);
     }
 }

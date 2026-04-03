@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,12 +11,18 @@ use tracing::{info, warn};
 use crate::config::CONFIG;
 
 static RATE_LIMITS: Lazy<Mutex<HashMap<i64, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static WHITELIST_CACHE: Lazy<Mutex<Option<Vec<String>>>> = Lazy::new(|| Mutex::new(None));
+static WHITELIST_CACHE: Lazy<Mutex<Option<HashSet<i64>>>> = Lazy::new(|| Mutex::new(None));
 static WHITELIST_LOADED: AtomicBool = AtomicBool::new(false);
+
+fn prune_rate_limits(limits: &mut HashMap<i64, Instant>, now: Instant) {
+    let ttl = Duration::from_secs(CONFIG.rate_limit_seconds.saturating_mul(4).max(60));
+    limits.retain(|_, last_seen| now.duration_since(*last_seen) <= ttl);
+}
 
 pub fn is_rate_limited(user_id: i64) -> bool {
     let mut limits = RATE_LIMITS.lock();
     let now = Instant::now();
+    prune_rate_limits(&mut limits, now);
 
     if let Some(last) = limits.get(&user_id) {
         if now.duration_since(*last) < Duration::from_secs(CONFIG.rate_limit_seconds) {
@@ -43,8 +49,14 @@ pub fn load_whitelist() {
                 .lines()
                 .map(|line| line.trim())
                 .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>();
+                .filter_map(|line| match line.parse::<i64>() {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        warn!("Ignoring invalid whitelist entry '{}'", line);
+                        None
+                    }
+                })
+                .collect::<HashSet<_>>();
             *cache = Some(ids);
             info!("Loaded whitelist file {}", path);
         }
@@ -65,7 +77,7 @@ pub fn is_user_whitelisted(user_id: i64) -> bool {
     let cache = WHITELIST_CACHE.lock();
     match &*cache {
         None => true,
-        Some(list) => list.contains(&user_id.to_string()),
+        Some(list) => list.contains(&user_id),
     }
 }
 
@@ -76,7 +88,7 @@ pub fn is_chat_whitelisted(chat_id: i64) -> bool {
     let cache = WHITELIST_CACHE.lock();
     match &*cache {
         None => true,
-        Some(list) => list.contains(&chat_id.to_string()),
+        Some(list) => list.contains(&chat_id),
     }
 }
 
@@ -169,8 +181,7 @@ pub async fn check_admin_access(bot: &Bot, message: &Message, command: &str) -> 
         .unwrap_or_default();
     let chat_id = message.chat.id.0;
 
-    let allowed =
-        whitelist.contains(&user_id.to_string()) || whitelist.contains(&chat_id.to_string());
+    let allowed = whitelist.contains(&user_id) || whitelist.contains(&chat_id);
 
     if !allowed {
         let _ = bot

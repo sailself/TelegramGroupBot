@@ -1,11 +1,17 @@
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 use regex::Regex;
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde_json::json;
 use teloxide::types::{MessageEntityKind, MessageEntityRef};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use crate::config::CONFIG;
@@ -13,6 +19,53 @@ use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
 use crate::tools::telegraph_extractor::{extract_telegraph_content, TelegraphContent};
 use crate::tools::twitter_extractor::{extract_twitter_content, TwitterContent};
 use crate::utils::http::get_http_client;
+
+const EXTRACTION_CACHE_TTL: Duration = Duration::from_secs(900);
+const EXTRACTION_CACHE_MAX_ENTRIES: usize = 64;
+
+static YOUTUBE_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"((?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})(?:[\?&][^\s]*)?)",
+    )
+    .expect("valid youtube regex")
+});
+static TELEGRAPH_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"https?://(?:telegra\.ph|t\.me)/[^\s\)>"]+"#).expect("valid telegraph url regex")
+});
+static TWITTER_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(https?://(?:www\.)?(?:x\.com|twitter\.com|mobile\.twitter\.com|m\.twitter\.com|fxtwitter\.com|vxtwitter\.com|fixupx\.com|fixvx\.com|twittpr\.com|pxtwitter\.com|tweetpik\.com)/[^\s\)>"]+)"#,
+    )
+    .expect("valid twitter url regex")
+});
+static MARKDOWN_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\[[^\]]*\]\((https?://[^)]+)\)"#).expect("valid markdown link regex")
+});
+static HTML_LINK_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"href=["'](https?://[^"']+)["']"#).expect("valid html link regex"));
+
+#[derive(Debug, Clone)]
+struct TelegraphCacheEntry {
+    stored_at: Instant,
+    content: TelegraphContent,
+}
+
+#[derive(Debug, Clone)]
+struct TwitterCacheEntry {
+    stored_at: Instant,
+    content: TwitterContent,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExternalMediaKind {
+    Image(&'static str),
+    Video,
+}
+
+static TELEGRAPH_CACHE: Lazy<Mutex<HashMap<String, TelegraphCacheEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static TWITTER_CACHE: Lazy<Mutex<HashMap<String, TwitterCacheEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn truncate_for_log(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
@@ -352,11 +405,7 @@ pub fn extract_youtube_urls(text: &str, max_urls: usize) -> (String, Vec<String>
         return (text.to_string(), Vec::new());
     }
 
-    let pattern = Regex::new(
-        r"((?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})(?:[\?&][^\s]*)?)",
-    )
-    .unwrap();
-    let mut matches = pattern.captures_iter(text).collect::<Vec<_>>();
+    let mut matches = YOUTUBE_URL_REGEX.captures_iter(text).collect::<Vec<_>>();
     let mut urls = Vec::new();
     let mut new_text = text.to_string();
     let mut count = 0;
@@ -397,6 +446,84 @@ fn is_telegraph_url(url: &str) -> bool {
     lowered.contains("telegra.ph") || lowered.contains("t.me/")
 }
 
+fn prune_telegraph_cache(cache: &mut HashMap<String, TelegraphCacheEntry>) {
+    cache.retain(|_, entry| entry.stored_at.elapsed() <= EXTRACTION_CACHE_TTL);
+    if cache.len() <= EXTRACTION_CACHE_MAX_ENTRIES {
+        return;
+    }
+
+    let mut ordered = cache
+        .iter()
+        .map(|(url, entry)| (url.clone(), entry.stored_at))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, stored_at)| *stored_at);
+    let remove_count = cache.len().saturating_sub(EXTRACTION_CACHE_MAX_ENTRIES);
+    for (url, _) in ordered.into_iter().take(remove_count) {
+        cache.remove(&url);
+    }
+}
+
+fn prune_twitter_cache(cache: &mut HashMap<String, TwitterCacheEntry>) {
+    cache.retain(|_, entry| entry.stored_at.elapsed() <= EXTRACTION_CACHE_TTL);
+    if cache.len() <= EXTRACTION_CACHE_MAX_ENTRIES {
+        return;
+    }
+
+    let mut ordered = cache
+        .iter()
+        .map(|(url, entry)| (url.clone(), entry.stored_at))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, stored_at)| *stored_at);
+    let remove_count = cache.len().saturating_sub(EXTRACTION_CACHE_MAX_ENTRIES);
+    for (url, _) in ordered.into_iter().take(remove_count) {
+        cache.remove(&url);
+    }
+}
+
+async fn extract_cached_telegraph_content(url: &str) -> anyhow::Result<TelegraphContent> {
+    {
+        let mut cache = TELEGRAPH_CACHE.lock();
+        prune_telegraph_cache(&mut cache);
+        if let Some(entry) = cache.get(url) {
+            return Ok(entry.content.clone());
+        }
+    }
+
+    let content = extract_telegraph_content(url).await?;
+    let mut cache = TELEGRAPH_CACHE.lock();
+    prune_telegraph_cache(&mut cache);
+    cache.insert(
+        url.to_string(),
+        TelegraphCacheEntry {
+            stored_at: Instant::now(),
+            content: content.clone(),
+        },
+    );
+    Ok(content)
+}
+
+async fn extract_cached_twitter_content(url: &str) -> anyhow::Result<TwitterContent> {
+    {
+        let mut cache = TWITTER_CACHE.lock();
+        prune_twitter_cache(&mut cache);
+        if let Some(entry) = cache.get(url) {
+            return Ok(entry.content.clone());
+        }
+    }
+
+    let content = extract_twitter_content(url).await?;
+    let mut cache = TWITTER_CACHE.lock();
+    prune_twitter_cache(&mut cache);
+    cache.insert(
+        url.to_string(),
+        TwitterCacheEntry {
+            stored_at: Instant::now(),
+            content: content.clone(),
+        },
+    );
+    Ok(content)
+}
+
 pub async fn extract_telegraph_urls_and_content(
     text: &str,
     message_entities: Option<&[MessageEntityRef<'_>]>,
@@ -406,9 +533,6 @@ pub async fn extract_telegraph_urls_and_content(
         return (text.to_string(), Vec::new());
     }
 
-    let url_pattern = Regex::new(r#"https?://(?:telegra\.ph|t\.me)/[^\s\)>"]+"#).unwrap();
-    let markdown_link_pattern = Regex::new(r#"\[[^\]]*\]\((https?://[^)]+)\)"#).unwrap();
-    let html_link_pattern = Regex::new(r#"href=["'](https?://[^"']+)["']"#).unwrap();
     let mut urls = Vec::new();
 
     if let Some(entities) = message_entities {
@@ -428,10 +552,10 @@ pub async fn extract_telegraph_urls_and_content(
         }
     }
 
-    for m in url_pattern.find_iter(text) {
+    for m in TELEGRAPH_URL_REGEX.find_iter(text) {
         urls.push(m.as_str().to_string());
     }
-    for caps in markdown_link_pattern.captures_iter(text) {
+    for caps in MARKDOWN_LINK_REGEX.captures_iter(text) {
         if let Some(url) = caps.get(1) {
             let candidate = clean_url_candidate(url.as_str());
             if is_telegraph_url(candidate) {
@@ -439,7 +563,7 @@ pub async fn extract_telegraph_urls_and_content(
             }
         }
     }
-    for caps in html_link_pattern.captures_iter(text) {
+    for caps in HTML_LINK_REGEX.captures_iter(text) {
         if let Some(url) = caps.get(1) {
             let candidate = clean_url_candidate(url.as_str());
             if is_telegraph_url(candidate) {
@@ -451,10 +575,34 @@ pub async fn extract_telegraph_urls_and_content(
     urls.sort();
     urls.dedup();
 
+    let ordered_urls = urls.into_iter().take(max_urls).collect::<Vec<_>>();
+    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
+    let mut join_set = JoinSet::new();
+    for url in ordered_urls.iter().cloned() {
+        let semaphore = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("external enrich semaphore should remain open");
+            let result = extract_cached_telegraph_content(&url).await;
+            (url, result)
+        });
+    }
+    let mut fetched = HashMap::new();
+    while let Some(result) = join_set.join_next().await {
+        if let Ok((url, content)) = result {
+            fetched.insert(url, content);
+        }
+    }
+
     let mut new_text = text.to_string();
     let mut extracted = Vec::new();
-    for url in urls.into_iter().take(max_urls) {
-        match extract_telegraph_content(&url).await {
+    for url in ordered_urls {
+        match fetched
+            .remove(&url)
+            .unwrap_or_else(|| Err(anyhow::anyhow!("Telegraph extraction task failed")))
+        {
             Ok(content) => {
                 log_extracted_content(
                     "telegraph",
@@ -493,13 +641,6 @@ pub async fn extract_twitter_urls_and_content(
         return (text.to_string(), Vec::new());
     }
 
-    let url_pattern = Regex::new(
-        r#"(https?://(?:www\.)?(?:x\.com|twitter\.com|mobile\.twitter\.com|m\.twitter\.com|fxtwitter\.com|vxtwitter\.com|fixupx\.com|fixvx\.com|twittpr\.com|pxtwitter\.com|tweetpik\.com)/[^\s\)>"]+)"#,
-    )
-    .unwrap();
-    let markdown_link_pattern = Regex::new(r#"\[[^\]]*\]\((https?://[^)]+)\)"#).unwrap();
-    let html_link_pattern = Regex::new(r#"href=["'](https?://[^"']+)["']"#).unwrap();
-
     let mut urls = Vec::new();
     if let Some(entities) = message_entities {
         for entity in entities {
@@ -512,26 +653,26 @@ pub async fn extract_twitter_urls_and_content(
                 _ => continue,
             };
             let candidate = clean_url_candidate(candidate);
-            if url_pattern.is_match(candidate) {
+            if TWITTER_URL_REGEX.is_match(candidate) {
                 urls.push(candidate.to_string());
             }
         }
     }
-    for m in url_pattern.find_iter(text) {
+    for m in TWITTER_URL_REGEX.find_iter(text) {
         urls.push(m.as_str().to_string());
     }
-    for caps in markdown_link_pattern.captures_iter(text) {
+    for caps in MARKDOWN_LINK_REGEX.captures_iter(text) {
         if let Some(url) = caps.get(1) {
             let candidate = clean_url_candidate(url.as_str());
-            if url_pattern.is_match(candidate) {
+            if TWITTER_URL_REGEX.is_match(candidate) {
                 urls.push(candidate.to_string());
             }
         }
     }
-    for caps in html_link_pattern.captures_iter(text) {
+    for caps in HTML_LINK_REGEX.captures_iter(text) {
         if let Some(url) = caps.get(1) {
             let candidate = clean_url_candidate(url.as_str());
-            if url_pattern.is_match(candidate) {
+            if TWITTER_URL_REGEX.is_match(candidate) {
                 urls.push(candidate.to_string());
             }
         }
@@ -539,11 +680,34 @@ pub async fn extract_twitter_urls_and_content(
     urls.sort();
     urls.dedup();
 
+    let ordered_urls = urls.into_iter().take(max_urls).collect::<Vec<_>>();
+    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
+    let mut join_set = JoinSet::new();
+    for url in ordered_urls.iter().cloned() {
+        let semaphore = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("external enrich semaphore should remain open");
+            let result = extract_cached_twitter_content(&url).await;
+            (url, result)
+        });
+    }
+    let mut fetched = HashMap::new();
+    while let Some(result) = join_set.join_next().await {
+        if let Ok((url, content)) = result {
+            fetched.insert(url, content);
+        }
+    }
+
     let mut new_text = text.to_string();
     let mut extracted = Vec::new();
-
-    for url in urls.into_iter().take(max_urls) {
-        match extract_twitter_content(&url).await {
+    for url in ordered_urls {
+        match fetched
+            .remove(&url)
+            .unwrap_or_else(|| Err(anyhow::anyhow!("Twitter extraction task failed")))
+        {
             Ok(content) => {
                 log_extracted_content(
                     "twitter",
@@ -695,6 +859,92 @@ async fn download_image_with_content_type(url: &str, source: &str) -> Option<(Ve
     Some((bytes, content_type))
 }
 
+async fn fetch_external_media(url: String, kind: ExternalMediaKind) -> Option<MediaFile> {
+    match kind {
+        ExternalMediaKind::Image(source) => {
+            if url.to_ascii_lowercase().contains(".svg") {
+                warn!(
+                    target: "content.extract",
+                    source = source,
+                    media_url = %url,
+                    reason = "svg",
+                    "Skipping image media"
+                );
+                return None;
+            }
+
+            let (bytes, mime_type) = download_image_with_content_type(&url, source).await?;
+            if mime_type == "image/svg+xml" {
+                warn!(
+                    target: "content.extract",
+                    source = source,
+                    media_url = %url,
+                    content_type = %mime_type,
+                    reason = "svg",
+                    "Skipping image media"
+                );
+                return None;
+            }
+            Some(MediaFile::new(
+                bytes,
+                mime_type,
+                MediaKind::Image,
+                display_name_from_url(&url),
+            ))
+        }
+        ExternalMediaKind::Video => {
+            let bytes = download_media(&url).await?;
+            let mime_type = video_mime_from_url(&url)
+                .map(|value| value.to_string())
+                .or_else(|| detect_mime_type(&bytes))
+                .unwrap_or_else(|| "video/mp4".to_string());
+            Some(MediaFile::new(
+                bytes,
+                mime_type,
+                MediaKind::Video,
+                display_name_from_url(&url),
+            ))
+        }
+    }
+}
+
+async fn collect_external_media(
+    requests: Vec<(usize, String, ExternalMediaKind)>,
+    max_files: usize,
+) -> Vec<MediaFile> {
+    if requests.is_empty() || max_files == 0 {
+        return Vec::new();
+    }
+
+    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
+    let mut join_set = JoinSet::new();
+
+    for (index, url, kind) in requests {
+        let semaphore = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("external enrich semaphore should remain open");
+            (index, fetch_external_media(url, kind).await)
+        });
+    }
+
+    let mut collected = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        if let Ok((index, Some(file))) = result {
+            collected.push((index, file));
+        }
+    }
+
+    collected.sort_by_key(|(index, _)| *index);
+    collected
+        .into_iter()
+        .take(max_files)
+        .map(|(_, file)| file)
+        .collect()
+}
+
 fn video_mime_from_url(url: &str) -> Option<&'static str> {
     let lowered = url.to_ascii_lowercase();
     if lowered.ends_with(".m3u8") {
@@ -714,107 +964,68 @@ pub async fn download_telegraph_media(
     contents: &[TelegraphContent],
     max_files: usize,
 ) -> Vec<MediaFile> {
-    let mut files = Vec::new();
     if max_files == 0 {
-        return files;
+        return Vec::new();
     }
 
+    let mut requests = Vec::new();
+    let mut request_index = 0usize;
     for content in contents {
         for url in &content.image_urls {
-            if files.len() >= max_files {
-                return files;
+            if requests.len() >= max_files {
+                break;
             }
-            if url.to_ascii_lowercase().contains(".svg") {
-                warn!(target: "content.extract", source = "twitter", media_url = %url, reason = "svg", "Skipping Twitter image");
-                continue;
-            }
-            if let Some((bytes, mime_type)) = download_image_with_content_type(url, "twitter").await
-            {
-                if mime_type == "image/svg+xml" {
-                    warn!(
-                        target: "content.extract",
-                        source = "twitter",
-                        media_url = %url,
-                        content_type = %mime_type,
-                        reason = "svg",
-                        "Skipping Twitter image"
-                    );
-                    continue;
-                }
-                files.push(MediaFile::new(
-                    bytes,
-                    mime_type,
-                    MediaKind::Image,
-                    display_name_from_url(url),
-                ));
-            }
+            requests.push((
+                request_index,
+                url.clone(),
+                ExternalMediaKind::Image("telegraph"),
+            ));
+            request_index += 1;
         }
 
         for url in &content.video_urls {
-            if files.len() >= max_files {
-                return files;
+            if requests.len() >= max_files {
+                break;
             }
-            if let Some(bytes) = download_media(url).await {
-                let mime_type = video_mime_from_url(url)
-                    .map(|value| value.to_string())
-                    .or_else(|| detect_mime_type(&bytes))
-                    .unwrap_or_else(|| "video/mp4".to_string());
-                files.push(MediaFile::new(
-                    bytes,
-                    mime_type,
-                    MediaKind::Video,
-                    display_name_from_url(url),
-                ));
-            }
+            requests.push((request_index, url.clone(), ExternalMediaKind::Video));
+            request_index += 1;
         }
     }
 
-    files
+    collect_external_media(requests, max_files).await
 }
 
 pub async fn download_twitter_media(
     contents: &[TwitterContent],
     max_files: usize,
 ) -> Vec<MediaFile> {
-    let mut files = Vec::new();
     if max_files == 0 {
-        return files;
+        return Vec::new();
     }
 
+    let mut requests = Vec::new();
+    let mut request_index = 0usize;
     for content in contents {
         for url in &content.image_urls {
-            if files.len() >= max_files {
-                return files;
+            if requests.len() >= max_files {
+                break;
             }
-            if let Some(bytes) = download_media(url).await {
-                let mime_type = detect_mime_type(&bytes).unwrap_or_else(|| "image/png".to_string());
-                files.push(MediaFile::new(
-                    bytes,
-                    mime_type,
-                    MediaKind::Image,
-                    display_name_from_url(url),
-                ));
-            }
+            requests.push((
+                request_index,
+                url.clone(),
+                ExternalMediaKind::Image("twitter"),
+            ));
+            request_index += 1;
         }
 
         for url in &content.video_urls {
-            if files.len() >= max_files {
-                return files;
+            if requests.len() >= max_files {
+                break;
             }
-            if let Some(bytes) = download_media(url).await {
-                let mime_type = video_mime_from_url(url)
-                    .map(|value| value.to_string())
-                    .or_else(|| detect_mime_type(&bytes))
-                    .unwrap_or_else(|| "video/mp4".to_string());
-                files.push(MediaFile::new(
-                    bytes,
-                    mime_type,
-                    MediaKind::Video,
-                    display_name_from_url(url),
-                ));
-            }
+            requests.push((request_index, url.clone(), ExternalMediaKind::Video));
+            request_index += 1;
         }
     }
 
-    files
+    collect_external_media(requests, max_files).await
 }

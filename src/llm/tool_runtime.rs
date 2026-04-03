@@ -16,7 +16,6 @@ const MAX_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_OFFSET: usize = 250;
 const MAX_CONTEXT_WINDOW: usize = 5;
 const MAX_WEB_RESULTS: usize = 10;
-const MAX_TOOL_TEXT_CHARS: usize = 1200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolProfile {
@@ -621,23 +620,12 @@ enum ToolName {
     ChatContextQuery,
 }
 
-fn truncate_tool_text(text: &str) -> String {
-    let char_count = text.chars().count();
-    if char_count <= MAX_TOOL_TEXT_CHARS {
-        return text.to_string();
-    }
-
-    let mut truncated: String = text.chars().take(MAX_TOOL_TEXT_CHARS).collect();
-    truncated.push_str("...");
-    truncated
-}
-
 fn message_row_to_tool_message(row: MessageRow) -> ToolMessage {
     ToolMessage {
         message_id: row.message_id,
         username: row.username,
         date_utc: row.date.to_rfc3339(),
-        text: truncate_tool_text(&row.text.unwrap_or_default()),
+        text: row.text.unwrap_or_default(),
         link: build_message_link(row.chat_id, row.message_id),
         asks_ai: row.asks_ai,
         ai_command: row.ai_command,
@@ -650,7 +638,7 @@ fn hit_to_tool_search_hit(hit: ChatSearchHit, context_messages: Vec<ToolMessage>
         message_id: hit.message_id,
         username: hit.username,
         date_utc: hit.date.to_rfc3339(),
-        text: truncate_tool_text(&hit.text),
+        text: hit.text,
         snippet: hit.snippet,
         link: hit.link,
         score: hit.score,

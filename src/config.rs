@@ -8,14 +8,6 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct ModelCapabilities {
-    pub images: bool,
-    pub video: bool,
-    pub audio: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub enum ThirdPartyProvider {
     #[serde(rename = "openrouter")]
@@ -86,17 +78,6 @@ pub struct ThirdPartyModelConfig {
     pub video: bool,
     pub audio: bool,
     pub tools: bool,
-}
-
-impl ThirdPartyModelConfig {
-    #[allow(dead_code)]
-    pub fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities {
-            images: self.image,
-            video: self.video,
-            audio: self.audio,
-        }
-    }
 }
 
 pub fn qualify_third_party_model_id(provider: ThirdPartyProvider, model: &str) -> String {
@@ -170,16 +151,22 @@ pub struct Config {
     pub exa_api_key: String,
     pub exa_search_endpoint: String,
     pub web_search_cache_ttl_seconds: u64,
+    pub web_search_cache_max_entries: usize,
     pub web_search_providers: Vec<String>,
-    pub llama_model: String,
-    pub grok_model: String,
-    pub qwen_model: String,
-    pub deepseek_model: String,
-    pub gpt_model: String,
+    pub heavy_command_max_concurrency: usize,
     pub rate_limit_seconds: u64,
     pub model_selection_timeout: u64,
+    pub db_max_connections: u32,
+    pub db_queue_capacity: usize,
+    pub db_write_batch_size: usize,
+    pub db_write_flush_ms: u64,
     pub default_q_model: String,
     pub telegram_max_length: usize,
+    pub media_group_max_items: usize,
+    pub external_enrich_fanout: usize,
+    pub gemini_upload_fanout: usize,
+    pub max_tool_context_items: usize,
+    pub enable_tldr_infographic: bool,
     pub telegraph_access_token: String,
     pub telegraph_author_name: String,
     pub telegraph_author_url: String,
@@ -219,6 +206,13 @@ fn env_i32(name: &str, default: i32) -> i32 {
     env::var(name)
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(default)
 }
 
@@ -376,43 +370,7 @@ fn load_third_party_models_from_path(path: &Path) -> Vec<ThirdPartyModelConfig> 
     models
 }
 
-fn load_legacy_openrouter_models(config: &LegacyOpenRouterEnv) -> Vec<ThirdPartyModelConfig> {
-    let legacy_entries: Vec<(&str, &str, bool, bool, bool, bool)> = vec![
-        ("Llama 4", &config.llama_model, true, false, false, true),
-        ("Grok 4", &config.grok_model, true, false, false, true),
-        ("Qwen 3", &config.qwen_model, false, false, false, true),
-        (
-            "DeepSeek 3.1",
-            &config.deepseek_model,
-            false,
-            false,
-            false,
-            false,
-        ),
-        ("GPT", &config.gpt_model, true, false, false, true),
-    ];
-
-    let mut models = Vec::new();
-    for (name, model_id, image, video, audio, tools) in legacy_entries {
-        if !model_id.trim().is_empty() {
-            models.push(build_third_party_model_config(
-                ThirdPartyProvider::OpenRouter,
-                name,
-                model_id.trim(),
-                image,
-                video,
-                audio,
-                tools,
-            ));
-        }
-    }
-    models
-}
-
-fn build_third_party_models(
-    path: &Path,
-    legacy_env: &LegacyOpenRouterEnv,
-) -> Vec<ThirdPartyModelConfig> {
+fn load_third_party_models(path: &Path) -> Vec<ThirdPartyModelConfig> {
     let models = load_third_party_models_from_path(path);
     if !models.is_empty() {
         info!(
@@ -420,27 +378,14 @@ fn build_third_party_models(
             models.len(),
             path.display()
         );
-        return models;
-    }
-    let legacy_models = load_legacy_openrouter_models(legacy_env);
-    if !legacy_models.is_empty() {
-        info!(
-            "Using legacy OpenRouter model configuration with {} model(s)",
-            legacy_models.len()
-        );
     } else {
-        info!(
-            "No third-party models configured via JSON or legacy OpenRouter environment variables"
-        );
+        info!("No third-party models configured in {}", path.display());
     }
-    legacy_models
+    models
 }
 
-fn resolve_exact_model_identifier(
-    value: &str,
-    models: &[ThirdPartyModelConfig],
-    default_provider: Option<ThirdPartyProvider>,
-) -> String {
+#[cfg(test)]
+fn resolve_exact_model_identifier(value: &str, models: &[ThirdPartyModelConfig]) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -462,103 +407,29 @@ fn resolve_exact_model_identifier(
         return exact_matches[0].id.clone();
     }
 
-    if let Some(provider) = default_provider {
-        return qualify_third_party_model_id(provider, trimmed);
-    }
-
     trimmed.to_string()
-}
-
-fn resolve_model_by_keyword(
-    value: &str,
-    models: &[ThirdPartyModelConfig],
-    keywords: &[&str],
-    default_provider: Option<ThirdPartyProvider>,
-) -> String {
-    if !value.trim().is_empty() {
-        return resolve_exact_model_identifier(value, models, default_provider);
-    }
-
-    let lowered: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
-    for config_entry in models {
-        let haystack = format!(
-            "{} {} {}",
-            config_entry.provider.as_str(),
-            config_entry.name,
-            config_entry.model
-        )
-        .to_lowercase();
-        if lowered.iter().all(|keyword| haystack.contains(keyword)) {
-            return config_entry.id.clone();
-        }
-    }
-
-    resolve_exact_model_identifier(value, models, default_provider)
-}
-
-#[derive(Debug, Clone)]
-struct LegacyOpenRouterEnv {
-    llama_model: String,
-    grok_model: String,
-    qwen_model: String,
-    deepseek_model: String,
-    gpt_model: String,
 }
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let bot_token = env::var("BOT_TOKEN").unwrap_or_default();
+        let bot_token = env::var("BOT_TOKEN").unwrap_or_else(|_| {
+            if cfg!(test) {
+                "test-bot-token".to_string()
+            } else {
+                String::new()
+            }
+        });
         if bot_token.trim().is_empty() {
             return Err(anyhow::anyhow!("BOT_TOKEN is required"));
         }
 
-        let legacy_env = LegacyOpenRouterEnv {
-            llama_model: env_string("LLAMA_MODEL", ""),
-            grok_model: env_string("GROK_MODEL", ""),
-            qwen_model: env_string("QWEN_MODEL", ""),
-            deepseek_model: env_string("DEEPSEEK_MODEL", ""),
-            gpt_model: env_string("GPT_MODEL", ""),
-        };
-
         let third_party_models_config_path = resolve_third_party_models_path();
-        let third_party_models =
-            build_third_party_models(&third_party_models_config_path, &legacy_env);
+        let third_party_models = load_third_party_models(&third_party_models_config_path);
         let third_party_models_by_id = third_party_models
             .iter()
             .cloned()
             .map(|model| (model.id.clone(), model))
             .collect::<HashMap<_, _>>();
-
-        let llama_model = resolve_model_by_keyword(
-            &legacy_env.llama_model,
-            &third_party_models,
-            &["llama"],
-            Some(ThirdPartyProvider::OpenRouter),
-        );
-        let grok_model = resolve_model_by_keyword(
-            &legacy_env.grok_model,
-            &third_party_models,
-            &["grok"],
-            Some(ThirdPartyProvider::OpenRouter),
-        );
-        let qwen_model = resolve_model_by_keyword(
-            &legacy_env.qwen_model,
-            &third_party_models,
-            &["qwen"],
-            Some(ThirdPartyProvider::OpenRouter),
-        );
-        let deepseek_model = resolve_model_by_keyword(
-            &legacy_env.deepseek_model,
-            &third_party_models,
-            &["deepseek"],
-            Some(ThirdPartyProvider::OpenRouter),
-        );
-        let gpt_model = resolve_model_by_keyword(
-            &legacy_env.gpt_model,
-            &third_party_models,
-            &["gpt"],
-            Some(ThirdPartyProvider::OpenRouter),
-        );
 
         let access_controlled_commands = env::var("ACCESS_CONTROLLED_COMMANDS")
             .ok()
@@ -659,16 +530,22 @@ impl Config {
             exa_api_key: env_string("EXA_API_KEY", ""),
             exa_search_endpoint: env_string("EXA_SEARCH_ENDPOINT", "https://api.exa.ai/search"),
             web_search_cache_ttl_seconds: env_u64("WEB_SEARCH_CACHE_TTL_SECONDS", 900),
+            web_search_cache_max_entries: env_usize("WEB_SEARCH_CACHE_MAX_ENTRIES", 256),
             web_search_providers,
-            llama_model,
-            grok_model,
-            qwen_model,
-            deepseek_model,
-            gpt_model,
+            heavy_command_max_concurrency: env_usize("HEAVY_COMMAND_MAX_CONCURRENCY", 5).max(1),
             rate_limit_seconds: env_u64("RATE_LIMIT_SECONDS", 15),
             model_selection_timeout: env_u64("MODEL_SELECTION_TIMEOUT", 30),
+            db_max_connections: env_u32("DB_MAX_CONNECTIONS", 5).max(1),
+            db_queue_capacity: env_usize("DB_QUEUE_CAPACITY", 2048).max(1),
+            db_write_batch_size: env_usize("DB_WRITE_BATCH_SIZE", 32).max(1),
+            db_write_flush_ms: env_u64("DB_WRITE_FLUSH_MS", 25),
             default_q_model: env_string("DEFAULT_Q_MODEL", "gemini").to_lowercase(),
             telegram_max_length: env_usize("TELEGRAM_MAX_LENGTH", 4000),
+            media_group_max_items: env_usize("MEDIA_GROUP_MAX_ITEMS", 256).max(1),
+            external_enrich_fanout: env_usize("EXTERNAL_ENRICH_FANOUT", 4).max(1),
+            gemini_upload_fanout: env_usize("GEMINI_UPLOAD_FANOUT", 3).max(1),
+            max_tool_context_items: env_usize("MAX_TOOL_CONTEXT_ITEMS", 10).max(1),
+            enable_tldr_infographic: env_bool("ENABLE_TLDR_INFOGRAPHIC", false),
             telegraph_access_token: env_string("TELEGRAPH_ACCESS_TOKEN", ""),
             telegraph_author_name: env_string("TELEGRAPH_AUTHOR_NAME", ""),
             telegraph_author_url: env_string("TELEGRAPH_AUTHOR_URL", ""),
@@ -850,13 +727,13 @@ mod tests {
         assert!(model_map.contains_key("openrouter:shared/model"));
         assert!(model_map.contains_key("nvidia:shared/model"));
         assert_eq!(
-            resolve_exact_model_identifier("shared/model", &models, None),
+            resolve_exact_model_identifier("shared/model", &models),
             "shared/model"
         );
     }
 
     #[test]
-    fn resolve_model_by_keyword_returns_provider_qualified_id() {
+    fn resolve_exact_model_identifier_returns_provider_qualified_id_for_unique_raw_match() {
         let models = vec![
             build_third_party_model_config(
                 ThirdPartyProvider::OpenRouter,
@@ -878,43 +755,15 @@ mod tests {
             ),
         ];
 
-        let resolved = resolve_model_by_keyword(
-            "",
-            &models,
-            &["nemotron"],
-            Some(ThirdPartyProvider::OpenRouter),
+        let exact = resolve_exact_model_identifier("meta-llama/llama-4", &models);
+        assert_eq!(exact, "openrouter:meta-llama/llama-4");
+
+        let unique_raw =
+            resolve_exact_model_identifier("nvidia/llama-3.3-nemotron-super-49b-v1.5", &models);
+        assert_eq!(
+            unique_raw,
+            "nvidia:nvidia/llama-3.3-nemotron-super-49b-v1.5"
         );
-        assert_eq!(resolved, "nvidia:nvidia/llama-3.3-nemotron-super-49b-v1.5");
-
-        let legacy_exact = resolve_model_by_keyword(
-            "meta-llama/llama-4",
-            &models,
-            &["llama"],
-            Some(ThirdPartyProvider::OpenRouter),
-        );
-        assert_eq!(legacy_exact, "openrouter:meta-llama/llama-4");
-    }
-
-    #[test]
-    fn legacy_openrouter_models_are_used_when_json_is_missing() {
-        let path = std::env::temp_dir().join(format!(
-            "missing-third-party-models-{}-{}.json",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let legacy_env = LegacyOpenRouterEnv {
-            llama_model: "meta-llama/llama-4".to_string(),
-            grok_model: String::new(),
-            qwen_model: String::new(),
-            deepseek_model: String::new(),
-            gpt_model: String::new(),
-        };
-
-        let models = build_third_party_models(&path, &legacy_env);
-
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].provider, ThirdPartyProvider::OpenRouter);
-        assert_eq!(models[0].id, "openrouter:meta-llama/llama-4");
     }
 }
 

@@ -446,6 +446,13 @@ async fn build_status_report(state: &AppState) -> String {
     let queue_max = state.db.queue_max_capacity();
     let queue_pending = state.db.queue_len();
     let queue_available = state.db.queue_available_capacity();
+    let heavy_active = state.heavy_command_active();
+    let heavy_waiting = state.heavy_command_waiting();
+    let media_group_count = state.media_group_count();
+    let pending_q_requests = state.pending_q_requests.lock().len();
+    let pending_image_requests = state.pending_image_requests.lock().len();
+    let pending_codex_model_requests = state.pending_codex_model_requests.lock().len();
+    let pending_codex_reasoning_requests = state.pending_codex_reasoning_requests.lock().len();
 
     let brave_ready = CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty();
     let exa_ready = CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty();
@@ -479,8 +486,32 @@ async fn build_status_report(state: &AppState) -> String {
         queue_pending, queue_available, queue_max
     ));
     report.push_str(&format!(
+        "db_search_ready: {}\n",
+        bool_label(state.db.is_search_ready())
+    ));
+    report.push_str(&format!(
+        "db_max_connections: {}\n",
+        CONFIG.db_max_connections
+    ));
+    report.push_str(&format!(
+        "heavy_commands: active={} waiting={} max={}\n",
+        heavy_active, heavy_waiting, CONFIG.heavy_command_max_concurrency
+    ));
+    report.push_str(&format!(
+        "pending_requests: q={} image={} codex_model={} codex_reasoning={}\n",
+        pending_q_requests,
+        pending_image_requests,
+        pending_codex_model_requests,
+        pending_codex_reasoning_requests
+    ));
+    report.push_str(&format!("media_groups_cached: {}\n", media_group_count));
+    report.push_str(&format!(
         "gemini_configured: {}\n",
         bool_label(!CONFIG.gemini_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "tldr_infographic_enabled: {}\n",
+        bool_label(CONFIG.enable_tldr_infographic)
     ));
     report.push_str(&format!(
         "openrouter_ready: {}\n",
@@ -989,12 +1020,7 @@ async fn prepare_image_request(
     let prompt_entities = message_entities_for_text(message);
 
     if let Some(media_group_id) = message.media_group_id() {
-        let group_items = state
-            .media_groups
-            .lock()
-            .get(media_group_id)
-            .cloned()
-            .unwrap_or_default();
+        let group_items = state.media_group_items(media_group_id);
         for item in group_items {
             if seen_file_ids.insert(item.file_id.clone()) {
                 if let Ok(url) = get_file_url(bot, &item.file_id).await {
@@ -1032,12 +1058,7 @@ async fn prepare_image_request(
     if let Some(reply) = message.reply_to_message() {
         let reply_has_images = message_has_image(reply);
         if let Some(media_group_id) = reply.media_group_id() {
-            let group_items = state
-                .media_groups
-                .lock()
-                .get(media_group_id)
-                .cloned()
-                .unwrap_or_default();
+            let group_items = state.media_group_items(media_group_id);
             for item in group_items {
                 if seen_file_ids.insert(item.file_id.clone()) {
                     if let Ok(url) = get_file_url(bot, &item.file_id).await {
@@ -1163,6 +1184,7 @@ async fn finalize_image_request(
     resolution: Option<&str>,
     aspect_ratio: Option<&str>,
 ) -> Result<()> {
+    let _heavy_permit = state.acquire_heavy_command_permit().await;
     let request = state.pending_image_requests.lock().remove(request_key);
     let Some(request) = request else {
         return Ok(());
@@ -1363,6 +1385,7 @@ pub async fn img_handler(
         .await?;
         return Ok(());
     }
+    let _heavy_permit = state.acquire_heavy_command_permit().await;
     let audit_context = create_command_audit_context(&state, &message, "img").await;
 
     let processing_message = bot
@@ -1586,6 +1609,7 @@ pub async fn vid_handler(
         .await?;
         return Ok(());
     }
+    let _heavy_permit = state.acquire_heavy_command_permit().await;
     let audit_context = create_command_audit_context(&state, &message, "vid").await;
 
     let processing_message = send_message_with_retry(
@@ -1640,6 +1664,7 @@ pub async fn tldr_handler(
         .await?;
         return Ok(());
     }
+    let _heavy_permit = state.acquire_heavy_command_permit().await;
 
     let mut timer = start_command_timer("tldr", &message);
     let processing_message = bot
@@ -1724,12 +1749,17 @@ pub async fn tldr_handler(
     let summary_text = response.text;
     let summary_model = response.model_used;
     let summary_with_model = format!("{}\n\nModel: {}", summary_text, summary_model);
+    let infographic_enabled = CONFIG.enable_tldr_infographic;
 
     let _ = bot
         .edit_message_text(
             processing_message.chat.id,
             processing_message.id,
-            "Summary generated. Generating infographic...",
+            if infographic_enabled {
+                "Summary generated. Generating infographic..."
+            } else {
+                "Summary generated. Skipping infographic step..."
+            },
         )
         .await;
 
@@ -1742,44 +1772,46 @@ Use the same language as the summary text for any labels.\
     );
 
     let mut infographic_url = None;
-    let infographic_config = Some(GeminiImageConfig {
-        aspect_ratio: Some("16:9".to_string()),
-        image_size: Some("4K".to_string()),
-    });
-    match generate_image_with_gemini(
-        &infographic_prompt,
-        &[],
-        infographic_config,
-        false,
-        audit_context.as_ref(),
-    )
-    .await
-    {
-        Ok(images) => {
-            if let Some(image) = images.into_iter().next() {
-                if CONFIG.cwd_pw_api_key.trim().is_empty() {
-                    warn!("TLDR infographic generated but CWD_PW_API_KEY is not configured.");
-                } else {
-                    let mime_type =
-                        detect_mime_type(&image).unwrap_or_else(|| "image/png".to_string());
-                    infographic_url = upload_image_bytes_to_cwd(
-                        &image,
-                        &CONFIG.cwd_pw_api_key,
-                        &mime_type,
-                        Some(CONFIG.gemini_image_model.as_str()),
-                        Some(&infographic_prompt),
-                    )
-                    .await;
-                    if infographic_url.is_none() {
-                        warn!("Failed to upload TLDR infographic to cwd.pw.");
+    if infographic_enabled {
+        let infographic_config = Some(GeminiImageConfig {
+            aspect_ratio: Some("16:9".to_string()),
+            image_size: Some("4K".to_string()),
+        });
+        match generate_image_with_gemini(
+            &infographic_prompt,
+            &[],
+            infographic_config,
+            false,
+            audit_context.as_ref(),
+        )
+        .await
+        {
+            Ok(images) => {
+                if let Some(image) = images.into_iter().next() {
+                    if CONFIG.cwd_pw_api_key.trim().is_empty() {
+                        warn!("TLDR infographic generated but CWD_PW_API_KEY is not configured.");
+                    } else {
+                        let mime_type =
+                            detect_mime_type(&image).unwrap_or_else(|| "image/png".to_string());
+                        infographic_url = upload_image_bytes_to_cwd(
+                            &image,
+                            &CONFIG.cwd_pw_api_key,
+                            &mime_type,
+                            Some(CONFIG.gemini_image_model.as_str()),
+                            Some(&infographic_prompt),
+                        )
+                        .await;
+                        if infographic_url.is_none() {
+                            warn!("Failed to upload TLDR infographic to cwd.pw.");
+                        }
                     }
+                } else {
+                    warn!("TLDR infographic generation returned no image.");
                 }
-            } else {
-                warn!("TLDR infographic generation returned no image.");
             }
-        }
-        Err(err) => {
-            error!("Error generating TLDR infographic: {}", err);
+            Err(err) => {
+                error!("Error generating TLDR infographic: {}", err);
+            }
         }
     }
 
@@ -1808,7 +1840,11 @@ Use the same language as the summary text for any labels.\
         .edit_message_text(
             processing_message.chat.id,
             processing_message.id,
-            "Infographic step completed. Finalizing response...",
+            if infographic_enabled {
+                "Infographic step completed. Finalizing response..."
+            } else {
+                "Finalizing response..."
+            },
         )
         .await;
 
@@ -1851,6 +1887,7 @@ pub async fn factcheck_handler(
         .await?;
         return Ok(());
     }
+    let _heavy_permit = state.acquire_heavy_command_permit().await;
 
     let reply_message = message.reply_to_message();
     let mut query_text = query.unwrap_or_default();
@@ -2097,6 +2134,7 @@ pub async fn profileme_handler(
         .await?;
         return Ok(());
     }
+    let _heavy_permit = state.acquire_heavy_command_permit().await;
 
     let processing_message = bot
         .send_message(message.chat.id, "Generating your profile...")
@@ -2199,6 +2237,7 @@ pub async fn mysong_handler(
         .await?;
         return Ok(());
     }
+    let _heavy_permit = state.acquire_heavy_command_permit().await;
 
     let mut timer = start_command_timer("mysong", &message);
     let processing_message = send_message_with_retry(
@@ -2407,6 +2446,7 @@ pub async fn paintme_handler(
         .await?;
         return Ok(());
     }
+    let _heavy_permit = state.acquire_heavy_command_permit().await;
 
     let processing_message = bot
         .send_message(message.chat.id, "Creating your image prompt...")
@@ -2702,11 +2742,12 @@ pub async fn handle_media_group(state: AppState, message: Message) {
     if let Some(media_group_id) = message.media_group_id() {
         if let Some(photo_sizes) = message.photo() {
             if let Some(photo) = photo_sizes.last() {
-                let mut groups = state.media_groups.lock();
-                let entry = groups.entry(media_group_id.clone()).or_default();
-                entry.push(MediaGroupItem {
-                    file_id: photo.file.id.clone(),
-                });
+                state.store_media_group_item(
+                    media_group_id,
+                    MediaGroupItem {
+                        file_id: photo.file.id.clone(),
+                    },
+                );
             }
         }
     }

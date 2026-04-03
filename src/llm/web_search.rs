@@ -101,6 +101,7 @@ async fn get_cached(query: &str, max_results: usize) -> Option<Vec<SearchResult>
 
     let key = cache_key(query, max_results);
     let mut cache = SEARCH_CACHE.lock().await;
+    prune_cache(&mut cache, ttl);
     if let Some(entry) = cache.get(&key) {
         if entry.stored_at.elapsed() < ttl {
             return Some(entry.results.clone());
@@ -121,7 +122,27 @@ async fn set_cached(query: &str, max_results: usize, results: Vec<SearchResult>)
         results,
     };
     let mut cache = SEARCH_CACHE.lock().await;
+    prune_cache(&mut cache, cache_ttl());
     cache.insert(key, entry);
+    prune_cache(&mut cache, cache_ttl());
+}
+
+fn prune_cache(cache: &mut HashMap<String, CacheEntry>, ttl: Duration) {
+    cache.retain(|_, entry| entry.stored_at.elapsed() < ttl);
+    let max_entries = CONFIG.web_search_cache_max_entries;
+    if cache.len() <= max_entries {
+        return;
+    }
+
+    let mut ordered = cache
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.stored_at))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, stored_at)| *stored_at);
+    let remove_count = cache.len().saturating_sub(max_entries);
+    for (key, _) in ordered.into_iter().take(remove_count) {
+        cache.remove(&key);
+    }
 }
 
 fn provider_order() -> Vec<WebSearchProvider> {

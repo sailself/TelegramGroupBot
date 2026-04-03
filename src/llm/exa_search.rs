@@ -104,28 +104,3 @@ pub async fn exa_search(
 
     Ok(extract_results(data))
 }
-
-#[allow(dead_code)]
-pub fn format_results_markdown(query: &str, results: &[(String, String, String)]) -> String {
-    if results.is_empty() {
-        return format!("No web results found for query: {}", query);
-    }
-
-    let mut lines = vec![format!("Search results for **{}**:", query)];
-    for (idx, (title, url, snippet)) in results.iter().enumerate() {
-        lines.push(format!("{}. [{}]({})", idx + 1, title, url));
-        if !snippet.is_empty() {
-            lines.push(format!("   {}", snippet));
-        }
-    }
-    lines.join("\n")
-}
-
-#[allow(dead_code)]
-pub async fn exa_search_tool(
-    query: &str,
-    max_results: Option<usize>,
-) -> Result<String, ExaSearchError> {
-    let results = exa_search(query, max_results).await?;
-    Ok(format_results_markdown(query, &results))
-}

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -112,7 +113,7 @@ pub enum MediaKind {
 
 #[derive(Debug, Clone)]
 pub struct MediaFile {
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<Vec<u8>>,
     pub mime_type: String,
     pub kind: MediaKind,
     pub display_name: Option<String>,
@@ -126,11 +127,15 @@ impl MediaFile {
         display_name: Option<String>,
     ) -> Self {
         Self {
-            bytes,
+            bytes: Arc::new(bytes),
             mime_type,
             kind,
             display_name,
         }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
     }
 }
 

@@ -164,8 +164,13 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
   - Examples:
     - `sqlite:///bot.db` (relative to project root)
     - `sqlite:///D:/Bots/telegram/bot.db` (absolute on Windows)
+- `DB_MAX_CONNECTIONS` - SQLite pool size. Default: `5`.
+- `DB_QUEUE_CAPACITY` - Buffered async message-write queue size. Default: `2048`.
+- `DB_WRITE_BATCH_SIZE` - Max queued message inserts written per DB batch. Default: `32`.
+- `DB_WRITE_FLUSH_MS` - Max wait before flushing a partial DB batch. Default: `25`.
 
 ### Telegram runtime
+- `HEAVY_COMMAND_MAX_CONCURRENCY` - Max number of heavy commands (`/q`, `/qc`, `/tldr`, generation commands, etc.) running at once. Default: `5`.
 - `RATE_LIMIT_SECONDS` - Per-user cooldown in seconds. Default: `15`.
 - `MODEL_SELECTION_TIMEOUT` - Model selection UI timeout seconds. Default: `30`.
 - `DEFAULT_Q_MODEL` - Default `/q` model (e.g., `gemini`). Default: `gemini`.
@@ -174,6 +179,9 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `LOG_LEVEL` - Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info`.
 - `PUBLISH_BOT_COMMANDS` - When `true`, publish the built-in command list on startup via Telegram `setMyCommands`. Default: `false`.
   - Warning: Telegram treats this as a replacement for the default-scope command list. Leave it `false` if you manage commands in BotFather.
+- `MEDIA_GROUP_MAX_ITEMS` - Max cached media groups kept in memory at once. Default: `256`.
+- `MAX_TOOL_CONTEXT_ITEMS` - Max selected chat-search hits returned in the final `/s` response. Default: `10`.
+- `ENABLE_TLDR_INFOGRAPHIC` - When `true`, `/tldr` also runs the Gemini infographic step. Default: `false`.
 
 ### Access control
 - `WHITELIST_FILE_PATH` - Path to whitelist file. Default: `allowed_chat.txt`.
@@ -239,13 +247,6 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.
 - When the selected Codex model advertises native search support, the bot now uses Codex's built-in `web_search` Responses tool instead of the local external `web_search` function tool.
 
-Legacy OpenRouter model variables (used if JSON is missing):
-- `LLAMA_MODEL`
-- `GROK_MODEL`
-- `QWEN_MODEL`
-- `DEEPSEEK_MODEL`
-- `GPT_MODEL`
-
 Example `third_party_models.json`:
 ```json
 {
@@ -285,12 +286,15 @@ Example `third_party_models.json`:
 - `JINA_READER_ENDPOINT` - Default: `https://r.jina.ai/`.
 - `WEB_SEARCH_PROVIDERS` - Comma-separated provider order. Default: `brave,exa,jina`.
 - `WEB_SEARCH_CACHE_TTL_SECONDS` - Cache TTL for web search results. Default: `900` (15 minutes).
+- `WEB_SEARCH_CACHE_MAX_ENTRIES` - Max cached web-search queries kept in memory. Default: `256`.
+- `EXTERNAL_ENRICH_FANOUT` - Max concurrent Telegraph/Twitter extraction or media-download tasks per request. Default: `4`.
+- `GEMINI_UPLOAD_FANOUT` - Max concurrent Gemini media uploads per request. Default: `3`.
 
 ### Hosting and publishing (optional)
 - `TELEGRAPH_ACCESS_TOKEN` - Required to publish long responses to Telegraph.
 - `TELEGRAPH_AUTHOR_NAME` - Optional author name for Telegraph pages.
 - `TELEGRAPH_AUTHOR_URL` - Optional author URL for Telegraph pages.
-- `CWD_PW_API_KEY` - API key for CWD.PW image hosting.
+- `CWD_PW_API_KEY` - API key for CWD.PW image hosting, including optional `/tldr` infographic uploads when enabled.
 
 ### Support message
 - `SUPPORT_MESSAGE` - Message shown by `/support`.
