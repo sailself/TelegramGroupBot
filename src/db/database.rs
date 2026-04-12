@@ -1418,6 +1418,7 @@ mod tests {
         assert_eq!(request.cached_input_tokens, Some(3));
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_invocation_with_usage(
         db: &Database,
         chat_id: i64,

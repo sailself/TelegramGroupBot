@@ -1310,7 +1310,7 @@ mod tests {
         );
 
         assert!(instructions.contains("Base prompt"));
-        assert!(instructions.contains("Prefer direct positive claims"));
+        assert!(instructions.contains("POSITIVE FRAMING ONLY"));
         assert!(instructions.contains("Tool guidance"));
     }
 
