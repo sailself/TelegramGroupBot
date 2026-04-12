@@ -5,7 +5,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 ## What it does
 - Stores chat history in SQLite for summaries and profiling.
 - Provides group-friendly commands for summaries, fact checks, Q and A, and media generation.
-- Uses Gemini by default with optional third-party hosted models (OpenRouter, NVIDIA, OpenAI Responses, and ChatGPT-backed OpenAI Codex) plus search integrations.
+- Uses Gemini by default with optional third-party hosted models (OpenRouter, NVIDIA, Ollama Cloud, OpenAI Responses, and ChatGPT-backed OpenAI Codex) plus search integrations.
 - Extracts content from Telegraph and Twitter links and can upload images to CWD.PW.
 - Writes text logs to `logs/bot.log` and `logs/timing.log`.
 - Writes structured JSON logs to `logs/bot.jsonl` and `logs/timing.jsonl`.
@@ -230,6 +230,14 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `NVIDIA_TOP_P` - Default: `0.95`.
 - NVIDIA hosted chat completions are integrated through their OpenAI-compatible endpoint.
 
+### Ollama Cloud (optional)
+- `ENABLE_OLLAMA` - Enable Ollama Cloud via the OpenAI-compatible chat endpoint. Default: `true`.
+- `OLLAMA_API_KEY` - Ollama API key from ollama.com.
+- `OLLAMA_BASE_URL` - Default: `https://ollama.com/v1`.
+- `OLLAMA_TEMPERATURE` - Default: `0.7`.
+- `OLLAMA_TOP_P` - Default: `0.95`.
+- Ollama models are configured through `third_party_models.json` using `"provider": "ollama"`.
+
 ### OpenAI Responses (optional)
 - `ENABLE_OPENAI` - Enable the public OpenAI Responses API provider. Default: `false`.
 - `OPENAI_API_KEY` - OpenAI API key used for billed fallback models.
@@ -249,6 +257,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - The active Codex model is selected live with `/codexmodel` and exposed in the bot as the runtime alias `openai-codex:selected`.
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.
 - When the selected Codex model advertises native search support, the bot now uses Codex's built-in `web_search` Responses tool instead of the local external `web_search` function tool.
+- Codex requests also include a condensed response-style addendum tuned for direct answers and shorter Chinese output.
 
 Example `third_party_models.json`:
 ```json
@@ -271,6 +280,15 @@ Example `third_party_models.json`:
       "video": false,
       "audio": true,
       "tools": false
+    },
+    {
+      "provider": "ollama",
+      "name": "Qwen 3 32B",
+      "model": "qwen3:32b",
+      "image": true,
+      "video": false,
+      "audio": false,
+      "tools": true
     }
   ]
 }

@@ -25,6 +25,27 @@ const RESPONSES_REQUEST_TIMEOUT_SECS: u64 = 60;
 const RESPONSES_STREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
 const TOOL_LIMIT_SYSTEM_PROMPT: &str = "Tool call limit reached. Provide the best possible answer using the available information without requesting more tool calls.";
 const RESPONSES_TOOL_LIMIT_GUIDANCE: &str = "Tool usage limit: you may use tools for at most {max_tool_calls} rounds total in this conversation. Plan your searches efficiently, avoid redundant tool calls, and after the final allowed tool round you must answer using the information already gathered without requesting more tool calls.";
+const CODEX_RESPONSE_STYLE_ADDENDUM: &str = r#"# ROLE & STYLE
+                                            Be direct, highly informative, and brutally concise. Match depth to complexity. 
+
+                                            # THE PRIME DIRECTIVE: POSITIVE FRAMING ONLY
+                                            You must strictly use direct positive claims. NEVER use negation-based contrastive phrasing (e.g., "reject then correct" or "correct then reject") in any language. 
+                                            - BAD: 真正的创新者不是有创意的人，而是特质拉满的人。
+                                            - GOOD: 真正的创新者是特质拉满的人。
+                                            *Exception: strict logical/mathematical conditions.*
+
+                                            # EXECUTION RULES
+                                            - Answers First: Lead with the core answer. For yes/no questions, answer first + 1 sentence reasoning. For comparisons, recommend one + brief reasoning.
+                                            - Concept Limits: Keep conceptual explanations to 3-5 sentences. Cover the essence. Do NOT restate points in "plain language" (No "简单来说", "翻成人话").
+                                            - Code: Provide code + non-trivial usage examples. 
+                                            - Lists: Max 3-4 points per side for pros/cons. Use bullets only for actual structural data, not decoration.
+                                            - Endings: Stop immediately after the final claim or concrete recommendation. 
+
+                                            # STRICT BLACKLIST (NEVER USE)
+                                            - Filler preambles: "I'd be happy to", "Great question", "Certainly", "首先我们需要", "让我们来看看".
+                                            - Restating the user's prompt.
+                                            - Summary labels: "In conclusion", "Hope this helps", "一句话总结", "总结一下", "简而言之", "概括来说".
+                                            - Conditional follow-ups: "If you want, I can...", "如果你愿意，我可以...", "If you need more details..."."#;
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -243,14 +264,29 @@ fn responses_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(RESPONSES_RETRY_BASE_DELAY_MS.saturating_mul(attempt))
 }
 
-fn build_responses_system_prompt(system_prompt: &str, include_tool_limit_guidance: bool) -> String {
-    if !include_tool_limit_guidance {
-        return system_prompt.to_string();
+fn responses_tool_limit_guidance() -> String {
+    RESPONSES_TOOL_LIMIT_GUIDANCE.replace("{max_tool_calls}", &MAX_TOOL_CALL_ITERATIONS.to_string())
+}
+
+fn build_responses_system_prompt(
+    system_prompt: &str,
+    model_config: &ThirdPartyModelConfig,
+    extra_guidance: Option<&str>,
+) -> String {
+    let mut sections = vec![system_prompt.to_string()];
+
+    if model_config.provider == ThirdPartyProvider::OpenAICodex {
+        sections.push(CODEX_RESPONSE_STYLE_ADDENDUM.to_string());
     }
 
-    let tool_limit_guidance = RESPONSES_TOOL_LIMIT_GUIDANCE
-        .replace("{max_tool_calls}", &MAX_TOOL_CALL_ITERATIONS.to_string());
-    format!("{system_prompt}\n\n{tool_limit_guidance}")
+    if let Some(guidance) = extra_guidance
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sections.push(guidance.to_string());
+    }
+
+    sections.join("\n\n")
 }
 
 fn build_responses_user_input(user_content: &str, image_data_list: &[Vec<u8>]) -> Vec<Value> {
@@ -1137,7 +1173,9 @@ pub async fn call_responses_provider(
         native_codex_web_search_tool.is_some(),
         image_data_list.len()
     );
-    let instructions = build_responses_system_prompt(system_prompt, custom_tools_enabled);
+    let tool_limit_guidance = custom_tools_enabled.then(responses_tool_limit_guidance);
+    let instructions =
+        build_responses_system_prompt(system_prompt, model_config, tool_limit_guidance.as_deref());
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
     if custom_tools_enabled {
@@ -1175,7 +1213,9 @@ pub async fn call_responses_provider_with_tool_runtime(
     runtime: &mut ToolRuntime,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<String> {
-    let instructions = format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance());
+    let runtime_guidance = runtime.tool_limit_guidance();
+    let instructions =
+        build_responses_system_prompt(system_prompt, model_config, Some(&runtime_guidance));
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
     let native_codex_web_search_tool = build_native_codex_web_search_tool(model_config);
@@ -1204,6 +1244,20 @@ pub async fn call_responses_provider_with_tool_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThirdPartyProvider;
+
+    fn model_config(provider: ThirdPartyProvider, model: &str) -> ThirdPartyModelConfig {
+        ThirdPartyModelConfig {
+            id: format!("{}:{}", provider.as_str(), model),
+            provider,
+            name: model.to_string(),
+            model: model.to_string(),
+            image: false,
+            video: false,
+            audio: false,
+            tools: true,
+        }
+    }
 
     #[test]
     fn extract_response_text_reads_output_text_blocks() {
@@ -1245,6 +1299,30 @@ mod tests {
             responses_base_url("https://chatgpt.com/backend-api/codex/responses"),
             "https://chatgpt.com/backend-api/codex/responses"
         );
+    }
+
+    #[test]
+    fn codex_system_prompt_appends_extra_style_guidance() {
+        let instructions = build_responses_system_prompt(
+            "Base prompt",
+            &model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.4"),
+            Some("Tool guidance"),
+        );
+
+        assert!(instructions.contains("Base prompt"));
+        assert!(instructions.contains("Prefer direct positive claims"));
+        assert!(instructions.contains("Tool guidance"));
+    }
+
+    #[test]
+    fn public_openai_system_prompt_skips_codex_style_guidance() {
+        let instructions = build_responses_system_prompt(
+            "Base prompt",
+            &model_config(ThirdPartyProvider::OpenAI, "gpt-5.4"),
+            None,
+        );
+
+        assert_eq!(instructions, "Base prompt");
     }
 
     #[test]

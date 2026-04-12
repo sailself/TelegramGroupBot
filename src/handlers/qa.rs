@@ -236,6 +236,7 @@ fn third_party_provider_label(provider: ThirdPartyProvider) -> &'static str {
     match provider {
         ThirdPartyProvider::OpenRouter => "OpenRouter",
         ThirdPartyProvider::Nvidia => "NVIDIA",
+        ThirdPartyProvider::Ollama => "Ollama",
         ThirdPartyProvider::OpenAI => "OpenAI",
         ThirdPartyProvider::OpenAICodex => "OpenAI Codex",
     }
@@ -312,6 +313,17 @@ fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
             } else {
                 format!(
                     "Sorry, {display_model} returned an NVIDIA error. Please try again later or choose another model."
+                )
+            }
+        }
+        Some("Ollama") if err_text.contains("Ollama request failed") => {
+            if err_text.contains("status 404") || err_text.contains("404 Not Found") {
+                format!(
+                    "Sorry, {display_model} is unavailable on Ollama right now. Please pick another model or try again later."
+                )
+            } else {
+                format!(
+                    "Sorry, {display_model} returned an Ollama error. Please try again later or choose another model."
                 )
             }
         }

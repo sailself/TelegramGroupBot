@@ -14,6 +14,8 @@ pub enum ThirdPartyProvider {
     OpenRouter,
     #[serde(rename = "nvidia")]
     Nvidia,
+    #[serde(rename = "ollama")]
+    Ollama,
     #[serde(rename = "openai")]
     OpenAI,
     #[serde(rename = "openai-codex")]
@@ -25,6 +27,7 @@ impl ThirdPartyProvider {
         match self {
             ThirdPartyProvider::OpenRouter => "openrouter",
             ThirdPartyProvider::Nvidia => "nvidia",
+            ThirdPartyProvider::Ollama => "ollama",
             ThirdPartyProvider::OpenAI => "openai",
             ThirdPartyProvider::OpenAICodex => "openai-codex",
         }
@@ -38,6 +41,7 @@ impl std::str::FromStr for ThirdPartyProvider {
         match value.trim().to_lowercase().as_str() {
             "openrouter" => Ok(ThirdPartyProvider::OpenRouter),
             "nvidia" => Ok(ThirdPartyProvider::Nvidia),
+            "ollama" => Ok(ThirdPartyProvider::Ollama),
             "openai" => Ok(ThirdPartyProvider::OpenAI),
             "openai-codex" => Ok(ThirdPartyProvider::OpenAICodex),
             other => Err(anyhow::anyhow!(
@@ -128,6 +132,11 @@ pub struct Config {
     pub nvidia_temperature: f32,
     pub nvidia_top_k: i32,
     pub nvidia_top_p: f32,
+    pub enable_ollama: bool,
+    pub ollama_api_key: String,
+    pub ollama_base_url: String,
+    pub ollama_temperature: f32,
+    pub ollama_top_p: f32,
     pub enable_openai: bool,
     pub openai_api_key: String,
     pub openai_base_url: String,
@@ -487,6 +496,11 @@ impl Config {
             nvidia_temperature: env_f32("NVIDIA_TEMPERATURE", 0.7),
             nvidia_top_k: env_i32("NVIDIA_TOP_K", 40),
             nvidia_top_p: env_f32("NVIDIA_TOP_P", 0.95),
+            enable_ollama: env_bool("ENABLE_OLLAMA", true),
+            ollama_api_key: env_string("OLLAMA_API_KEY", ""),
+            ollama_base_url: env_string("OLLAMA_BASE_URL", "https://ollama.com/v1"),
+            ollama_temperature: env_f32("OLLAMA_TEMPERATURE", 0.7),
+            ollama_top_p: env_f32("OLLAMA_TOP_P", 0.95),
             enable_openai: env_bool("ENABLE_OPENAI", false),
             openai_api_key: env_string("OPENAI_API_KEY", ""),
             openai_base_url: env_string("OPENAI_BASE_URL", "https://api.openai.com/v1"),
@@ -575,6 +589,9 @@ impl Config {
             }
             ThirdPartyProvider::Nvidia => {
                 self.enable_nvidia && !self.nvidia_api_key.trim().is_empty()
+            }
+            ThirdPartyProvider::Ollama => {
+                self.enable_ollama && !self.ollama_api_key.trim().is_empty()
             }
             ThirdPartyProvider::OpenAI => {
                 self.enable_openai && !self.openai_api_key.trim().is_empty()
@@ -671,6 +688,13 @@ mod tests {
                     "tools": true
                 },
                 {
+                    "provider": "ollama",
+                    "name": "Qwen 3 32B",
+                    "model": "qwen3:32b",
+                    "image": true,
+                    "tools": true
+                },
+                {
                     "provider": "openai-codex",
                     "name": "Codex Selected",
                     "model": "selected",
@@ -682,7 +706,7 @@ mod tests {
 
         let models = parse_third_party_models_from_str(raw);
 
-        assert_eq!(models.len(), 4);
+        assert_eq!(models.len(), 5);
         assert_eq!(
             models[0].id,
             "openrouter:qwen/qwen3-next-80b-a3b-instruct:free"
@@ -695,8 +719,10 @@ mod tests {
         assert!(!models[1].tools);
         assert_eq!(models[2].provider, ThirdPartyProvider::OpenAI);
         assert_eq!(models[2].id, "openai:gpt-5.4");
-        assert_eq!(models[3].provider, ThirdPartyProvider::OpenAICodex);
-        assert_eq!(models[3].id, "openai-codex:selected");
+        assert_eq!(models[3].provider, ThirdPartyProvider::Ollama);
+        assert_eq!(models[3].id, "ollama:qwen3:32b");
+        assert_eq!(models[4].provider, ThirdPartyProvider::OpenAICodex);
+        assert_eq!(models[4].id, "openai-codex:selected");
     }
 
     #[test]

@@ -247,6 +247,9 @@ pub fn is_runtime_provider_ready(provider: ThirdPartyProvider) -> bool {
         ThirdPartyProvider::Nvidia => {
             CONFIG.enable_nvidia && !CONFIG.nvidia_api_key.trim().is_empty()
         }
+        ThirdPartyProvider::Ollama => {
+            CONFIG.enable_ollama && !CONFIG.ollama_api_key.trim().is_empty()
+        }
         ThirdPartyProvider::OpenAI => {
             CONFIG.enable_openai && !CONFIG.openai_api_key.trim().is_empty()
         }

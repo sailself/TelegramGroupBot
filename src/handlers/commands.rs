@@ -758,6 +758,8 @@ async fn build_status_report(state: &AppState) -> String {
         CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenRouter);
     let nvidia_ready =
         CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::Nvidia);
+    let ollama_ready =
+        CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::Ollama);
     let openai_ready =
         CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenAI);
     let codex_auth = openai_codex::auth_summary();
@@ -815,6 +817,7 @@ async fn build_status_report(state: &AppState) -> String {
         bool_label(openrouter_ready)
     ));
     report.push_str(&format!("nvidia_ready: {}\n", bool_label(nvidia_ready)));
+    report.push_str(&format!("ollama_ready: {}\n", bool_label(ollama_ready)));
     report.push_str(&format!("openai_ready: {}\n", bool_label(openai_ready)));
     report.push_str(&format!(
         "openai_codex_ready: {}\n",
@@ -960,6 +963,10 @@ async fn build_diagnose_report(state: &AppState) -> String {
     report.push_str(&format!(
         "NVIDIA_API_KEY_present: {}\n",
         bool_label(!CONFIG.nvidia_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "OLLAMA_API_KEY_present: {}\n",
+        bool_label(!CONFIG.ollama_api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "OPENAI_API_KEY_present: {}\n",

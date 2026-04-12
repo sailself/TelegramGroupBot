@@ -306,6 +306,15 @@ fn provider_runtime_config(provider: ThirdPartyProvider) -> Result<ProviderRunti
             top_p: CONFIG.nvidia_top_p,
             top_k: None,
         },
+        ThirdPartyProvider::Ollama => ProviderRuntimeConfig {
+            provider,
+            display_name: "Ollama",
+            base_url: CONFIG.ollama_base_url.clone(),
+            api_key: CONFIG.ollama_api_key.clone(),
+            temperature: CONFIG.ollama_temperature,
+            top_p: CONFIG.ollama_top_p,
+            top_k: None,
+        },
         ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex => {
             return Err(anyhow!(
                 "Responses providers are handled by the responses provider adapter"
@@ -962,6 +971,50 @@ mod tests {
             .iter()
             .any(|(name, _)| name == "HTTP-Referer" || name == "X-Title"));
         assert!(details.payload.get("top_k").is_none());
+    }
+
+    #[test]
+    fn ollama_request_details_use_cloud_endpoint_and_bearer_auth() {
+        let runtime = ProviderRuntimeConfig {
+            provider: ThirdPartyProvider::Ollama,
+            display_name: "Ollama",
+            base_url: "https://ollama.com/v1".to_string(),
+            api_key: "test-ollama".to_string(),
+            temperature: 0.3,
+            top_p: 0.7,
+            top_k: None,
+        };
+        let details = build_request_details_for_runtime(
+            &model(ThirdPartyProvider::Ollama, "Qwen 3 32B", "qwen3:32b"),
+            &runtime,
+            vec![json!({ "role": "user", "content": "hello" })],
+            Some(vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "parameters": { "type": "object" }
+                }
+            })]),
+            Some("auto"),
+        );
+
+        assert_eq!(details.url, "https://ollama.com/v1/chat/completions");
+        assert!(details
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "Authorization" && value == "Bearer test-ollama" }));
+        assert!(!details
+            .headers
+            .iter()
+            .any(|(name, _)| name == "HTTP-Referer" || name == "X-Title"));
+        assert!(details.payload.get("top_k").is_none());
+        assert_eq!(
+            details
+                .payload
+                .get("tool_choice")
+                .and_then(|value| value.as_str()),
+            Some("auto")
+        );
     }
 
     #[test]
