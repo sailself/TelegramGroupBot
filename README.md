@@ -220,6 +220,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OPENROUTER_TEMPERATURE` - Default: `0.7`.
 - `OPENROUTER_TOP_K` - Default: `40`.
 - `OPENROUTER_TOP_P` - Default: `0.95`.
+- `OPENROUTER_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `60`.
 
 ### NVIDIA hosted models (optional)
 - `ENABLE_NVIDIA` - Enable NVIDIA-hosted chat models. Default: `true`.
@@ -228,6 +229,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `NVIDIA_TEMPERATURE` - Default: `0.7`.
 - `NVIDIA_TOP_K` - Stored for config symmetry; not sent to hosted NVIDIA chat requests unless NVIDIA documents support.
 - `NVIDIA_TOP_P` - Default: `0.95`.
+- `NVIDIA_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `60`.
 - NVIDIA hosted chat completions are integrated through their OpenAI-compatible endpoint.
 
 ### Ollama Cloud (optional)
@@ -236,12 +238,14 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OLLAMA_BASE_URL` - Default: `https://ollama.com/v1`.
 - `OLLAMA_TEMPERATURE` - Default: `0.7`.
 - `OLLAMA_TOP_P` - Default: `0.95`.
+- `OLLAMA_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `60`.
 - Ollama models are configured through `third_party_models.json` using `"provider": "ollama"`.
 
 ### OpenAI Responses (optional)
 - `ENABLE_OPENAI` - Enable the public OpenAI Responses API provider. Default: `false`.
 - `OPENAI_API_KEY` - OpenAI API key used for billed fallback models.
 - `OPENAI_BASE_URL` - Default: `https://api.openai.com/v1`.
+- `OPENAI_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `60`.
 
 ### OpenAI Codex via ChatGPT (optional)
 - `ENABLE_OPENAI_CODEX` - Enable ChatGPT-backed Codex support. Default: `true`.
@@ -253,6 +257,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OPENAI_CODEX_WEB_SEARCH_ALLOWED_DOMAINS` - Optional comma-separated domain allowlist for native Codex web search.
 - `OPENAI_CODEX_AUTH_PATH` - Local auth cache path. Default: `data/openai_codex_auth.json`.
 - `OPENAI_CODEX_MODEL_PATH` - Local selected-model cache path. Default: `data/openai_codex_model.json`.
+- `OPENAI_CODEX_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `300`.
 - Login is managed with `/codexlogin` and `/codexlogout`.
 - The active Codex model is selected live with `/codexmodel` and exposed in the bot as the runtime alias `openai-codex:selected`.
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.

@@ -1,0 +1,15 @@
+.env
+.env.*
+*.db
+target/
+logs/
+data/
+agent_logs/
+agent_workspace/
+feature_plans/
+.git/
+.github/
+whitelist.txt
+acl.json
+third_party_models.json
+openrouter_models.json

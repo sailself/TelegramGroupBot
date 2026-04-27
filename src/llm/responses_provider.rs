@@ -21,8 +21,6 @@ use crate::utils::http::{get_http_client, get_http_client_no_compression};
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const RESPONSES_MAX_ATTEMPTS: usize = 3;
 const RESPONSES_RETRY_BASE_DELAY_MS: u64 = 900;
-const RESPONSES_REQUEST_TIMEOUT_SECS: u64 = 60;
-const RESPONSES_STREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
 const TOOL_LIMIT_SYSTEM_PROMPT: &str = "Tool call limit reached. Provide the best possible answer using the available information without requesting more tool calls.";
 const RESPONSES_TOOL_LIMIT_GUIDANCE: &str = "Tool usage limit: you may use tools for at most {max_tool_calls} rounds total in this conversation. Plan your searches efficiently, avoid redundant tool calls, and after the final allowed tool round you must answer using the information already gathered without requesting more tool calls.";
 const CODEX_RESPONSE_STYLE_ADDENDUM: &str = r#"# ROLE & STYLE
@@ -56,6 +54,7 @@ struct ResponsesRequestDetails {
     headers: Vec<(String, String)>,
     payload: Value,
     streaming_sse: bool,
+    request_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +261,16 @@ fn responses_should_retry_status(status: StatusCode) -> bool {
 fn responses_retry_delay(attempt: usize) -> Duration {
     let attempt = attempt.max(1) as u64;
     Duration::from_millis(RESPONSES_RETRY_BASE_DELAY_MS.saturating_mul(attempt))
+}
+
+fn responses_request_timeout_secs(provider: ThirdPartyProvider) -> u64 {
+    match provider {
+        ThirdPartyProvider::OpenAI => CONFIG.openai_request_timeout_secs,
+        ThirdPartyProvider::OpenAICodex => CONFIG.openai_codex_request_timeout_secs,
+        ThirdPartyProvider::OpenRouter
+        | ThirdPartyProvider::Nvidia
+        | ThirdPartyProvider::Ollama => 60,
+    }
 }
 
 fn responses_tool_limit_guidance() -> String {
@@ -472,6 +481,7 @@ async fn build_request_details(
         headers,
         payload,
         streaming_sse,
+        request_timeout_secs: responses_request_timeout_secs(model_config.provider),
     })
 }
 
@@ -586,7 +596,8 @@ async fn call_provider_api(
     let started_at = chrono::Utc::now();
     let metadata = json!({
         "request_summary": summarize_responses_payload(&details.payload),
-        "streaming_sse": details.streaming_sse
+        "streaming_sse": details.streaming_sse,
+        "timeout_secs": details.request_timeout_secs
     });
     log_llm_request_started(
         details.provider.as_str(),
@@ -605,11 +616,6 @@ async fn call_provider_api(
         details.display_name,
         truncate_for_log(&details.payload.to_string(), 2000)
     );
-    let request_timeout_secs = if details.streaming_sse {
-        RESPONSES_STREAM_REQUEST_TIMEOUT_SECS
-    } else {
-        RESPONSES_REQUEST_TIMEOUT_SECS
-    };
     let client = if details.streaming_sse {
         get_http_client_no_compression()
     } else {
@@ -618,7 +624,7 @@ async fn call_provider_api(
     for attempt in 1..=RESPONSES_MAX_ATTEMPTS {
         let mut request = client
             .post(&details.url)
-            .timeout(Duration::from_secs(request_timeout_secs));
+            .timeout(Duration::from_secs(details.request_timeout_secs));
         for (name, value) in &details.headers {
             request = request.header(name, value);
         }
@@ -629,7 +635,7 @@ async fn call_provider_api(
             "{} request timeout configured: model={}, timeout_secs={}, streaming_sse={}, attempt={}/{}",
             details.display_name,
             model,
-            request_timeout_secs,
+            details.request_timeout_secs,
             details.streaming_sse,
             attempt,
             RESPONSES_MAX_ATTEMPTS
@@ -1323,6 +1329,18 @@ mod tests {
         );
 
         assert_eq!(instructions, "Base prompt");
+    }
+
+    #[test]
+    fn responses_request_timeout_uses_provider_config() {
+        assert_eq!(
+            responses_request_timeout_secs(ThirdPartyProvider::OpenAI),
+            CONFIG.openai_request_timeout_secs
+        );
+        assert_eq!(
+            responses_request_timeout_secs(ThirdPartyProvider::OpenAICodex),
+            CONFIG.openai_codex_request_timeout_secs
+        );
     }
 
     #[test]

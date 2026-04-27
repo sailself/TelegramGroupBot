@@ -22,7 +22,6 @@ use crate::utils::http::get_http_client;
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const THIRD_PARTY_MAX_ATTEMPTS: usize = 3;
 const THIRD_PARTY_RETRY_BASE_DELAY_MS: u64 = 900;
-const THIRD_PARTY_REQUEST_TIMEOUT_SECS: u64 = 60;
 const TOOL_LIMIT_SYSTEM_PROMPT: &str = "Tool call limit reached. Provide the best possible answer using the available information without requesting more tool calls.";
 const THIRD_PARTY_TOOL_LIMIT_GUIDANCE: &str = "Third-party tool usage limit: you may use tools for at most {max_tool_calls} rounds total in this conversation. Plan your searches efficiently, avoid redundant tool calls, and after the final allowed tool round you must answer using the information already gathered without requesting more tool calls.";
 const OPENROUTER_REFERER: &str = "https://github.com/sailself/TelegramGroupHelperBot";
@@ -37,6 +36,7 @@ struct ProviderRuntimeConfig {
     temperature: f32,
     top_p: f32,
     top_k: Option<i32>,
+    request_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +45,7 @@ struct ProviderRequestDetails {
     url: String,
     headers: Vec<(String, String)>,
     payload: Value,
+    request_timeout_secs: u64,
 }
 
 fn truncate_for_log(value: &str, limit: usize) -> String {
@@ -296,6 +297,7 @@ fn provider_runtime_config(provider: ThirdPartyProvider) -> Result<ProviderRunti
             temperature: CONFIG.openrouter_temperature,
             top_p: CONFIG.openrouter_top_p,
             top_k: Some(CONFIG.openrouter_top_k),
+            request_timeout_secs: CONFIG.openrouter_request_timeout_secs,
         },
         ThirdPartyProvider::Nvidia => ProviderRuntimeConfig {
             provider,
@@ -305,6 +307,7 @@ fn provider_runtime_config(provider: ThirdPartyProvider) -> Result<ProviderRunti
             temperature: CONFIG.nvidia_temperature,
             top_p: CONFIG.nvidia_top_p,
             top_k: None,
+            request_timeout_secs: CONFIG.nvidia_request_timeout_secs,
         },
         ThirdPartyProvider::Ollama => ProviderRuntimeConfig {
             provider,
@@ -314,6 +317,7 @@ fn provider_runtime_config(provider: ThirdPartyProvider) -> Result<ProviderRunti
             temperature: CONFIG.ollama_temperature,
             top_p: CONFIG.ollama_top_p,
             top_k: None,
+            request_timeout_secs: CONFIG.ollama_request_timeout_secs,
         },
         ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex => {
             return Err(anyhow!(
@@ -372,6 +376,7 @@ fn build_request_details_for_runtime(
         ),
         headers,
         payload,
+        request_timeout_secs: runtime.request_timeout_secs,
     }
 }
 
@@ -408,7 +413,8 @@ async fn call_provider_api(
         .unwrap_or("unknown");
     let started_at = chrono::Utc::now();
     let metadata = json!({
-        "request_summary": summarize_payload(&details.payload)
+        "request_summary": summarize_payload(&details.payload),
+        "timeout_secs": details.request_timeout_secs
     });
     log_llm_request_started(
         details.display_name,
@@ -422,10 +428,18 @@ async fn call_provider_api(
     for attempt in 1..=THIRD_PARTY_MAX_ATTEMPTS {
         let mut request = client
             .post(&details.url)
-            .timeout(Duration::from_secs(THIRD_PARTY_REQUEST_TIMEOUT_SECS));
+            .timeout(Duration::from_secs(details.request_timeout_secs));
         for (name, value) in &details.headers {
             request = request.header(name, value);
         }
+        debug!(
+            "{} request timeout configured: model={}, timeout_secs={}, attempt={}/{}",
+            details.display_name,
+            model,
+            details.request_timeout_secs,
+            attempt,
+            THIRD_PARTY_MAX_ATTEMPTS
+        );
         let response = match request.json(&details.payload).send().await {
             Ok(response) => response,
             Err(err) => {
@@ -911,6 +925,7 @@ mod tests {
             temperature: 0.7,
             top_p: 0.95,
             top_k: Some(40),
+            request_timeout_secs: 75,
         };
         let details = build_request_details_for_runtime(
             &model(
@@ -937,6 +952,7 @@ mod tests {
             details.payload.get("top_k").and_then(|v| v.as_i64()),
             Some(40)
         );
+        assert_eq!(details.request_timeout_secs, 75);
     }
 
     #[test]
@@ -949,6 +965,7 @@ mod tests {
             temperature: 0.4,
             top_p: 0.8,
             top_k: None,
+            request_timeout_secs: 120,
         };
         let details = build_request_details_for_runtime(
             &model(
@@ -971,6 +988,7 @@ mod tests {
             .iter()
             .any(|(name, _)| name == "HTTP-Referer" || name == "X-Title"));
         assert!(details.payload.get("top_k").is_none());
+        assert_eq!(details.request_timeout_secs, 120);
     }
 
     #[test]
@@ -983,6 +1001,7 @@ mod tests {
             temperature: 0.3,
             top_p: 0.7,
             top_k: None,
+            request_timeout_secs: 90,
         };
         let details = build_request_details_for_runtime(
             &model(ThirdPartyProvider::Ollama, "Qwen 3 32B", "qwen3:32b"),
@@ -1015,6 +1034,7 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("auto")
         );
+        assert_eq!(details.request_timeout_secs, 90);
     }
 
     #[test]

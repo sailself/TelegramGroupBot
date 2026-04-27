@@ -126,20 +126,24 @@ pub struct Config {
     pub openrouter_temperature: f32,
     pub openrouter_top_k: i32,
     pub openrouter_top_p: f32,
+    pub openrouter_request_timeout_secs: u64,
     pub enable_nvidia: bool,
     pub nvidia_api_key: String,
     pub nvidia_base_url: String,
     pub nvidia_temperature: f32,
     pub nvidia_top_k: i32,
     pub nvidia_top_p: f32,
+    pub nvidia_request_timeout_secs: u64,
     pub enable_ollama: bool,
     pub ollama_api_key: String,
     pub ollama_base_url: String,
     pub ollama_temperature: f32,
     pub ollama_top_p: f32,
+    pub ollama_request_timeout_secs: u64,
     pub enable_openai: bool,
     pub openai_api_key: String,
     pub openai_base_url: String,
+    pub openai_request_timeout_secs: u64,
     pub enable_openai_codex: bool,
     pub openai_codex_base_url: String,
     pub openai_codex_originator: String,
@@ -149,6 +153,7 @@ pub struct Config {
     pub openai_codex_web_search_allowed_domains: Vec<String>,
     pub openai_codex_auth_path: String,
     pub openai_codex_model_path: String,
+    pub openai_codex_request_timeout_secs: u64,
     pub enable_jina_mcp: bool,
     pub jina_ai_api_key: String,
     pub jina_search_endpoint: String,
@@ -230,6 +235,10 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn env_timeout_secs(name: &str, default: u64) -> u64 {
+    env_u64(name, default).max(1)
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -490,20 +499,27 @@ impl Config {
             openrouter_temperature: env_f32("OPENROUTER_TEMPERATURE", 0.7),
             openrouter_top_k: env_i32("OPENROUTER_TOP_K", 40),
             openrouter_top_p: env_f32("OPENROUTER_TOP_P", 0.95),
+            openrouter_request_timeout_secs: env_timeout_secs(
+                "OPENROUTER_REQUEST_TIMEOUT_SECS",
+                60,
+            ),
             enable_nvidia: env_bool("ENABLE_NVIDIA", true),
             nvidia_api_key: env_string("NVIDIA_API_KEY", ""),
             nvidia_base_url: env_string("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
             nvidia_temperature: env_f32("NVIDIA_TEMPERATURE", 0.7),
             nvidia_top_k: env_i32("NVIDIA_TOP_K", 40),
             nvidia_top_p: env_f32("NVIDIA_TOP_P", 0.95),
+            nvidia_request_timeout_secs: env_timeout_secs("NVIDIA_REQUEST_TIMEOUT_SECS", 60),
             enable_ollama: env_bool("ENABLE_OLLAMA", true),
             ollama_api_key: env_string("OLLAMA_API_KEY", ""),
             ollama_base_url: env_string("OLLAMA_BASE_URL", "https://ollama.com/v1"),
             ollama_temperature: env_f32("OLLAMA_TEMPERATURE", 0.7),
             ollama_top_p: env_f32("OLLAMA_TOP_P", 0.95),
+            ollama_request_timeout_secs: env_timeout_secs("OLLAMA_REQUEST_TIMEOUT_SECS", 60),
             enable_openai: env_bool("ENABLE_OPENAI", false),
             openai_api_key: env_string("OPENAI_API_KEY", ""),
             openai_base_url: env_string("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            openai_request_timeout_secs: env_timeout_secs("OPENAI_REQUEST_TIMEOUT_SECS", 60),
             enable_openai_codex: env_bool("ENABLE_OPENAI_CODEX", true),
             openai_codex_base_url: env_string(
                 "OPENAI_CODEX_BASE_URL",
@@ -529,6 +545,10 @@ impl Config {
             openai_codex_model_path: env_string(
                 "OPENAI_CODEX_MODEL_PATH",
                 "data/openai_codex_model.json",
+            ),
+            openai_codex_request_timeout_secs: env_timeout_secs(
+                "OPENAI_CODEX_REQUEST_TIMEOUT_SECS",
+                300,
             ),
             enable_jina_mcp: env_bool("ENABLE_JINA_MCP", false),
             jina_ai_api_key: env_string("JINA_AI_API_KEY", ""),
