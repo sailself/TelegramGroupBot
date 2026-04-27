@@ -17,8 +17,9 @@
 - `cargo build --release` - Produce an optimized binary.
 - `docker build -t telegram-group-helper-bot .` - Build the container image.
 - `docker run --env-file .env -v ./data:/app/data -v ./logs:/app/logs telegram-group-helper-bot` - Run with persisted DB/logs.
-- `cargo fmt` - Apply Rust formatting (recommended).
-- `cargo clippy` - Lint for common mistakes (optional).
+- `cargo fmt` - Apply Rust formatting (Recommended).
+- `cargo clippy` - Lint for common mistakes (Recommended).
+
 ## Build Verification
 - After big code changes, run `cargo build` and debug any issues before finishing.
 

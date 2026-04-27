@@ -823,10 +823,8 @@ fn extract_text_from_response(response: GeminiResponse) -> String {
             if let Some(parts) = content.parts {
                 for part in parts {
                     match part {
-                        GeminiPart::Text { text } => {
-                            if !text.trim().is_empty() {
-                                text_parts.push(text);
-                            }
+                        GeminiPart::Text { text } if !text.trim().is_empty() => {
+                            text_parts.push(text);
                         }
                         GeminiPart::ExecutableCode { executable_code } => {
                             if let Some(language) = executable_code
@@ -1120,16 +1118,16 @@ fn extract_music_generation_result(
                                 lyric_parts.push(trimmed.to_string());
                             }
                         }
-                        GeminiPart::InlineData { inline_data } => {
-                            if inline_data.mime_type.starts_with("audio/") {
-                                let bytes = general_purpose::STANDARD
-                                    .decode(&inline_data.data)
-                                    .map_err(|err| {
-                                        anyhow!("Failed to decode Lyria audio payload: {}", err)
-                                    })?;
-                                audio_mime_type = Some(inline_data.mime_type);
-                                audio_bytes = Some(bytes);
-                            }
+                        GeminiPart::InlineData { inline_data }
+                            if inline_data.mime_type.starts_with("audio/") =>
+                        {
+                            let bytes = general_purpose::STANDARD
+                                .decode(&inline_data.data)
+                                .map_err(|err| {
+                                    anyhow!("Failed to decode Lyria audio payload: {}", err)
+                                })?;
+                            audio_mime_type = Some(inline_data.mime_type);
+                            audio_bytes = Some(bytes);
                         }
                         _ => {}
                     }
