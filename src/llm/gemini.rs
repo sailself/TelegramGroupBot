@@ -135,7 +135,6 @@ struct UploadedFileRef {
 const GEMINI_MAX_RETRY_ATTEMPTS: usize = 2;
 const GEMINI_LITE_FALLBACK_MAX_ATTEMPTS: usize = 3;
 const GEMINI_RETRY_BASE_DELAY_MS: u64 = 900;
-const GEMINI_DEFAULT_TIMEOUT_SECS: u64 = 90;
 const LYRIA_GENERATION_TIMEOUT_SECS: u64 = 240;
 const VEO_DEFAULT_RESOLUTION: &str = "1080p";
 const VEO_DEFAULT_DURATION_SECONDS: u32 = 8;
@@ -164,6 +163,14 @@ fn gemini_should_retry_status(status: StatusCode) -> bool {
 fn gemini_retry_delay(attempt: usize) -> Duration {
     let attempt = attempt.max(1) as u64;
     Duration::from_millis(GEMINI_RETRY_BASE_DELAY_MS.saturating_mul(attempt))
+}
+
+fn gemini_generate_content_timeout() -> Duration {
+    Duration::from_secs(CONFIG.gemini_request_timeout_secs)
+}
+
+fn gemini_image_generation_timeout() -> Duration {
+    Duration::from_secs(CONFIG.gemini_image_request_timeout_secs)
 }
 
 fn build_safety_settings() -> Vec<serde_json::Value> {
@@ -940,7 +947,7 @@ async fn call_gemini_api_value(
         model,
         payload,
         system_prompt_label,
-        Duration::from_secs(GEMINI_DEFAULT_TIMEOUT_SECS),
+        gemini_generate_content_timeout(),
         audit_context,
         operation,
     )
@@ -1666,10 +1673,11 @@ pub async fn generate_image_with_gemini(
     });
 
     let model = &CONFIG.gemini_image_model;
-    let response = call_gemini_api(
+    let response = call_gemini_api_with_timeout(
         model,
         payload,
         Some("image_generation_system_prompt"),
+        gemini_image_generation_timeout(),
         audit_context,
         "generate_image_with_gemini",
     )
@@ -2013,5 +2021,17 @@ mod tests {
         assert!(err
             .to_string()
             .contains("No audio returned by Lyria (model: lyria-3-pro-preview)"));
+    }
+
+    #[test]
+    fn gemini_timeout_helpers_use_general_and_image_specific_config() {
+        assert_eq!(
+            gemini_generate_content_timeout().as_secs(),
+            CONFIG.gemini_request_timeout_secs
+        );
+        assert_eq!(
+            gemini_image_generation_timeout().as_secs(),
+            CONFIG.gemini_image_request_timeout_secs
+        );
     }
 }

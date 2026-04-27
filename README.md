@@ -21,8 +21,8 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/token_devourers [n]` - Show the top token consumers in the current group chat.
 - `/token_stats [model|user]` - Show bot-wide token usage totals (admin-only).
 - `/s` - Search this chat and return relevant message links.
-- `/img` - Generate or edit an image with Gemini.
-- `/image` - Generate an image with selectable resolution and aspect ratio.
+- `/img` - Generate or edit an image with Gemini, or Codex `gpt-image-2` with automatic sizing when Codex is enabled.
+- `/image` - Generate an image with selectable Gemini resolution/aspect ratio or Codex image size; Gemini aspect ratio can be left automatic.
 - `/vid` - Generate a video from text.
 - `/mysong` - Generate a theme song from your chat history.
 - `/profileme` - Generate a profile based on your chat history.
@@ -207,6 +207,8 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `GEMINI_THINKING_LEVEL` - Default: `high`.
 - `GEMINI_SAFETY_SETTINGS` - Safety profile: `standard` or `permissive` (`off`/`none` are treated as `permissive`). Default: `permissive`.
   - `standard` maps to `BLOCK_MEDIUM_AND_ABOVE`; `permissive` maps to `OFF` for all Gemini safety categories.
+- `GEMINI_REQUEST_TIMEOUT_SECS` - Per-attempt timeout for Gemini `generateContent` requests. Default: `90`.
+- `GEMINI_IMAGE_REQUEST_TIMEOUT_SECS` - Per-attempt timeout for Gemini image generation. Default: `300`.
 
 ### Shared third-party model catalog
 - `THIRD_PARTY_MODELS_CONFIG_PATH` - Path to the mixed-provider model config JSON.
@@ -258,6 +260,8 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OPENAI_CODEX_AUTH_PATH` - Local auth cache path. Default: `data/openai_codex_auth.json`.
 - `OPENAI_CODEX_MODEL_PATH` - Local selected-model cache path. Default: `data/openai_codex_model.json`.
 - `OPENAI_CODEX_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `300`.
+- `OPENAI_CODEX_IMAGE_RESPONSES_MODEL` - Responses model used to invoke Codex image generation. Default: `gpt-5.5`.
+- `OPENAI_CODEX_IMAGE_MODEL` - Codex image-generation tool model offered in `/img` and `/image`. Default: `gpt-image-2`.
 - Login is managed with `/codexlogin` and `/codexlogout`.
 - The active Codex model is selected live with `/codexmodel` and exposed in the bot as the runtime alias `openai-codex:selected`.
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.

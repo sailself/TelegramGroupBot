@@ -609,7 +609,11 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
         });
         return Ok(());
     }
-    if data.starts_with("image_res:") || data.starts_with("image_aspect:") {
+    if data.starts_with("image_model:")
+        || data.starts_with("image_codex_size:")
+        || data.starts_with("image_res:")
+        || data.starts_with("image_aspect:")
+    {
         let bot = bot.clone();
         let state = state.clone();
         tokio::spawn(async move {
