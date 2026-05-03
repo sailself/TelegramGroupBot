@@ -14,8 +14,8 @@ use teloxide::types::{
 use teloxide::RequestError;
 
 use crate::config::{
-    CONFIG, FACTCHECK_SYSTEM_PROMPT, PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT,
-    PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
+    ThirdPartyProvider, CONFIG, FACTCHECK_SYSTEM_PROMPT, PAINTME_SYSTEM_PROMPT,
+    PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
 };
 use crate::db::models::{ModelTokenStat, TokenUserStat};
 use crate::handlers::access::{check_access_control, check_admin_access, is_rate_limited};
@@ -26,14 +26,19 @@ use crate::handlers::media::{
     collect_message_media, get_file_url, summarize_media_files, MediaCollectionOptions,
     MediaSummary,
 };
+use crate::handlers::qa::{resolve_default_text_model_for_request, MODEL_GEMINI};
 use crate::handlers::responses::send_response;
 use crate::llm::audit::LLM_TRIGGER_KIND_COMMAND;
-use crate::llm::media::detect_mime_type;
+use crate::llm::gemini::ImageGenerationError;
+use crate::llm::media::{detect_mime_type, MediaKind};
 use crate::llm::openai_codex;
-use crate::llm::runtime_models::{runtime_model_count, selected_codex_model_record};
+use crate::llm::runtime_models::{
+    codex_selected_model_label, runtime_model_config, runtime_model_count,
+    selected_codex_model_record,
+};
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
-    audit_context_from_id, call_gemini, create_audit_context_from_message,
+    audit_context_from_id, call_gemini, call_third_party, create_audit_context_from_message,
     generate_image_with_codex, generate_image_with_gemini, generate_music_with_lyria,
     generate_video_with_veo, CodexImageConfig, GeminiImageConfig, LlmAuditContext,
 };
@@ -145,6 +150,90 @@ async fn create_command_audit_context(
 ) -> Option<LlmAuditContext> {
     create_audit_context_from_message(&state.db, LLM_TRIGGER_KIND_COMMAND, trigger_name, message)
         .await
+}
+
+fn default_text_model_display_name(model_name: &str, gemini_model_used: Option<&str>) -> String {
+    if model_name == MODEL_GEMINI {
+        return gemini_model_used
+            .unwrap_or(CONFIG.gemini_model.as_str())
+            .to_string();
+    }
+
+    if let Some(config) = runtime_model_config(model_name) {
+        if config.provider == ThirdPartyProvider::OpenAICodex {
+            if let Some(record) = selected_codex_model_record() {
+                if record.slug == config.model {
+                    return codex_selected_model_label(&record);
+                }
+            }
+        }
+        return config.model;
+    }
+
+    model_name.to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_configured_text_model(
+    system_prompt: &str,
+    user_content: &str,
+    response_title: &str,
+    tools_enabled: bool,
+    use_pro: bool,
+    media_files: Option<Vec<crate::llm::media::MediaFile>>,
+    prompt_name: Option<&str>,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<(String, String)> {
+    let media_summary = media_files
+        .as_ref()
+        .map(|files| summarize_media_files(files))
+        .unwrap_or_default();
+    let model_name = resolve_default_text_model_for_request(
+        media_summary.images > 0,
+        media_summary.videos > 0,
+        media_summary.audios > 0,
+        media_summary.documents > 0,
+        tools_enabled,
+    )?;
+
+    if model_name == MODEL_GEMINI {
+        let response = call_gemini(
+            system_prompt,
+            user_content,
+            tools_enabled,
+            false,
+            Some(&CONFIG.gemini_thinking_level),
+            None,
+            use_pro,
+            media_files,
+            None,
+            prompt_name,
+            audit_context,
+        )
+        .await?;
+        let model_used = response.model_used;
+        return Ok((response.text, model_used));
+    }
+
+    let image_data_list = media_files
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|file| file.kind == MediaKind::Image)
+        .map(|file| file.bytes().to_vec())
+        .collect::<Vec<_>>();
+    let response = call_third_party(
+        system_prompt,
+        user_content,
+        &model_name,
+        response_title,
+        &image_data_list,
+        tools_enabled,
+        audit_context,
+    )
+    .await?;
+    let model_used = default_text_model_display_name(&model_name, None);
+
+    Ok((response, model_used))
 }
 
 fn format_compact_token_count(tokens: i64) -> String {
@@ -1476,6 +1565,90 @@ fn parse_image_generation_model(value: &str) -> Option<ImageGenerationModel> {
     }
 }
 
+fn parse_default_image_generation_model(value: &str) -> Option<ImageGenerationModel> {
+    match value.trim().to_lowercase().as_str() {
+        "gemini" => Some(ImageGenerationModel::Gemini),
+        "codex" | "openai-codex" | "openai-codex:selected" => {
+            Some(ImageGenerationModel::CodexGptImage2)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_default_image_generation_model(
+    default_model: &str,
+    codex_available: bool,
+) -> std::result::Result<ImageGenerationModel, String> {
+    let Some(model) = parse_default_image_generation_model(default_model) else {
+        return Err(format!(
+            "Default image model {} is not supported. Set DEFAULT_IMAGE_MODEL to gemini or codex.",
+            default_model.trim()
+        ));
+    };
+
+    if model == ImageGenerationModel::CodexGptImage2 && !codex_available {
+        return Err(format!(
+            "Default image model {} is unavailable. Complete Codex setup with /codexlogin or set DEFAULT_IMAGE_MODEL=gemini.",
+            default_model.trim()
+        ));
+    }
+
+    Ok(model)
+}
+
+async fn generate_image_with_configured_default(
+    prompt: &str,
+    image_urls: &[String],
+    gemini_config: Option<GeminiImageConfig>,
+    codex_config: Option<CodexImageConfig>,
+    upload_to_cwd: bool,
+    audit_context: Option<&LlmAuditContext>,
+) -> (
+    String,
+    std::result::Result<Vec<Vec<u8>>, ImageGenerationError>,
+) {
+    let model = match resolve_default_image_generation_model(
+        &CONFIG.default_image_model,
+        crate::llm::codex_image::codex_image_available(),
+    ) {
+        Ok(model) => model,
+        Err(err) => {
+            return (
+                CONFIG.default_image_model.clone(),
+                Err(ImageGenerationError(err)),
+            );
+        }
+    };
+
+    match model {
+        ImageGenerationModel::Gemini => (
+            CONFIG.gemini_image_model.clone(),
+            generate_image_with_gemini(
+                prompt,
+                image_urls,
+                gemini_config,
+                upload_to_cwd,
+                audit_context,
+            )
+            .await,
+        ),
+        ImageGenerationModel::CodexGptImage2 => {
+            let model_name = crate::llm::codex_image::codex_image_display_model();
+            (
+                model_name,
+                generate_image_with_codex(
+                    prompt,
+                    image_urls,
+                    codex_config,
+                    upload_to_cwd,
+                    audit_context,
+                )
+                .await,
+            )
+        }
+    }
+}
+
 fn build_image_model_keyboard(request_key: &str, include_codex: bool) -> InlineKeyboardMarkup {
     let mut buttons = vec![InlineKeyboardButton::callback(
         CONFIG.gemini_image_model.clone(),
@@ -1574,7 +1747,25 @@ async fn finalize_image_request(
         return Ok(());
     };
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
-    let selected_model = request.model.unwrap_or(ImageGenerationModel::Gemini);
+    let selected_model = match request.model {
+        Some(model) => model,
+        None => match resolve_default_image_generation_model(
+            &CONFIG.default_image_model,
+            crate::llm::codex_image::codex_image_available(),
+        ) {
+            Ok(model) => model,
+            Err(err) => {
+                let _ = bot
+                    .edit_message_text(
+                        ChatId(request.chat_id),
+                        MessageId(request.selection_message_id as i32),
+                        err,
+                    )
+                    .await;
+                return Ok(());
+            }
+        },
+    };
 
     let mut prompt = request.prompt.clone();
     if !request.telegraph_contents.is_empty() {
@@ -1965,20 +2156,23 @@ pub async fn img_handler(
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
 
-    let image_result = generate_image_with_gemini(
+    let (model_name, image_result) = generate_image_with_configured_default(
         &prompt_text,
         &context.image_urls,
+        None,
         None,
         !CONFIG.cwd_pw_api_key.is_empty(),
         audit_context.as_ref(),
     )
     .await;
 
-    let model_name = CONFIG.gemini_image_model.as_str();
     let images = match image_result {
         Ok(images) => images,
         Err(err) => {
-            error!(model = model_name, "Image generation failed: {}", err.0);
+            error!(
+                model = model_name.as_str(),
+                "Image generation failed: {}", err.0
+            );
             let error_text = format!(
                 "Sorry, I couldn't generate the image using {}.\n\nError: {}",
                 model_name, err.0
@@ -1990,7 +2184,7 @@ pub async fn img_handler(
         }
     };
 
-    let caption = build_image_caption(model_name, &prompt_text).await;
+    let caption = build_image_caption(&model_name, &prompt_text).await;
     let mut image_iter = images.into_iter();
     if let Some(first_image) = image_iter.next() {
         let media = InputMedia::Photo(
@@ -2064,6 +2258,14 @@ pub async fn image_handler(
     let audit_context = create_command_audit_context(&state, &message, "image").await;
 
     let codex_available = crate::llm::codex_image::codex_image_available();
+    if let Err(err) =
+        resolve_default_image_generation_model(&CONFIG.default_image_model, codex_available)
+    {
+        bot.send_message(message.chat.id, err)
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await?;
+        return Ok(());
+    }
     let request_key = format!("{}_{}", message.chat.id.0, message.id.0);
     let (selection_text, selection_keyboard, initial_model) = if codex_available {
         (
@@ -2288,15 +2490,12 @@ pub async fn tldr_handler(
     let chat_content = super::format_tldr_chat_content(&messages);
 
     let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph_author_name);
-    let response = match call_gemini(
+    let response = match call_configured_text_model(
         &system_prompt,
         &chat_content,
+        "Message Summary",
         true,
-        false,
-        Some(&CONFIG.gemini_thinking_level),
-        None,
         true,
-        None,
         None,
         Some("TLDR_SYSTEM_PROMPT"),
         audit_context.as_ref(),
@@ -2309,7 +2508,7 @@ pub async fn tldr_handler(
             bot.edit_message_text(
                 processing_message.chat.id,
                 processing_message.id,
-                "Failed to generate a summary. Please try again later.",
+                format!("Failed to generate a summary.\n\nError: {}", err),
             )
             .await?;
             complete_command_timer(
@@ -2321,7 +2520,8 @@ pub async fn tldr_handler(
         }
     };
 
-    if response.text.trim().is_empty() {
+    let (summary_text, summary_model) = response;
+    if summary_text.trim().is_empty() {
         bot.edit_message_text(
             processing_message.chat.id,
             processing_message.id,
@@ -2332,8 +2532,6 @@ pub async fn tldr_handler(
         return Ok(());
     }
 
-    let summary_text = response.text;
-    let summary_model = response.model_used;
     let summary_with_model = format!("{}\n\nModel: {}", summary_text, summary_model);
     let infographic_enabled = CONFIG.enable_tldr_infographic;
 
@@ -2363,15 +2561,16 @@ Use the same language as the summary text for any labels.\
             aspect_ratio: Some("16:9".to_string()),
             image_size: Some("4K".to_string()),
         });
-        match generate_image_with_gemini(
+        let (infographic_model, infographic_result) = generate_image_with_configured_default(
             &infographic_prompt,
             &[],
             infographic_config,
+            None,
             false,
             audit_context.as_ref(),
         )
-        .await
-        {
+        .await;
+        match infographic_result {
             Ok(images) => {
                 if let Some(image) = images.into_iter().next() {
                     if CONFIG.cwd_pw_api_key.trim().is_empty() {
@@ -2383,7 +2582,7 @@ Use the same language as the summary text for any labels.\
                             &image,
                             &CONFIG.cwd_pw_api_key,
                             &mime_type,
-                            Some(CONFIG.gemini_image_model.as_str()),
+                            Some(infographic_model.as_str()),
                             Some(&infographic_prompt),
                         )
                         .await;
@@ -2652,16 +2851,13 @@ pub async fn factcheck_handler(
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
     let system_prompt = build_factcheck_system_prompt(user_language_code);
-    let response = match call_gemini(
+    let response = match call_configured_text_model(
         &system_prompt,
         &statement,
+        "Fact Check",
         true,
-        false,
-        Some(&CONFIG.gemini_thinking_level),
-        None,
         media_summary.total > 0,
         Some(media_files),
-        None,
         Some("FACTCHECK_SYSTEM_PROMPT"),
         audit_context.as_ref(),
     )
@@ -2673,14 +2869,15 @@ pub async fn factcheck_handler(
             bot.edit_message_text(
                 processing_message.chat.id,
                 processing_message.id,
-                "Failed to fact-check this message. Please try again later.",
+                format!("Failed to fact-check this message.\n\nError: {}", err),
             )
             .await?;
             return Ok(());
         }
     };
 
-    let response_with_model = format!("{}\n\nModel: {}", response.text, response.model_used);
+    let (response_text, response_model) = response;
+    let response_with_model = format!("{}\n\nModel: {}", response_text, response_model);
 
     send_response(
         &bot,
@@ -2770,26 +2967,37 @@ pub async fn profileme_handler(
         )
     };
 
-    let response = call_gemini(
+    let response = match call_configured_text_model(
         &system_prompt,
         &formatted_history,
+        "Your User Profile",
         false,
         false,
-        Some(&CONFIG.gemini_thinking_level),
-        None,
-        false,
-        None,
         None,
         Some("PROFILEME_SYSTEM_PROMPT"),
         audit_context.as_ref(),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            error!("Profile generation failed: {}", err);
+            bot.edit_message_text(
+                processing_message.chat.id,
+                processing_message.id,
+                format!("Failed to generate your profile.\n\nError: {}", err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
+    let (response_text, _response_model) = response;
     send_response(
         &bot,
         processing_message.chat.id,
         processing_message.id,
-        &response.text,
+        &response_text,
         "Your User Profile",
         ParseMode::Markdown,
     )
@@ -3080,15 +3288,16 @@ pub async fn paintme_handler(
         PAINTME_SYSTEM_PROMPT
     };
 
-    let prompt = call_gemini(
+    let (prompt, _prompt_model) = match call_configured_text_model(
         prompt_system,
         &formatted_history,
+        if portrait {
+            "Portrait Prompt"
+        } else {
+            "Paint Prompt"
+        },
         false,
         false,
-        Some(&CONFIG.gemini_thinking_level),
-        None,
-        false,
-        None,
         None,
         Some(if portrait {
             "PORTRAIT_SYSTEM_PROMPT"
@@ -3097,8 +3306,20 @@ pub async fn paintme_handler(
         }),
         audit_context.as_ref(),
     )
-    .await?
-    .text;
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            error!("Image prompt generation failed: {}", err);
+            bot.edit_message_text(
+                message.chat.id,
+                processing_message.id,
+                format!("Failed to create your image prompt.\n\nError: {}", err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     drop(typing_chat_action);
 
     let status_text = if portrait {
@@ -3112,20 +3333,23 @@ pub async fn paintme_handler(
     let _photo_chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
 
-    let image_result = generate_image_with_gemini(
+    let (model_name, image_result) = generate_image_with_configured_default(
         &prompt,
         &[],
+        None,
         None,
         !CONFIG.cwd_pw_api_key.is_empty(),
         audit_context.as_ref(),
     )
     .await;
 
-    let model_name = CONFIG.gemini_image_model.as_str();
     let images = match image_result {
         Ok(images) => images,
         Err(err) => {
-            error!(model = model_name, "Image generation failed: {}", err.0);
+            error!(
+                model = model_name.as_str(),
+                "Image generation failed: {}", err.0
+            );
             let error_text = format!(
                 "Sorry, I couldn't generate the image using {}.\n\nError: {}",
                 model_name, err.0
@@ -3136,7 +3360,7 @@ pub async fn paintme_handler(
             return Ok(());
         }
     };
-    let caption = build_image_caption(model_name, &prompt).await;
+    let caption = build_image_caption(&model_name, &prompt).await;
 
     let mut image_iter = images.into_iter();
     if let Some(first_image) = image_iter.next() {
@@ -3492,6 +3716,50 @@ mod tests {
 
         assert_eq!(selection.target_language, "English");
         assert_eq!(selection.fallback_notice, None);
+    }
+
+    #[test]
+    fn default_image_model_accepts_gemini_and_codex_aliases() {
+        assert_eq!(
+            parse_default_image_generation_model("gemini"),
+            Some(ImageGenerationModel::Gemini)
+        );
+        assert_eq!(
+            parse_default_image_generation_model("codex"),
+            Some(ImageGenerationModel::CodexGptImage2)
+        );
+        assert_eq!(
+            parse_default_image_generation_model("openai-codex"),
+            Some(ImageGenerationModel::CodexGptImage2)
+        );
+        assert_eq!(
+            parse_default_image_generation_model("openai-codex:selected"),
+            Some(ImageGenerationModel::CodexGptImage2)
+        );
+    }
+
+    #[test]
+    fn default_image_model_rejects_unknown_values() {
+        assert_eq!(parse_default_image_generation_model("openrouter:gpt"), None);
+        assert_eq!(parse_default_image_generation_model(""), None);
+    }
+
+    #[test]
+    fn default_image_model_errors_when_codex_unavailable() {
+        let result = resolve_default_image_generation_model("codex", false);
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Default image model codex is unavailable"));
+    }
+
+    #[test]
+    fn default_image_model_accepts_available_codex() {
+        assert_eq!(
+            resolve_default_image_generation_model("codex", true),
+            Ok(ImageGenerationModel::CodexGptImage2)
+        );
     }
 
     #[test]

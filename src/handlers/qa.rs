@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use teloxide::prelude::*;
@@ -31,6 +31,7 @@ use crate::llm::media::MediaKind;
 use crate::llm::runtime_models::{
     codex_selected_model_label, is_runtime_provider_ready, resolve_runtime_model_identifier,
     runtime_model_config, runtime_model_count, runtime_models, selected_codex_model_record,
+    OPENAI_CODEX_SELECTED_MODEL_ID,
 };
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::{
@@ -539,14 +540,6 @@ fn has_available_third_party_models_for_request(
     .is_empty()
 }
 
-fn is_model_configured(model_key: &str) -> bool {
-    let normalized = normalize_model_identifier(model_key);
-    if normalized == MODEL_GEMINI {
-        return true;
-    }
-    runtime_model_config(&normalized).is_some()
-}
-
 fn is_model_configured_for_request(
     model_key: &str,
     has_images: bool,
@@ -595,6 +588,95 @@ fn model_supports_media_for_request(
         has_documents,
         require_tools,
     )
+}
+
+fn default_text_model_error(model_name: &str, reason: &str) -> String {
+    format!(
+        "Default text model {} is {}. Update DEFAULT_TEXT_MODEL or complete Codex setup with /codexlogin and /codexmodel.",
+        model_name, reason
+    )
+}
+
+fn resolve_default_text_model_with_models(
+    default_model: &str,
+    models: &[ThirdPartyModelConfig],
+    ready_providers: &[ThirdPartyProvider],
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+    require_tools: bool,
+) -> std::result::Result<String, String> {
+    let trimmed = default_model.trim();
+    let normalized = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(MODEL_GEMINI) {
+        MODEL_GEMINI.to_string()
+    } else if trimmed.eq_ignore_ascii_case("openai-codex") {
+        OPENAI_CODEX_SELECTED_MODEL_ID.to_string()
+    } else {
+        normalize_model_identifier_with_models(trimmed, models, &[])
+    };
+
+    if normalized == MODEL_GEMINI {
+        return Ok(normalized);
+    }
+
+    if has_documents {
+        return Err(default_text_model_error(
+            &normalized,
+            "unsupported for document input",
+        ));
+    }
+
+    let Some(config) = models.iter().find(|config| config.id == normalized) else {
+        return Err(default_text_model_error(&normalized, "not configured"));
+    };
+
+    if !ready_providers.contains(&config.provider) {
+        return Err(default_text_model_error(&normalized, "unavailable"));
+    }
+
+    if !third_party_model_matches_request_capabilities(
+        config,
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    ) {
+        return Err(default_text_model_error(
+            &normalized,
+            "unsupported for this request",
+        ));
+    }
+
+    Ok(normalized)
+}
+
+pub(crate) fn resolve_default_text_model_for_request(
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+    require_tools: bool,
+) -> Result<String> {
+    let models = runtime_models();
+    let ready_providers = models
+        .iter()
+        .filter(|config| is_runtime_provider_ready(config.provider))
+        .map(|config| config.provider)
+        .collect::<Vec<_>>();
+
+    resolve_default_text_model_with_models(
+        &CONFIG.default_text_model,
+        &models,
+        &ready_providers,
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    )
+    .map_err(|message| anyhow!(message))
 }
 
 fn third_party_model_matches_request_capabilities(
@@ -1262,6 +1344,53 @@ mod tests {
     fn media_only_prompt_returns_none_without_media() {
         assert_eq!(build_media_only_qa_prompt(&MediaSummary::default()), None);
     }
+
+    #[test]
+    fn default_text_model_resolution_errors_when_codex_is_not_ready() {
+        let models = vec![model(
+            ThirdPartyProvider::OpenAICodex,
+            "Codex Selected",
+            "selected",
+        )];
+
+        let result = resolve_default_text_model_with_models(
+            "openai-codex:selected",
+            &models,
+            &[],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Default text model openai-codex:selected is unavailable"));
+    }
+
+    #[test]
+    fn default_text_model_resolution_accepts_ready_codex() {
+        let models = vec![model(
+            ThirdPartyProvider::OpenAICodex,
+            "Codex Selected",
+            "selected",
+        )];
+
+        let result = resolve_default_text_model_with_models(
+            "openai-codex:selected",
+            &models,
+            &[ThirdPartyProvider::OpenAICodex],
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(result.as_deref(), Ok("openai-codex:selected"));
+    }
 }
 
 #[allow(deprecated)]
@@ -1451,7 +1580,7 @@ async fn q_handler_internal(
     let has_documents = media_summary.documents > 0;
 
     let require_tools = mode.requires_custom_tools();
-    let must_use_gemini = force_gemini
+    let must_use_default_model = force_gemini
         || has_video
         || has_audio
         || has_documents
@@ -1464,33 +1593,64 @@ async fn q_handler_internal(
             require_tools,
         )
         || runtime_model_count() == 0;
-    if must_use_gemini {
+    if must_use_default_model {
+        let default_model = match resolve_default_text_model_for_request(
+            has_images,
+            has_video,
+            has_audio,
+            has_documents,
+            require_tools,
+        ) {
+            Ok(model) => model,
+            Err(err) => {
+                send_message_with_retry(
+                    &bot,
+                    message.chat.id,
+                    &err.to_string(),
+                    Some(message.id),
+                    None,
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let display_name = configured_model_display_name(&default_model);
         let processing_message_text = if has_video {
-            "Analyzing video and processing your question...".to_string()
+            format!(
+                "Analyzing video and processing your question with {}...",
+                display_name
+            )
         } else if has_audio {
-            "Analyzing audio and processing your question...".to_string()
+            format!(
+                "Analyzing audio and processing your question with {}...",
+                display_name
+            )
         } else if has_images {
             format!(
-                "Analyzing {} image(s) and processing your question...",
-                media_summary.images
+                "Analyzing {} image(s) and processing your question with {}...",
+                media_summary.images, display_name
             )
         } else if has_documents {
             format!(
-                "Analyzing {} document(s) and processing your question...",
-                media_summary.documents
+                "Analyzing {} document(s) and processing your question with {}...",
+                media_summary.documents, display_name
             )
         } else if !twitter_contents.is_empty() {
             format!(
-                "Analyzing {} Twitter post(s) and processing your question...",
-                twitter_contents.len()
+                "Analyzing {} Twitter post(s) and processing your question with {}...",
+                twitter_contents.len(),
+                display_name
             )
         } else if !youtube_urls.is_empty() {
             format!(
-                "Analyzing {} YouTube video(s) and processing your question...",
-                youtube_urls.len()
+                "Analyzing {} YouTube video(s) and processing your question with {}...",
+                youtube_urls.len(),
+                display_name
             )
         } else {
-            "Processing your question...".to_string()
+            format!("Processing your question with {}...", display_name)
         };
         let processing_message = send_message_with_retry(
             &bot,
@@ -1502,71 +1662,38 @@ async fn q_handler_internal(
         )
         .await?;
         let mut timer = start_command_timer(command_name, &message);
-        let _chat_action =
-            start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-        let use_pro = if command_name == "qq" {
-            false
-        } else {
-            media_summary.total > 0 || !youtube_urls.is_empty()
-        };
-        let response = if mode == QaCommandMode::ChatContext {
-            let mut runtime = ToolRuntime::for_qc(state.db.clone(), message.chat.id.0);
-            call_gemini_with_tool_runtime(
-                &format!(
-                    "{}\n\n{}",
-                    build_chat_context_system_prompt(user_language_code),
-                    runtime.tool_limit_guidance()
-                ),
-                &query_text,
-                &mut runtime,
-                use_pro,
-                Some(media_files.clone()),
-                Some(youtube_urls.clone()),
-                Some("QC_SYSTEM_PROMPT"),
-                None,
-                audit_context.as_ref(),
-            )
-            .await
-        } else {
-            call_gemini(
-                &build_system_prompt(user_language_code),
-                &query_text,
-                true,
-                false,
-                Some(&CONFIG.gemini_thinking_level),
-                None,
-                use_pro,
-                Some(media_files.clone()),
-                Some(youtube_urls.clone()),
-                Some("Q_SYSTEM_PROMPT"),
-                audit_context.as_ref(),
-            )
-            .await
-        };
-        let response = match response {
-            Ok(response) => response.text,
-            Err(err) => {
-                let message = format_llm_error_message(MODEL_GEMINI, &err);
-                bot.edit_message_text(processing_message.chat.id, processing_message.id, message)
-                    .await?;
-                return Err(err);
-            }
+        let pending_request = PendingQRequest {
+            user_id,
+            username: username.clone(),
+            query: query_text.clone(),
+            original_query: original_query.clone(),
+            db_query_text: db_query_text.clone(),
+            telegram_language_code: user_language_code.map(str::to_string),
+            media_files,
+            youtube_urls,
+            telegraph_contents: telegraph_contents
+                .iter()
+                .map(|c| c.text_content.clone())
+                .collect(),
+            twitter_contents: twitter_contents
+                .iter()
+                .map(|c| c.text_content.clone())
+                .collect(),
+            chat_id: message.chat.id.0,
+            message_id: message.id.0 as i64,
+            selection_message_id: processing_message.id.0 as i64,
+            original_user_id: user_id,
+            reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
+            llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
+            timestamp: now_unix_seconds(),
+            command_timer: None,
+            mode,
         };
 
-        send_response(
-            &bot,
-            processing_message.chat.id,
-            processing_message.id,
-            &response,
-            if mode == QaCommandMode::ChatContext {
-                "Answer about Chat"
-            } else {
-                "Answer to Your Question"
-            },
-            ParseMode::Markdown,
-        )
-        .await?;
-        complete_command_timer(&mut timer, "success", None);
+        let result = process_request(&bot, &state, pending_request, &default_model).await;
+        let status = if result.is_ok() { "success" } else { "error" };
+        complete_command_timer(&mut timer, status, Some("default_text_model".to_string()));
+        result?;
         return Ok(());
     }
 
@@ -1871,26 +1998,40 @@ pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String
         return;
     };
 
-    let mut default_model = normalize_model_identifier(&CONFIG.default_q_model);
-    if default_model != MODEL_GEMINI && !is_model_configured(&default_model) {
-        default_model = MODEL_GEMINI.to_string();
-    }
-
     let summary = summarize_media_files(&request.media_files);
     let has_images = summary.images > 0;
     let has_video = summary.videos > 0;
     let has_audio = summary.audios > 0;
     let has_documents = summary.documents > 0;
-    if !is_model_configured_for_request(
-        &default_model,
+    let default_model = match resolve_default_text_model_for_request(
         has_images,
         has_video,
         has_audio,
         has_documents,
         request.mode.requires_custom_tools(),
     ) {
-        default_model = MODEL_GEMINI.to_string();
-    }
+        Ok(model) => model,
+        Err(err) => {
+            let _ = bot
+                .edit_message_text(
+                    ChatId(request.chat_id),
+                    MessageId(request.selection_message_id as i32),
+                    err.to_string(),
+                )
+                .reply_markup(InlineKeyboardMarkup::new(
+                    Vec::<Vec<InlineKeyboardButton>>::new(),
+                ))
+                .await;
+            if let Some(mut timer) = request.command_timer.take() {
+                complete_command_timer(
+                    &mut timer,
+                    "error",
+                    Some("default_text_model_unavailable".to_string()),
+                );
+            }
+            return;
+        }
+    };
 
     let _ = bot
         .edit_message_text(

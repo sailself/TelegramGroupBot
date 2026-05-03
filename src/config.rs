@@ -178,6 +178,8 @@ pub struct Config {
     pub db_queue_capacity: usize,
     pub db_write_batch_size: usize,
     pub db_write_flush_ms: u64,
+    pub default_text_model: String,
+    pub default_image_model: String,
     pub default_q_model: String,
     pub telegram_max_length: usize,
     pub media_group_max_items: usize,
@@ -432,6 +434,24 @@ fn resolve_exact_model_identifier(value: &str, models: &[ThirdPartyModelConfig])
     trimmed.to_string()
 }
 
+fn resolve_default_text_model_value(
+    default_text_model: Option<&str>,
+    default_q_model: Option<&str>,
+) -> String {
+    default_text_model
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .or_else(|| {
+            default_q_model.and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+        })
+        .unwrap_or_else(|| "gemini".to_string())
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let bot_token = env::var("BOT_TOKEN").unwrap_or_else(|_| {
@@ -587,7 +607,12 @@ impl Config {
             db_queue_capacity: env_usize("DB_QUEUE_CAPACITY", 2048).max(1),
             db_write_batch_size: env_usize("DB_WRITE_BATCH_SIZE", 32).max(1),
             db_write_flush_ms: env_u64("DB_WRITE_FLUSH_MS", 25),
-            default_q_model: env_string("DEFAULT_Q_MODEL", "gemini").to_lowercase(),
+            default_text_model: resolve_default_text_model_value(
+                env::var("DEFAULT_TEXT_MODEL").ok().as_deref(),
+                env::var("DEFAULT_Q_MODEL").ok().as_deref(),
+            ),
+            default_image_model: env_string("DEFAULT_IMAGE_MODEL", "gemini"),
+            default_q_model: env_string("DEFAULT_Q_MODEL", "gemini"),
             telegram_max_length: env_usize("TELEGRAM_MAX_LENGTH", 4000),
             media_group_max_items: env_usize("MEDIA_GROUP_MAX_ITEMS", 256).max(1),
             external_enrich_fanout: env_usize("EXTERNAL_ENRICH_FANOUT", 4).max(1),
@@ -695,6 +720,27 @@ Return ONLY the raw JSON string."#;
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_text_model_prefers_new_env_value_over_legacy_q_value() {
+        assert_eq!(
+            resolve_default_text_model_value(Some("openai-codex"), Some("gemini")),
+            "openai-codex"
+        );
+    }
+
+    #[test]
+    fn default_text_model_uses_legacy_q_value_when_new_value_missing() {
+        assert_eq!(
+            resolve_default_text_model_value(None, Some("openai-codex:selected")),
+            "openai-codex:selected"
+        );
+    }
+
+    #[test]
+    fn default_text_model_defaults_to_gemini_when_both_values_missing() {
+        assert_eq!(resolve_default_text_model_value(None, None), "gemini");
+    }
 
     #[test]
     fn parse_third_party_models_supports_mixed_providers() {

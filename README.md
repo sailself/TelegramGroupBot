@@ -5,7 +5,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 ## What it does
 - Stores chat history in SQLite for summaries and profiling.
 - Provides group-friendly commands for summaries, fact checks, Q and A, and media generation.
-- Uses Gemini by default with optional third-party hosted models (OpenRouter, NVIDIA, Ollama Cloud, OpenAI Responses, and ChatGPT-backed OpenAI Codex) plus search integrations.
+- Uses configurable Gemini or Codex defaults with optional third-party hosted models (OpenRouter, NVIDIA, Ollama Cloud, OpenAI Responses, and ChatGPT-backed OpenAI Codex) plus search integrations.
 - Extracts content from Telegraph and Twitter links and can upload images to CWD.PW.
 - Writes text logs to `logs/bot.log` and `logs/timing.log`.
 - Writes structured JSON logs to `logs/bot.jsonl` and `logs/timing.jsonl`.
@@ -16,13 +16,13 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/q` - Ask a question (uses model selection when third-party models are configured).
 - `/qc` - Ask a question about this chat using chat-scoped retrieval plus web search when needed.
 - Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically.
-- `/qq` - Quick Gemini response using the default Gemini model.
+- `/qq` - Quick response using the configured default text model.
 - `/burn_baby_burn` - Show how many tokens you have used in the current chat.
 - `/token_devourers [n]` - Show the top token consumers in the current group chat.
 - `/token_stats [model|user]` - Show bot-wide token usage totals (admin-only).
 - `/s` - Search this chat and return relevant message links.
-- `/img` - Generate or edit an image with Gemini, or Codex `gpt-image-2` with automatic sizing when Codex is enabled.
-- `/image` - Generate an image with selectable Gemini resolution/aspect ratio or Codex image size; Gemini aspect ratio can be left automatic.
+- `/img` - Generate or edit an image with the configured default image model, or choose Gemini/Codex when Codex is enabled.
+- `/image` - Generate an image with selectable Gemini resolution/aspect ratio or Codex image size; timeout uses the configured default image model.
 - `/vid` - Generate a video from text.
 - `/mysong` - Generate a theme song from your chat history.
 - `/profileme` - Generate a profile based on your chat history.
@@ -176,7 +176,9 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `HEAVY_COMMAND_MAX_CONCURRENCY` - Max number of heavy commands (`/q`, `/qc`, `/tldr`, generation commands, etc.) running at once. Default: `5`.
 - `RATE_LIMIT_SECONDS` - Per-user cooldown in seconds. Default: `15`.
 - `MODEL_SELECTION_TIMEOUT` - Model selection UI timeout seconds. Default: `30`.
-- `DEFAULT_Q_MODEL` - Default `/q` model (e.g., `gemini`). Default: `gemini`.
+- `DEFAULT_TEXT_MODEL` - Default text model for `/qq`, model-selection timeouts, `/tldr`, `/factcheck`, `/profileme`, and the prompt step for `/paintme`/`/portraitme`. Use `gemini` or a runtime model such as `openai-codex:selected`/`openai-codex`. Default: `gemini`.
+- `DEFAULT_Q_MODEL` - Deprecated alias used only when `DEFAULT_TEXT_MODEL` is unset.
+- `DEFAULT_IMAGE_MODEL` - Default image model for `/img`, `/image` timeout/default generation, `/tldr` infographics, and `/paintme`/`/portraitme`. Use `gemini` or `codex`. Default: `gemini`.
 - `TELEGRAM_MAX_LENGTH` - Max message length before truncation or Telegraph. Default: `4000`.
 - `USER_HISTORY_MESSAGE_COUNT` - Messages to retain for user history. Default: `200`.
 - `LOG_LEVEL` - Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info`.
@@ -184,7 +186,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
   - Warning: Telegram treats this as a replacement for the default-scope command list. Leave it `false` if you manage commands in BotFather.
 - `MEDIA_GROUP_MAX_ITEMS` - Max cached media groups kept in memory at once. Default: `256`.
 - `MAX_TOOL_CONTEXT_ITEMS` - Max selected chat-search hits returned in the final `/s` response. Default: `10`.
-- `ENABLE_TLDR_INFOGRAPHIC` - When `true`, `/tldr` also runs the Gemini infographic step. Default: `false`.
+- `ENABLE_TLDR_INFOGRAPHIC` - When `true`, `/tldr` also runs the configured default image model for an infographic step. Default: `false`.
 
 ### Access control
 - `WHITELIST_FILE_PATH` - Path to whitelist file. Default: `allowed_chat.txt`.
@@ -261,7 +263,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OPENAI_CODEX_MODEL_PATH` - Local selected-model cache path. Default: `data/openai_codex_model.json`.
 - `OPENAI_CODEX_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `300`.
 - `OPENAI_CODEX_IMAGE_RESPONSES_MODEL` - Responses model used to invoke Codex image generation. Default: `gpt-5.5`.
-- `OPENAI_CODEX_IMAGE_MODEL` - Codex image-generation tool model offered in `/img` and `/image`. Default: `gpt-image-2`.
+- `OPENAI_CODEX_IMAGE_MODEL` - Codex image-generation tool model offered in `/img` and `/image`, and used when `DEFAULT_IMAGE_MODEL=codex`. Default: `gpt-image-2`.
 - Login is managed with `/codexlogin` and `/codexlogout`.
 - The active Codex model is selected live with `/codexmodel` and exposed in the bot as the runtime alias `openai-codex:selected`.
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.
