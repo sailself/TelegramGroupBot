@@ -597,15 +597,20 @@ fn default_text_model_error(model_name: &str, reason: &str) -> String {
     )
 }
 
-fn resolve_default_text_model_with_models(
-    default_model: &str,
-    models: &[ThirdPartyModelConfig],
-    ready_providers: &[ThirdPartyProvider],
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelRequestCapabilities {
     has_images: bool,
     has_video: bool,
     has_audio: bool,
     has_documents: bool,
     require_tools: bool,
+}
+
+fn resolve_default_text_model_with_models(
+    default_model: &str,
+    models: &[ThirdPartyModelConfig],
+    ready_providers: &[ThirdPartyProvider],
+    request: ModelRequestCapabilities,
 ) -> std::result::Result<String, String> {
     let trimmed = default_model.trim();
     let normalized = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(MODEL_GEMINI) {
@@ -620,7 +625,7 @@ fn resolve_default_text_model_with_models(
         return Ok(normalized);
     }
 
-    if has_documents {
+    if request.has_documents {
         return Err(default_text_model_error(
             &normalized,
             "unsupported for document input",
@@ -637,11 +642,11 @@ fn resolve_default_text_model_with_models(
 
     if !third_party_model_matches_request_capabilities(
         config,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
+        request.has_images,
+        request.has_video,
+        request.has_audio,
+        request.has_documents,
+        request.require_tools,
     ) {
         return Err(default_text_model_error(
             &normalized,
@@ -670,11 +675,13 @@ pub(crate) fn resolve_default_text_model_for_request(
         &CONFIG.default_text_model,
         &models,
         &ready_providers,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
+        ModelRequestCapabilities {
+            has_images,
+            has_video,
+            has_audio,
+            has_documents,
+            require_tools,
+        },
     )
     .map_err(|message| anyhow!(message))
 }
@@ -1357,11 +1364,7 @@ mod tests {
             "openai-codex:selected",
             &models,
             &[],
-            false,
-            false,
-            false,
-            false,
-            false,
+            ModelRequestCapabilities::default(),
         );
 
         assert!(result.is_err());
@@ -1382,11 +1385,7 @@ mod tests {
             "openai-codex:selected",
             &models,
             &[ThirdPartyProvider::OpenAICodex],
-            false,
-            false,
-            false,
-            false,
-            false,
+            ModelRequestCapabilities::default(),
         );
 
         assert_eq!(result.as_deref(), Ok("openai-codex:selected"));

@@ -22,6 +22,7 @@
 
 ## Build Verification
 - After big code changes, run `cargo build` and debug any issues before finishing.
+- Before delivering Rust code changes, run `cargo clippy --all-targets -- -D warnings` and fix any issues.
 
 ## Coding Style & Naming Conventions
 - Rust style follows `rustfmt` defaults; use 4-space indentation.
