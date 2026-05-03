@@ -169,6 +169,10 @@ fn gemini_generate_content_timeout() -> Duration {
     Duration::from_secs(CONFIG.gemini_request_timeout_secs)
 }
 
+fn gemini_generate_content_url(model: &str) -> String {
+    format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent")
+}
+
 fn gemini_image_generation_timeout() -> Duration {
     Duration::from_secs(CONFIG.gemini_image_request_timeout_secs)
 }
@@ -961,10 +965,7 @@ async fn call_gemini_api_value_with_timeout(
     operation: &str,
 ) -> Result<Value> {
     let client = get_http_client();
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model, CONFIG.gemini_api_key
-    );
+    let url = gemini_generate_content_url(model);
     let started_at = chrono::Utc::now();
     let metadata = json!({
         "system_prompt_label": system_prompt_label.unwrap_or(""),
@@ -982,6 +983,7 @@ async fn call_gemini_api_value_with_timeout(
         attempt += 1;
         let response = match client
             .post(&url)
+            .header("x-goog-api-key", &CONFIG.gemini_api_key)
             .timeout(timeout)
             .json(&payload)
             .send()
@@ -1941,6 +1943,20 @@ pub async fn generate_video_with_veo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_generate_content_url_does_not_embed_api_key() {
+        let url = gemini_generate_content_url("gemini-test-model");
+
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-test-model:generateContent"
+        );
+        assert!(!url.contains("key="));
+        if !CONFIG.gemini_api_key.is_empty() {
+            assert!(!url.contains(&CONFIG.gemini_api_key));
+        }
+    }
 
     #[test]
     fn extract_gemini_usage_reads_usage_metadata() {

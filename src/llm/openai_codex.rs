@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -369,10 +370,43 @@ fn load_auth_file_internal() -> Result<Option<OpenAICodexAuthFile>> {
 
 fn save_auth_file(auth: &OpenAICodexAuthFile) -> Result<()> {
     let path = auth_file_path();
+    save_auth_file_to_path(path, auth)
+}
+
+fn save_auth_file_to_path(path: &Path, auth: &OpenAICodexAuthFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(auth)?)?;
+    write_private_file(path, serde_json::to_string_pretty(auth)?.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(contents)?;
     Ok(())
 }
 
@@ -1048,6 +1082,82 @@ pub fn logout() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_file_save_helper_writes_json() {
+        let path = std::env::temp_dir().join(format!(
+            "telegram_bot_codex_auth_{}_{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let auth = OpenAICodexAuthFile {
+            auth_mode: Some("chatgpt".to_string()),
+            openai_api_key: None,
+            tokens: Some(OpenAICodexTokenData {
+                id_token: "id".to_string(),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct".to_string()),
+                plan_type: Some("plus".to_string()),
+                user_id: Some("user".to_string()),
+                email: Some("user@example.com".to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        };
+
+        save_auth_file_to_path(&path, &auth).expect("auth file should save");
+
+        let saved = std::fs::read_to_string(&path).expect("auth file should be readable");
+        let parsed: OpenAICodexAuthFile =
+            serde_json::from_str(&saved).expect("auth file should be valid JSON");
+        assert_eq!(parsed.auth_mode.as_deref(), Some("chatgpt"));
+        assert_eq!(
+            parsed
+                .tokens
+                .as_ref()
+                .map(|tokens| tokens.refresh_token.as_str()),
+            Some("refresh")
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auth_file_is_saved_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "telegram_bot_codex_auth_{}_{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let auth = OpenAICodexAuthFile {
+            auth_mode: Some("chatgpt".to_string()),
+            openai_api_key: None,
+            tokens: Some(OpenAICodexTokenData {
+                id_token: "id".to_string(),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct".to_string()),
+                plan_type: Some("plus".to_string()),
+                user_id: Some("user".to_string()),
+                email: Some("user@example.com".to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        };
+
+        save_auth_file_to_path(&path, &auth).expect("auth file should save");
+
+        let mode = std::fs::metadata(&path)
+            .expect("auth file metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn parse_id_token_extracts_openai_claims() {

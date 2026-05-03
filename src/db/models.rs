@@ -20,7 +20,7 @@ pub struct MessageRow {
     pub is_synthetic_record: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageInsert {
     pub message_id: i64,
     pub chat_id: i64,

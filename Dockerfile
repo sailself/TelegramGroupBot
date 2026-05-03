@@ -3,6 +3,7 @@
 WORKDIR /app
 
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY src ./src
 
 RUN cargo build --release
@@ -16,7 +17,6 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/telegram_group_helper_bot /app/telegram_group_helper_bot
-COPY . /app
 
 VOLUME /app/data
 

@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -16,11 +19,12 @@ use crate::db::search::{
 };
 use crate::utils::telegram::build_message_link;
 use anyhow::{anyhow, Result};
+use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{FromRow, SqlitePool};
 use teloxide::types::Message;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const SEARCH_LIMIT_MAX: i64 = 20;
 const SEARCH_OFFSET_MAX: i64 = 250;
@@ -29,6 +33,8 @@ const SNIPPET_LIMIT: usize = 140;
 const SEARCH_REBUILD_BATCH_SIZE: i64 = 5_000;
 const SEARCH_INDEX_META_KEY: &str = "search_index_schema_version";
 const TOKEN_TOTAL_EXPR: &str = "COALESCE(r.total_tokens, r.input_tokens + r.output_tokens, 0)";
+const DB_WRITE_RETRY_DELAY_MS: u64 = 100;
+const DB_WRITE_DEAD_LETTER_PATH: &str = "data/db_writer_dead_letters.jsonl";
 
 #[derive(Clone)]
 pub struct Database {
@@ -1175,14 +1181,110 @@ async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<MessageInsert>
             }
         }
 
-        if let Err(err) = write_message_batch(&pool, &buffer).await {
-            warn!("Error in db_writer batch: {err}");
+        if let Err(err) =
+            write_message_batch_with_recovery(&pool, &buffer, Path::new(DB_WRITE_DEAD_LETTER_PATH))
+                .await
+        {
+            error!("Error in db_writer batch after recovery attempts: {err}");
         }
         buffer.clear();
     }
 
     let _ = pool.close().await;
     info!("Database writer task stopped");
+}
+
+async fn write_message_batch_with_recovery(
+    pool: &SqlitePool,
+    batch: &[MessageInsert],
+    dead_letter_path: &Path,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    match write_message_batch(pool, batch).await {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            warn!(
+                "db_writer batch failed for {} message(s), retrying once: {first_err}",
+                batch.len()
+            );
+            tokio::time::sleep(Duration::from_millis(DB_WRITE_RETRY_DELAY_MS)).await;
+
+            match write_message_batch(pool, batch).await {
+                Ok(()) => {
+                    warn!(
+                        "db_writer batch recovered after retry for {} message(s)",
+                        batch.len()
+                    );
+                    Ok(())
+                }
+                Err(retry_err) => {
+                    error!(
+                        "db_writer retry failed for {} message(s), attempting per-message salvage: {retry_err}",
+                        batch.len()
+                    );
+                    let mut failed = Vec::new();
+                    for message in batch {
+                        if let Err(err) =
+                            write_message_batch(pool, std::slice::from_ref(message)).await
+                        {
+                            failed.push((message.clone(), err.to_string()));
+                        }
+                    }
+
+                    if failed.is_empty() {
+                        warn!(
+                            "db_writer salvaged {} message(s) after batch retry failure",
+                            batch.len()
+                        );
+                        return Ok(());
+                    }
+
+                    write_dead_letter_messages(dead_letter_path, &failed)?;
+                    Err(anyhow!(
+                        "Failed to write {} of {} message(s); dead-lettered to {}",
+                        failed.len(),
+                        batch.len(),
+                        dead_letter_path.display()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DeadLetterMessage<'a> {
+    failed_at: chrono::DateTime<chrono::Utc>,
+    error: &'a str,
+    message: &'a MessageInsert,
+}
+
+fn write_dead_letter_messages(
+    dead_letter_path: &Path,
+    failed: &[(MessageInsert, String)],
+) -> Result<()> {
+    if let Some(parent) = dead_letter_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dead_letter_path)?;
+    let failed_at = chrono::Utc::now();
+    for (message, error) in failed {
+        let entry = DeadLetterMessage {
+            failed_at,
+            error,
+            message,
+        };
+        serde_json::to_writer(&mut file, &entry)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 async fn write_message_batch(pool: &SqlitePool, batch: &[MessageInsert]) -> Result<()> {
@@ -1357,6 +1459,46 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         panic!("message row did not become visible in time");
+    }
+
+    #[tokio::test]
+    async fn failed_message_batches_are_dead_lettered() {
+        let path = test_db_path("db-writer-dead-letter");
+        let db = Database::init(&sqlite_url_for_path(&path))
+            .await
+            .expect("test database should initialize");
+        wait_for_search_ready(&db).await;
+        sqlx::query("DROP TABLE messages")
+            .execute(db.pool())
+            .await
+            .expect("messages table should be dropped for failure test");
+
+        let dead_letter_path = path.with_extension("dead-letter.jsonl");
+        let insert = build_message_insert(
+            Some(123_i64),
+            Some("alice".to_string()),
+            Some("message that cannot be inserted".to_string()),
+            Some("en".to_string()),
+            Utc::now(),
+            None,
+            Some(-1001374348669),
+            Some(777),
+            None,
+            false,
+            None,
+            false,
+            false,
+        );
+
+        let err = write_message_batch_with_recovery(db.pool(), &[insert], &dead_letter_path)
+            .await
+            .expect_err("unrecoverable batch should return an error");
+
+        assert!(err.to_string().contains("dead-lettered"));
+        let dead_letter =
+            std::fs::read_to_string(&dead_letter_path).expect("dead-letter file should be written");
+        assert!(dead_letter.contains("\"message_id\":777"));
+        assert!(dead_letter.contains("\"chat_id\":-1001374348669"));
     }
 
     #[tokio::test]
