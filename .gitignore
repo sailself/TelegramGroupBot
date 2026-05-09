@@ -13,3 +13,5 @@ agent_workspace/
 third_party_models.json
 acl.json
 data/
+code_review/
+

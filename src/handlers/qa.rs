@@ -27,7 +27,6 @@ use crate::llm::audit::{
     audit_context_from_id, create_audit_context_from_message, LlmAuditContext,
     LLM_TRIGGER_KIND_AUTO_Q, LLM_TRIGGER_KIND_COMMAND,
 };
-use crate::llm::media::MediaKind;
 use crate::llm::runtime_models::{
     codex_selected_model_label, is_runtime_provider_ready, resolve_runtime_model_identifier,
     runtime_model_config, runtime_model_count, runtime_models, selected_codex_model_record,
@@ -48,6 +47,8 @@ pub const MODEL_GEMINI: &str = "gemini";
 const SEND_MESSAGE_RETRY_ATTEMPTS: usize = 3;
 const USER_ERROR_DETAIL_LIMIT: usize = 400;
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
+const NO_VIDEO_CAPABLE_MODEL_MESSAGE: &str =
+    "No video-capable AI model is available. Enable Gemini or configure a ready third-party model with video=true.";
 
 const QC_SYSTEM_PROMPT: &str = "You are a helpful assistant in a Telegram group chat. You can use chat_context_query to retrieve messages from the current source chat only, and you must never assume access to any other chat. Use chat_context_query first when the user asks about prior discussion in this chat. Use web_search only for external or current facts that are not contained in the retrieved chat messages. Cite chat evidence with short snippets and the exact message link when chat history materially informs your answer. Cite web sources normally when web_search is used.\n\nGuidelines for your responses:\n1. Provide a direct, clear answer.\n2. Be concise but comprehensive.\n3. If you use retrieved chat messages, treat them as evidence from this chat only.\n4. If you use web search, cite the sources you relied on.\n5. IMPORTANT: The current UTC date and time is {current_datetime}.\n6. CRITICAL: You must decide the response language yourself using the same language policy as /q.\n7. Language policy:\n- Prefer the language of the user's actual question or request.\n- Ignore quoted text, links, usernames, slash commands, inline code, emojis, and other noise when deciding the response language.\n- If the replied-to content is in a different language from the user's current question, prioritize the current question unless the user explicitly asks you to answer in another language.\n- If the user's message is too short or ambiguous to infer reliably, use this Telegram user language hint: {telegram_user_language_hint}.\n- If that hint is missing, unknown, or still does not provide a reliable answer, default to Chinese.\n- When there is a clear instruction to answer in a specific language, follow that instruction.";
 
@@ -521,6 +522,21 @@ fn is_third_party_model_available(config: &ThirdPartyModelConfig) -> bool {
     is_runtime_provider_ready(config.provider)
 }
 
+fn ready_runtime_providers(models: &[ThirdPartyModelConfig]) -> Vec<ThirdPartyProvider> {
+    models
+        .iter()
+        .filter(|config| is_runtime_provider_ready(config.provider))
+        .map(|config| config.provider)
+        .collect()
+}
+
+fn is_third_party_model_available_with_ready_providers(
+    config: &ThirdPartyModelConfig,
+    ready_providers: &[ThirdPartyProvider],
+) -> bool {
+    ready_providers.contains(&config.provider)
+}
+
 fn has_available_third_party_models_for_request(
     has_images: bool,
     has_video: bool,
@@ -529,8 +545,10 @@ fn has_available_third_party_models_for_request(
     require_tools: bool,
 ) -> bool {
     let models = runtime_models();
+    let ready_providers = ready_runtime_providers(&models);
     !available_third_party_models_for_request(
         &models,
+        &ready_providers,
         has_images,
         has_video,
         has_audio,
@@ -568,7 +586,7 @@ fn model_supports_media_for_request(
     require_tools: bool,
 ) -> bool {
     if model_name == MODEL_GEMINI {
-        return true;
+        return CONFIG.gemini_api_available();
     }
     if has_documents {
         return false;
@@ -610,6 +628,7 @@ fn resolve_default_text_model_with_models(
     default_model: &str,
     models: &[ThirdPartyModelConfig],
     ready_providers: &[ThirdPartyProvider],
+    gemini_available: bool,
     request: ModelRequestCapabilities,
 ) -> std::result::Result<String, String> {
     let trimmed = default_model.trim();
@@ -622,6 +641,9 @@ fn resolve_default_text_model_with_models(
     };
 
     if normalized == MODEL_GEMINI {
+        if !gemini_available {
+            return Err(default_text_model_error(&normalized, "unavailable"));
+        }
         return Ok(normalized);
     }
 
@@ -665,16 +687,13 @@ pub(crate) fn resolve_default_text_model_for_request(
     require_tools: bool,
 ) -> Result<String> {
     let models = runtime_models();
-    let ready_providers = models
-        .iter()
-        .filter(|config| is_runtime_provider_ready(config.provider))
-        .map(|config| config.provider)
-        .collect::<Vec<_>>();
+    let ready_providers = ready_runtime_providers(&models);
 
     resolve_default_text_model_with_models(
         &CONFIG.default_text_model,
         &models,
         &ready_providers,
+        CONFIG.gemini_api_available(),
         ModelRequestCapabilities {
             has_images,
             has_video,
@@ -712,17 +731,20 @@ fn third_party_model_matches_request_capabilities(
     true
 }
 
-fn available_third_party_models_for_request(
-    models: &[ThirdPartyModelConfig],
+fn available_third_party_models_for_request<'a>(
+    models: &'a [ThirdPartyModelConfig],
+    ready_providers: &[ThirdPartyProvider],
     has_images: bool,
     has_video: bool,
     has_audio: bool,
     has_documents: bool,
     require_tools: bool,
-) -> Vec<&ThirdPartyModelConfig> {
+) -> Vec<&'a ThirdPartyModelConfig> {
     models
         .iter()
-        .filter(|config| is_third_party_model_available(config))
+        .filter(|config| {
+            is_third_party_model_available_with_ready_providers(config, ready_providers)
+        })
         .filter(|config| {
             third_party_model_matches_request_capabilities(
                 config,
@@ -736,7 +758,23 @@ fn available_third_party_models_for_request(
         .collect()
 }
 
-pub fn create_model_selection_keyboard(
+fn default_model_selection_key(default_model: &str, models: &[ThirdPartyModelConfig]) -> String {
+    let trimmed = default_model.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(MODEL_GEMINI) {
+        MODEL_GEMINI.to_string()
+    } else if trimmed.eq_ignore_ascii_case("openai-codex") {
+        OPENAI_CODEX_SELECTED_MODEL_ID.to_string()
+    } else {
+        normalize_model_identifier_with_models(trimmed, models, &[])
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_model_selection_keyboard_with_models(
+    models: &[ThirdPartyModelConfig],
+    ready_providers: &[ThirdPartyProvider],
+    gemini_available: bool,
+    default_model: &str,
     has_images: bool,
     has_video: bool,
     has_audio: bool,
@@ -744,17 +782,18 @@ pub fn create_model_selection_keyboard(
     require_tools: bool,
 ) -> InlineKeyboardMarkup {
     let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
-    let gemini_button = InlineKeyboardButton::callback(
-        "Gemini 3",
-        format!("{}{}", MODEL_CALLBACK_PREFIX, MODEL_GEMINI),
-    );
-
-    let mut first_row = vec![gemini_button];
-    let mut third_party_buttons = Vec::new();
-    let models = runtime_models();
+    let default_model_key = default_model_selection_key(default_model, models);
+    let mut model_buttons = Vec::new();
+    if gemini_available {
+        model_buttons.push(InlineKeyboardButton::callback(
+            "Gemini 3",
+            format!("{}{}", MODEL_CALLBACK_PREFIX, MODEL_GEMINI),
+        ));
+    }
 
     for config in available_third_party_models_for_request(
-        &models,
+        models,
+        ready_providers,
         has_images,
         has_video,
         has_audio,
@@ -765,22 +804,48 @@ pub fn create_model_selection_keyboard(
         if model_identifier.is_empty() {
             continue;
         }
-        third_party_buttons.push(InlineKeyboardButton::callback(
+        model_buttons.push(InlineKeyboardButton::callback(
             config.name.clone(),
             format!("{}{}", MODEL_CALLBACK_PREFIX, model_identifier),
         ));
     }
 
-    if !third_party_buttons.is_empty() {
-        first_row.push(third_party_buttons.remove(0));
+    let default_callback = format!("{}{}", MODEL_CALLBACK_PREFIX, default_model_key);
+    if let Some(default_index) = model_buttons.iter().position(|button| match &button.kind {
+        teloxide::types::InlineKeyboardButtonKind::CallbackData(data) => data == &default_callback,
+        _ => false,
+    }) {
+        let default_button = model_buttons.remove(default_index);
+        model_buttons.insert(0, default_button);
     }
-    keyboard.push(first_row);
 
-    for chunk in third_party_buttons.chunks(2) {
+    for chunk in model_buttons.chunks(2) {
         keyboard.push(chunk.to_vec());
     }
 
     InlineKeyboardMarkup::new(keyboard)
+}
+
+pub fn create_model_selection_keyboard(
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+    require_tools: bool,
+) -> InlineKeyboardMarkup {
+    let models = runtime_models();
+    let ready_providers = ready_runtime_providers(&models);
+    create_model_selection_keyboard_with_models(
+        &models,
+        &ready_providers,
+        CONFIG.gemini_api_available(),
+        &CONFIG.default_text_model,
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    )
 }
 
 fn build_prompt_from_template(template: &str, telegram_user_language_hint: Option<&str>) -> String {
@@ -797,6 +862,24 @@ fn build_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
 
 fn build_chat_context_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
     build_prompt_from_template(QC_SYSTEM_PROMPT, telegram_user_language_hint)
+}
+
+fn extract_youtube_urls_for_available_models(
+    query_base: &str,
+    gemini_available: bool,
+) -> (String, Vec<String>) {
+    if gemini_available {
+        extract_youtube_urls(query_base, 10)
+    } else {
+        (query_base.to_string(), Vec::new())
+    }
+}
+
+fn video_request_has_capable_model(
+    gemini_available: bool,
+    third_party_video_model_available: bool,
+) -> bool {
+    gemini_available || third_party_video_model_available
 }
 
 fn chat_search_rebuilding_message(command_name: &str) -> String {
@@ -980,6 +1063,19 @@ async fn process_request(
     request: PendingQRequest,
     model_name: &str,
 ) -> Result<()> {
+    if model_name == MODEL_GEMINI && !CONFIG.gemini_api_available() {
+        bot.edit_message_text(
+            ChatId(request.chat_id),
+            MessageId(request.selection_message_id as i32),
+            "Gemini is disabled or not configured. Please choose another model.",
+        )
+        .reply_markup(InlineKeyboardMarkup::new(
+            Vec::<Vec<InlineKeyboardButton>>::new(),
+        ))
+        .await?;
+        return Ok(());
+    }
+
     let _heavy_permit = state.acquire_heavy_command_permit().await;
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
     if request.mode == QaCommandMode::ChatContext && !state.db.is_search_ready() {
@@ -1067,18 +1163,12 @@ async fn process_request(
                 .await
                 .map(|result| (result.text, Some(result.model_used)))
             } else {
-                let image_data_list: Vec<Vec<u8>> = request
-                    .media_files
-                    .iter()
-                    .filter(|file| file.kind == MediaKind::Image)
-                    .map(|file| file.bytes().to_vec())
-                    .collect();
                 call_third_party(
                     &system_prompt,
                     &query,
                     model_name,
                     "Answer to Your Question",
-                    &image_data_list,
+                    &request.media_files,
                     supports_tools,
                     audit_context.as_ref(),
                 )
@@ -1104,18 +1194,12 @@ async fn process_request(
                 .await
                 .map(|result| (result.text, Some(result.model_used)))
             } else {
-                let image_data_list: Vec<Vec<u8>> = request
-                    .media_files
-                    .iter()
-                    .filter(|file| file.kind == MediaKind::Image)
-                    .map(|file| file.bytes().to_vec())
-                    .collect();
                 call_third_party_with_tool_runtime(
                     &system_prompt,
                     &query,
                     model_name,
                     "Answer about Chat",
-                    &image_data_list,
+                    &request.media_files,
                     &mut runtime,
                     audit_context.as_ref(),
                 )
@@ -1190,6 +1274,7 @@ async fn process_request(
 mod tests {
     use super::*;
     use crate::handlers::media::MediaSummary;
+    use teloxide::types::InlineKeyboardButtonKind;
 
     fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPartyModelConfig {
         ThirdPartyModelConfig {
@@ -1364,6 +1449,7 @@ mod tests {
             "openai-codex:selected",
             &models,
             &[],
+            true,
             ModelRequestCapabilities::default(),
         );
 
@@ -1385,10 +1471,150 @@ mod tests {
             "openai-codex:selected",
             &models,
             &[ThirdPartyProvider::OpenAICodex],
+            true,
             ModelRequestCapabilities::default(),
         );
 
         assert_eq!(result.as_deref(), Ok("openai-codex:selected"));
+    }
+
+    #[test]
+    fn default_text_model_resolution_rejects_gemini_when_disabled() {
+        let result = resolve_default_text_model_with_models(
+            "gemini",
+            &[],
+            &[],
+            false,
+            ModelRequestCapabilities::default(),
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Default text model gemini is unavailable"));
+    }
+
+    #[test]
+    fn model_selection_keyboard_omits_gemini_when_disabled() {
+        let keyboard = create_model_selection_keyboard_with_models(
+            &[],
+            &[],
+            false,
+            "gemini",
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        let callbacks = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!callbacks
+            .iter()
+            .any(|callback| *callback == format!("{}{}", MODEL_CALLBACK_PREFIX, MODEL_GEMINI)));
+    }
+
+    #[test]
+    fn video_selection_includes_only_video_capable_ready_models() {
+        let mut video_model = model(ThirdPartyProvider::Nvidia, "Video Qwen", "qwen-video");
+        video_model.video = true;
+        let text_model = model(ThirdPartyProvider::Nvidia, "Text Qwen", "qwen-text");
+        let mut unavailable_video = model(
+            ThirdPartyProvider::OpenRouter,
+            "Unavailable Video",
+            "or-video",
+        );
+        unavailable_video.video = true;
+        let models = vec![video_model, text_model, unavailable_video];
+
+        let keyboard = create_model_selection_keyboard_with_models(
+            &models,
+            &[ThirdPartyProvider::Nvidia],
+            false,
+            "gemini",
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+        let callbacks = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(callbacks, vec!["model_select:nvidia:qwen-video"]);
+    }
+
+    #[test]
+    fn model_selection_keyboard_puts_default_third_party_model_first() {
+        let openrouter = model(ThirdPartyProvider::OpenRouter, "OpenRouter Qwen", "or-qwen");
+        let nvidia = model(ThirdPartyProvider::Nvidia, "NVIDIA Qwen", "nv-qwen");
+        let models = vec![openrouter, nvidia];
+
+        let keyboard = create_model_selection_keyboard_with_models(
+            &models,
+            &[ThirdPartyProvider::OpenRouter, ThirdPartyProvider::Nvidia],
+            true,
+            "nvidia:nv-qwen",
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        let callbacks = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            callbacks.first().copied(),
+            Some("model_select:nvidia:nv-qwen")
+        );
+        assert_eq!(
+            callbacks,
+            vec![
+                "model_select:nvidia:nv-qwen",
+                "model_select:gemini",
+                "model_select:openrouter:or-qwen",
+            ]
+        );
+    }
+
+    #[test]
+    fn video_request_without_capable_model_uses_error_path_predicate() {
+        assert!(!video_request_has_capable_model(false, false));
+        assert!(video_request_has_capable_model(true, false));
+        assert!(video_request_has_capable_model(false, true));
+    }
+
+    #[test]
+    fn youtube_query_is_text_when_gemini_is_disabled() {
+        let query = "watch this https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+        let (text, urls) = extract_youtube_urls_for_available_models(query, false);
+
+        assert_eq!(text, query);
+        assert!(urls.is_empty());
     }
 }
 
@@ -1528,7 +1754,8 @@ async fn q_handler_internal(
         )
     };
 
-    let (query_text, youtube_urls) = extract_youtube_urls(&query_base, 10);
+    let (query_text, youtube_urls) =
+        extract_youtube_urls_for_available_models(&query_base, CONFIG.gemini_api_available());
 
     let user_language_code = message
         .from
@@ -1579,19 +1806,38 @@ async fn q_handler_internal(
     let has_documents = media_summary.documents > 0;
 
     let require_tools = mode.requires_custom_tools();
-    let must_use_default_model = force_gemini
-        || has_video
+    let video_third_party_models_available = has_available_third_party_models_for_request(
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    );
+    if has_video
+        && !video_request_has_capable_model(
+            CONFIG.gemini_api_available(),
+            video_third_party_models_available,
+        )
+    {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            NO_VIDEO_CAPABLE_MODEL_MESSAGE,
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let force_default_gemini = force_gemini && CONFIG.gemini_api_available() && !has_video;
+    let must_use_default_model = force_default_gemini
         || has_audio
         || has_documents
-        || !youtube_urls.is_empty()
-        || !has_available_third_party_models_for_request(
-            has_images,
-            has_video,
-            has_audio,
-            has_documents,
-            require_tools,
-        )
-        || runtime_model_count() == 0;
+        || (!youtube_urls.is_empty() && CONFIG.gemini_api_available())
+        || (!has_video && !video_third_party_models_available)
+        || (!has_video && runtime_model_count() == 0);
     if must_use_default_model {
         let default_model = match resolve_default_text_model_for_request(
             has_images,
@@ -1830,6 +2076,18 @@ pub async fn s_handler(
     query: Option<String>,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, "s").await {
+        return Ok(());
+    }
+    if !CONFIG.gemini_api_available() {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "The /s command requires Gemini and is disabled.",
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
         return Ok(());
     }
 

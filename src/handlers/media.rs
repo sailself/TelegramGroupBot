@@ -158,6 +158,27 @@ fn extension_mime_hint(file_name: &str) -> Option<&'static str> {
     }
 }
 
+fn animation_media_hint(
+    mime_type_hint: Option<&str>,
+    file_name_hint: Option<&str>,
+) -> (String, MediaKind) {
+    let mime_type = mime_type_hint
+        .filter(|mime| !mime.trim().is_empty())
+        .or_else(|| file_name_hint.and_then(extension_mime_hint))
+        .unwrap_or("video/mp4");
+    (mime_type.to_string(), MediaKind::Video)
+}
+
+fn sticker_media_hint(is_animated: bool, is_video: bool) -> Option<(&'static str, MediaKind)> {
+    if is_video {
+        Some(("video/webm", MediaKind::Video))
+    } else if is_animated {
+        None
+    } else {
+        Some(("image/webp", MediaKind::Image))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn add_file_from_file_id(
     bot: &Bot,
@@ -277,6 +298,28 @@ async fn collect_from_message(
         return;
     }
 
+    if let Some(animation) = message.animation() {
+        let (mime_hint, kind_hint) = animation_media_hint(
+            animation.mime_type.as_ref().map(|mime| mime.essence_str()),
+            animation.file_name.as_deref(),
+        );
+        add_file_from_file_id(
+            bot,
+            &animation.file.id,
+            collection,
+            options,
+            seen_file_ids,
+            Some(&mime_hint),
+            animation.file_name.as_deref(),
+            Some(kind_hint),
+        )
+        .await;
+    }
+
+    if collection.files.len() >= options.max_files {
+        return;
+    }
+
     if let Some(audio) = message.audio() {
         let mime_hint = audio
             .mime_type
@@ -319,14 +362,28 @@ async fn collect_from_message(
     }
 
     if let Some(sticker) = message.sticker() {
-        if !sticker.flags.is_animated && !sticker.flags.is_video {
+        if let Some((mime_hint, kind_hint)) =
+            sticker_media_hint(sticker.flags.is_animated, sticker.flags.is_video)
+        {
             add_file_from_file_id(
                 bot,
                 &sticker.file.id,
                 collection,
                 options,
                 seen_file_ids,
-                Some("image/webp"),
+                Some(mime_hint),
+                None,
+                Some(kind_hint),
+            )
+            .await;
+        } else if let Some(thumbnail) = sticker.thumbnail.as_ref() {
+            add_file_from_file_id(
+                bot,
+                &thumbnail.file.id,
+                collection,
+                options,
+                seen_file_ids,
+                None,
                 None,
                 Some(MediaKind::Image),
             )
@@ -392,4 +449,34 @@ pub async fn collect_message_media(
     }
 
     collection
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn animation_media_hint_is_video() {
+        assert_eq!(
+            animation_media_hint(Some("video/mp4"), Some("clip.gif")),
+            ("video/mp4".to_string(), MediaKind::Video)
+        );
+        assert_eq!(
+            animation_media_hint(None, Some("clip.gif")),
+            ("image/gif".to_string(), MediaKind::Video)
+        );
+    }
+
+    #[test]
+    fn sticker_media_hint_supports_video_and_static_stickers() {
+        assert_eq!(
+            sticker_media_hint(false, false),
+            Some(("image/webp", MediaKind::Image))
+        );
+        assert_eq!(
+            sticker_media_hint(false, true),
+            Some(("video/webm", MediaKind::Video))
+        );
+        assert_eq!(sticker_media_hint(true, false), None);
+    }
 }

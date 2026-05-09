@@ -173,6 +173,16 @@ fn gemini_generate_content_url(model: &str) -> String {
     format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent")
 }
 
+fn ensure_gemini_api_available() -> Result<()> {
+    if CONFIG.gemini_api_available() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Gemini is disabled or GEMINI_API_KEY is not configured"
+        ))
+    }
+}
+
 fn gemini_image_generation_timeout() -> Duration {
     Duration::from_secs(CONFIG.gemini_image_request_timeout_secs)
 }
@@ -539,6 +549,7 @@ async fn upload_file_bytes(
     mime_type: &str,
     bytes: &[u8],
 ) -> Result<GeminiFileInfo> {
+    ensure_gemini_api_available()?;
     let client = get_http_client();
     let start_response = client
         .post("https://generativelanguage.googleapis.com/upload/v1beta/files")
@@ -964,6 +975,7 @@ async fn call_gemini_api_value_with_timeout(
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
 ) -> Result<Value> {
+    ensure_gemini_api_available()?;
     let client = get_http_client();
     let url = gemini_generate_content_url(model);
     let started_at = chrono::Utc::now();
@@ -1287,6 +1299,7 @@ pub async fn call_gemini_with_tool_runtime(
     final_response_json_schema: Option<Value>,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiCallResult> {
+    ensure_gemini_api_available()?;
     let content = user_content.to_string();
     let youtube_urls = youtube_urls.unwrap_or_default();
     let files = media_files.unwrap_or_default();
@@ -1485,6 +1498,7 @@ pub async fn call_gemini(
     system_prompt_label: Option<&str>,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiCallResult> {
+    ensure_gemini_api_available()?;
     let content = user_content.to_string();
 
     let youtube_urls = youtube_urls.unwrap_or_default();
@@ -1640,6 +1654,9 @@ pub async fn generate_image_with_gemini(
     upload_to_cwd: bool,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<Vec<Vec<u8>>, ImageGenerationError> {
+    if let Err(err) = ensure_gemini_api_available() {
+        return Err(ImageGenerationError(err.to_string()));
+    }
     let mut images = Vec::new();
     for url in image_urls {
         if let Some(data) = download_media(url).await {
@@ -1713,6 +1730,7 @@ pub async fn generate_music_with_lyria(
     prompt: &str,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiMusicGenerationResult, anyhow::Error> {
+    ensure_gemini_api_available()?;
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return Err(anyhow!("Music prompt is empty"));
@@ -1751,6 +1769,7 @@ pub async fn generate_video_with_veo(
     user_prompt: &str,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<(Option<Vec<u8>>, Option<String>), anyhow::Error> {
+    ensure_gemini_api_available()?;
     let prompt = user_prompt.trim();
     if prompt.is_empty() {
         return Ok((None, None));

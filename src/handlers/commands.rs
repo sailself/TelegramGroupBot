@@ -30,7 +30,7 @@ use crate::handlers::qa::{resolve_default_text_model_for_request, MODEL_GEMINI};
 use crate::handlers::responses::send_response;
 use crate::llm::audit::LLM_TRIGGER_KIND_COMMAND;
 use crate::llm::gemini::ImageGenerationError;
-use crate::llm::media::{detect_mime_type, MediaKind};
+use crate::llm::media::detect_mime_type;
 use crate::llm::openai_codex;
 use crate::llm::runtime_models::{
     codex_selected_model_label, runtime_model_config, runtime_model_count,
@@ -215,18 +215,13 @@ async fn call_configured_text_model(
         return Ok((response.text, model_used));
     }
 
-    let image_data_list = media_files
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|file| file.kind == MediaKind::Image)
-        .map(|file| file.bytes().to_vec())
-        .collect::<Vec<_>>();
+    let media_files = media_files.unwrap_or_default();
     let response = call_third_party(
         system_prompt,
         user_content,
         &model_name,
         response_title,
-        &image_data_list,
+        &media_files,
         tools_enabled,
         audit_context,
     )
@@ -1577,6 +1572,7 @@ fn parse_default_image_generation_model(value: &str) -> Option<ImageGenerationMo
 
 fn resolve_default_image_generation_model(
     default_model: &str,
+    gemini_available: bool,
     codex_available: bool,
 ) -> std::result::Result<ImageGenerationModel, String> {
     let Some(model) = parse_default_image_generation_model(default_model) else {
@@ -1585,6 +1581,16 @@ fn resolve_default_image_generation_model(
             default_model.trim()
         ));
     };
+
+    if model == ImageGenerationModel::Gemini && !gemini_available {
+        if codex_available {
+            return Ok(ImageGenerationModel::CodexGptImage2);
+        }
+        return Err(
+            "No image model is configured. Enable Gemini or complete Codex setup with /codexlogin."
+                .to_string(),
+        );
+    }
 
     if model == ImageGenerationModel::CodexGptImage2 && !codex_available {
         return Err(format!(
@@ -1609,6 +1615,7 @@ async fn generate_image_with_configured_default(
 ) {
     let model = match resolve_default_image_generation_model(
         &CONFIG.default_image_model,
+        CONFIG.gemini_api_available(),
         crate::llm::codex_image::codex_image_available(),
     ) {
         Ok(model) => model,
@@ -1649,17 +1656,45 @@ async fn generate_image_with_configured_default(
     }
 }
 
-fn build_image_model_keyboard(request_key: &str, include_codex: bool) -> InlineKeyboardMarkup {
-    let mut buttons = vec![InlineKeyboardButton::callback(
-        CONFIG.gemini_image_model.clone(),
-        image_model_callback_data(request_key, ImageGenerationModel::Gemini),
-    )];
+fn build_image_model_keyboard(
+    request_key: &str,
+    include_gemini: bool,
+    include_codex: bool,
+    default_model: ImageGenerationModel,
+) -> InlineKeyboardMarkup {
+    let mut buttons = Vec::new();
+    if include_gemini {
+        buttons.push(InlineKeyboardButton::callback(
+            CONFIG.gemini_image_model.clone(),
+            image_model_callback_data(request_key, ImageGenerationModel::Gemini),
+        ));
+    }
 
     if include_codex {
         buttons.push(InlineKeyboardButton::callback(
             crate::llm::codex_image::codex_image_display_model(),
             image_model_callback_data(request_key, ImageGenerationModel::CodexGptImage2),
         ));
+    }
+
+    if let Some(default_index) = buttons.iter().position(|button| match default_model {
+        ImageGenerationModel::Gemini => {
+            matches!(
+                &button.kind,
+                teloxide::types::InlineKeyboardButtonKind::CallbackData(data)
+                    if data == &image_model_callback_data(request_key, ImageGenerationModel::Gemini)
+            )
+        }
+        ImageGenerationModel::CodexGptImage2 => {
+            matches!(
+                &button.kind,
+                teloxide::types::InlineKeyboardButtonKind::CallbackData(data)
+                    if data == &image_model_callback_data(request_key, ImageGenerationModel::CodexGptImage2)
+            )
+        }
+    }) {
+        let default_button = buttons.remove(default_index);
+        buttons.insert(0, default_button);
     }
 
     InlineKeyboardMarkup::new(vec![buttons])
@@ -1751,6 +1786,7 @@ async fn finalize_image_request(
         Some(model) => model,
         None => match resolve_default_image_generation_model(
             &CONFIG.default_image_model,
+            CONFIG.gemini_api_available(),
             crate::llm::codex_image::codex_image_available(),
         ) {
             Ok(model) => model,
@@ -1766,6 +1802,28 @@ async fn finalize_image_request(
             }
         },
     };
+    if selected_model == ImageGenerationModel::Gemini && !CONFIG.gemini_api_available() {
+        let _ = bot
+            .edit_message_text(
+                ChatId(request.chat_id),
+                MessageId(request.selection_message_id as i32),
+                "Gemini image generation is disabled. Please choose another image model.",
+            )
+            .await;
+        return Ok(());
+    }
+    if selected_model == ImageGenerationModel::CodexGptImage2
+        && !crate::llm::codex_image::codex_image_available()
+    {
+        let _ = bot
+            .edit_message_text(
+                ChatId(request.chat_id),
+                MessageId(request.selection_message_id as i32),
+                "Codex image generation is unavailable. Complete Codex setup with /codexlogin.",
+            )
+            .await;
+        return Ok(());
+    }
 
     let mut prompt = request.prompt.clone();
     if !request.telegraph_contents.is_empty() {
@@ -1920,6 +1978,14 @@ pub async fn image_selection_callback(
         let Some(model) = parse_image_generation_model(model_token) else {
             return Ok(());
         };
+        if model == ImageGenerationModel::Gemini && !CONFIG.gemini_api_available() {
+            return Ok(());
+        }
+        if model == ImageGenerationModel::CodexGptImage2
+            && !crate::llm::codex_image::codex_image_available()
+        {
+            return Ok(());
+        }
 
         let next_command = {
             let mut requests = state.pending_image_requests.lock();
@@ -2089,13 +2155,40 @@ pub async fn img_handler(
         return Ok(());
     }
 
-    if crate::llm::codex_image::codex_image_available() {
+    let gemini_available = CONFIG.gemini_api_available();
+    let codex_available = crate::llm::codex_image::codex_image_available();
+    if !gemini_available && !codex_available {
+        bot.send_message(
+            message.chat.id,
+            "No image model is configured. Enable Gemini or complete Codex setup with /codexlogin.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
+
+    let default_image_model = match resolve_default_image_generation_model(
+        &CONFIG.default_image_model,
+        gemini_available,
+        codex_available,
+    ) {
+        Ok(model) => model,
+        Err(_) if gemini_available => ImageGenerationModel::Gemini,
+        Err(_) => ImageGenerationModel::CodexGptImage2,
+    };
+
+    if gemini_available && codex_available {
         let audit_context = create_command_audit_context(&state, &message, "img").await;
         let request_key = format!("{}_{}", message.chat.id.0, message.id.0);
         let selection_message = bot
             .send_message(message.chat.id, "Choose an image model:")
             .reply_parameters(ReplyParameters::new(message.id))
-            .reply_markup(build_image_model_keyboard(&request_key, true))
+            .reply_markup(build_image_model_keyboard(
+                &request_key,
+                true,
+                true,
+                default_image_model,
+            ))
             .await?;
         let pending = PendingImageRequest {
             user_id,
@@ -2257,23 +2350,39 @@ pub async fn image_handler(
     }
     let audit_context = create_command_audit_context(&state, &message, "image").await;
 
+    let gemini_available = CONFIG.gemini_api_available();
     let codex_available = crate::llm::codex_image::codex_image_available();
-    if let Err(err) =
-        resolve_default_image_generation_model(&CONFIG.default_image_model, codex_available)
-    {
-        bot.send_message(message.chat.id, err)
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+    if !gemini_available && !codex_available {
+        bot.send_message(
+            message.chat.id,
+            "No image model is configured. Enable Gemini or complete Codex setup with /codexlogin.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
+    let default_image_model = match resolve_default_image_generation_model(
+        &CONFIG.default_image_model,
+        gemini_available,
+        codex_available,
+    ) {
+        Ok(model) => model,
+        Err(err) => {
+            bot.send_message(message.chat.id, err)
+                .reply_parameters(ReplyParameters::new(message.id))
+                .await?;
+            return Ok(());
+        }
+    };
     let request_key = format!("{}_{}", message.chat.id.0, message.id.0);
-    let (selection_text, selection_keyboard, initial_model) = if codex_available {
+    let (selection_text, selection_keyboard, initial_model) = if gemini_available && codex_available
+    {
         (
             "Choose an image model:".to_string(),
-            build_image_model_keyboard(&request_key, true),
+            build_image_model_keyboard(&request_key, true, true, default_image_model),
             None,
         )
-    } else {
+    } else if gemini_available {
         (
             format!(
                 "Choose a resolution (default: {}):",
@@ -2281,6 +2390,12 @@ pub async fn image_handler(
             ),
             build_resolution_keyboard(&request_key),
             Some(ImageGenerationModel::Gemini),
+        )
+    } else {
+        (
+            "Choose an image size (default: Auto):".to_string(),
+            build_codex_size_keyboard(&request_key),
+            Some(ImageGenerationModel::CodexGptImage2),
         )
     };
     let selection_message = bot
@@ -2347,6 +2462,15 @@ pub async fn vid_handler(
     prompt: Option<String>,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, "vid").await {
+        return Ok(());
+    }
+    if !CONFIG.gemini_api_available() {
+        bot.send_message(
+            message.chat.id,
+            "The /vid command requires Gemini and is disabled.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
 
@@ -3016,6 +3140,15 @@ pub async fn mysong_handler(
     if !check_access_control(&bot, &message, "mysong").await {
         return Ok(());
     }
+    if !CONFIG.gemini_api_available() {
+        bot.send_message(
+            message.chat.id,
+            "The /mysong command requires Gemini and is disabled.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
 
     let user_id = message
         .from
@@ -3398,6 +3531,29 @@ pub async fn paintme_handler(
 }
 
 #[allow(deprecated)]
+fn filter_gemini_help_text(help_text: &str, gemini_available: bool) -> String {
+    let mut text = help_text.to_string();
+    if gemini_available {
+        return text;
+    }
+
+    for command in ["s", "vid", "mysong"] {
+        let marker = format!("\n/{command} -");
+        let Some(start) = text.find(&marker) else {
+            continue;
+        };
+        let after_start = start + marker.len();
+        let end = text[after_start..]
+            .find("\n\n")
+            .map(|offset| after_start + offset + 2)
+            .unwrap_or(text.len());
+        text.replace_range(start..end, "\n");
+    }
+
+    text
+}
+
+#[allow(deprecated)]
 pub async fn help_handler(bot: Bot, message: Message) -> Result<()> {
     if !check_access_control(&bot, &message, "help").await {
         return Ok(());
@@ -3485,6 +3641,7 @@ Usage: `/codexreasoning`
 Usage: `/codexusage`
 
 "#;
+    let help_text = filter_gemini_help_text(help_text, CONFIG.gemini_api_available());
 
     bot.send_message(message.chat.id, help_text)
         .reply_parameters(ReplyParameters::new(message.id))
@@ -3746,7 +3903,7 @@ mod tests {
 
     #[test]
     fn default_image_model_errors_when_codex_unavailable() {
-        let result = resolve_default_image_generation_model("codex", false);
+        let result = resolve_default_image_generation_model("codex", true, false);
 
         assert!(result.is_err());
         assert!(result
@@ -3757,9 +3914,29 @@ mod tests {
     #[test]
     fn default_image_model_accepts_available_codex() {
         assert_eq!(
-            resolve_default_image_generation_model("codex", true),
+            resolve_default_image_generation_model("codex", true, true),
             Ok(ImageGenerationModel::CodexGptImage2)
         );
+    }
+
+    #[test]
+    fn default_image_model_uses_codex_when_gemini_disabled() {
+        assert_eq!(
+            resolve_default_image_generation_model("gemini", false, true),
+            Ok(ImageGenerationModel::CodexGptImage2)
+        );
+    }
+
+    #[test]
+    fn help_text_excludes_gemini_only_commands_when_disabled() {
+        let raw =
+            "\n/s - search\nusage\n\n/vid - video\nusage\n\n/mysong - song\nusage\n\n/q - ask\n";
+        let filtered = filter_gemini_help_text(raw, false);
+
+        assert!(!filtered.contains("/s -"));
+        assert!(!filtered.contains("/vid -"));
+        assert!(!filtered.contains("/mysong -"));
+        assert!(filtered.contains("/q -"));
     }
 
     #[test]
@@ -3862,6 +4039,25 @@ mod tests {
             Some(ImageGenerationModel::CodexGptImage2)
         );
         assert_eq!(parse_image_generation_model("unknown"), None);
+    }
+
+    #[test]
+    fn image_model_keyboard_puts_default_model_first() {
+        let keyboard =
+            build_image_model_keyboard("req", true, true, ImageGenerationModel::CodexGptImage2);
+        let rows = keyboard.inline_keyboard;
+        let callbacks = rows
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                teloxide::types::InlineKeyboardButtonKind::CallbackData(value) => {
+                    Some(value.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(callbacks.first().copied(), Some("image_model:req|codex"));
     }
 
     #[test]

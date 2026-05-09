@@ -106,6 +106,7 @@ pub struct Config {
     pub log_level: String,
     pub database_url: String,
     pub publish_bot_commands: bool,
+    pub enable_gemini: bool,
     pub gemini_api_key: String,
     pub gemini_model: String,
     pub gemini_lite_model: String,
@@ -497,6 +498,7 @@ impl Config {
                 "sqlite+aiosqlite:///bot.db",
             )),
             publish_bot_commands: env_bool("PUBLISH_BOT_COMMANDS", false),
+            enable_gemini: env_bool("ENABLE_GEMINI", true),
             gemini_api_key: env_string("GEMINI_API_KEY", ""),
             gemini_model: env_string("GEMINI_MODEL", "gemini-flash-latest"),
             gemini_lite_model: env_string("GEMINI_LITE_MODEL", "gemini-flash-lite-latest"),
@@ -658,6 +660,14 @@ impl Config {
             ThirdPartyProvider::OpenAICodex => self.enable_openai_codex,
         }
     }
+
+    pub fn gemini_api_available(&self) -> bool {
+        gemini_api_available_from(self.enable_gemini, &self.gemini_api_key)
+    }
+}
+
+pub(crate) fn gemini_api_available_from(enable_gemini: bool, api_key: &str) -> bool {
+    enable_gemini && !api_key.trim().is_empty()
 }
 
 pub const TLDR_SYSTEM_PROMPT: &str = r#"你是一个AI助手，名叫{bot_name}，请用中文总结以下群聊内容。
@@ -740,6 +750,13 @@ mod tests {
     #[test]
     fn default_text_model_defaults_to_gemini_when_both_values_missing() {
         assert_eq!(resolve_default_text_model_value(None, None), "gemini");
+    }
+
+    #[test]
+    fn gemini_api_available_respects_enable_flag() {
+        assert!(!gemini_api_available_from(false, "test-key"));
+        assert!(!gemini_api_available_from(true, ""));
+        assert!(gemini_api_available_from(true, "test-key"));
     }
 
     #[test]

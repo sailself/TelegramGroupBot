@@ -189,8 +189,8 @@ async fn fetch_bot_commands(bot_token: &str) -> anyhow::Result<Vec<BotCommand>> 
     Ok(payload.result.unwrap_or_default())
 }
 
-fn public_bot_commands() -> Vec<BotCommand> {
-    vec![
+fn public_bot_commands_with_gemini(gemini_available: bool) -> Vec<BotCommand> {
+    let mut commands = vec![
         BotCommand::new("start", "介绍AI小喵和可用指令"),
         BotCommand::new("help", "查看帮助与指令说明"),
         BotCommand::new(
@@ -225,7 +225,15 @@ fn public_bot_commands() -> Vec<BotCommand> {
         BotCommand::new("portraitme", "基于你在本群的聊天记录生成肖像"),
         BotCommand::new("mysong", "基于你在本群的聊天记录生成你的主题歌"),
         BotCommand::new("support", "投喂AI小喵"),
-    ]
+    ];
+    if !gemini_available {
+        commands.retain(|command| !matches!(command.command.as_str(), "s" | "vid" | "mysong"));
+    }
+    commands
+}
+
+fn public_bot_commands() -> Vec<BotCommand> {
+    public_bot_commands_with_gemini(CONFIG.gemini_api_available())
 }
 
 #[tokio::main]
@@ -656,4 +664,22 @@ async fn handle_text_message(bot: Bot, state: AppState, message: Message) -> Han
 
 async fn ignore_message(_message: Message) -> HandlerResult {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn published_commands_exclude_gemini_only_commands_when_disabled() {
+        let commands = public_bot_commands_with_gemini(false)
+            .into_iter()
+            .map(|command| command.command)
+            .collect::<Vec<_>>();
+
+        assert!(!commands.iter().any(|command| command == "s"));
+        assert!(!commands.iter().any(|command| command == "vid"));
+        assert!(!commands.iter().any(|command| command == "mysong"));
+        assert!(commands.iter().any(|command| command == "q"));
+    }
 }

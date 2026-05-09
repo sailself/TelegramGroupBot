@@ -196,6 +196,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
   - Example: `/tldr,/factcheck,/profileme,/mysong`
 
 ### Gemini settings
+- `ENABLE_GEMINI` - When `false`, Gemini API-backed models and Gemini-only commands (`/vid`, `/mysong`, `/s`) are disabled and hidden from model/command pickers. Default: `true`.
 - `GEMINI_MODEL` - Default Gemini model. Default: `gemini-2.0-flash`.
 - `GEMINI_LITE_MODEL` - Lite fallback model after `GEMINI_MODEL` failures. Default: `gemini-2.0-flash-lite`.
 - `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-2.5-pro-exp-03-25`.

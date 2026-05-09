@@ -11,6 +11,7 @@ use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
 use crate::llm::audit::{
     log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
 };
+use crate::llm::media::{MediaFile, MediaKind};
 use crate::llm::responses_provider::{
     call_responses_provider, call_responses_provider_with_tool_runtime,
 };
@@ -262,8 +263,20 @@ fn build_function_tools() -> Vec<Value> {
     })]
 }
 
-fn build_message_content(user_content: &str, image_data_list: &[Vec<u8>]) -> Value {
-    if image_data_list.is_empty() {
+fn image_data_list_from_media(media_files: &[MediaFile]) -> Vec<Vec<u8>> {
+    media_files
+        .iter()
+        .filter(|file| file.kind == MediaKind::Image)
+        .map(|file| file.bytes().to_vec())
+        .collect()
+}
+
+fn build_message_content(user_content: &str, media_files: &[MediaFile]) -> Value {
+    let supported_media = media_files
+        .iter()
+        .filter(|file| matches!(file.kind, MediaKind::Image | MediaKind::Video))
+        .collect::<Vec<_>>();
+    if supported_media.is_empty() {
         return Value::String(user_content.to_string());
     }
 
@@ -273,15 +286,28 @@ fn build_message_content(user_content: &str, image_data_list: &[Vec<u8>]) -> Val
         "text": user_content
     }));
 
-    for image_data in image_data_list {
-        let mime_type = crate::llm::media::detect_mime_type(image_data)
-            .unwrap_or_else(|| "image/png".to_string());
-        let encoded = general_purpose::STANDARD.encode(image_data);
+    for file in supported_media {
+        let fallback_mime_type = match file.kind {
+            MediaKind::Image => "image/png",
+            MediaKind::Video => "video/mp4",
+            MediaKind::Audio | MediaKind::Document => continue,
+        };
+        let mime_type = crate::llm::media::detect_mime_type(file.bytes())
+            .or_else(|| (!file.mime_type.trim().is_empty()).then(|| file.mime_type.clone()))
+            .unwrap_or_else(|| fallback_mime_type.to_string());
+        let encoded = general_purpose::STANDARD.encode(file.bytes());
         let data_url = format!("data:{};base64,{}", mime_type, encoded);
-        parts.push(json!({
-            "type": "image_url",
-            "image_url": { "url": data_url }
-        }));
+        match file.kind {
+            MediaKind::Image => parts.push(json!({
+                "type": "image_url",
+                "image_url": { "url": data_url }
+            })),
+            MediaKind::Video => parts.push(json!({
+                "type": "video_url",
+                "video_url": { "url": data_url }
+            })),
+            MediaKind::Audio | MediaKind::Document => {}
+        }
     }
 
     Value::Array(parts)
@@ -798,7 +824,7 @@ pub async fn call_third_party_with_tool_runtime(
     user_content: &str,
     model_id: &str,
     response_title: &str,
-    image_data_list: &[Vec<u8>],
+    media_files: &[MediaFile],
     runtime: &mut ToolRuntime,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<String> {
@@ -815,19 +841,20 @@ pub async fn call_third_party_with_tool_runtime(
         model_config.provider,
         ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
     ) {
+        let image_data_list = image_data_list_from_media(media_files);
         return call_responses_provider_with_tool_runtime(
             system_prompt,
             user_content,
             &model_config,
             response_title,
-            image_data_list,
+            &image_data_list,
             runtime,
             audit_context,
         )
         .await;
     }
     let system_prompt = format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance());
-    let message_content = build_message_content(user_content, image_data_list);
+    let message_content = build_message_content(user_content, media_files);
     let messages = vec![
         json!({ "role": "system", "content": system_prompt }),
         json!({ "role": "user", "content": message_content }),
@@ -843,7 +870,7 @@ pub async fn call_third_party(
     user_content: &str,
     model_id: &str,
     response_title: &str,
-    image_data_list: &[Vec<u8>],
+    media_files: &[MediaFile],
     supports_tools: bool,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<String> {
@@ -860,12 +887,13 @@ pub async fn call_third_party(
         model_config.provider,
         ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
     ) {
+        let image_data_list = image_data_list_from_media(media_files);
         return call_responses_provider(
             system_prompt,
             user_content,
             &model_config,
             response_title,
-            image_data_list,
+            &image_data_list,
             supports_tools,
             audit_context,
         )
@@ -873,7 +901,7 @@ pub async fn call_third_party(
     }
     let tools_enabled = supports_tools && web_search::is_search_enabled();
     let system_prompt = build_third_party_system_prompt(system_prompt, tools_enabled);
-    let message_content = build_message_content(user_content, image_data_list);
+    let message_content = build_message_content(user_content, media_files);
 
     let messages = vec![
         json!({ "role": "system", "content": system_prompt }),
@@ -989,6 +1017,29 @@ mod tests {
             .any(|(name, _)| name == "HTTP-Referer" || name == "X-Title"));
         assert!(details.payload.get("top_k").is_none());
         assert_eq!(details.request_timeout_secs, 120);
+    }
+
+    #[test]
+    fn message_content_includes_video_url_parts_for_video_media() {
+        let media = vec![MediaFile::new(
+            b"video-bytes".to_vec(),
+            "video/mp4".to_string(),
+            MediaKind::Video,
+            None,
+        )];
+
+        let content = build_message_content("analyze this", &media);
+        let parts = content.as_array().expect("content should be media parts");
+
+        assert_eq!(parts[0], json!({"type": "text", "text": "analyze this"}));
+        assert_eq!(parts[1]["type"], "video_url");
+        assert_eq!(
+            parts[1]["video_url"]["url"],
+            format!(
+                "data:video/mp4;base64,{}",
+                general_purpose::STANDARD.encode(b"video-bytes")
+            )
+        );
     }
 
     #[test]
