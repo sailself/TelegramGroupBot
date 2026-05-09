@@ -44,6 +44,8 @@ use tracing::{error, info, warn};
 
 pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 pub const MODEL_GEMINI: &str = "gemini";
+const MODEL_CALLBACK_COMPACT_PREFIX: &str = "m:";
+const TELEGRAM_CALLBACK_DATA_LIMIT: usize = 64;
 const SEND_MESSAGE_RETRY_ATTEMPTS: usize = 3;
 const USER_ERROR_DETAIL_LIMIT: usize = 400;
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
@@ -518,6 +520,56 @@ fn normalize_model_identifier(identifier: &str) -> String {
         .unwrap_or_else(|| normalize_model_identifier_with_models(identifier, &models, &[]))
 }
 
+fn compact_model_callback_hash(model_identifier: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in model_identifier.trim().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn compact_model_callback_token(model_identifier: &str) -> String {
+    format!(
+        "{}{:016x}",
+        MODEL_CALLBACK_COMPACT_PREFIX,
+        compact_model_callback_hash(model_identifier)
+    )
+}
+
+fn model_selection_callback_data(model_identifier: &str) -> String {
+    let model_identifier = model_identifier.trim();
+    let full_callback = format!("{}{}", MODEL_CALLBACK_PREFIX, model_identifier);
+    if full_callback.len() <= TELEGRAM_CALLBACK_DATA_LIMIT {
+        full_callback
+    } else {
+        format!(
+            "{}{}",
+            MODEL_CALLBACK_PREFIX,
+            compact_model_callback_token(model_identifier)
+        )
+    }
+}
+
+fn resolve_model_callback_token_with_models(
+    token: &str,
+    models: &[ThirdPartyModelConfig],
+) -> Option<String> {
+    let token = token.trim();
+    if token.eq_ignore_ascii_case(MODEL_GEMINI) {
+        return Some(MODEL_GEMINI.to_string());
+    }
+
+    if token.starts_with(MODEL_CALLBACK_COMPACT_PREFIX) {
+        return models
+            .iter()
+            .find(|config| compact_model_callback_token(&config.id) == token)
+            .map(|config| config.id.clone());
+    }
+
+    resolve_exact_model_identifier_with_models(token, models)
+}
+
 fn is_third_party_model_available(config: &ThirdPartyModelConfig) -> bool {
     is_runtime_provider_ready(config.provider)
 }
@@ -679,6 +731,21 @@ fn resolve_default_text_model_with_models(
     Ok(normalized)
 }
 
+fn should_use_default_model_without_selection(
+    force_default_gemini: bool,
+    request: ModelRequestCapabilities,
+    has_youtube_urls: bool,
+    gemini_available: bool,
+    third_party_models_available_for_request: bool,
+    runtime_model_count: usize,
+) -> bool {
+    force_default_gemini
+        || request.has_documents
+        || (has_youtube_urls && gemini_available)
+        || (!request.has_video && !third_party_models_available_for_request)
+        || (!request.has_video && runtime_model_count == 0)
+}
+
 pub(crate) fn resolve_default_text_model_for_request(
     has_images: bool,
     has_video: bool,
@@ -758,6 +825,63 @@ fn available_third_party_models_for_request<'a>(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn selectable_model_ids_for_request_with_models(
+    models: &[ThirdPartyModelConfig],
+    ready_providers: &[ThirdPartyProvider],
+    gemini_available: bool,
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+    require_tools: bool,
+) -> Vec<String> {
+    let mut model_ids = Vec::new();
+    if gemini_available {
+        model_ids.push(MODEL_GEMINI.to_string());
+    }
+
+    model_ids.extend(
+        available_third_party_models_for_request(
+            models,
+            ready_providers,
+            has_images,
+            has_video,
+            has_audio,
+            has_documents,
+            require_tools,
+        )
+        .into_iter()
+        .filter_map(|config| {
+            let model_identifier = config.id.trim();
+            (!model_identifier.is_empty()).then(|| model_identifier.to_string())
+        }),
+    );
+
+    model_ids
+}
+
+fn selectable_model_ids_for_request(
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+    require_tools: bool,
+) -> Vec<String> {
+    let models = runtime_models();
+    let ready_providers = ready_runtime_providers(&models);
+    selectable_model_ids_for_request_with_models(
+        &models,
+        &ready_providers,
+        CONFIG.gemini_api_available(),
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    )
+}
+
 fn default_model_selection_key(default_model: &str, models: &[ThirdPartyModelConfig]) -> String {
     let trimmed = default_model.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(MODEL_GEMINI) {
@@ -783,34 +907,27 @@ fn create_model_selection_keyboard_with_models(
 ) -> InlineKeyboardMarkup {
     let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     let default_model_key = default_model_selection_key(default_model, models);
-    let mut model_buttons = Vec::new();
-    if gemini_available {
-        model_buttons.push(InlineKeyboardButton::callback(
-            "Gemini 3",
-            format!("{}{}", MODEL_CALLBACK_PREFIX, MODEL_GEMINI),
-        ));
-    }
-
-    for config in available_third_party_models_for_request(
+    let selectable_model_ids = selectable_model_ids_for_request_with_models(
         models,
         ready_providers,
+        gemini_available,
         has_images,
         has_video,
         has_audio,
         has_documents,
         require_tools,
-    ) {
-        let model_identifier = config.id.trim();
-        if model_identifier.is_empty() {
-            continue;
-        }
-        model_buttons.push(InlineKeyboardButton::callback(
-            config.name.clone(),
-            format!("{}{}", MODEL_CALLBACK_PREFIX, model_identifier),
-        ));
-    }
+    );
+    let mut model_buttons = selectable_model_ids
+        .iter()
+        .map(|model_id| {
+            InlineKeyboardButton::callback(
+                configured_model_display_name(model_id),
+                model_selection_callback_data(model_id),
+            )
+        })
+        .collect::<Vec<_>>();
 
-    let default_callback = format!("{}{}", MODEL_CALLBACK_PREFIX, default_model_key);
+    let default_callback = model_selection_callback_data(&default_model_key);
     if let Some(default_index) = model_buttons.iter().position(|button| match &button.kind {
         teloxide::types::InlineKeyboardButtonKind::CallbackData(data) => data == &default_callback,
         _ => false,
@@ -1495,6 +1612,114 @@ mod tests {
     }
 
     #[test]
+    fn audio_request_with_audio_capable_third_party_model_uses_picker() {
+        assert!(!should_use_default_model_without_selection(
+            false,
+            ModelRequestCapabilities {
+                has_audio: true,
+                ..ModelRequestCapabilities::default()
+            },
+            false,
+            true,
+            true,
+            1,
+        ));
+    }
+
+    #[test]
+    fn audio_selection_includes_only_audio_capable_ready_models() {
+        let mut audio_model = model(
+            ThirdPartyProvider::Nvidia,
+            "NVIDIA Nemotron Omni",
+            "nemotron-omni",
+        );
+        audio_model.audio = true;
+        let text_model = model(ThirdPartyProvider::Nvidia, "Text Only", "text-only");
+        let mut unavailable_audio = model(
+            ThirdPartyProvider::OpenRouter,
+            "Unavailable Audio",
+            "or-audio",
+        );
+        unavailable_audio.audio = true;
+        let models = vec![audio_model, text_model, unavailable_audio];
+
+        let keyboard = create_model_selection_keyboard_with_models(
+            &models,
+            &[ThirdPartyProvider::Nvidia],
+            false,
+            "gemini",
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        let callbacks = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(callbacks, vec!["model_select:nvidia:nemotron-omni"]);
+    }
+
+    #[test]
+    fn selectable_models_returns_single_audio_model_when_it_is_the_only_option() {
+        let mut audio_model = model(
+            ThirdPartyProvider::Nvidia,
+            "NVIDIA Nemotron Omni",
+            "nemotron-omni",
+        );
+        audio_model.audio = true;
+        let text_model = model(ThirdPartyProvider::Nvidia, "Text Only", "text-only");
+        let models = vec![audio_model, text_model];
+
+        let model_ids = selectable_model_ids_for_request_with_models(
+            &models,
+            &[ThirdPartyProvider::Nvidia],
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(model_ids, vec!["nvidia:nemotron-omni"]);
+    }
+
+    #[test]
+    fn selectable_models_keeps_picker_when_gemini_and_audio_model_are_available() {
+        let mut audio_model = model(
+            ThirdPartyProvider::Nvidia,
+            "NVIDIA Nemotron Omni",
+            "nemotron-omni",
+        );
+        audio_model.audio = true;
+        let models = vec![audio_model];
+
+        let model_ids = selectable_model_ids_for_request_with_models(
+            &models,
+            &[ThirdPartyProvider::Nvidia],
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            model_ids,
+            vec!["gemini".to_string(), "nvidia:nemotron-omni".to_string()]
+        );
+    }
+
+    #[test]
     fn model_selection_keyboard_omits_gemini_when_disabled() {
         let keyboard = create_model_selection_keyboard_with_models(
             &[],
@@ -1558,6 +1783,49 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(callbacks, vec!["model_select:nvidia:qwen-video"]);
+    }
+
+    #[test]
+    fn model_selection_keyboard_compacts_long_third_party_model_callbacks() {
+        let long_model = model(
+            ThirdPartyProvider::Nvidia,
+            "NVIDIA Nemotron 3 Nano Omni",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        );
+        let models = vec![long_model.clone()];
+
+        let keyboard = create_model_selection_keyboard_with_models(
+            &models,
+            &[ThirdPartyProvider::Nvidia],
+            false,
+            &long_model.id,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        let callbacks = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(callbacks.len(), 1);
+        let callback = callbacks[0];
+        assert!(callback.len() <= TELEGRAM_CALLBACK_DATA_LIMIT);
+        assert!(callback.starts_with("model_select:m:"));
+        assert!(!callback.contains(long_model.model.as_str()));
+
+        let token = callback.trim_start_matches(MODEL_CALLBACK_PREFIX);
+        assert_eq!(
+            resolve_model_callback_token_with_models(token, &models).as_deref(),
+            Some(long_model.id.as_str())
+        );
     }
 
     #[test]
@@ -1806,7 +2074,14 @@ async fn q_handler_internal(
     let has_documents = media_summary.documents > 0;
 
     let require_tools = mode.requires_custom_tools();
-    let video_third_party_models_available = has_available_third_party_models_for_request(
+    let request_capabilities = ModelRequestCapabilities {
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    };
+    let third_party_models_available_for_request = has_available_third_party_models_for_request(
         has_images,
         has_video,
         has_audio,
@@ -1816,7 +2091,7 @@ async fn q_handler_internal(
     if has_video
         && !video_request_has_capable_model(
             CONFIG.gemini_api_available(),
-            video_third_party_models_available,
+            third_party_models_available_for_request,
         )
     {
         send_message_with_retry(
@@ -1832,21 +2107,23 @@ async fn q_handler_internal(
     }
 
     let force_default_gemini = force_gemini && CONFIG.gemini_api_available() && !has_video;
-    let must_use_default_model = force_default_gemini
-        || has_audio
-        || has_documents
-        || (!youtube_urls.is_empty() && CONFIG.gemini_api_available())
-        || (!has_video && !video_third_party_models_available)
-        || (!has_video && runtime_model_count() == 0);
-    if must_use_default_model {
-        let default_model = match resolve_default_text_model_for_request(
+    let must_use_default_model = should_use_default_model_without_selection(
+        force_default_gemini,
+        request_capabilities,
+        !youtube_urls.is_empty(),
+        CONFIG.gemini_api_available(),
+        third_party_models_available_for_request,
+        runtime_model_count(),
+    );
+    let direct_model = if must_use_default_model {
+        match resolve_default_text_model_for_request(
             has_images,
             has_video,
             has_audio,
             has_documents,
             require_tools,
         ) {
-            Ok(model) => model,
+            Ok(model) => Some((model, "default_text_model")),
             Err(err) => {
                 send_message_with_retry(
                     &bot,
@@ -1859,9 +2136,27 @@ async fn q_handler_internal(
                 .await?;
                 return Ok(());
             }
-        };
+        }
+    } else {
+        let selectable_model_ids = selectable_model_ids_for_request(
+            has_images,
+            has_video,
+            has_audio,
+            has_documents,
+            require_tools,
+        );
+        if selectable_model_ids.len() == 1 {
+            selectable_model_ids
+                .into_iter()
+                .next()
+                .map(|model| (model, "single_selectable_model"))
+        } else {
+            None
+        }
+    };
 
-        let display_name = configured_model_display_name(&default_model);
+    if let Some((selected_model, timer_detail)) = direct_model {
+        let display_name = configured_model_display_name(&selected_model);
         let processing_message_text = if has_video {
             format!(
                 "Analyzing video and processing your question with {}...",
@@ -1935,9 +2230,9 @@ async fn q_handler_internal(
             mode,
         };
 
-        let result = process_request(&bot, &state, pending_request, &default_model).await;
+        let result = process_request(&bot, &state, pending_request, &selected_model).await;
         let status = if result.is_ok() { "success" } else { "error" };
-        complete_command_timer(&mut timer, status, Some("default_text_model".to_string()));
+        complete_command_timer(&mut timer, status, Some(timer_detail.to_string()));
         result?;
         return Ok(());
     }
@@ -2335,7 +2630,9 @@ pub async fn model_selection_callback(
     }
 
     let selected_token = data.trim_start_matches(MODEL_CALLBACK_PREFIX);
-    let selected_model = normalize_model_identifier(selected_token);
+    let models = runtime_models();
+    let selected_model = resolve_model_callback_token_with_models(selected_token, &models)
+        .unwrap_or_else(|| normalize_model_identifier(selected_token));
 
     let message = match query.message.clone() {
         Some(msg) => msg,
@@ -2365,7 +2662,7 @@ pub async fn model_selection_callback(
     let has_audio = summary.audios > 0;
     let has_documents = summary.documents > 0;
     if !is_model_configured_for_request(
-        selected_token,
+        &selected_model,
         has_images,
         has_video,
         has_audio,

@@ -274,7 +274,12 @@ fn image_data_list_from_media(media_files: &[MediaFile]) -> Vec<Vec<u8>> {
 fn build_message_content(user_content: &str, media_files: &[MediaFile]) -> Value {
     let supported_media = media_files
         .iter()
-        .filter(|file| matches!(file.kind, MediaKind::Image | MediaKind::Video))
+        .filter(|file| {
+            matches!(
+                file.kind,
+                MediaKind::Image | MediaKind::Video | MediaKind::Audio
+            )
+        })
         .collect::<Vec<_>>();
     if supported_media.is_empty() {
         return Value::String(user_content.to_string());
@@ -290,7 +295,8 @@ fn build_message_content(user_content: &str, media_files: &[MediaFile]) -> Value
         let fallback_mime_type = match file.kind {
             MediaKind::Image => "image/png",
             MediaKind::Video => "video/mp4",
-            MediaKind::Audio | MediaKind::Document => continue,
+            MediaKind::Audio => "audio/mpeg",
+            MediaKind::Document => continue,
         };
         let mime_type = crate::llm::media::detect_mime_type(file.bytes())
             .or_else(|| (!file.mime_type.trim().is_empty()).then(|| file.mime_type.clone()))
@@ -306,7 +312,11 @@ fn build_message_content(user_content: &str, media_files: &[MediaFile]) -> Value
                 "type": "video_url",
                 "video_url": { "url": data_url }
             })),
-            MediaKind::Audio | MediaKind::Document => {}
+            MediaKind::Audio => parts.push(json!({
+                "type": "audio_url",
+                "audio_url": { "url": data_url }
+            })),
+            MediaKind::Document => {}
         }
     }
 
@@ -1040,6 +1050,48 @@ mod tests {
                 general_purpose::STANDARD.encode(b"video-bytes")
             )
         );
+    }
+
+    #[test]
+    fn message_content_includes_audio_url_parts_for_audio_media() {
+        let media = vec![MediaFile::new(
+            b"audio-bytes".to_vec(),
+            "audio/mpeg".to_string(),
+            MediaKind::Audio,
+            None,
+        )];
+
+        let content = build_message_content("transcribe this", &media);
+        let parts = content.as_array().expect("content should be media parts");
+
+        assert_eq!(parts[0], json!({"type": "text", "text": "transcribe this"}));
+        assert_eq!(parts[1]["type"], "audio_url");
+        assert_eq!(
+            parts[1]["audio_url"]["url"],
+            format!(
+                "data:audio/mpeg;base64,{}",
+                general_purpose::STANDARD.encode(b"audio-bytes")
+            )
+        );
+    }
+
+    #[test]
+    fn message_content_keeps_large_audio_as_base64_data_url() {
+        let media = vec![MediaFile::new(
+            vec![b'x'; 190 * 1024],
+            "audio/mpeg".to_string(),
+            MediaKind::Audio,
+            None,
+        )];
+
+        let content = build_message_content("transcribe this", &media);
+        let parts = content.as_array().expect("content should be media parts");
+        let url = parts[1]["audio_url"]["url"]
+            .as_str()
+            .expect("audio url should be a string");
+
+        assert!(url.starts_with("data:audio/mpeg;base64,"));
+        assert!(!url.contains("asset_id"));
     }
 
     #[test]
