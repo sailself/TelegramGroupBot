@@ -106,9 +106,17 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
         children: Vec<serde_json::Value>,
     }
 
+    #[derive(Debug, Default)]
+    struct TableBuilder {
+        rows: Vec<Vec<String>>,
+        current_row: Option<Vec<String>>,
+        current_cell: Option<String>,
+    }
+
     enum StackEntry {
         Node(NodeBuilder),
         Image { src: String, alt: String },
+        Table(TableBuilder),
     }
 
     fn push_text(children: &mut Vec<serde_json::Value>, text: &str) {
@@ -175,10 +183,128 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
                     );
                 }
             }
+            StackEntry::Table(table) => {
+                if let Some(value) = render_table_pre(table) {
+                    push_value(stack, root, value);
+                }
+            }
         }
     }
 
+    fn active_table_mut(stack: &mut [StackEntry]) -> Option<&mut TableBuilder> {
+        stack.iter_mut().rev().find_map(|entry| match entry {
+            StackEntry::Table(table) => Some(table),
+            StackEntry::Node(_) | StackEntry::Image { .. } => None,
+        })
+    }
+
+    fn push_table_text(stack: &mut [StackEntry], text: &str) -> bool {
+        let Some(table) = active_table_mut(stack) else {
+            return false;
+        };
+        let Some(cell) = table.current_cell.as_mut() else {
+            return true;
+        };
+        cell.push_str(text);
+        true
+    }
+
+    fn finish_table_cell(stack: &mut [StackEntry]) -> bool {
+        let Some(table) = active_table_mut(stack) else {
+            return false;
+        };
+        if let Some(cell) = table.current_cell.take() {
+            table
+                .current_row
+                .get_or_insert_with(Vec::new)
+                .push(normalize_table_cell(&cell));
+        }
+        true
+    }
+
+    fn finish_table_row(stack: &mut [StackEntry]) -> bool {
+        if active_table_mut(stack).is_none() {
+            return false;
+        }
+        finish_table_cell(stack);
+        let Some(table) = active_table_mut(stack) else {
+            return false;
+        };
+        if let Some(row) = table.current_row.take() {
+            if row.iter().any(|cell| !cell.trim().is_empty()) {
+                table.rows.push(row);
+            }
+        }
+        true
+    }
+
+    fn normalize_table_cell(value: &str) -> String {
+        value.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn render_table_pre(mut table: TableBuilder) -> Option<serde_json::Value> {
+        if table.current_cell.is_some() {
+            if let Some(cell) = table.current_cell.take() {
+                table
+                    .current_row
+                    .get_or_insert_with(Vec::new)
+                    .push(normalize_table_cell(&cell));
+            }
+        }
+        if let Some(row) = table.current_row.take() {
+            if row.iter().any(|cell| !cell.trim().is_empty()) {
+                table.rows.push(row);
+            }
+        }
+
+        let rows = table
+            .rows
+            .into_iter()
+            .filter(|row| row.iter().any(|cell| !cell.trim().is_empty()))
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return None;
+        }
+
+        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+        if columns == 0 {
+            return None;
+        }
+
+        let mut widths = vec![0usize; columns];
+        for row in &rows {
+            for (index, cell) in row.iter().enumerate() {
+                widths[index] = widths[index].max(cell.chars().count());
+            }
+        }
+
+        let mut lines = Vec::new();
+        for (row_index, row) in rows.iter().enumerate() {
+            let mut cells = Vec::new();
+            for (index, width) in widths.iter().enumerate().take(columns) {
+                let cell = row.get(index).map(String::as_str).unwrap_or("");
+                let padding = width.saturating_sub(cell.chars().count());
+                cells.push(format!("{}{}", cell, " ".repeat(padding)));
+            }
+            lines.push(cells.join(" | ").trim_end().to_string());
+            if row_index == 0 && rows.len() > 1 {
+                let separator = widths
+                    .iter()
+                    .map(|width| "-".repeat((*width).max(3)))
+                    .collect::<Vec<_>>()
+                    .join("-+-");
+                lines.push(separator);
+            }
+        }
+
+        Some(json!({
+            "tag": "pre",
+            "children": [lines.join("\n")]
+        }))
+    }
+
     let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
 
@@ -189,6 +315,23 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
     for event in parser {
         match event {
             Event::Start(tag) => match tag {
+                Tag::Table(_) => stack.push(StackEntry::Table(TableBuilder::default())),
+                Tag::TableHead => {
+                    if let Some(table) = active_table_mut(&mut stack) {
+                        table.current_row = Some(Vec::new());
+                    }
+                }
+                Tag::TableRow => {
+                    if let Some(table) = active_table_mut(&mut stack) {
+                        table.current_row = Some(Vec::new());
+                    }
+                }
+                Tag::TableCell => {
+                    if let Some(table) = active_table_mut(&mut stack) {
+                        table.current_cell = Some(String::new());
+                    }
+                }
+                _ if active_table_mut(&mut stack).is_some() => {}
                 Tag::Paragraph => stack.push(StackEntry::Node(NodeBuilder {
                     tag: "p".to_string(),
                     attrs: None,
@@ -264,6 +407,17 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
                 _ => {}
             },
             Event::End(tag) => match tag {
+                Tag::Table(_) => close_node(&mut stack, &mut root),
+                Tag::TableHead => {
+                    finish_table_row(&mut stack);
+                }
+                Tag::TableRow => {
+                    finish_table_row(&mut stack);
+                }
+                Tag::TableCell => {
+                    finish_table_cell(&mut stack);
+                }
+                _ if active_table_mut(&mut stack).is_some() => {}
                 Tag::Image(_, _, _) => close_node(&mut stack, &mut root),
                 Tag::Paragraph
                 | Tag::Heading(..)
@@ -278,7 +432,9 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
                 _ => {}
             },
             Event::Text(text) => {
-                if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
+                if push_table_text(&mut stack, &text) {
+                    continue;
+                } else if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
                     alt.push_str(&text);
                 } else if let Some(StackEntry::Node(parent)) = stack.last_mut() {
                     push_text(&mut parent.children, &text);
@@ -287,7 +443,9 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
                 }
             }
             Event::Code(text) => {
-                if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
+                if push_table_text(&mut stack, &text) {
+                    continue;
+                } else if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
                     alt.push_str(&text);
                 } else {
                     push_value(
@@ -301,13 +459,17 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
-                push_value(&mut stack, &mut root, json!({ "tag": "br" }));
+                if !push_table_text(&mut stack, " ") {
+                    push_value(&mut stack, &mut root, json!({ "tag": "br" }));
+                }
             }
             Event::Rule => {
                 push_value(&mut stack, &mut root, json!({ "tag": "hr" }));
             }
             Event::Html(html) => {
-                if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
+                if push_table_text(&mut stack, &html) {
+                    continue;
+                } else if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
                     alt.push_str(&html);
                 } else if let Some(StackEntry::Node(parent)) = stack.last_mut() {
                     push_text(&mut parent.children, &html);
@@ -317,7 +479,9 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
             }
             Event::TaskListMarker(checked) => {
                 let marker = if checked { "[x] " } else { "[ ] " };
-                if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
+                if push_table_text(&mut stack, marker) {
+                    continue;
+                } else if let Some(StackEntry::Image { alt, .. }) = stack.last_mut() {
                     alt.push_str(marker);
                 } else if let Some(StackEntry::Node(parent)) = stack.last_mut() {
                     push_text(&mut parent.children, marker);
@@ -1028,4 +1192,41 @@ pub async fn download_twitter_media(
     }
 
     collect_external_media(requests, max_files).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_tables_render_as_telegraph_pre_blocks() {
+        let nodes = markdown_to_telegraph_nodes(
+            "Intro\n\n| 指標 | 日本 NISA | 英國 ISA |\n|---|---:|---:|\n| 參與人數/帳戶 | **2,826萬個** | 1,500萬個 |\n\nAfter",
+        );
+
+        let pre = nodes
+            .iter()
+            .find(|node| node.get("tag").and_then(|tag| tag.as_str()) == Some("pre"))
+            .expect("table should render as a pre block");
+        let table_text = pre["children"][0]
+            .as_str()
+            .expect("pre block should contain text");
+
+        assert!(table_text.contains("指標"));
+        assert!(table_text.contains("日本 NISA"));
+        assert!(table_text.contains("2,826萬個"));
+        assert!(!table_text.contains("|---"));
+    }
+
+    #[test]
+    fn markdown_table_output_preserves_surrounding_paragraphs() {
+        let nodes =
+            markdown_to_telegraph_nodes("Before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nAfter");
+        let tags = nodes
+            .iter()
+            .filter_map(|node| node.get("tag").and_then(|tag| tag.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(tags, vec!["p", "pre", "p"]);
+    }
 }
