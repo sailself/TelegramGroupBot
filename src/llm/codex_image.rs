@@ -46,6 +46,13 @@ pub struct ImageInput {
     pub mime_type: String,
 }
 
+#[derive(Debug, Clone)]
+struct CodexImageGenerationResult {
+    images: Vec<Vec<u8>>,
+    usage_model: Option<String>,
+    usage: LlmUsageRecord,
+}
+
 pub fn codex_image_display_model() -> String {
     let model = CONFIG.openai_codex_image_model.trim();
     if model.is_empty() {
@@ -212,12 +219,51 @@ fn collect_image_generation_results_from_item(item: &Value, encoded_images: &mut
     }
 }
 
-pub fn extract_codex_image_generation_images(
+fn usage_has_counts(usage: &LlmUsageRecord) -> bool {
+    usage.input_tokens.is_some() || usage.output_tokens.is_some() || usage.total_tokens.is_some()
+}
+
+fn usage_record_from_value(usage: &Value, response_id: Option<String>) -> LlmUsageRecord {
+    let input_tokens = usage.get("input_tokens").and_then(|value| value.as_i64());
+    let output_tokens = usage.get("output_tokens").and_then(|value| value.as_i64());
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(|value| value.as_i64())
+        .or_else(|| match (input_tokens, output_tokens) {
+            (Some(input_tokens), Some(output_tokens)) => Some(input_tokens + output_tokens),
+            _ => None,
+        });
+    let reasoning_tokens = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .and_then(|value| value.as_i64());
+    let cached_input_tokens = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(|value| value.as_i64());
+
+    LlmUsageRecord {
+        response_id,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        reasoning_tokens,
+        cached_input_tokens,
+        raw_usage_json: Some(usage.to_string()),
+    }
+}
+
+fn usage_value(value: &Value) -> Option<&Value> {
+    value.get("usage").filter(|usage| !usage.is_null())
+}
+
+fn extract_codex_image_generation_result(
     body: &str,
-) -> Result<Vec<Vec<u8>>, ImageGenerationError> {
+) -> Result<CodexImageGenerationResult, ImageGenerationError> {
     let events = parse_sse_events(body).map_err(|err| ImageGenerationError(err.to_string()))?;
     let mut output_item_images = Vec::new();
     let mut completed_output_images = Vec::new();
+    let mut response_id = None;
+    let mut response_usage = LlmUsageRecord::default();
+    let mut image_usage = LlmUsageRecord::default();
 
     for event in &events {
         match event.get("type").and_then(|value| value.as_str()) {
@@ -229,9 +275,26 @@ pub fn extract_codex_image_generation_images(
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
                     collect_image_generation_results_from_item(item, &mut output_item_images);
+                    if item.get("type").and_then(|value| value.as_str())
+                        == Some("image_generation_call")
+                    {
+                        if let Some(usage) = usage_value(item) {
+                            image_usage = usage_record_from_value(usage, response_id.clone());
+                        }
+                    }
                 }
             }
             Some("response.completed") => {
+                response_id = event
+                    .pointer("/response/id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string());
+                if let Some(usage) = event
+                    .pointer("/response/usage")
+                    .filter(|usage| !usage.is_null())
+                {
+                    response_usage = usage_record_from_value(usage, response_id.clone());
+                }
                 if let Some(output) = event
                     .pointer("/response/output")
                     .and_then(|value| value.as_array())
@@ -241,6 +304,13 @@ pub fn extract_codex_image_generation_images(
                             item,
                             &mut completed_output_images,
                         );
+                        if item.get("type").and_then(|value| value.as_str())
+                            == Some("image_generation_call")
+                        {
+                            if let Some(usage) = usage_value(item) {
+                                image_usage = usage_record_from_value(usage, response_id.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -273,7 +343,19 @@ pub fn extract_codex_image_generation_images(
         ));
     }
 
-    Ok(images)
+    let (usage_model, usage) = if usage_has_counts(&image_usage) {
+        (Some(codex_image_display_model()), image_usage)
+    } else if usage_has_counts(&response_usage) {
+        (Some(codex_image_display_model()), response_usage)
+    } else {
+        (None, LlmUsageRecord::default())
+    };
+
+    Ok(CodexImageGenerationResult {
+        images,
+        usage_model,
+        usage,
+    })
 }
 
 async fn read_response_body_limited(mut response: reqwest::Response) -> Result<String> {
@@ -412,20 +494,22 @@ async fn call_codex_image_api(
         let body = read_response_body_limited(response)
             .await
             .map_err(|err| ImageGenerationError(err.to_string()))?;
-        let images = extract_codex_image_generation_images(&body)?;
+        let result = extract_codex_image_generation_result(&body)?;
+        let images = result.images;
         info!(
             "OpenAI Codex image request completed: model={}, images={}",
             model,
             images.len()
         );
+        let usage_model = result.usage_model.unwrap_or_else(|| model.clone());
         record_llm_request_success(
             audit_context,
             ThirdPartyProvider::OpenAICodex.as_str(),
-            &model,
+            &usage_model,
             "generate_image_with_codex",
             started_at,
             chrono::Utc::now(),
-            LlmUsageRecord::default(),
+            result.usage,
         )
         .await;
         return Ok(images);
@@ -565,7 +649,7 @@ mod tests {
             })
         );
 
-        let images = extract_codex_image_generation_images(&body).unwrap();
+        let images = extract_codex_image_generation_result(&body).unwrap().images;
         assert_eq!(images, vec![b"png-bytes".to_vec()]);
     }
 
@@ -586,15 +670,104 @@ mod tests {
             })
         );
 
-        let images = extract_codex_image_generation_images(&body).unwrap();
+        let images = extract_codex_image_generation_result(&body).unwrap().images;
         assert_eq!(images, vec![b"completed-image".to_vec()]);
+    }
+
+    #[test]
+    fn attributes_top_level_response_usage_to_image_model() {
+        let body = format!(
+            "event: response.completed\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_123",
+                    "model": "gpt-5.5",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "input_tokens_details": {
+                            "cached_tokens": 3
+                        },
+                        "output_tokens_details": {
+                            "reasoning_tokens": 7
+                        }
+                    },
+                    "output": [{
+                        "type": "image_generation_call",
+                        "id": "ig_1",
+                        "status": "completed",
+                        "result": general_purpose::STANDARD.encode(b"completed-image")
+                    }]
+                }
+            })
+        );
+
+        let result = extract_codex_image_generation_result(&body).unwrap();
+
+        assert_eq!(result.images, vec![b"completed-image".to_vec()]);
+        assert_eq!(
+            result.usage_model.as_deref(),
+            Some(codex_image_display_model().as_str())
+        );
+        assert_eq!(result.usage.response_id.as_deref(), Some("resp_123"));
+        assert_eq!(result.usage.input_tokens, Some(10));
+        assert_eq!(result.usage.output_tokens, Some(20));
+        assert_eq!(result.usage.total_tokens, Some(30));
+        assert_eq!(result.usage.cached_input_tokens, Some(3));
+        assert_eq!(result.usage.reasoning_tokens, Some(7));
+    }
+
+    #[test]
+    fn prefers_image_generation_item_usage_for_image_model() {
+        let body = format!(
+            "event: response.completed\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_123",
+                    "model": "gpt-5.5",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "total_tokens": 30
+                    },
+                    "output": [{
+                        "type": "image_generation_call",
+                        "id": "ig_1",
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 200,
+                            "total_tokens": 300,
+                            "input_tokens_details": {
+                                "image_tokens": 80,
+                                "text_tokens": 20
+                            }
+                        },
+                        "result": general_purpose::STANDARD.encode(b"completed-image")
+                    }]
+                }
+            })
+        );
+
+        let result = extract_codex_image_generation_result(&body).unwrap();
+
+        assert_eq!(
+            result.usage_model.as_deref(),
+            Some(codex_image_display_model().as_str())
+        );
+        assert_eq!(result.usage.response_id.as_deref(), Some("resp_123"));
+        assert_eq!(result.usage.input_tokens, Some(100));
+        assert_eq!(result.usage.output_tokens, Some(200));
+        assert_eq!(result.usage.total_tokens, Some(300));
     }
 
     #[test]
     fn returns_failure_message_from_failed_sse_event() {
         let body = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exceeded\"}}}\n\n";
 
-        let err = extract_codex_image_generation_images(body).unwrap_err();
+        let err = extract_codex_image_generation_result(body).unwrap_err();
         assert!(err.0.contains("quota exceeded"));
     }
 }
