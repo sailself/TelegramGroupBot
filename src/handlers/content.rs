@@ -184,7 +184,7 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
                 }
             }
             StackEntry::Table(table) => {
-                if let Some(value) = render_table_pre(table) {
+                if let Some(value) = render_table_list(table) {
                     push_value(stack, root, value);
                 }
             }
@@ -242,7 +242,7 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
         value.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    fn render_table_pre(mut table: TableBuilder) -> Option<serde_json::Value> {
+    fn render_table_list(mut table: TableBuilder) -> Option<serde_json::Value> {
         if table.current_cell.is_some() {
             if let Some(cell) = table.current_cell.take() {
                 table
@@ -266,40 +266,50 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
             return None;
         }
 
-        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-        if columns == 0 {
+        let headers = rows[0].clone();
+        let data_rows = rows.iter().skip(1).collect::<Vec<_>>();
+        if data_rows.is_empty() {
             return None;
         }
 
-        let mut widths = vec![0usize; columns];
-        for row in &rows {
-            for (index, cell) in row.iter().enumerate() {
-                widths[index] = widths[index].max(cell.chars().count());
+        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let mut items = Vec::new();
+        for row in data_rows {
+            let mut children = Vec::new();
+            for index in 0..columns {
+                let cell = row.get(index).map(String::as_str).unwrap_or("").trim();
+                if cell.is_empty() {
+                    continue;
+                }
+                if !children.is_empty() {
+                    children.push(json!({ "tag": "br" }));
+                }
+                let header = headers
+                    .get(index)
+                    .map(String::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("Column");
+                children.push(json!({
+                    "tag": "strong",
+                    "children": [header]
+                }));
+                children.push(serde_json::Value::String(format!(": {}", cell)));
+            }
+            if !children.is_empty() {
+                items.push(json!({
+                    "tag": "li",
+                    "children": children
+                }));
             }
         }
 
-        let mut lines = Vec::new();
-        for (row_index, row) in rows.iter().enumerate() {
-            let mut cells = Vec::new();
-            for (index, width) in widths.iter().enumerate().take(columns) {
-                let cell = row.get(index).map(String::as_str).unwrap_or("");
-                let padding = width.saturating_sub(cell.chars().count());
-                cells.push(format!("{}{}", cell, " ".repeat(padding)));
-            }
-            lines.push(cells.join(" | ").trim_end().to_string());
-            if row_index == 0 && rows.len() > 1 {
-                let separator = widths
-                    .iter()
-                    .map(|width| "-".repeat((*width).max(3)))
-                    .collect::<Vec<_>>()
-                    .join("-+-");
-                lines.push(separator);
-            }
+        if items.is_empty() {
+            return None;
         }
 
         Some(json!({
-            "tag": "pre",
-            "children": [lines.join("\n")]
+            "tag": "ul",
+            "children": items
         }))
     }
 
@@ -1199,23 +1209,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn markdown_tables_render_as_telegraph_pre_blocks() {
+    fn markdown_tables_render_as_readable_telegraph_lists() {
         let nodes = markdown_to_telegraph_nodes(
-            "Intro\n\n| 指標 | 日本 NISA | 英國 ISA |\n|---|---:|---:|\n| 參與人數/帳戶 | **2,826萬個** | 1,500萬個 |\n\nAfter",
+            "Intro\n\n| Rank | Brand / division | Revenue |\n|---|---|---:|\n| 1 | **Gucci** | $5.99B |\n| 2 | Saint Laurent | $2.88B |\n\nAfter",
         );
 
-        let pre = nodes
+        let list = nodes
             .iter()
-            .find(|node| node.get("tag").and_then(|tag| tag.as_str()) == Some("pre"))
-            .expect("table should render as a pre block");
-        let table_text = pre["children"][0]
-            .as_str()
-            .expect("pre block should contain text");
+            .find(|node| node.get("tag").and_then(|tag| tag.as_str()) == Some("ul"))
+            .expect("table should render as a list");
+        let list_text = serde_json::to_string(list).expect("list should serialize");
 
-        assert!(table_text.contains("指標"));
-        assert!(table_text.contains("日本 NISA"));
-        assert!(table_text.contains("2,826萬個"));
-        assert!(!table_text.contains("|---"));
+        assert!(list_text.contains("Brand / division"));
+        assert!(list_text.contains("Gucci"));
+        assert!(list_text.contains("$5.99B"));
+        assert!(!list_text.contains("|---"));
     }
 
     #[test]
@@ -1227,6 +1235,6 @@ mod tests {
             .filter_map(|node| node.get("tag").and_then(|tag| tag.as_str()))
             .collect::<Vec<_>>();
 
-        assert_eq!(tags, vec!["p", "pre", "p"]);
+        assert_eq!(tags, vec!["p", "ul", "p"]);
     }
 }
