@@ -184,6 +184,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `LOG_LEVEL` - Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info`.
 - `PUBLISH_BOT_COMMANDS` - When `true`, publish the built-in command list on startup via Telegram `setMyCommands`. Default: `false`.
   - Warning: Telegram treats this as a replacement for the default-scope command list. Leave it `false` if you manage commands in BotFather.
+- `ENABLE_BOT_TO_BOT_AUTO_Q` - When `true`, auto-Q responds to another bot that mentions this bot or replies to this bot. This still ignores this bot's own messages. Default: `false`.
 - `MEDIA_GROUP_MAX_ITEMS` - Max cached media groups kept in memory at once. Default: `256`.
 - `MAX_TOOL_CONTEXT_ITEMS` - Max selected chat-search hits returned in the final `/s` response. Default: `10`.
 - `ENABLE_TLDR_INFOGRAPHIC` - When `true`, `/tldr` also runs the configured default image model for an infographic step. Default: `false`.

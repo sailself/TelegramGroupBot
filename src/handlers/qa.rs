@@ -157,11 +157,25 @@ pub fn should_auto_q_trigger(
     bot_user_id: i64,
     bot_username_lower: &str,
 ) -> bool {
+    should_auto_q_trigger_with_config(
+        message,
+        bot_user_id,
+        bot_username_lower,
+        CONFIG.enable_bot_to_bot_auto_q,
+    )
+}
+
+fn should_auto_q_trigger_with_config(
+    message: &Message,
+    bot_user_id: i64,
+    bot_username_lower: &str,
+    enable_bot_to_bot_auto_q: bool,
+) -> bool {
     if message
         .from
         .as_ref()
-        .map(|user| user.is_bot)
-        .unwrap_or(false)
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        == Some(bot_user_id)
     {
         return false;
     }
@@ -170,6 +184,16 @@ pub fn should_auto_q_trigger(
         return false;
     };
     if text.trim_start().starts_with('/') {
+        return false;
+    }
+
+    if !enable_bot_to_bot_auto_q
+        && message
+            .from
+            .as_ref()
+            .map(|user| user.is_bot)
+            .unwrap_or(false)
+    {
         return false;
     }
 
@@ -1391,6 +1415,7 @@ async fn process_request(
 mod tests {
     use super::*;
     use crate::handlers::media::MediaSummary;
+    use serde_json::json;
     use teloxide::types::InlineKeyboardButtonKind;
 
     fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPartyModelConfig {
@@ -1404,6 +1429,99 @@ mod tests {
             audio: false,
             tools: true,
         }
+    }
+
+    fn text_message_from(
+        sender_id: u64,
+        is_bot: bool,
+        text: &str,
+        entities: Vec<serde_json::Value>,
+    ) -> Message {
+        serde_json::from_value(json!({
+            "message_id": 42,
+            "date": 1,
+            "chat": {
+                "id": -100123,
+                "type": "group",
+                "title": "test group"
+            },
+            "from": {
+                "id": sender_id,
+                "is_bot": is_bot,
+                "first_name": if is_bot { "PeerBot" } else { "Human" },
+                "username": if is_bot { "peer_bot" } else { "human_user" }
+            },
+            "text": text,
+            "entities": entities
+        }))
+        .expect("test message should deserialize")
+    }
+
+    #[test]
+    fn auto_q_triggers_for_other_bot_mentioning_this_bot() {
+        let message = text_message_from(
+            1001,
+            true,
+            "@HelperBot please review this",
+            vec![json!({
+                "type": "mention",
+                "offset": 0,
+                "length": 10
+            })],
+        );
+
+        assert!(should_auto_q_trigger_with_config(
+            &message,
+            42,
+            "helperbot",
+            true
+        ));
+        assert_eq!(
+            build_auto_q_query(&message, 42, "helperbot").as_deref(),
+            Some("please review this")
+        );
+    }
+
+    #[test]
+    fn auto_q_ignores_other_bot_mentions_when_bot_to_bot_auto_q_disabled() {
+        let message = text_message_from(
+            1001,
+            true,
+            "@HelperBot please review this",
+            vec![json!({
+                "type": "mention",
+                "offset": 0,
+                "length": 10
+            })],
+        );
+
+        assert!(!should_auto_q_trigger_with_config(
+            &message,
+            42,
+            "helperbot",
+            false
+        ));
+    }
+
+    #[test]
+    fn auto_q_ignores_messages_from_this_bot() {
+        let message = text_message_from(
+            42,
+            true,
+            "@HelperBot please review this",
+            vec![json!({
+                "type": "mention",
+                "offset": 0,
+                "length": 10
+            })],
+        );
+
+        assert!(!should_auto_q_trigger_with_config(
+            &message,
+            42,
+            "helperbot",
+            true
+        ));
     }
 
     #[test]
