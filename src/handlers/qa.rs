@@ -634,25 +634,6 @@ fn has_available_third_party_models_for_request(
     .is_empty()
 }
 
-fn is_model_configured_for_request(
-    model_key: &str,
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
-) -> bool {
-    let normalized = normalize_model_identifier(model_key);
-    model_supports_media_for_request(
-        &normalized,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    )
-}
-
 fn model_supports_media_for_request(
     model_name: &str,
     has_images: bool,
@@ -698,6 +679,51 @@ struct ModelRequestCapabilities {
     has_audio: bool,
     has_documents: bool,
     require_tools: bool,
+}
+
+enum PendingQRequestCallbackAction {
+    Missing,
+    Ignored,
+    InvalidSelection,
+    UseDefault(PendingQRequest),
+    UseSelected(PendingQRequest),
+}
+
+fn take_pending_q_request_for_callback<F>(
+    pending: &mut std::collections::HashMap<String, PendingQRequest>,
+    request_key: &str,
+    query_user_id: i64,
+    now: i64,
+    timeout_secs: u64,
+    selected_model_is_allowed: F,
+) -> PendingQRequestCallbackAction
+where
+    F: FnOnce(&PendingQRequest) -> bool,
+{
+    let Some(request) = pending.get(request_key) else {
+        return PendingQRequestCallbackAction::Missing;
+    };
+
+    if request.original_user_id != query_user_id {
+        return PendingQRequestCallbackAction::Ignored;
+    }
+
+    let timeout_secs = i64::try_from(timeout_secs).unwrap_or(i64::MAX);
+    if now.saturating_sub(request.timestamp) > timeout_secs {
+        return pending
+            .remove(request_key)
+            .map(PendingQRequestCallbackAction::UseDefault)
+            .unwrap_or(PendingQRequestCallbackAction::Missing);
+    }
+
+    if !selected_model_is_allowed(request) {
+        return PendingQRequestCallbackAction::InvalidSelection;
+    }
+
+    pending
+        .remove(request_key)
+        .map(PendingQRequestCallbackAction::UseSelected)
+        .unwrap_or(PendingQRequestCallbackAction::Missing)
 }
 
 fn resolve_default_text_model_with_models(
@@ -1416,6 +1442,7 @@ mod tests {
     use super::*;
     use crate::handlers::media::MediaSummary;
     use serde_json::json;
+    use std::collections::HashMap;
     use teloxide::types::InlineKeyboardButtonKind;
 
     fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPartyModelConfig {
@@ -1429,6 +1456,83 @@ mod tests {
             audio: false,
             tools: true,
         }
+    }
+
+    fn pending_q_request(original_user_id: i64, timestamp: i64) -> PendingQRequest {
+        PendingQRequest {
+            user_id: original_user_id,
+            username: "Test User".to_string(),
+            query: "question".to_string(),
+            original_query: "question".to_string(),
+            db_query_text: "question".to_string(),
+            telegram_language_code: None,
+            media_files: Vec::new(),
+            youtube_urls: Vec::new(),
+            telegraph_contents: Vec::new(),
+            twitter_contents: Vec::new(),
+            chat_id: 123,
+            message_id: 456,
+            selection_message_id: 789,
+            original_user_id,
+            reply_to_message_id: None,
+            llm_invocation_id: None,
+            timestamp,
+            command_timer: None,
+            mode: QaCommandMode::Standard,
+        }
+    }
+
+    #[test]
+    fn callback_take_keeps_pending_request_for_wrong_user() {
+        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+
+        let action =
+            take_pending_q_request_for_callback(&mut pending, "request", 20, 105, 30, |_| true);
+
+        assert!(matches!(action, PendingQRequestCallbackAction::Ignored));
+        assert!(pending.contains_key("request"));
+    }
+
+    #[test]
+    fn callback_take_uses_default_model_when_selection_arrives_after_timeout() {
+        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+
+        let action =
+            take_pending_q_request_for_callback(&mut pending, "request", 10, 131, 30, |_| true);
+
+        let PendingQRequestCallbackAction::UseDefault(request) = action else {
+            panic!("expected expired callback to use the default model");
+        };
+        assert_eq!(request.original_user_id, 10);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn callback_take_keeps_pending_request_for_invalid_model_selection() {
+        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+
+        let action =
+            take_pending_q_request_for_callback(&mut pending, "request", 10, 105, 30, |_| false);
+
+        assert!(matches!(
+            action,
+            PendingQRequestCallbackAction::InvalidSelection
+        ));
+        assert!(pending.contains_key("request"));
+    }
+
+    #[test]
+    fn callback_take_consumes_pending_request_for_valid_selection() {
+        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+
+        let action =
+            take_pending_q_request_for_callback(&mut pending, "request", 10, 105, 30, |_| true);
+
+        let PendingQRequestCallbackAction::UseSelected(request) = action else {
+            panic!("expected valid callback to use the selected model");
+        };
+        assert_eq!(request.original_user_id, 10);
+        assert!(pending.is_empty());
     }
 
     fn text_message_from(
@@ -2664,10 +2768,18 @@ pub async fn qq_handler(
 pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String) {
     tokio::time::sleep(Duration::from_secs(CONFIG.model_selection_timeout)).await;
     let request = state.pending_q_requests.lock().remove(&request_key);
-    let Some(mut request) = request else {
+    let Some(request) = request else {
         return;
     };
 
+    process_timed_out_q_request_with_default_model(&bot, &state, request).await;
+}
+
+async fn process_timed_out_q_request_with_default_model(
+    bot: &Bot,
+    state: &AppState,
+    mut request: PendingQRequest,
+) {
     let summary = summarize_media_files(&request.media_files);
     let has_images = summary.images > 0;
     let has_video = summary.videos > 0;
@@ -2715,7 +2827,7 @@ pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String
         .await;
 
     let command_timer = request.command_timer.take();
-    let result = process_request(&bot, &state, request, &default_model).await;
+    let result = process_request(bot, state, request, &default_model).await;
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(
@@ -2758,84 +2870,45 @@ pub async fn model_selection_callback(
     };
 
     let request_key = format!("{}_{}", message.chat().id.0, message.id().0);
-    let request = {
+    let query_user_id = i64::try_from(query.from.id.0).unwrap_or_default();
+    let action = {
         let mut pending = state.pending_q_requests.lock();
-        pending.remove(&request_key)
+        take_pending_q_request_for_callback(
+            &mut pending,
+            &request_key,
+            query_user_id,
+            now_unix_seconds(),
+            CONFIG.model_selection_timeout,
+            |request| {
+                let summary = summarize_media_files(&request.media_files);
+                let has_images = summary.images > 0;
+                let has_video = summary.videos > 0;
+                let has_audio = summary.audios > 0;
+                let has_documents = summary.documents > 0;
+                model_supports_media_for_request(
+                    &selected_model,
+                    has_images,
+                    has_video,
+                    has_audio,
+                    has_documents,
+                    request.mode.requires_custom_tools(),
+                )
+            },
+        )
     };
-    let mut request = match request {
-        Some(req) => req,
-        None => {
-            bot.edit_message_text(message.chat().id, message.id(), "This request has expired.")
-                .reply_markup(InlineKeyboardMarkup::new(
-                    Vec::<Vec<InlineKeyboardButton>>::new(),
-                ))
-                .await?;
+
+    let mut request = match action {
+        PendingQRequestCallbackAction::UseSelected(request) => request,
+        PendingQRequestCallbackAction::UseDefault(request) => {
+            process_timed_out_q_request_with_default_model(&bot, &state, request).await;
             return Ok(());
         }
+        PendingQRequestCallbackAction::Missing
+        | PendingQRequestCallbackAction::Ignored
+        | PendingQRequestCallbackAction::InvalidSelection => return Ok(()),
     };
 
     let summary = summarize_media_files(&request.media_files);
-    let has_images = summary.images > 0;
-    let has_video = summary.videos > 0;
-    let has_audio = summary.audios > 0;
-    let has_documents = summary.documents > 0;
-    if !is_model_configured_for_request(
-        &selected_model,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        request.mode.requires_custom_tools(),
-    ) {
-        bot.answer_callback_query(query.id.clone()).await?;
-        return Ok(());
-    }
-
-    let query_user_id = i64::try_from(query.from.id.0).unwrap_or_default();
-    if request.original_user_id != query_user_id {
-        bot.answer_callback_query(query.id.clone()).await?;
-        return Ok(());
-    }
-
-    if now_unix_seconds() - request.timestamp > CONFIG.model_selection_timeout as i64 {
-        if let Some(mut timer) = request.command_timer.take() {
-            complete_command_timer(&mut timer, "expired", Some("selection_timeout".to_string()));
-        }
-        bot.edit_message_text(
-            message.chat().id,
-            message.id(),
-            "Selection timed out. Please try again.",
-        )
-        .reply_markup(InlineKeyboardMarkup::new(
-            Vec::<Vec<InlineKeyboardButton>>::new(),
-        ))
-        .await?;
-        return Ok(());
-    }
-
-    if !model_supports_media_for_request(
-        &selected_model,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        request.mode.requires_custom_tools(),
-    ) {
-        bot.edit_message_text(
-            message.chat().id,
-            message.id(),
-            if request.mode == QaCommandMode::ChatContext {
-                "Selected model cannot use the required tool set for this request. Please choose Gemini or a tool-capable model."
-            } else {
-                "Selected model does not support the attached media. Please choose Gemini."
-            },
-        )
-        .reply_markup(InlineKeyboardMarkup::new(
-            Vec::<Vec<InlineKeyboardButton>>::new(),
-        ))
-        .await?;
-        return Ok(());
-    }
 
     let display_name = configured_model_display_name(&selected_model);
 
