@@ -788,8 +788,10 @@ fn should_use_default_model_without_selection(
     gemini_available: bool,
     third_party_models_available_for_request: bool,
     runtime_model_count: usize,
+    query_message_is_from_bot: bool,
 ) -> bool {
     force_default_gemini
+        || query_message_is_from_bot
         || request.has_documents
         || (has_youtube_urls && gemini_available)
         || (!request.has_video && !third_party_models_available_for_request)
@@ -1845,6 +1847,20 @@ mod tests {
             true,
             true,
             1,
+            false,
+        ));
+    }
+
+    #[test]
+    fn bot_query_message_uses_default_model_without_selection() {
+        assert!(should_use_default_model_without_selection(
+            false,
+            ModelRequestCapabilities::default(),
+            false,
+            true,
+            true,
+            2,
+            true,
         ));
     }
 
@@ -2329,6 +2345,11 @@ async fn q_handler_internal(
     }
 
     let force_default_gemini = force_gemini && CONFIG.gemini_api_available() && !has_video;
+    let query_message_is_from_bot = message
+        .from
+        .as_ref()
+        .map(|user| user.is_bot)
+        .unwrap_or(false);
     let must_use_default_model = should_use_default_model_without_selection(
         force_default_gemini,
         request_capabilities,
@@ -2336,6 +2357,7 @@ async fn q_handler_internal(
         CONFIG.gemini_api_available(),
         third_party_models_available_for_request,
         runtime_model_count(),
+        query_message_is_from_bot,
     );
     let direct_model = if must_use_default_model {
         match resolve_default_text_model_for_request(
