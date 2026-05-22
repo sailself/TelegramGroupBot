@@ -50,7 +50,16 @@
 - Name format: `<task-name>_<YYYYMMDD_HHMMSS>.md` using a descriptive task name and timestamp.
 - Each log file must include:
   - The user prompt/request that triggered the work.
+  - The goal of this task
   - The implementation plan used.
-  - The actions completed (files changed, behavior added/updated).
+  - The actions completed (files touched, code change summary, commands run with results).
   - Validation performed (build/tests/other checks) and outcomes.
+  - Follow-ups or TODOs
+- Append when relevant (skip a heading if it's empty — don't pad):
+  - Design decisions — choices made when the spec/conversation was ambiguous, with the reason.
+  - Deviations — intentional departures from spec or original plan, with why.
+  - Tradeoffs — alternatives you'd defend to a reviewer, not micro-choices.
+  - Open questions — things you want the user to confirm or revise.
+  - Update at decision points, not on routine progress. At session end, re-read the originating prompt and check whether anything in the implementation contradicts a literal reading; if yes, log it under Deviations.
 - Do not include secrets, API keys, or sensitive runtime credentials in log content.
+
