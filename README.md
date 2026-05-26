@@ -272,6 +272,19 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - When the selected Codex model advertises native search support, the bot now uses Codex's built-in `web_search` Responses tool instead of the local external `web_search` function tool.
 - Codex requests also include a condensed response-style addendum tuned for direct answers and shorter Chinese output.
 
+### Hidden Img2 image generation (optional)
+- `/img2` is a hidden command: it is callable when enabled, but it is not published with `setMyCommands` and is not shown in `/help`.
+- `ENABLE_IMG2` - Enable the hidden `/img2` command. Default: `false`.
+- `IMG2_BASE_URL` - API base URL. Default: `https://wspark.taild6a660.ts.net:8443`.
+- `IMG2_API_KEY` - API key sent in the `X-API-Key` header. Keep this in `.env` or deployment secrets only.
+- `IMG2_GENERATE_PATH` - Generate endpoint path. Default: `/v1/images/generate`.
+- `IMG2_HEALTH_PATH` - Health endpoint path shown in `/status`. Default: `/v1/health`.
+- `IMG2_REQUEST_TIMEOUT_SECS` - Per-request timeout. Default: `300`.
+- `IMG2_MEDIA_DIR` - Server-side folder for generated PNG files. Default: `data/media/img2`.
+- `IMG2_WIDTH`, `IMG2_HEIGHT`, `IMG2_STEPS` - Optional multipart fields sent only when set to positive integers.
+- `/img2` sends only `prompt`, optional first replied source image, and the configured optional `width`/`height`/`steps` fields. It does not upload generated files to cwd.pw.
+- In Docker, the existing `./data:/app/data` mount persists the default `data/media/img2` folder.
+
 Example `third_party_models.json`:
 ```json
 {
@@ -355,6 +368,8 @@ sudo swapon /swapfile
 BOT_TOKEN=123456789:your-telegram-token
 GEMINI_API_KEY=your-gemini-key
 DATABASE_URL=sqlite:///bot.db
+ENABLE_IMG2=false
+IMG2_API_KEY=
 ```
 
 ## Notes and limitations

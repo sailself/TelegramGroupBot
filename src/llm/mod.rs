@@ -3,6 +3,7 @@ pub mod brave_search;
 pub mod codex_image;
 pub mod exa_search;
 pub mod gemini;
+pub mod img2_image;
 pub mod jina_search;
 pub mod media;
 pub mod openai_codex;
@@ -18,4 +19,5 @@ pub use gemini::{
     call_gemini, call_gemini_with_tool_runtime, generate_image_with_gemini,
     generate_music_with_lyria, generate_video_with_veo, GeminiImageConfig,
 };
+pub use img2_image::generate_image_with_img2;
 pub use third_party::{call_third_party, call_third_party_with_tool_runtime};

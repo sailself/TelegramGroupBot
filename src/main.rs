@@ -68,6 +68,8 @@ enum Command {
         description = "用 Gemini（或已配置的 Vertex）生成/编辑图片，可直接描述或回复图片/贴纸"
     )]
     Img(String),
+    #[command(description = "hidden image generation command")]
+    Img2(String),
     #[command(description = "与 /img 相同，但附带分辨率与长宽比按钮")]
     Image(String),
     #[command(description = "用 Veo 生成视频")]
@@ -433,6 +435,17 @@ async fn handle_command(
                 }
             });
         }
+        Command::Img2(arg) => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let arg = optional_arg(arg);
+            tokio::spawn(async move {
+                if let Err(err) = commands::img2_handler(bot, state, message, arg).await {
+                    error!("img2 handler failed: {err}");
+                }
+            });
+        }
         Command::Image(arg) => {
             let bot = bot.clone();
             let state = state.clone();
@@ -669,6 +682,18 @@ async fn ignore_message(_message: Message) -> HandlerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn img2_command_parses_but_is_not_published() {
+        assert!(<Command as BotCommands>::parse("/img2 draw a nebula", "test_bot").is_ok());
+
+        let commands = public_bot_commands_with_gemini(true)
+            .into_iter()
+            .map(|command| command.command)
+            .collect::<Vec<_>>();
+
+        assert!(!commands.iter().any(|command| command == "img2"));
+    }
 
     #[test]
     fn published_commands_exclude_gemini_only_commands_when_disabled() {

@@ -39,8 +39,9 @@ use crate::llm::runtime_models::{
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
     audit_context_from_id, call_gemini, call_third_party, create_audit_context_from_message,
-    generate_image_with_codex, generate_image_with_gemini, generate_music_with_lyria,
-    generate_video_with_veo, CodexImageConfig, GeminiImageConfig, LlmAuditContext,
+    generate_image_with_codex, generate_image_with_gemini, generate_image_with_img2,
+    generate_music_with_lyria, generate_video_with_veo, CodexImageConfig, GeminiImageConfig,
+    LlmAuditContext,
 };
 use crate::state::{
     AppState, ImageGenerationModel, MediaGroupItem, PendingImageCommand, PendingImageRequest,
@@ -49,7 +50,7 @@ use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::utils::logging::read_recent_log_lines;
 use crate::utils::telegram::start_chat_action_heartbeat;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const IMAGE_RESOLUTION_OPTIONS: [&str; 3] = ["2K", "4K", "1K"];
 const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 14] = [
@@ -908,6 +909,15 @@ async fn build_status_report(state: &AppState) -> String {
     report.push_str(&format!("ollama_ready: {}\n", bool_label(ollama_ready)));
     report.push_str(&format!("openai_ready: {}\n", bool_label(openai_ready)));
     report.push_str(&format!(
+        "img2_ready: {}\n",
+        bool_label(crate::llm::img2_image::img2_available())
+    ));
+    report.push_str(&format!(
+        "img2_health_url: {}\n",
+        crate::llm::img2_image::img2_health_url()
+    ));
+    report.push_str(&format!("img2_media_dir: {}\n", CONFIG.img2_media_dir));
+    report.push_str(&format!(
         "openai_codex_ready: {}\n",
         bool_label(codex_ready)
     ));
@@ -1147,6 +1157,19 @@ async fn build_image_caption(model_name: &str, prompt: &str) -> String {
     } else {
         base_caption
     }
+}
+
+fn build_img2_spoiler_caption(caption: &str) -> String {
+    format!("<tg-spoiler>{}</tg-spoiler>", caption)
+}
+
+fn build_img2_spoiler_photo_media(input_file: InputFile, caption: &str) -> InputMedia {
+    InputMedia::Photo(
+        InputMediaPhoto::new(input_file)
+            .caption(build_img2_spoiler_caption(caption))
+            .parse_mode(ParseMode::Html)
+            .spoiler(),
+    )
 }
 
 fn message_has_image(message: &Message) -> bool {
@@ -2308,6 +2331,124 @@ pub async fn img_handler(
         bot.send_photo(message.chat.id, InputFile::memory(image))
             .reply_parameters(ReplyParameters::new(message.id))
             .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn img2_handler(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    _prompt: Option<String>,
+) -> Result<()> {
+    if !check_access_control(&bot, &message, "img2").await {
+        return Ok(());
+    }
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+    if is_rate_limited(user_id) {
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
+
+    if !crate::llm::img2_image::img2_available() {
+        bot.send_message(
+            message.chat.id,
+            "Img2 image generation is disabled. Set ENABLE_IMG2=true and IMG2_API_KEY to enable it.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
+
+    let context = prepare_image_request(&bot, &state, &message, "/img2").await?;
+    if context.prompt.trim().is_empty() {
+        bot.send_message(message.chat.id, "Please provide a prompt for /img2.")
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await?;
+        return Ok(());
+    }
+
+    let _heavy_permit = state.acquire_heavy_command_permit().await;
+    let audit_context = create_command_audit_context(&state, &message, "img2").await;
+
+    let processing_message = bot
+        .send_message(message.chat.id, "Generating your image with img2...")
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+
+    let mut prompt_text = context.prompt.clone();
+    if !context.telegraph_contents.is_empty() {
+        prompt_text.push_str("\n\nAdditional context:\n");
+        for content in &context.telegraph_contents {
+            prompt_text.push_str(content);
+            prompt_text.push('\n');
+        }
+    }
+
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
+    let result = match generate_image_with_img2(
+        &prompt_text,
+        &context.image_urls,
+        message.chat.id.0,
+        message.id.0 as i64,
+        audit_context.as_ref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            error!("Img2 image generation failed: {}", err.0);
+            let _ = bot
+                .edit_message_text(
+                    message.chat.id,
+                    processing_message.id,
+                    format!(
+                        "Sorry, I couldn't generate the image with img2.\n\nError: {}",
+                        err.0
+                    ),
+                )
+                .await;
+            return Ok(());
+        }
+    };
+
+    info!(
+        "Sending Img2 image to Telegram: request_id={:?}, bytes={}, content_type={:?}, path={}",
+        result.request_id,
+        result.byte_len,
+        result.content_type,
+        result.path.display()
+    );
+    let caption = build_image_caption("img2", &prompt_text).await;
+    let media = build_img2_spoiler_photo_media(InputFile::file(result.path.clone()), &caption);
+    let edit_result = bot
+        .edit_message_media(message.chat.id, processing_message.id, media)
+        .await;
+    if edit_result.is_err() {
+        bot.send_photo(message.chat.id, InputFile::file(result.path.clone()))
+            .reply_parameters(ReplyParameters::new(message.id))
+            .caption(build_img2_spoiler_caption(&caption))
+            .parse_mode(ParseMode::Html)
+            .has_spoiler(true)
+            .await?;
+        let _ = bot
+            .edit_message_text(
+                message.chat.id,
+                processing_message.id,
+                "Generated image below.",
+            )
+            .await;
     }
 
     Ok(())
@@ -3553,13 +3694,8 @@ fn filter_gemini_help_text(help_text: &str, gemini_available: bool) -> String {
     text
 }
 
-#[allow(deprecated)]
-pub async fn help_handler(bot: Bot, message: Message) -> Result<()> {
-    if !check_access_control(&bot, &message, "help").await {
-        return Ok(());
-    }
-
-    let help_text = r#"
+fn command_help_text() -> &'static str {
+    r#"
 *TelegramGroupHelperBot 指令说明*
 
 /tldr - 汇总最近 N 条消息
@@ -3640,7 +3776,16 @@ Usage: `/codexreasoning`
 /codexusage - show current Codex usage/rate limits (admin only)
 Usage: `/codexusage`
 
-"#;
+"#
+}
+
+#[allow(deprecated)]
+pub async fn help_handler(bot: Bot, message: Message) -> Result<()> {
+    if !check_access_control(&bot, &message, "help").await {
+        return Ok(());
+    }
+
+    let help_text = command_help_text();
     let help_text = filter_gemini_help_text(help_text, CONFIG.gemini_api_available());
 
     bot.send_message(message.chat.id, help_text)
@@ -4018,6 +4163,34 @@ mod tests {
 
         assert_eq!(final_resolution, "2K");
         assert_eq!(final_aspect, None);
+    }
+
+    #[test]
+    fn help_text_keeps_img2_hidden() {
+        assert!(!command_help_text().contains("/img2"));
+    }
+
+    #[test]
+    fn img2_caption_is_wrapped_in_html_spoiler() {
+        assert_eq!(
+            build_img2_spoiler_caption("Generated by img2"),
+            "<tg-spoiler>Generated by img2</tg-spoiler>"
+        );
+    }
+
+    #[test]
+    fn img2_photo_media_uses_spoiler_flag_and_spoiler_caption() {
+        let media = build_img2_spoiler_photo_media(InputFile::file("img2.png"), "caption");
+
+        let InputMedia::Photo(photo) = media else {
+            panic!("img2 should use photo media");
+        };
+        assert!(photo.has_spoiler);
+        assert_eq!(
+            photo.caption.as_deref(),
+            Some("<tg-spoiler>caption</tg-spoiler>")
+        );
+        assert_eq!(photo.parse_mode, Some(ParseMode::Html));
     }
 
     #[test]

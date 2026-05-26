@@ -160,6 +160,16 @@ pub struct Config {
     pub openai_codex_request_timeout_secs: u64,
     pub openai_codex_image_responses_model: String,
     pub openai_codex_image_model: String,
+    pub enable_img2: bool,
+    pub img2_base_url: String,
+    pub img2_api_key: String,
+    pub img2_generate_path: String,
+    pub img2_health_path: String,
+    pub img2_request_timeout_secs: u64,
+    pub img2_media_dir: String,
+    pub img2_width: Option<u32>,
+    pub img2_height: Option<u32>,
+    pub img2_steps: Option<u32>,
     pub enable_jina_mcp: bool,
     pub jina_ai_api_key: String,
     pub jina_search_endpoint: String,
@@ -236,6 +246,20 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(default)
+}
+
+fn parse_optional_positive_u32(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn env_optional_positive_u32(name: &str) -> Option<u32> {
+    env::var(name)
+        .ok()
+        .and_then(|value| parse_optional_positive_u32(&value))
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -588,6 +612,16 @@ impl Config {
                 "gpt-5.5",
             ),
             openai_codex_image_model: env_string("OPENAI_CODEX_IMAGE_MODEL", "gpt-image-2"),
+            enable_img2: env_bool("ENABLE_IMG2", false),
+            img2_base_url: env_string("IMG2_BASE_URL", "https://wspark.taild6a660.ts.net:8443"),
+            img2_api_key: env_string("IMG2_API_KEY", ""),
+            img2_generate_path: env_string("IMG2_GENERATE_PATH", "/v1/images/generate"),
+            img2_health_path: env_string("IMG2_HEALTH_PATH", "/v1/health"),
+            img2_request_timeout_secs: env_timeout_secs("IMG2_REQUEST_TIMEOUT_SECS", 300),
+            img2_media_dir: env_string("IMG2_MEDIA_DIR", "data/media/img2"),
+            img2_width: env_optional_positive_u32("IMG2_WIDTH"),
+            img2_height: env_optional_positive_u32("IMG2_HEIGHT"),
+            img2_steps: env_optional_positive_u32("IMG2_STEPS"),
             enable_jina_mcp: env_bool("ENABLE_JINA_MCP", false),
             jina_ai_api_key: env_string("JINA_AI_API_KEY", ""),
             jina_search_endpoint: env_string("JINA_SEARCH_ENDPOINT", "https://s.jina.ai/search"),
@@ -665,6 +699,10 @@ impl Config {
 
     pub fn gemini_api_available(&self) -> bool {
         gemini_api_available_from(self.enable_gemini, &self.gemini_api_key)
+    }
+
+    pub fn img2_api_available(&self) -> bool {
+        self.enable_img2 && !self.img2_api_key.trim().is_empty()
     }
 }
 
@@ -889,6 +927,15 @@ mod tests {
             unique_raw,
             "nvidia:nvidia/llama-3.3-nemotron-super-49b-v1.5"
         );
+    }
+
+    #[test]
+    fn img2_optional_u32_values_are_positive_or_omitted() {
+        assert_eq!(parse_optional_positive_u32("1024"), Some(1024));
+        assert_eq!(parse_optional_positive_u32(" 4 "), Some(4));
+        assert_eq!(parse_optional_positive_u32(""), None);
+        assert_eq!(parse_optional_positive_u32("0"), None);
+        assert_eq!(parse_optional_positive_u32("wide"), None);
     }
 }
 
