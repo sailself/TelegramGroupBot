@@ -1224,7 +1224,10 @@ pub async fn call_responses_provider_with_tool_runtime(
         build_responses_system_prompt(system_prompt, model_config, Some(&runtime_guidance));
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
-    let native_codex_web_search_tool = build_native_codex_web_search_tool(model_config);
+    let native_codex_web_search_tool = runtime
+        .allows_web_search()
+        .then(|| build_native_codex_web_search_tool(model_config))
+        .flatten();
     let model_label = debug_model_label(model_config);
     debug!(
         "Responses provider runtime selected: provider={}, model={}, response_title={}, native_codex_web_search={}, image_count={}",

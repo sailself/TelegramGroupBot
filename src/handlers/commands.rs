@@ -3678,7 +3678,7 @@ fn filter_gemini_help_text(help_text: &str, gemini_available: bool) -> String {
         return text;
     }
 
-    for command in ["s", "vid", "mysong"] {
+    for command in ["vid", "mysong"] {
         let marker = format!("\n/{command} -");
         let Some(start) = text.find(&marker) else {
             continue;
@@ -4073,12 +4073,12 @@ mod tests {
     }
 
     #[test]
-    fn help_text_excludes_gemini_only_commands_when_disabled() {
+    fn help_text_keeps_search_when_gemini_is_disabled() {
         let raw =
             "\n/s - search\nusage\n\n/vid - video\nusage\n\n/mysong - song\nusage\n\n/q - ask\n";
         let filtered = filter_gemini_help_text(raw, false);
 
-        assert!(!filtered.contains("/s -"));
+        assert!(filtered.contains("/s -"));
         assert!(!filtered.contains("/vid -"));
         assert!(!filtered.contains("/mysong -"));
         assert!(filtered.contains("/q -"));

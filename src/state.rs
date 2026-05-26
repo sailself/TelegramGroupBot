@@ -17,11 +17,16 @@ use crate::utils::timing::CommandTimer;
 pub enum QaCommandMode {
     Standard,
     ChatContext,
+    ChatSearch,
 }
 
 impl QaCommandMode {
     pub fn requires_custom_tools(self) -> bool {
-        matches!(self, Self::ChatContext)
+        matches!(self, Self::ChatContext | Self::ChatSearch)
+    }
+
+    pub fn requires_chat_search_index(self) -> bool {
+        matches!(self, Self::ChatContext | Self::ChatSearch)
     }
 }
 

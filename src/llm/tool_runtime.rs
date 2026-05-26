@@ -153,6 +153,10 @@ impl ToolRuntime {
         self.budget.max_total_successful_calls
     }
 
+    pub fn allows_web_search(&self) -> bool {
+        self.profile == ToolProfile::ChatQuestion
+    }
+
     pub fn tool_limit_guidance(&self) -> String {
         match self.profile {
             ToolProfile::ChatQuestion => {
@@ -166,7 +170,7 @@ impl ToolRuntime {
 
     pub fn build_openai_function_tools(&self) -> Vec<Value> {
         let mut tools = Vec::new();
-        if self.profile == ToolProfile::ChatQuestion && web_search::is_search_enabled() {
+        if self.allows_web_search() && web_search::is_search_enabled() {
             tools.push(json!({
                 "type": "function",
                 "function": {
@@ -247,7 +251,7 @@ impl ToolRuntime {
 
     pub fn build_gemini_tools(&self) -> Vec<Value> {
         let mut declarations = Vec::new();
-        if self.profile == ToolProfile::ChatQuestion && web_search::is_search_enabled() {
+        if self.allows_web_search() && web_search::is_search_enabled() {
             declarations.push(json!({
                 "name": "web_search",
                 "description": "Search the web using the configured providers and return a concise Markdown summary.",

@@ -39,7 +39,7 @@ use crate::llm::{
 };
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
 use crate::utils::telegram::{build_message_link, start_chat_action_heartbeat};
-use crate::utils::timing::{complete_command_timer, start_command_timer};
+use crate::utils::timing::{complete_command_timer, start_command_timer, CommandTimer};
 use tracing::{error, info, warn};
 
 pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
@@ -51,6 +51,7 @@ const USER_ERROR_DETAIL_LIMIT: usize = 400;
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
 const NO_VIDEO_CAPABLE_MODEL_MESSAGE: &str =
     "No video-capable AI model is available. Enable Gemini or configure a ready third-party model with video=true.";
+const CHAT_SEARCH_JSON_OUTPUT_PROMPT: &str = "Final response format: return only valid JSON with this shape: {\"selected_message_ids\":[123],\"note\":\"optional short note\"}. Do not wrap the JSON in Markdown. Do not include message IDs that were not returned by chat_context_query.";
 
 const QC_SYSTEM_PROMPT: &str = "You are a helpful assistant in a Telegram group chat. You can use chat_context_query to retrieve messages from the current source chat only, and you must never assume access to any other chat. Use chat_context_query first when the user asks about prior discussion in this chat. Use web_search only for external or current facts that are not contained in the retrieved chat messages. Cite chat evidence with short snippets and the exact message link when chat history materially informs your answer. Cite web sources normally when web_search is used.\n\nGuidelines for your responses:\n1. Provide a direct, clear answer.\n2. Be concise but comprehensive.\n3. If you use retrieved chat messages, treat them as evidence from this chat only.\n4. If you use web search, cite the sources you relied on.\n5. IMPORTANT: The current UTC date and time is {current_datetime}.\n6. CRITICAL: You must decide the response language yourself using the same language policy as /q.\n7. Language policy:\n- Prefer the language of the user's actual question or request.\n- Ignore quoted text, links, usernames, slash commands, inline code, emojis, and other noise when deciding the response language.\n- If the replied-to content is in a different language from the user's current question, prioritize the current question unless the user explicitly asks you to answer in another language.\n- If the user's message is too short or ambiguous to infer reliably, use this Telegram user language hint: {telegram_user_language_hint}.\n- If that hint is missing, unknown, or still does not provide a reliable answer, default to Chinese.\n- When there is a clear instruction to answer in a specific language, follow that instruction.";
 
@@ -312,6 +313,15 @@ fn qa_mode_label(mode: QaCommandMode) -> &'static str {
     match mode {
         QaCommandMode::Standard => "standard",
         QaCommandMode::ChatContext => "chat_context",
+        QaCommandMode::ChatSearch => "chat_search",
+    }
+}
+
+fn qa_mode_command_name(mode: QaCommandMode) -> &'static str {
+    match mode {
+        QaCommandMode::Standard => "q",
+        QaCommandMode::ChatContext => "qc",
+        QaCommandMode::ChatSearch => "s",
     }
 }
 
@@ -1089,6 +1099,11 @@ struct ChatSearchSelection {
     note: Option<String>,
 }
 
+struct ChatSearchModelResponse {
+    text: String,
+    model_used: String,
+}
+
 fn chat_search_response_schema() -> Value {
     json!({
         "type": "object",
@@ -1109,7 +1124,27 @@ fn chat_search_response_schema() -> Value {
 }
 
 fn parse_chat_search_selection(text: &str) -> Option<ChatSearchSelection> {
-    serde_json::from_str::<ChatSearchSelection>(text).ok()
+    let trimmed = text.trim();
+    if let Ok(selection) = serde_json::from_str::<ChatSearchSelection>(trimmed) {
+        return Some(selection);
+    }
+
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim);
+    if let Some(candidate) = unfenced {
+        if let Ok(selection) = serde_json::from_str::<ChatSearchSelection>(candidate) {
+            return Some(selection);
+        }
+    }
+
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (start < end)
+        .then(|| &trimmed[start..=end])
+        .and_then(|candidate| serde_json::from_str::<ChatSearchSelection>(candidate).ok())
 }
 
 fn format_chat_search_results_html(
@@ -1225,6 +1260,165 @@ async fn send_chat_search_response(
     Ok(())
 }
 
+async fn run_chat_search_model(
+    state: &AppState,
+    request: &PendingQRequest,
+    query: &str,
+    model_name: &str,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<(ChatSearchModelResponse, ToolRuntime)> {
+    let mut runtime = ToolRuntime::for_search(state.db.clone(), request.chat_id);
+    let chat_search_prompt = CHAT_SEARCH_SYSTEM_PROMPT.replace(
+        "{result_target}",
+        &CONFIG.max_tool_context_items.to_string(),
+    );
+
+    let response = if model_name == MODEL_GEMINI {
+        call_gemini_with_tool_runtime(
+            &format!(
+                "{}\n\n{}",
+                chat_search_prompt,
+                runtime.tool_limit_guidance()
+            ),
+            query,
+            &mut runtime,
+            false,
+            None,
+            None,
+            Some("CHAT_SEARCH_SYSTEM_PROMPT"),
+            Some(chat_search_response_schema()),
+            audit_context,
+        )
+        .await
+        .map(|result| ChatSearchModelResponse {
+            text: result.text,
+            model_used: result.model_used,
+        })?
+    } else {
+        let third_party_prompt = format!(
+            "{}\n\n{}",
+            chat_search_prompt, CHAT_SEARCH_JSON_OUTPUT_PROMPT
+        );
+        let response = call_third_party_with_tool_runtime(
+            &third_party_prompt,
+            query,
+            model_name,
+            "Chat Search",
+            &[],
+            &mut runtime,
+            audit_context,
+        )
+        .await?;
+        ChatSearchModelResponse {
+            text: response,
+            model_used: result_model_display_name(model_name, None),
+        }
+    };
+
+    Ok((response, runtime))
+}
+
+async fn process_chat_search_request(
+    bot: &Bot,
+    state: &AppState,
+    request: &PendingQRequest,
+    query: &str,
+    model_name: &str,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<()> {
+    let (response, runtime) =
+        match run_chat_search_model(state, request, query, model_name, audit_context).await {
+            Ok(response) => response,
+            Err(err) => {
+                let message = format_llm_error_message(model_name, &err);
+                bot.edit_message_text(
+                    ChatId(request.chat_id),
+                    MessageId(request.selection_message_id as i32),
+                    message,
+                )
+                .await?;
+                return Err(err);
+            }
+        };
+
+    let max_selected_hits = CONFIG.max_tool_context_items;
+    let selection = parse_chat_search_selection(&response.text);
+    let mut selected_hits = selection
+        .as_ref()
+        .map(|selection| {
+            runtime.select_hits_by_message_ids(&selection.selected_message_ids, max_selected_hits)
+        })
+        .unwrap_or_default();
+    if selected_hits.len() > max_selected_hits {
+        selected_hits.truncate(max_selected_hits);
+    }
+
+    let note = selection
+        .as_ref()
+        .and_then(|value| value.note.as_deref().map(str::to_string))
+        .or_else(|| {
+            (selected_hits.len() < max_selected_hits).then(|| {
+                format!(
+                    "Fewer than {} clearly relevant messages were found within the 5 allowed search attempts.",
+                    max_selected_hits
+                )
+            })
+        });
+    let response_html = format_chat_search_results_html(
+        query,
+        &selected_hits,
+        note.as_deref(),
+        &response.model_used,
+    );
+
+    send_chat_search_response(
+        bot,
+        ChatId(request.chat_id),
+        MessageId(request.selection_message_id as i32),
+        &response_html,
+    )
+    .await
+}
+
+fn build_chat_search_pending_request(
+    message: &Message,
+    user_id: i64,
+    query_text: &str,
+    selection_message_id: i64,
+    audit_context: Option<&LlmAuditContext>,
+    command_timer: Option<CommandTimer>,
+) -> PendingQRequest {
+    PendingQRequest {
+        user_id,
+        username: message
+            .from
+            .as_ref()
+            .map(|user| user.full_name())
+            .unwrap_or_else(|| "Anonymous".to_string()),
+        query: query_text.to_string(),
+        original_query: query_text.to_string(),
+        db_query_text: query_text.to_string(),
+        telegram_language_code: message
+            .from
+            .as_ref()
+            .and_then(|user| user.language_code.as_deref())
+            .map(str::to_string),
+        media_files: Vec::new(),
+        youtube_urls: Vec::new(),
+        telegraph_contents: Vec::new(),
+        twitter_contents: Vec::new(),
+        chat_id: message.chat.id.0,
+        message_id: message.id.0 as i64,
+        selection_message_id,
+        original_user_id: user_id,
+        reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
+        llm_invocation_id: audit_context.map(|context| context.invocation_id),
+        timestamp: now_unix_seconds(),
+        command_timer,
+        mode: QaCommandMode::ChatSearch,
+    }
+}
+
 #[allow(deprecated)]
 async fn process_request(
     bot: &Bot,
@@ -1247,11 +1441,11 @@ async fn process_request(
 
     let _heavy_permit = state.acquire_heavy_command_permit().await;
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
-    if request.mode == QaCommandMode::ChatContext && !state.db.is_search_ready() {
+    if request.mode.requires_chat_search_index() && !state.db.is_search_ready() {
         bot.edit_message_text(
             ChatId(request.chat_id),
             MessageId(request.selection_message_id as i32),
-            chat_search_rebuilding_message("qc"),
+            chat_search_rebuilding_message(qa_mode_command_name(request.mode)),
         )
         .await?;
         return Ok(());
@@ -1262,6 +1456,7 @@ async fn process_request(
         QaCommandMode::ChatContext => {
             build_chat_context_system_prompt(request.telegram_language_code.as_deref())
         }
+        QaCommandMode::ChatSearch => String::new(),
     };
 
     let mut query = request.query.clone();
@@ -1313,6 +1508,17 @@ async fn process_request(
         start_chat_action_heartbeat(bot.clone(), ChatId(request.chat_id), ChatAction::Typing);
 
     let response = match request.mode {
+        QaCommandMode::ChatSearch => {
+            return process_chat_search_request(
+                bot,
+                state,
+                &request,
+                &query,
+                model_name,
+                audit_context.as_ref(),
+            )
+            .await;
+        }
         QaCommandMode::Standard => {
             if model_name == MODEL_GEMINI {
                 let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
@@ -2122,6 +2328,23 @@ mod tests {
         assert_eq!(text, query);
         assert!(urls.is_empty());
     }
+
+    #[test]
+    fn chat_search_mode_requires_custom_tools() {
+        assert!(QaCommandMode::ChatSearch.requires_custom_tools());
+        assert_eq!(qa_mode_label(QaCommandMode::ChatSearch), "chat_search");
+    }
+
+    #[test]
+    fn chat_search_selection_accepts_wrapped_json() {
+        let selection = parse_chat_search_selection(
+            "```json\n{\"selected_message_ids\":[42,43],\"note\":\"two hits\"}\n```",
+        )
+        .expect("wrapped JSON should parse");
+
+        assert_eq!(selection.selected_message_ids, vec![42, 43]);
+        assert_eq!(selection.note.as_deref(), Some("two hits"));
+    }
 }
 
 #[allow(deprecated)]
@@ -2617,18 +2840,6 @@ pub async fn s_handler(
     if !check_access_control(&bot, &message, "s").await {
         return Ok(());
     }
-    if !CONFIG.gemini_api_available() {
-        send_message_with_retry(
-            &bot,
-            message.chat.id,
-            "The /s command requires Gemini and is disabled.",
-            Some(message.id),
-            None,
-            None,
-        )
-        .await?;
-        return Ok(());
-    }
 
     let user_id = message
         .from
@@ -2684,96 +2895,123 @@ pub async fn s_handler(
         .await?;
         return Ok(());
     }
-    let _heavy_permit = state.acquire_heavy_command_permit().await;
     let audit_context = create_q_audit_context(&state, &message, "s").await;
 
-    let mut timer = start_command_timer("s", &message);
-    let processing_message = send_message_with_retry(
-        &bot,
-        message.chat.id,
-        "Searching this chat...",
-        Some(message.id),
-        None,
-        None,
-    )
-    .await?;
-    let _chat_action =
-        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-
-    let mut runtime = ToolRuntime::for_search(state.db.clone(), message.chat.id.0);
-    let chat_search_prompt = CHAT_SEARCH_SYSTEM_PROMPT.replace(
-        "{result_target}",
-        &CONFIG.max_tool_context_items.to_string(),
-    );
-    let response = call_gemini_with_tool_runtime(
-        &format!(
-            "{}\n\n{}",
-            chat_search_prompt,
-            runtime.tool_limit_guidance()
-        ),
-        &query_text,
-        &mut runtime,
+    let request_capabilities = ModelRequestCapabilities {
+        require_tools: true,
+        ..ModelRequestCapabilities::default()
+    };
+    let third_party_models_available_for_request =
+        has_available_third_party_models_for_request(false, false, false, false, true);
+    let must_use_default_model = should_use_default_model_without_selection(
         false,
-        None,
-        None,
-        Some("CHAT_SEARCH_SYSTEM_PROMPT"),
-        Some(chat_search_response_schema()),
-        audit_context.as_ref(),
-    )
-    .await;
-    let response = match response {
-        Ok(response) => response,
-        Err(err) => {
-            let message = format_llm_error_message(MODEL_GEMINI, &err);
-            bot.edit_message_text(processing_message.chat.id, processing_message.id, message)
+        request_capabilities,
+        false,
+        CONFIG.gemini_api_available(),
+        third_party_models_available_for_request,
+        runtime_model_count(),
+        false,
+    );
+    let direct_model = if must_use_default_model {
+        match resolve_default_text_model_for_request(false, false, false, false, true) {
+            Ok(model) => Some((model, "default_text_model")),
+            Err(err) => {
+                send_message_with_retry(
+                    &bot,
+                    message.chat.id,
+                    &err.to_string(),
+                    Some(message.id),
+                    None,
+                    None,
+                )
                 .await?;
-            complete_command_timer(
-                &mut timer,
-                "error",
-                Some("gemini_search_failed".to_string()),
-            );
-            return Err(err);
+                return Ok(());
+            }
+        }
+    } else {
+        let selectable_model_ids =
+            selectable_model_ids_for_request(false, false, false, false, true);
+        if selectable_model_ids.is_empty() {
+            send_message_with_retry(
+                &bot,
+                message.chat.id,
+                "No tool-capable AI model is available for /s. Enable Gemini or configure a ready third-party model with tools=true.",
+                Some(message.id),
+                None,
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+        if selectable_model_ids.len() == 1 {
+            selectable_model_ids
+                .into_iter()
+                .next()
+                .map(|model| (model, "single_selectable_model"))
+        } else {
+            None
         }
     };
 
-    let max_selected_hits = CONFIG.max_tool_context_items;
-    let selection = parse_chat_search_selection(&response.text);
-    let mut selected_hits = selection
-        .as_ref()
-        .map(|selection| {
-            runtime.select_hits_by_message_ids(&selection.selected_message_ids, max_selected_hits)
-        })
-        .unwrap_or_default();
-    if selected_hits.len() > max_selected_hits {
-        selected_hits.truncate(max_selected_hits);
+    if let Some((selected_model, timer_detail)) = direct_model {
+        let display_name = configured_model_display_name(&selected_model);
+        let processing_message = send_message_with_retry(
+            &bot,
+            message.chat.id,
+            &format!("Searching this chat with {}...", display_name),
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
+        let mut timer = start_command_timer("s", &message);
+        let pending_request = build_chat_search_pending_request(
+            &message,
+            user_id,
+            &query_text,
+            processing_message.id.0 as i64,
+            audit_context.as_ref(),
+            None,
+        );
+
+        let result = process_request(&bot, &state, pending_request, &selected_model).await;
+        let status = if result.is_ok() { "success" } else { "error" };
+        complete_command_timer(&mut timer, status, Some(timer_detail.to_string()));
+        result?;
+        return Ok(());
     }
 
-    let note = selection
-        .as_ref()
-        .and_then(|value| value.note.as_deref().map(str::to_string))
-        .or_else(|| {
-            (selected_hits.len() < max_selected_hits).then(|| {
-                format!(
-                    "Fewer than {} clearly relevant messages were found within the 5 allowed search attempts.",
-                    max_selected_hits
-                )
-            })
-        });
-    let response_html = format_chat_search_results_html(
-        &query_text,
-        &selected_hits,
-        note.as_deref(),
-        &response.model_used,
-    );
-
-    send_chat_search_response(
+    let keyboard = create_model_selection_keyboard(false, false, false, false, true);
+    let selection_message = send_message_with_retry(
         &bot,
-        processing_message.chat.id,
-        processing_message.id,
-        &response_html,
+        message.chat.id,
+        "Please select which AI model to use for chat search:",
+        Some(message.id),
+        None,
+        Some(keyboard),
     )
     .await?;
-    complete_command_timer(&mut timer, "success", None);
+    let request_key = format!("{}_{}", message.chat.id.0, selection_message.id.0);
+    let timer = start_command_timer("s", &message);
+    let pending_request = build_chat_search_pending_request(
+        &message,
+        user_id,
+        &query_text,
+        selection_message.id.0 as i64,
+        audit_context.as_ref(),
+        Some(timer),
+    );
+
+    state
+        .pending_q_requests
+        .lock()
+        .insert(request_key.clone(), pending_request);
+
+    let bot_clone = bot.clone();
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        handle_model_timeout(bot_clone, state_clone, request_key).await;
+    });
 
     Ok(())
 }
@@ -2934,7 +3172,9 @@ pub async fn model_selection_callback(
 
     let display_name = configured_model_display_name(&selected_model);
 
-    let processing_text = if summary.videos > 0 {
+    let processing_text = if request.mode == QaCommandMode::ChatSearch {
+        format!("Searching this chat with {}...", display_name)
+    } else if summary.videos > 0 {
         format!(
             "Analyzing video and processing your question with {}...",
             display_name

@@ -20,7 +20,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/burn_baby_burn` - Show how many tokens you have used in the current chat.
 - `/token_devourers [n]` - Show the top token consumers in the current group chat.
 - `/token_stats [model|user]` - Show bot-wide token usage totals (admin-only).
-- `/s` - Search this chat and return relevant message links.
+- `/s` - Search this chat with a tool-capable model and return relevant message links.
 - `/img` - Generate or edit an image with the configured default image model, or choose Gemini/Codex when Codex is enabled.
 - `/image` - Generate an image with selectable Gemini resolution/aspect ratio or Codex image size; timeout uses the configured default image model.
 - `/vid` - Generate a video from text.
@@ -197,7 +197,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
   - Example: `/tldr,/factcheck,/profileme,/mysong`
 
 ### Gemini settings
-- `ENABLE_GEMINI` - When `false`, Gemini API-backed models and Gemini-only commands (`/vid`, `/mysong`, `/s`) are disabled and hidden from model/command pickers. Default: `true`.
+- `ENABLE_GEMINI` - When `false`, Gemini API-backed models and Gemini-only commands (`/vid`, `/mysong`) are disabled and hidden from model/command pickers. `/s` remains available when another ready model with `tools=true` is configured. Default: `true`.
 - `GEMINI_MODEL` - Default Gemini model. Default: `gemini-2.0-flash`.
 - `GEMINI_LITE_MODEL` - Lite fallback model after `GEMINI_MODEL` failures. Default: `gemini-2.0-flash-lite`.
 - `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-2.5-pro-exp-03-25`.

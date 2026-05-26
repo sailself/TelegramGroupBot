@@ -229,7 +229,7 @@ fn public_bot_commands_with_gemini(gemini_available: bool) -> Vec<BotCommand> {
         BotCommand::new("support", "投喂AI小喵"),
     ];
     if !gemini_available {
-        commands.retain(|command| !matches!(command.command.as_str(), "s" | "vid" | "mysong"));
+        commands.retain(|command| !matches!(command.command.as_str(), "vid" | "mysong"));
     }
     commands
 }
@@ -696,13 +696,13 @@ mod tests {
     }
 
     #[test]
-    fn published_commands_exclude_gemini_only_commands_when_disabled() {
+    fn published_commands_keep_search_when_gemini_is_disabled() {
         let commands = public_bot_commands_with_gemini(false)
             .into_iter()
             .map(|command| command.command)
             .collect::<Vec<_>>();
 
-        assert!(!commands.iter().any(|command| command == "s"));
+        assert!(commands.iter().any(|command| command == "s"));
         assert!(!commands.iter().any(|command| command == "vid"));
         assert!(!commands.iter().any(|command| command == "mysong"));
         assert!(commands.iter().any(|command| command == "q"));
