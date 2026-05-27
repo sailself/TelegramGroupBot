@@ -73,6 +73,7 @@ const MYSONG_LLM_RETRY_BASE_DELAY_MS: u64 = 2_000;
 const MYSONG_DEFAULT_LANGUAGE: &str = "English";
 const TOKEN_DEVOURERS_DEFAULT_LIMIT: i64 = 5;
 const TOKEN_DEVOURERS_MAX_LIMIT: i64 = 20;
+const HELP_PARSE_MODE: Option<ParseMode> = None;
 const MYSONG_SUMMARY_SYSTEM_PROMPT: &str = r#"You are preparing a music-generation brief for a Telegram user's personal theme song.
 
 Analyze the user's recent chat history and summarize only stable patterns, not one-off comments.
@@ -3696,7 +3697,7 @@ fn filter_gemini_help_text(help_text: &str, gemini_available: bool) -> String {
 
 fn command_help_text() -> &'static str {
     r#"
-*TelegramGroupHelperBot 指令说明*
+TelegramGroupHelperBot 指令说明
 
 /tldr - 汇总最近 N 条消息
 用法：回复一条消息后发送 `/tldr`，会汇总从那条消息到现在的聊天内容。
@@ -3748,33 +3749,10 @@ fn command_help_text() -> &'static str {
 /portraitme - 基于你在本群的聊天记录生成肖像
 用法：`/portraitme`
 
-/status - 查看机器人状态（仅管理员）
-用法：`/status`
-
-/diagnose - 查看扩展诊断信息与最近日志（仅管理员）
-用法：`/diagnose`
-
-/token_stats - 查看全局 token 统计（仅管理员）
-用法：`/token_stats`、`/token_stats model`、`/token_stats user`
-
 /support - 查看投喂信息
 用法：`/support`
 
 /help - 查看这份帮助说明
-/codexlogin - log in to ChatGPT Codex (admin only)
-Usage: `/codexlogin`
-
-/codexlogout - log out from ChatGPT Codex (admin only)
-Usage: `/codexlogout`
-
-/codexmodel - choose the active Codex model (admin only)
-Usage: `/codexmodel`
-
-/codexreasoning - choose the active Codex reasoning level (admin only)
-Usage: `/codexreasoning`
-
-/codexusage - show current Codex usage/rate limits (admin only)
-Usage: `/codexusage`
 
 "#
 }
@@ -3788,10 +3766,16 @@ pub async fn help_handler(bot: Bot, message: Message) -> Result<()> {
     let help_text = command_help_text();
     let help_text = filter_gemini_help_text(help_text, CONFIG.gemini_api_available());
 
-    bot.send_message(message.chat.id, help_text)
-        .reply_parameters(ReplyParameters::new(message.id))
-        .parse_mode(ParseMode::Markdown)
-        .await?;
+    let request = bot
+        .send_message(message.chat.id, help_text)
+        .reply_parameters(ReplyParameters::new(message.id));
+
+    if let Some(parse_mode) = HELP_PARSE_MODE {
+        request.parse_mode(parse_mode).await?;
+    } else {
+        request.await?;
+    }
+
     Ok(())
 }
 
@@ -4082,6 +4066,11 @@ mod tests {
         assert!(!filtered.contains("/vid -"));
         assert!(!filtered.contains("/mysong -"));
         assert!(filtered.contains("/q -"));
+    }
+
+    #[test]
+    fn help_text_is_not_sent_with_markdown_parse_mode() {
+        assert!(HELP_PARSE_MODE.is_none());
     }
 
     #[test]
