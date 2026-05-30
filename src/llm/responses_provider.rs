@@ -224,8 +224,13 @@ async fn read_response_body_bytes(
             }
             Err(err) => {
                 let body_preview = truncate_for_log(&String::from_utf8_lossy(&body), 2000);
-                error!(
-                    "{} response body decode failed: model={}, attempt={}/{}, streaming_sse={}, timeout={}, connect={}, headers=[{}], partial_bytes={}, partial_body={}, error={}",
+                // A failure while streaming the body (e.g. an intermediary closing an
+                // idle chunked connection mid-reasoning) is transient and safe to retry,
+                // so log it as a warning while attempts remain and reserve `error!` for
+                // the final, give-up attempt.
+                let will_retry = attempt < RESPONSES_MAX_ATTEMPTS;
+                let log_message = format!(
+                    "{} response body decode failed: model={}, attempt={}/{}, streaming_sse={}, timeout={}, connect={}, headers=[{}], partial_bytes={}, retrying={}, partial_body={}, error={}",
                     display_name,
                     model,
                     attempt,
@@ -235,9 +240,15 @@ async fn read_response_body_bytes(
                     err.is_connect(),
                     header_summary,
                     body.len(),
+                    will_retry,
                     body_preview,
                     err
                 );
+                if will_retry {
+                    warn!("{log_message}");
+                } else {
+                    error!("{log_message}");
+                }
                 return Err(anyhow!(
                     "{} response body decode failed: {}",
                     display_name,
@@ -719,14 +730,31 @@ async fn call_provider_api(
             ));
         }
 
-        let (body_bytes, header_summary) = read_response_body_bytes(
+        let (body_bytes, header_summary) = match read_response_body_bytes(
             response,
             details.display_name,
             model,
             attempt,
             details.streaming_sse,
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            // The body stream was interrupted (e.g. a Cloudflare-fronted chunked SSE
+            // connection dropped while the model was reasoning and emitting no events).
+            // Re-issuing is safe: the payload is unchanged across attempts, and
+            // `store=false` means the failed attempt left no server-side state behind.
+            // So retry with the same backoff used for send-phase failures instead of
+            // surfacing the failure to the user. `read_response_body_bytes` already
+            // logged the diagnostics, including whether a retry would follow.
+            Err(err) => {
+                if attempt < RESPONSES_MAX_ATTEMPTS {
+                    tokio::time::sleep(responses_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        };
         debug!(
             "{} response headers for model={}: [{}]",
             details.display_name, model, header_summary
@@ -1406,5 +1434,115 @@ data: {"type":"response.completed","response":{"id":"resp1","output":[],"usage":
                 .and_then(|value| value.as_i64()),
             Some(12)
         );
+    }
+
+    #[tokio::test]
+    async fn read_response_body_bytes_errors_on_truncated_chunked_stream() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            // A valid first chunk, then the socket is dropped without the terminating
+            // `0\r\n\r\n` chunk — the exact "truncated mid-stream" shape from production.
+            let partial = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+            let _ = stream.write_all(partial.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let response = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request headers should arrive");
+        let result =
+            read_response_body_bytes(response, "Test", "test-model", 1, true).await;
+        assert!(
+            result.is_err(),
+            "a truncated chunked body must surface as an error so the loop can retry"
+        );
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_response_body_bytes_reads_complete_chunked_stream() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let full = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+            let _ = stream.write_all(full.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let response = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request headers should arrive");
+        let (body, _headers) = read_response_body_bytes(response, "Test", "test-model", 1, true)
+            .await
+            .expect("a complete chunked body should read cleanly");
+        assert_eq!(String::from_utf8(body).unwrap(), "hello");
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_provider_api_retries_after_truncated_stream() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            // Attempt 1: a truncated chunked SSE stream (connection drops mid-stream).
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let partial = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+                let _ = stream.write_all(partial.as_bytes());
+                let _ = stream.flush();
+            }
+            // Attempt 2: a complete SSE response the parser can consume.
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp1\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"recovered\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let details = ResponsesRequestDetails {
+            provider: ThirdPartyProvider::OpenAICodex,
+            display_name: "OpenAI Codex",
+            url: format!("http://{addr}/responses"),
+            headers: Vec::new(),
+            payload: json!({ "model": "gpt-5.5", "stream": true }),
+            streaming_sse: true,
+            request_timeout_secs: 30,
+        };
+
+        let value = call_provider_api(&details, None, "test:qa")
+            .await
+            .expect("the loop should recover from a single truncated stream by retrying");
+        let output = extract_response_output_items(&value);
+        assert_eq!(extract_response_text(&output), "recovered");
+        handle.join().unwrap();
     }
 }

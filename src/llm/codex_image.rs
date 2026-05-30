@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -358,17 +358,40 @@ fn extract_codex_image_generation_result(
     })
 }
 
-async fn read_response_body_limited(mut response: reqwest::Response) -> Result<String> {
+/// Failure reading a streaming Codex image response body.
+///
+/// `Stream` wraps a transient connection/stream read error (e.g. an idle
+/// chunked connection dropped by an intermediary mid-reasoning) and is safe to
+/// retry. `Fatal` covers deterministic failures (oversized or non-UTF-8 body)
+/// that will not succeed on a re-issue.
+enum CodexImageBodyError {
+    Stream(reqwest::Error),
+    Fatal(String),
+}
+
+async fn read_response_body_limited(
+    mut response: reqwest::Response,
+) -> std::result::Result<String, CodexImageBodyError> {
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        body.extend_from_slice(&chunk);
-        if body.len() > MAX_CODEX_IMAGE_SSE_BYTES {
-            return Err(anyhow!(
-                "OpenAI Codex image response exceeded the maximum size"
-            ));
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                body.extend_from_slice(&chunk);
+                if body.len() > MAX_CODEX_IMAGE_SSE_BYTES {
+                    return Err(CodexImageBodyError::Fatal(
+                        "OpenAI Codex image response exceeded the maximum size".to_string(),
+                    ));
+                }
+            }
+            Ok(None) => break,
+            Err(err) => return Err(CodexImageBodyError::Stream(err)),
         }
     }
-    String::from_utf8(body).context("OpenAI Codex image response was not valid UTF-8")
+    String::from_utf8(body).map_err(|_| {
+        CodexImageBodyError::Fatal(
+            "OpenAI Codex image response was not valid UTF-8".to_string(),
+        )
+    })
 }
 
 fn should_retry_error(err: &reqwest::Error) -> bool {
@@ -491,9 +514,35 @@ async fn call_codex_image_api(
             )));
         }
 
-        let body = read_response_body_limited(response)
-            .await
-            .map_err(|err| ImageGenerationError(err.to_string()))?;
+        let body = match read_response_body_limited(response).await {
+            Ok(body) => body,
+            // The body stream was interrupted (the same idle chunked-connection
+            // drop that affects Codex text streaming). Re-issue the identical
+            // request instead of failing the user outright.
+            Err(CodexImageBodyError::Stream(err)) => {
+                let retrying = attempt < CODEX_IMAGE_MAX_ATTEMPTS;
+                warn!(
+                    "OpenAI Codex image response body decode failed: model={}, error={}, timeout={}, connect={}, attempt={}/{}, retrying={}",
+                    model,
+                    err,
+                    err.is_timeout(),
+                    err.is_connect(),
+                    attempt,
+                    CODEX_IMAGE_MAX_ATTEMPTS,
+                    retrying
+                );
+                if retrying {
+                    tokio::time::sleep(retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(ImageGenerationError(format!(
+                    "OpenAI Codex image response body decode failed: {err}"
+                )));
+            }
+            Err(CodexImageBodyError::Fatal(message)) => {
+                return Err(ImageGenerationError(message));
+            }
+        };
         let result = extract_codex_image_generation_result(&body)?;
         let images = result.images;
         info!(
