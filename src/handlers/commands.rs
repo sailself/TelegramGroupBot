@@ -1173,7 +1173,7 @@ fn build_img2_spoiler_photo_media(input_file: InputFile, caption: &str) -> Input
     )
 }
 
-fn message_has_image(message: &Message) -> bool {
+pub(crate) fn message_has_image(message: &Message) -> bool {
     if message.photo().is_some() {
         return true;
     }

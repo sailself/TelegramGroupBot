@@ -15,6 +15,7 @@ use crate::config::{
 };
 use crate::db::database::build_message_insert;
 use crate::handlers::access::{check_access_control, is_rate_limited};
+use crate::handlers::commands::message_has_image;
 use crate::handlers::content::{
     download_telegraph_media, download_twitter_media, extract_telegraph_urls_and_content,
     extract_twitter_urls_and_content, extract_youtube_urls,
@@ -139,6 +140,19 @@ pub fn is_reply_to_this_bot(message: &Message, bot_user_id: i64) -> bool {
     i64::try_from(reply_from.id.0).ok() == Some(bot_user_id)
 }
 
+/// Whether the message this update replies to contains an image.
+///
+/// A reply to one of the bot's own image responses (`/img`, `/image`, `/img2`)
+/// is almost always a comment on the picture rather than a follow-up question,
+/// so the auto-`/q` reply trigger skips those unless the user also mentions the
+/// bot explicitly.
+fn reply_target_has_image(message: &Message) -> bool {
+    message
+        .reply_to_message()
+        .map(message_has_image)
+        .unwrap_or(false)
+}
+
 pub fn is_mentioning_this_bot(
     message: &Message,
     bot_user_id: i64,
@@ -199,7 +213,7 @@ fn should_auto_q_trigger_with_config(
     }
 
     is_mentioning_this_bot(message, bot_user_id, bot_username_lower)
-        || is_reply_to_this_bot(message, bot_user_id)
+        || (is_reply_to_this_bot(message, bot_user_id) && !reply_target_has_image(message))
 }
 
 pub fn build_auto_q_query(
@@ -1829,6 +1843,107 @@ mod tests {
         );
 
         assert!(!should_auto_q_trigger_with_config(
+            &message,
+            42,
+            "helperbot",
+            true
+        ));
+    }
+
+    fn reply_to_this_bot_message(
+        sender_id: u64,
+        text: &str,
+        entities: Vec<serde_json::Value>,
+        bot_user_id: u64,
+        reply_has_photo: bool,
+    ) -> Message {
+        let mut replied = json!({
+            "message_id": 7,
+            "date": 1,
+            "chat": {
+                "id": -100123,
+                "type": "group",
+                "title": "test group"
+            },
+            "from": {
+                "id": bot_user_id,
+                "is_bot": true,
+                "first_name": "HelperBot",
+                "username": "helperbot"
+            }
+        });
+        if reply_has_photo {
+            replied["photo"] = json!([{
+                "file_id": "photo-file-id",
+                "file_unique_id": "photo-unique-id",
+                "file_size": 1024,
+                "width": 90,
+                "height": 90
+            }]);
+        } else {
+            replied["text"] = json!("here is your answer");
+        }
+
+        serde_json::from_value(json!({
+            "message_id": 42,
+            "date": 1,
+            "chat": {
+                "id": -100123,
+                "type": "group",
+                "title": "test group"
+            },
+            "from": {
+                "id": sender_id,
+                "is_bot": false,
+                "first_name": "Human",
+                "username": "human_user"
+            },
+            "text": text,
+            "entities": entities,
+            "reply_to_message": replied
+        }))
+        .expect("test reply message should deserialize")
+    }
+
+    #[test]
+    fn auto_q_triggers_when_replying_to_bot_text_message() {
+        let message = reply_to_this_bot_message(1001, "tell me more", vec![], 42, false);
+
+        assert!(should_auto_q_trigger_with_config(
+            &message,
+            42,
+            "helperbot",
+            true
+        ));
+    }
+
+    #[test]
+    fn auto_q_skips_reply_to_bot_image_message() {
+        let message = reply_to_this_bot_message(1001, "nice picture", vec![], 42, true);
+
+        assert!(!should_auto_q_trigger_with_config(
+            &message,
+            42,
+            "helperbot",
+            true
+        ));
+    }
+
+    #[test]
+    fn auto_q_still_triggers_when_mentioning_bot_despite_reply_image() {
+        let message = reply_to_this_bot_message(
+            1001,
+            "@HelperBot describe this image",
+            vec![json!({
+                "type": "mention",
+                "offset": 0,
+                "length": 10
+            })],
+            42,
+            true,
+        );
+
+        assert!(should_auto_q_trigger_with_config(
             &message,
             42,
             "helperbot",
