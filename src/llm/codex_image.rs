@@ -388,9 +388,7 @@ async fn read_response_body_limited(
         }
     }
     String::from_utf8(body).map_err(|_| {
-        CodexImageBodyError::Fatal(
-            "OpenAI Codex image response was not valid UTF-8".to_string(),
-        )
+        CodexImageBodyError::Fatal("OpenAI Codex image response was not valid UTF-8".to_string())
     })
 }
 

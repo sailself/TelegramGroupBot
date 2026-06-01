@@ -756,7 +756,10 @@ mod tests {
                 })
                 .await
                 .expect("window query should succeed");
-            assert_eq!(result.get("operation").and_then(Value::as_str), Some("window"));
+            assert_eq!(
+                result.get("operation").and_then(Value::as_str),
+                Some("window")
+            );
 
             // P3 regression: every message surfaced via the window op is recorded,
             // so the /qc citation verifier won't flag them as fabricated.
