@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,9 @@ pub struct ToolRuntime {
     chat_context_query_calls: usize,
     force_final_answer: bool,
     accumulated_hits: BTreeMap<i64, ChatSearchHit>,
+    // Every message id surfaced to the model — search hits plus their context
+    // windows plus window-op results — used to verify /qc citations are real.
+    returned_message_ids: BTreeSet<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +127,7 @@ impl ToolRuntime {
             chat_context_query_calls: 0,
             force_final_answer: false,
             accumulated_hits: BTreeMap::new(),
+            returned_message_ids: BTreeSet::new(),
         }
     }
 
@@ -142,6 +146,7 @@ impl ToolRuntime {
             chat_context_query_calls: 0,
             force_final_answer: false,
             accumulated_hits: BTreeMap::new(),
+            returned_message_ids: BTreeSet::new(),
         }
     }
 
@@ -312,6 +317,13 @@ impl ToolRuntime {
         }));
 
         vec![json!({ "functionDeclarations": declarations })]
+    }
+
+    /// Message IDs that `chat_context_query` actually returned during this run.
+    /// Used to verify that a model's cited message links were genuinely
+    /// retrieved rather than fabricated.
+    pub fn accumulated_message_ids(&self) -> Vec<i64> {
+        self.returned_message_ids.iter().copied().collect()
     }
 
     pub fn select_hits_by_message_ids(&self, ids: &[i64], max_hits: usize) -> Vec<ChatSearchHit> {
@@ -505,26 +517,31 @@ impl ToolRuntime {
                     .await?;
                 for hit in &hits {
                     self.accumulated_hits.insert(hit.message_id, hit.clone());
+                    self.returned_message_ids.insert(hit.message_id);
                 }
 
                 let mut results = Vec::new();
                 for hit in hits {
-                    let context_messages = if context_before > 0 || context_after > 0 {
-                        self.db
-                            .get_message_window(
-                                self.chat_id,
-                                hit.message_id,
-                                context_before as i64,
-                                context_after as i64,
-                            )
-                            .await?
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(message_row_to_tool_message)
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let context_messages: Vec<ToolMessage> =
+                        if context_before > 0 || context_after > 0 {
+                            self.db
+                                .get_message_window(
+                                    self.chat_id,
+                                    hit.message_id,
+                                    context_before as i64,
+                                    context_after as i64,
+                                )
+                                .await?
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(message_row_to_tool_message)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                    for message in &context_messages {
+                        self.returned_message_ids.insert(message.message_id);
+                    }
                     results.push(hit_to_tool_search_hit(hit, context_messages));
                 }
 
@@ -563,6 +580,9 @@ impl ToolRuntime {
                     .into_iter()
                     .map(message_row_to_tool_message)
                     .collect::<Vec<_>>();
+                for message in &messages {
+                    self.returned_message_ids.insert(message.message_id);
+                }
 
                 Ok(json!({
                     "operation": "window",
@@ -684,6 +704,66 @@ mod tests {
         Database::init(&sqlite_url_for_path(&path))
             .await
             .expect("test database should initialize")
+    }
+
+    async fn insert_test_message(db: &Database, message_id: i64, chat_id: i64, text: &str) {
+        let insert = crate::db::database::build_message_insert(
+            Some(123_i64),
+            Some("tester".to_string()),
+            Some(text.to_string()),
+            Some("en".to_string()),
+            Utc::now(),
+            None,
+            Some(chat_id),
+            Some(message_id),
+            None,
+            false,
+            None,
+            text.trim_start().starts_with('/'),
+            false,
+        );
+        db.queue_message_insert(insert)
+            .await
+            .expect("message insert should queue");
+        // Wait for the async write queue to flush the row before querying it.
+        for _ in 0..200 {
+            if let Ok(Some(rows)) = db.get_message_window(chat_id, message_id, 0, 0).await {
+                if !rows.is_empty() {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("message {message_id} was not persisted in time");
+    }
+
+    #[test]
+    fn window_op_records_returned_message_ids_for_qc_verification() {
+        let runtime = Runtime::new().expect("tokio runtime should initialize");
+        runtime.block_on(async {
+            let db = init_test_db("qc-returned-ids").await;
+            let chat_id = -1001374348669_i64;
+            for (id, text) in [(10_i64, "first"), (11, "middle"), (12, "third")] {
+                insert_test_message(&db, id, chat_id, text).await;
+            }
+
+            let mut tool_runtime = ToolRuntime::for_qc(db, chat_id);
+            let result = tool_runtime
+                .run_chat_context_query(ChatContextQueryArgs::Window {
+                    message_id: 11,
+                    context_before: Some(2),
+                    context_after: Some(2),
+                })
+                .await
+                .expect("window query should succeed");
+            assert_eq!(result.get("operation").and_then(Value::as_str), Some("window"));
+
+            // P3 regression: every message surfaced via the window op is recorded,
+            // so the /qc citation verifier won't flag them as fabricated.
+            let mut ids = tool_runtime.accumulated_message_ids();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![10, 11, 12]);
+        });
     }
 
     #[test]

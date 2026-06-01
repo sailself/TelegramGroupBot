@@ -16,6 +16,7 @@ use crate::llm::responses_provider::{
     call_responses_provider, call_responses_provider_with_tool_runtime,
 };
 use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config};
+use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::get_http_client;
@@ -23,8 +24,6 @@ use crate::utils::http::get_http_client;
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const THIRD_PARTY_MAX_ATTEMPTS: usize = 3;
 const THIRD_PARTY_RETRY_BASE_DELAY_MS: u64 = 900;
-const TOOL_LIMIT_SYSTEM_PROMPT: &str = "Tool call limit reached. Provide the best possible answer using the available information without requesting more tool calls.";
-const THIRD_PARTY_TOOL_LIMIT_GUIDANCE: &str = "Third-party tool usage limit: you may use tools for at most {max_tool_calls} rounds total in this conversation. Plan your searches efficiently, avoid redundant tool calls, and after the final allowed tool round you must answer using the information already gathered without requesting more tool calls.";
 const OPENROUTER_REFERER: &str = "https://github.com/sailself/TelegramGroupHelperBot";
 const OPENROUTER_TITLE: &str = "TelegramGroupHelperBot";
 
@@ -142,9 +141,8 @@ fn build_third_party_system_prompt(
         return system_prompt.to_string();
     }
 
-    let tool_limit_guidance = THIRD_PARTY_TOOL_LIMIT_GUIDANCE
-        .replace("{max_tool_calls}", &MAX_TOOL_CALL_ITERATIONS.to_string());
-    format!("{system_prompt}\n\n{tool_limit_guidance}")
+    let guidance = tool_limit_guidance(MAX_TOOL_CALL_ITERATIONS);
+    format!("{system_prompt}\n\n{guidance}")
 }
 
 fn parse_gpt_content(content: &str) -> String {

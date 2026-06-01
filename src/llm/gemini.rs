@@ -1665,9 +1665,9 @@ pub async fn generate_image_with_gemini(
     }
 
     let base_instruction = if images.is_empty() {
-        "Generate an image based on the prompt. CRITICAL: response be an image, NOT TEXT."
+        "Generate an image from the prompt. Respond with an image, not text."
     } else {
-        "Edit the images based on the prompt. CRITICAL: response be an image, NOT TEXT."
+        "Edit the provided images according to the prompt. Respond with an image, not text."
     };
 
     let system_instruction = base_instruction.to_string();

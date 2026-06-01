@@ -14,6 +14,7 @@ use crate::llm::audit::{
 };
 use crate::llm::openai_codex;
 use crate::llm::runtime_models::selected_codex_model_record;
+use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::{get_http_client, get_http_client_no_compression};
@@ -21,29 +22,26 @@ use crate::utils::http::{get_http_client, get_http_client_no_compression};
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const RESPONSES_MAX_ATTEMPTS: usize = 3;
 const RESPONSES_RETRY_BASE_DELAY_MS: u64 = 900;
-const TOOL_LIMIT_SYSTEM_PROMPT: &str = "Tool call limit reached. Provide the best possible answer using the available information without requesting more tool calls.";
-const RESPONSES_TOOL_LIMIT_GUIDANCE: &str = "Tool usage limit: you may use tools for at most {max_tool_calls} rounds total in this conversation. Plan your searches efficiently, avoid redundant tool calls, and after the final allowed tool round you must answer using the information already gathered without requesting more tool calls.";
-const CODEX_RESPONSE_STYLE_ADDENDUM: &str = r#"# ROLE & STYLE
-                                            Be direct, highly informative, and brutally concise. Match depth to complexity. 
+const CODEX_RESPONSE_STYLE_ADDENDUM: &str = r#"# Style
+Be direct, highly informative, and concise. Match depth to complexity.
 
-                                            # THE PRIME DIRECTIVE: POSITIVE FRAMING ONLY
-                                            You must strictly use direct positive claims. NEVER use negation-based contrastive phrasing (e.g., "reject then correct" or "correct then reject") in any language. 
-                                            - BAD: 真正的创新者不是有创意的人，而是特质拉满的人。
-                                            - GOOD: 真正的创新者是特质拉满的人。
-                                            *Exception: strict logical/mathematical conditions.*
+# Framing
+Prefer direct positive claims over negation-contrastive phrasing ("not X, but Y") when a plain statement is clearer. This is a preference, not an absolute: keep contrastive phrasing when evaluating or correcting a claim genuinely needs it.
+- Weaker: 真正的创新者不是有创意的人，而是特质拉满的人。
+- Better: 真正的创新者是特质拉满的人。
 
-                                            # EXECUTION RULES
-                                            - Answers First: Lead with the core answer. For yes/no questions, answer first + 1 sentence reasoning. For comparisons, recommend one + brief reasoning.
-                                            - Concept Limits: Keep conceptual explanations to 3-5 sentences. Cover the essence. Do NOT restate points in "plain language" (No "简单来说", "翻成人话").
-                                            - Code: Provide code + non-trivial usage examples. 
-                                            - Lists: Max 3-4 points per side for pros/cons. Use bullets only for actual structural data, not decoration.
-                                            - Endings: Stop immediately after the final claim or concrete recommendation. 
+# Execution
+- Answers first: lead with the core answer. For yes/no questions, answer first + one sentence of reasoning. For comparisons, recommend one + brief reasoning.
+- Concept limits: keep conceptual explanations to 3-5 sentences; cover the essence. Do not restate points in "plain language".
+- Code: provide code + non-trivial usage examples.
+- Lists: at most 3-4 points per side; use bullets only for genuinely structural data, not decoration.
+- Endings: stop after the final claim or concrete recommendation.
 
-                                            # STRICT BLACKLIST (NEVER USE)
-                                            - Filler preambles: "I'd be happy to", "Great question", "Certainly", "首先我们需要", "让我们来看看".
-                                            - Restating the user's prompt.
-                                            - Summary labels: "In conclusion", "Hope this helps", "一句话总结", "总结一下", "简而言之", "概括来说".
-                                            - Conditional follow-ups: "If you want, I can...", "如果你愿意，我可以...", "If you need more details..."."#;
+# Avoid (in whatever language you answer)
+- Filler preambles (e.g. "Great question", "Certainly", "首先我们需要").
+- Restating the user's prompt.
+- Summary-label closers (e.g. "In conclusion", "Hope this helps", "总结一下").
+- Conditional follow-up offers (e.g. "If you want, I can...", "如果你愿意，我可以...")."#;
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -285,7 +283,7 @@ fn responses_request_timeout_secs(provider: ThirdPartyProvider) -> u64 {
 }
 
 fn responses_tool_limit_guidance() -> String {
-    RESPONSES_TOOL_LIMIT_GUIDANCE.replace("{max_tool_calls}", &MAX_TOOL_CALL_ITERATIONS.to_string())
+    tool_limit_guidance(MAX_TOOL_CALL_ITERATIONS)
 }
 
 fn build_responses_system_prompt(
@@ -1347,8 +1345,12 @@ mod tests {
         );
 
         assert!(instructions.contains("Base prompt"));
-        assert!(instructions.contains("POSITIVE FRAMING ONLY"));
+        assert!(instructions.contains("Answers first"));
         assert!(instructions.contains("Tool guidance"));
+        // The addendum must be left-aligned: no source indentation may bleed
+        // into the prompt the model receives.
+        assert!(instructions.contains("\n# Style"));
+        assert!(!instructions.contains("    # Style"));
     }
 
     #[test]
@@ -1459,8 +1461,7 @@ data: {"type":"response.completed","response":{"id":"resp1","output":[],"usage":
             .send()
             .await
             .expect("request headers should arrive");
-        let result =
-            read_response_body_bytes(response, "Test", "test-model", 1, true).await;
+        let result = read_response_body_bytes(response, "Test", "test-model", 1, true).await;
         assert!(
             result.is_err(),
             "a truncated chunked body must surface as an error so the loop can retry"
