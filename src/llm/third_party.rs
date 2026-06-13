@@ -858,6 +858,7 @@ pub async fn call_third_party_with_tool_runtime(
             &image_data_list,
             runtime,
             audit_context,
+            None,
         )
         .await;
     }
@@ -882,6 +883,33 @@ pub async fn call_third_party(
     supports_tools: bool,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<String> {
+    call_third_party_with_reasoning(
+        system_prompt,
+        user_content,
+        model_id,
+        response_title,
+        media_files,
+        supports_tools,
+        audit_context,
+        None,
+    )
+    .await
+}
+
+/// Like [`call_third_party`], with a per-call reasoning-effort override that
+/// applies to Responses-provider models (OpenAI Codex). Other providers ignore
+/// the override.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_third_party_with_reasoning(
+    system_prompt: &str,
+    user_content: &str,
+    model_id: &str,
+    response_title: &str,
+    media_files: &[MediaFile],
+    supports_tools: bool,
+    audit_context: Option<&LlmAuditContext>,
+    reasoning_override: Option<&str>,
+) -> Result<String> {
     if model_id.trim().is_empty() {
         return Err(anyhow!("Model identifier is required"));
     }
@@ -891,6 +919,34 @@ pub async fn call_third_party(
         .cloned()
         .or_else(|| runtime_model_config(model_id))
         .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))?;
+    call_third_party_with_reasoning_config(
+        system_prompt,
+        user_content,
+        &model_config,
+        response_title,
+        media_files,
+        supports_tools,
+        audit_context,
+        reasoning_override,
+    )
+    .await
+}
+
+/// Variant of [`call_third_party_with_reasoning`] that takes an already
+/// resolved model config, so callers can use synthesized configs that are not
+/// in the runtime catalog (e.g. a foreign Codex slug used as agent step model).
+#[allow(clippy::too_many_arguments)]
+pub async fn call_third_party_with_reasoning_config(
+    system_prompt: &str,
+    user_content: &str,
+    model_config: &ThirdPartyModelConfig,
+    response_title: &str,
+    media_files: &[MediaFile],
+    supports_tools: bool,
+    audit_context: Option<&LlmAuditContext>,
+    reasoning_override: Option<&str>,
+) -> Result<String> {
+    let model_config = model_config.clone();
     if matches!(
         model_config.provider,
         ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
@@ -904,6 +960,7 @@ pub async fn call_third_party(
             &image_data_list,
             supports_tools,
             audit_context,
+            reasoning_override,
         )
         .await;
     }

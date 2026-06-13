@@ -343,6 +343,37 @@ impl ToolRuntime {
         selected
     }
 
+    /// Programmatic chat search for the agentic pipelines. Consumes the same
+    /// `chat_context_query` budget as a model-driven call and records hits and
+    /// returned message ids, so accumulated state and downstream citation
+    /// verification behave identically.
+    pub async fn run_search_query(
+        &mut self,
+        query: &str,
+        limit: Option<usize>,
+        context_before: usize,
+        context_after: usize,
+    ) -> Result<Value> {
+        self.begin_tool_call(ToolName::ChatContextQuery)
+            .map_err(|err| anyhow!(tool_budget_error_parts(err).1))?;
+        self.run_chat_context_query(ChatContextQueryArgs::Search {
+            query: query.to_string(),
+            limit,
+            offset: None,
+            context_before: Some(context_before),
+            context_after: Some(context_after),
+        })
+        .await
+    }
+
+    /// Programmatic web search consuming the same `web_search` budget (and
+    /// profile gating) as a model-driven call.
+    pub async fn run_web_search(&mut self, query: &str, max_results: usize) -> Result<String> {
+        self.begin_tool_call(ToolName::WebSearch)
+            .map_err(|err| anyhow!(tool_budget_error_parts(err).1))?;
+        web_search_tool(query, Some(max_results.clamp(1, MAX_WEB_RESULTS))).await
+    }
+
     pub async fn execute_tool(&mut self, name: &str, arguments: &Value) -> String {
         match name {
             "web_search" => match self.begin_tool_call(ToolName::WebSearch) {
@@ -616,25 +647,29 @@ impl ToolRuntime {
     }
 
     fn tool_budget_error_payload(&self, tool: &str, error: ToolBudgetError) -> String {
-        let (error_code, message) = match error.kind {
-            ToolBudgetErrorKind::Total => (
-                "total_budget_exhausted",
-                "The total tool-call budget for this request is exhausted. Answer using the evidence already gathered.",
-            ),
-            ToolBudgetErrorKind::WebSearch => (
-                "web_search_budget_exhausted",
-                "The web_search budget for this request is exhausted. Answer using the evidence already gathered.",
-            ),
-            ToolBudgetErrorKind::ChatContextQuery => (
-                "chat_context_query_budget_exhausted",
-                "The chat_context_query budget for this request is exhausted. Answer using the evidence already gathered.",
-            ),
-            ToolBudgetErrorKind::Disabled => (
-                "tool_disabled",
-                "This tool is unavailable for the current request. Answer using the evidence already gathered.",
-            ),
-        };
+        let (error_code, message) = tool_budget_error_parts(error);
         self.error_payload(tool, error_code, message)
+    }
+}
+
+fn tool_budget_error_parts(error: ToolBudgetError) -> (&'static str, &'static str) {
+    match error.kind {
+        ToolBudgetErrorKind::Total => (
+            "total_budget_exhausted",
+            "The total tool-call budget for this request is exhausted. Answer using the evidence already gathered.",
+        ),
+        ToolBudgetErrorKind::WebSearch => (
+            "web_search_budget_exhausted",
+            "The web_search budget for this request is exhausted. Answer using the evidence already gathered.",
+        ),
+        ToolBudgetErrorKind::ChatContextQuery => (
+            "chat_context_query_budget_exhausted",
+            "The chat_context_query budget for this request is exhausted. Answer using the evidence already gathered.",
+        ),
+        ToolBudgetErrorKind::Disabled => (
+            "tool_disabled",
+            "This tool is unavailable for the current request. Answer using the evidence already gathered.",
+        ),
     }
 }
 
@@ -766,6 +801,62 @@ mod tests {
             let mut ids = tool_runtime.accumulated_message_ids();
             ids.sort_unstable();
             assert_eq!(ids, vec![10, 11, 12]);
+        });
+    }
+
+    #[test]
+    fn programmatic_search_consumes_budget_and_records_ids() {
+        let runtime = Runtime::new().expect("tokio runtime should initialize");
+        runtime.block_on(async {
+            let db = init_test_db("programmatic-search").await;
+            let chat_id = -1001374348669_i64;
+            for (id, text) in [(21_i64, "rust telegram bot"), (22, "unrelated chatter")] {
+                insert_test_message(&db, id, chat_id, text).await;
+            }
+
+            let mut tool_runtime = ToolRuntime::for_qc(db, chat_id);
+            let result = tool_runtime
+                .run_search_query("telegram", None, 0, 0)
+                .await
+                .expect("programmatic search should succeed");
+            assert_eq!(
+                result.get("operation").and_then(Value::as_str),
+                Some("search")
+            );
+
+            assert!(tool_runtime.accumulated_message_ids().contains(&21));
+            assert_eq!(tool_runtime.successful_calls, 1);
+            assert_eq!(tool_runtime.chat_context_query_calls, 1);
+        });
+    }
+
+    #[test]
+    fn programmatic_web_search_blocked_for_search_profile() {
+        let runtime = Runtime::new().expect("tokio runtime should initialize");
+        runtime.block_on(async {
+            let db = init_test_db("programmatic-web-blocked").await;
+            let mut tool_runtime = ToolRuntime::for_search(db, -1001374348669);
+
+            // The search profile has no web budget, so this is rejected by the
+            // budget gate before any network access happens.
+            let result = tool_runtime.run_web_search("anything", 3).await;
+            assert!(result.is_err());
+            assert!(tool_runtime.force_final_answer());
+            assert_eq!(tool_runtime.web_search_calls, 0);
+        });
+    }
+
+    #[test]
+    fn programmatic_search_errors_once_budget_is_exhausted() {
+        let runtime = Runtime::new().expect("tokio runtime should initialize");
+        runtime.block_on(async {
+            let db = init_test_db("programmatic-budget-exhausted").await;
+            let mut tool_runtime = ToolRuntime::for_qc(db, -1001374348669);
+            tool_runtime.successful_calls = tool_runtime.budget.max_total_successful_calls;
+
+            let result = tool_runtime.run_search_query("anything", None, 0, 0).await;
+            assert!(result.is_err());
+            assert!(tool_runtime.force_final_answer());
         });
     }
 

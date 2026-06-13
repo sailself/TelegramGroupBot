@@ -21,4 +21,6 @@ pub use gemini::{
     generate_music_with_lyria, generate_video_with_veo, GeminiImageConfig,
 };
 pub use img2_image::generate_image_with_img2;
-pub use third_party::{call_third_party, call_third_party_with_tool_runtime};
+pub use third_party::{
+    call_third_party, call_third_party_with_reasoning_config, call_third_party_with_tool_runtime,
+};

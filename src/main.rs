@@ -9,6 +9,7 @@ use teloxide::types::BotCommand;
 use teloxide::utils::command::BotCommands;
 use tracing::{error, info, warn};
 
+mod agents;
 mod config;
 mod db;
 mod handlers;

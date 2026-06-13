@@ -39,6 +39,7 @@ use crate::llm::{
     call_third_party_with_tool_runtime,
 };
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
+use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::{build_message_link, start_chat_action_heartbeat};
 use crate::utils::timing::{complete_command_timer, start_command_timer, CommandTimer};
 use tracing::{error, info, warn};
@@ -1151,27 +1152,7 @@ fn chat_search_response_schema() -> Value {
 }
 
 fn parse_chat_search_selection(text: &str) -> Option<ChatSearchSelection> {
-    let trimmed = text.trim();
-    if let Ok(selection) = serde_json::from_str::<ChatSearchSelection>(trimmed) {
-        return Some(selection);
-    }
-
-    let unfenced = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .map(str::trim);
-    if let Some(candidate) = unfenced {
-        if let Ok(selection) = serde_json::from_str::<ChatSearchSelection>(candidate) {
-            return Some(selection);
-        }
-    }
-
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    (start < end)
-        .then(|| &trimmed[start..=end])
-        .and_then(|candidate| serde_json::from_str::<ChatSearchSelection>(candidate).ok())
+    crate::agents::step::parse_lenient_json::<ChatSearchSelection>(text)
 }
 
 /// Collect message IDs referenced via `t.me/c/<chat>/<id>` links for the current
@@ -1622,37 +1603,75 @@ async fn process_request(
             }
         }
         QaCommandMode::ChatContext => {
-            let mut runtime = ToolRuntime::for_qc(state.db.clone(), request.chat_id);
-            let qc_result = if model_name == MODEL_GEMINI {
-                let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
-                call_gemini_with_tool_runtime(
-                    &format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance()),
-                    &query,
-                    &mut runtime,
-                    use_pro,
-                    Some(request.media_files.clone()),
-                    Some(request.youtube_urls.clone()),
-                    Some("QC_SYSTEM_PROMPT"),
-                    None,
-                    audit_context.as_ref(),
-                )
-                .await
-                .map(|result| (result.text, Some(result.model_used)))
-            } else {
-                call_third_party_with_tool_runtime(
-                    &system_prompt,
+            let mut agentic_result: Option<Result<(String, Option<String>)>> = None;
+            if CONFIG.enable_agentic_qc {
+                let mut progress_reporter = ProgressReporter::new(
+                    bot.clone(),
+                    ChatId(request.chat_id),
+                    MessageId(request.selection_message_id as i32),
+                );
+                match crate::agents::qc::run_qc_pipeline(
+                    &state.db,
+                    request.chat_id,
                     &query,
                     model_name,
-                    "Answer about Chat",
+                    &system_prompt,
                     &request.media_files,
-                    &mut runtime,
+                    &request.youtube_urls,
                     audit_context.as_ref(),
+                    &mut progress_reporter,
                 )
                 .await
-                .map(|result| (result, None))
-            };
-            qc_valid_message_ids = runtime.accumulated_message_ids();
-            qc_result
+                {
+                    Ok(crate::agents::qc::QcPipelineResult::Answer(outcome)) => {
+                        qc_valid_message_ids = outcome.valid_message_ids;
+                        agentic_result = Some(Ok((outcome.answer, outcome.gemini_model_used)));
+                    }
+                    Ok(crate::agents::qc::QcPipelineResult::UseLegacy(reason)) => {
+                        info!("Agentic /qc fell back to the legacy tool loop: {reason}");
+                    }
+                    Err(err) => {
+                        agentic_result = Some(Err(err));
+                    }
+                }
+            }
+
+            if let Some(result) = agentic_result {
+                result
+            } else {
+                let mut runtime = ToolRuntime::for_qc(state.db.clone(), request.chat_id);
+                let qc_result = if model_name == MODEL_GEMINI {
+                    let use_pro =
+                        !request.media_files.is_empty() || !request.youtube_urls.is_empty();
+                    call_gemini_with_tool_runtime(
+                        &format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance()),
+                        &query,
+                        &mut runtime,
+                        use_pro,
+                        Some(request.media_files.clone()),
+                        Some(request.youtube_urls.clone()),
+                        Some("QC_SYSTEM_PROMPT"),
+                        None,
+                        audit_context.as_ref(),
+                    )
+                    .await
+                    .map(|result| (result.text, Some(result.model_used)))
+                } else {
+                    call_third_party_with_tool_runtime(
+                        &system_prompt,
+                        &query,
+                        model_name,
+                        "Answer about Chat",
+                        &request.media_files,
+                        &mut runtime,
+                        audit_context.as_ref(),
+                    )
+                    .await
+                    .map(|result| (result, None))
+                };
+                qc_valid_message_ids = runtime.accumulated_message_ids();
+                qc_result
+            }
         }
     };
     let (response, gemini_model_used) = match response {

@@ -1409,6 +1409,55 @@ pub async fn call_gemini_with_tool_runtime(
     })
 }
 
+/// Single Gemini call against a specific model, with optional media and an
+/// optional JSON response schema, and no tools or pro/lite fallback chain.
+/// This is the cheap-step primitive used by the agentic pipelines (typically
+/// with `CONFIG.gemini_lite_model`).
+#[allow(clippy::too_many_arguments)]
+pub async fn call_gemini_model_simple(
+    model: &str,
+    system_prompt: &str,
+    user_content: &str,
+    media_files: Option<Vec<MediaFile>>,
+    response_json_schema: Option<&Value>,
+    system_prompt_label: Option<&str>,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
+) -> Result<GeminiCallResult> {
+    ensure_gemini_api_available()?;
+    let files = media_files.unwrap_or_default();
+    let uploaded_files = if files.is_empty() {
+        Vec::new()
+    } else {
+        upload_media_files(&files).await?
+    };
+    let text_after_media = !uploaded_files.is_empty();
+    let parts = build_gemini_file_parts(user_content, &uploaded_files, &[], text_after_media);
+
+    let payload = json!({
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "contents": [json!({ "role": "user", "parts": parts })],
+        "generationConfig": with_response_json_schema(
+            base_generation_config(),
+            response_json_schema
+        ),
+        "safetySettings": build_safety_settings(),
+    });
+
+    let response = call_gemini_api_value(
+        model,
+        payload,
+        system_prompt_label,
+        audit_context,
+        operation,
+    )
+    .await?;
+    Ok(GeminiCallResult {
+        text: extract_text_from_response_value(&response),
+        model_used: model.to_string(),
+    })
+}
+
 async fn call_gemini_lite_fallback(
     payload: &serde_json::Value,
     system_prompt_label: Option<&str>,

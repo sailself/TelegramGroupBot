@@ -189,6 +189,21 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `MAX_TOOL_CONTEXT_ITEMS` - Max selected chat-search hits returned in the final `/s` response. Default: `10`.
 - `ENABLE_TLDR_INFOGRAPHIC` - When `true`, `/tldr` also runs the configured default image model for an infographic step. Default: `false`.
 
+### Agentic pipelines
+`/factcheck` and `/qc` run as multi-phase pipelines (claim extraction → web research → synthesis; query planning → chat search → reflect → answer) with live progress edits on the processing message; `/tldr` switches to map-reduce chunk summarization above a threshold. Cheap orchestration steps use a configurable step model; the final answer keeps using the configured default/user-selected model. Each command still holds a single `HEAVY_COMMAND_MAX_CONCURRENCY` permit for its whole run.
+
+- `ENABLE_AGENTIC_FACTCHECK` - When `false`, `/factcheck` reverts to the legacy single-call flow. The legacy flow is also the automatic fallback when claim extraction fails or finds nothing check-worthy. Default: `true`.
+- `ENABLE_AGENTIC_QC` - When `false`, `/qc` reverts to the legacy monolithic tool loop (also the fallback when query planning fails). Default: `true`.
+- `AGENT_STEP_MODEL` - Model for cheap pipeline steps (claim extraction, query planning, reflection, chunk summaries). Accepts `gemini` or a runtime model id; `openai-codex:<slug>` works even for slugs not in the catalog (e.g. `openai-codex:gpt-5.4-mini`). Empty = derive automatically: a Codex/OpenAI final model runs steps on itself at `AGENT_STEP_REASONING`; a Gemini final model uses `GEMINI_LITE_MODEL`. Default: empty.
+- `AGENT_STEP_REASONING` - Per-call reasoning effort for step calls on Responses-provider models (validated against the selected Codex model's supported levels). Default: `low`.
+- `AGENT_MAX_WALL_CLOCK_SECS` - Soft time budget per pipeline run, checked between phases; when exceeded the pipeline stops gathering more evidence and answers with what it has. Default: `480`.
+- `TLDR_MAP_REDUCE_THRESHOLD` - `/tldr` switches to map-reduce above this many messages; at or below it the original single-call path runs unchanged. Default: `150`.
+- `TLDR_CHUNK_SIZE` - Messages per map-reduce chunk (chunks are summarized sequentially to keep memory flat). Default: `100`.
+- `TLDR_MAX_MESSAGES` - Hard cap on messages fetched for `/tldr`, including the previously unbounded reply-anchored variant. Default: `2000`.
+- `FACTCHECK_MAX_CLAIMS` - Max claims extracted and researched per `/factcheck`. Default: `5` (clamped 1-8).
+- `FACTCHECK_SEARCHES_PER_CLAIM` - Max web searches per claim. Default: `2` (clamped 1-3).
+- `FACTCHECK_CLAIM_CONCURRENCY` - Claims researched concurrently (network-bound; keep small on 1-CPU hosts). Default: `2` (clamped 1-4).
+
 ### Access control
 - `WHITELIST_FILE_PATH` - Path to whitelist file. Default: `allowed_chat.txt`.
   - File contents: one user ID or chat ID per line. Empty or missing file means no restrictions.

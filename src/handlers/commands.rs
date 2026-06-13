@@ -13,6 +13,7 @@ use teloxide::types::{
 };
 use teloxide::RequestError;
 
+use crate::agents::factcheck::{run_factcheck_pipeline, FactcheckOutcome};
 use crate::config::{
     ThirdPartyProvider, CONFIG, FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY, PAINTME_SYSTEM_PROMPT,
     PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
@@ -48,6 +49,7 @@ use crate::state::{
 };
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::utils::logging::read_recent_log_lines;
+use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::start_chat_action_heartbeat;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::{error, info, warn};
@@ -178,7 +180,7 @@ fn default_text_model_display_name(model_name: &str, gemini_model_used: Option<&
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn call_configured_text_model(
+pub(crate) async fn call_configured_text_model(
     system_prompt: &str,
     user_content: &str,
     response_title: &str,
@@ -2734,6 +2736,27 @@ pub async fn vid_handler(
     Ok(())
 }
 
+/// Legacy single-call /tldr: the whole history in one prompt. Used below the
+/// map-reduce threshold and as the fallback when the pipeline cannot start.
+async fn tldr_single_call(
+    messages: &[crate::db::models::MessageRow],
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<(String, String)> {
+    let chat_content = super::wrap_chat_history(&super::format_tldr_chat_content(messages));
+    let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph_author_name);
+    call_configured_text_model(
+        &system_prompt,
+        &chat_content,
+        "Message Summary",
+        true,
+        true,
+        None,
+        Some("TLDR_SYSTEM_PROMPT"),
+        audit_context,
+    )
+    .await
+}
+
 #[allow(deprecated)]
 pub async fn tldr_handler(
     bot: Bot,
@@ -2769,7 +2792,7 @@ pub async fn tldr_handler(
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
 
-    let messages = if let Some(reply) = message.reply_to_message() {
+    let mut messages = if let Some(reply) = message.reply_to_message() {
         state
             .db
             .select_messages_from_id(message.chat.id.0, reply.id.0 as i64)
@@ -2792,23 +2815,41 @@ pub async fn tldr_handler(
         complete_command_timer(&mut timer, "error", Some("no_messages".to_string()));
         return Ok(());
     }
+
+    // The reply-anchored fetch has no LIMIT; cap it, keeping the newest
+    // messages, so a reply to an ancient message cannot pull the whole table.
+    let truncated_to_cap = messages.len() > CONFIG.tldr_max_messages;
+    if truncated_to_cap {
+        let skip = messages.len() - CONFIG.tldr_max_messages;
+        messages.drain(..skip);
+    }
     let audit_context = create_command_audit_context(&state, &message, "tldr").await;
 
-    let chat_content = super::wrap_chat_history(&super::format_tldr_chat_content(&messages));
+    let summary_result = if messages.len() > CONFIG.tldr_map_reduce_threshold {
+        let mut progress_reporter =
+            ProgressReporter::new(bot.clone(), message.chat.id, processing_message.id);
+        match crate::agents::tldr::summarize_messages_map_reduce(
+            &messages,
+            audit_context.as_ref(),
+            &mut progress_reporter,
+        )
+        .await
+        {
+            Ok(crate::agents::tldr::TldrOutcome::Summary {
+                text,
+                model_display,
+            }) => Ok((text, model_display)),
+            Ok(crate::agents::tldr::TldrOutcome::UseLegacy { reason }) => {
+                info!("Map-reduce /tldr fell back to the single-call path: {reason}");
+                tldr_single_call(&messages, audit_context.as_ref()).await
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        tldr_single_call(&messages, audit_context.as_ref()).await
+    };
 
-    let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph_author_name);
-    let response = match call_configured_text_model(
-        &system_prompt,
-        &chat_content,
-        "Message Summary",
-        true,
-        true,
-        None,
-        Some("TLDR_SYSTEM_PROMPT"),
-        audit_context.as_ref(),
-    )
-    .await
-    {
+    let response = match summary_result {
         Ok(response) => response,
         Err(err) => {
             error!("TLDR summary generation failed: {}", err);
@@ -2827,7 +2868,13 @@ pub async fn tldr_handler(
         }
     };
 
-    let (summary_text, summary_model) = response;
+    let (mut summary_text, summary_model) = response;
+    if truncated_to_cap {
+        summary_text = format!(
+            "（注：消息数量超过上限，本次仅总结最近 {} 条消息。）\n\n{}",
+            CONFIG.tldr_max_messages, summary_text
+        );
+    }
     if summary_text.trim().is_empty() {
         bot.edit_message_text(
             processing_message.chat.id,
@@ -3157,6 +3204,52 @@ pub async fn factcheck_handler(
         .await?;
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
+
+    if CONFIG.enable_agentic_factcheck {
+        let mut progress_reporter =
+            ProgressReporter::new(bot.clone(), message.chat.id, processing_message.id);
+        match run_factcheck_pipeline(
+            &statement,
+            &media_files,
+            &media_summary,
+            user_language_code,
+            audit_context.as_ref(),
+            &mut progress_reporter,
+        )
+        .await
+        {
+            Ok(FactcheckOutcome::Answer {
+                text,
+                model_display,
+            }) => {
+                let response_with_model = format!("{}\n\nModel: {}", text, model_display);
+                send_response(
+                    &bot,
+                    processing_message.chat.id,
+                    processing_message.id,
+                    &response_with_model,
+                    "Fact Check",
+                    ParseMode::Markdown,
+                )
+                .await?;
+                return Ok(());
+            }
+            Ok(FactcheckOutcome::UseLegacy { reason }) => {
+                info!("Agentic fact-check fell back to the legacy path: {reason}");
+            }
+            Err(err) => {
+                error!("Agentic fact-check failed: {}", err);
+                bot.edit_message_text(
+                    processing_message.chat.id,
+                    processing_message.id,
+                    format!("Failed to fact-check this message.\n\nError: {}", err),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
     let system_prompt = build_factcheck_system_prompt(user_language_code);
     let response = match call_configured_text_model(
         &system_prompt,

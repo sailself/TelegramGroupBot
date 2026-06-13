@@ -13,7 +13,7 @@ use crate::llm::audit::{
     log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
 };
 use crate::llm::openai_codex;
-use crate::llm::runtime_models::selected_codex_model_record;
+use crate::llm::runtime_models::{selected_codex_model_record, CodexSelectedModelRecord};
 use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
@@ -408,12 +408,59 @@ fn responses_base_url(base_url: &str) -> String {
     }
 }
 
+/// Decide the `reasoning.effort` value for a request, if any.
+///
+/// `reasoning_override` is a per-call request (e.g. cheap agent steps asking
+/// for "low"); it is validated against the selected Codex record's supported
+/// levels when that record matches the requested model, and passed through
+/// unvalidated for foreign slugs (the backend rejects unknown levels itself).
+/// With no override this reproduces the original behavior: the globally
+/// selected reasoning level of the matching Codex record.
+fn reasoning_effort_for_request(
+    provider: ThirdPartyProvider,
+    model: &str,
+    reasoning_override: Option<&str>,
+    selected_record: Option<&CodexSelectedModelRecord>,
+) -> Option<String> {
+    if provider != ThirdPartyProvider::OpenAICodex {
+        return None;
+    }
+
+    let matching_record = selected_record.filter(|record| record.slug == model);
+    let recorded_level = matching_record.and_then(|record| record.selected_reasoning_level.clone());
+
+    let Some(requested) = reasoning_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return recorded_level;
+    };
+
+    if let Some(record) = matching_record {
+        let supported = record.supported_reasoning_levels.is_empty()
+            || record
+                .supported_reasoning_levels
+                .iter()
+                .any(|option| option.effort.eq_ignore_ascii_case(requested));
+        if !supported {
+            warn!(
+                "Reasoning override '{}' is not supported by Codex model '{}'; keeping the selected level",
+                requested, record.slug
+            );
+            return recorded_level;
+        }
+    }
+
+    Some(requested.to_ascii_lowercase())
+}
+
 async fn build_request_details(
     model_config: &ThirdPartyModelConfig,
     instructions: &str,
     input_items: Vec<Value>,
     tools: Option<Vec<Value>>,
     session_id: &str,
+    reasoning_override: Option<&str>,
 ) -> Result<ResponsesRequestDetails> {
     let (display_name, url, mut headers, streaming_sse) = match model_config.provider {
         ThirdPartyProvider::OpenAI => (
@@ -467,16 +514,15 @@ async fn build_request_details(
         },
     });
 
-    if model_config.provider == ThirdPartyProvider::OpenAICodex {
-        if let Some(record) = selected_codex_model_record() {
-            if record.slug == model_config.model {
-                if let Some(level) = record.selected_reasoning_level.as_ref() {
-                    payload["reasoning"] = json!({
-                        "effort": level,
-                    });
-                }
-            }
-        }
+    if let Some(effort) = reasoning_effort_for_request(
+        model_config.provider,
+        &model_config.model,
+        reasoning_override,
+        selected_codex_model_record().as_ref(),
+    ) {
+        payload["reasoning"] = json!({
+            "effort": effort,
+        });
     }
 
     if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
@@ -999,6 +1045,7 @@ async fn responses_completion_with_tools(
     model_config: &ThirdPartyModelConfig,
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
+    reasoning_override: Option<&str>,
 ) -> Result<String> {
     let tools = build_responses_function_tools();
     let session_id = generate_session_id();
@@ -1024,6 +1071,7 @@ async fn responses_completion_with_tools(
             input_items.clone(),
             Some(tools.clone()),
             &session_id,
+            reasoning_override,
         )
         .await?;
         let response = call_provider_api(&details, audit_context, operation).await?;
@@ -1067,6 +1115,7 @@ async fn responses_completion_with_tools(
                 input_items,
                 None,
                 &session_id,
+                reasoning_override,
             )
             .await?;
             let response = call_provider_api(&details, audit_context, operation).await?;
@@ -1079,6 +1128,7 @@ async fn responses_completion_with_tools(
     unreachable!("responses tool loop exhausted without returning")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn responses_completion_with_tool_runtime(
     instructions: &str,
     mut input_items: Vec<Value>,
@@ -1087,6 +1137,7 @@ async fn responses_completion_with_tool_runtime(
     native_codex_web_search_tool: Option<Value>,
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
+    reasoning_override: Option<&str>,
 ) -> Result<String> {
     let mut tools =
         convert_openai_function_tools_to_responses(runtime.build_openai_function_tools());
@@ -1124,6 +1175,7 @@ async fn responses_completion_with_tool_runtime(
             input_items.clone(),
             tools_enabled.then_some(tools.clone()),
             &session_id,
+            reasoning_override,
         )
         .await?;
         let response = call_provider_api(&details, audit_context, operation).await?;
@@ -1172,6 +1224,7 @@ async fn responses_completion_with_tool_runtime(
         input_items,
         None,
         &session_id,
+        reasoning_override,
     )
     .await?;
     let response = call_provider_api(&details, audit_context, operation).await?;
@@ -1180,6 +1233,7 @@ async fn responses_completion_with_tool_runtime(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn call_responses_provider(
     system_prompt: &str,
     user_content: &str,
@@ -1188,6 +1242,7 @@ pub async fn call_responses_provider(
     image_data_list: &[Vec<u8>],
     supports_tools: bool,
     audit_context: Option<&LlmAuditContext>,
+    reasoning_override: Option<&str>,
 ) -> Result<String> {
     let native_codex_web_search_tool = supports_tools
         .then(|| build_native_codex_web_search_tool(model_config))
@@ -1217,6 +1272,7 @@ pub async fn call_responses_provider(
             model_config,
             audit_context,
             &operation,
+            reasoning_override,
         )
         .await;
     }
@@ -1228,6 +1284,7 @@ pub async fn call_responses_provider(
         input_items,
         native_codex_web_search_tool.map(|tool| vec![tool]),
         &session_id,
+        reasoning_override,
     )
     .await?;
     let response = call_provider_api(&details, audit_context, &operation).await?;
@@ -1236,6 +1293,7 @@ pub async fn call_responses_provider(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn call_responses_provider_with_tool_runtime(
     system_prompt: &str,
     user_content: &str,
@@ -1244,6 +1302,7 @@ pub async fn call_responses_provider_with_tool_runtime(
     image_data_list: &[Vec<u8>],
     runtime: &mut ToolRuntime,
     audit_context: Option<&LlmAuditContext>,
+    reasoning_override: Option<&str>,
 ) -> Result<String> {
     let runtime_guidance = runtime.tool_limit_guidance();
     let instructions =
@@ -1272,6 +1331,7 @@ pub async fn call_responses_provider_with_tool_runtime(
         native_codex_web_search_tool.clone(),
         audit_context,
         &operation,
+        reasoning_override,
     )
     .await
 }
@@ -1292,6 +1352,112 @@ mod tests {
             audio: false,
             tools: true,
         }
+    }
+
+    fn codex_record(
+        slug: &str,
+        supported: &[&str],
+        selected: Option<&str>,
+    ) -> CodexSelectedModelRecord {
+        CodexSelectedModelRecord {
+            slug: slug.to_string(),
+            display_name: slug.to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 0,
+            etag: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: supported
+                .iter()
+                .map(
+                    |effort| crate::llm::openai_codex::CodexReasoningEffortOption {
+                        effort: effort.to_string(),
+                        description: effort.to_string(),
+                    },
+                )
+                .collect(),
+            selected_reasoning_level: selected.map(str::to_string),
+            web_search_tool_type: Default::default(),
+            supports_search_tool: false,
+            fetched_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn reasoning_override_ignored_for_non_codex_providers() {
+        assert_eq!(
+            reasoning_effort_for_request(ThirdPartyProvider::OpenAI, "gpt-5.4", Some("low"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_without_override_uses_selected_record_level() {
+        let record = codex_record("gpt-5.5", &["low", "xhigh"], Some("xhigh"));
+        assert_eq!(
+            reasoning_effort_for_request(
+                ThirdPartyProvider::OpenAICodex,
+                "gpt-5.5",
+                None,
+                Some(&record)
+            ),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(
+            reasoning_effort_for_request(ThirdPartyProvider::OpenAICodex, "gpt-5.5", None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_override_applies_when_supported() {
+        let record = codex_record("gpt-5.5", &["low", "medium", "xhigh"], Some("xhigh"));
+        assert_eq!(
+            reasoning_effort_for_request(
+                ThirdPartyProvider::OpenAICodex,
+                "gpt-5.5",
+                Some("Low"),
+                Some(&record)
+            ),
+            Some("low".to_string())
+        );
+    }
+
+    #[test]
+    fn unsupported_reasoning_override_falls_back_to_selected_level() {
+        let record = codex_record("gpt-5.5", &["medium", "xhigh"], Some("xhigh"));
+        assert_eq!(
+            reasoning_effort_for_request(
+                ThirdPartyProvider::OpenAICodex,
+                "gpt-5.5",
+                Some("low"),
+                Some(&record)
+            ),
+            Some("xhigh".to_string())
+        );
+    }
+
+    #[test]
+    fn reasoning_override_passes_through_for_foreign_slugs() {
+        let record = codex_record("gpt-5.5", &["medium"], Some("medium"));
+        assert_eq!(
+            reasoning_effort_for_request(
+                ThirdPartyProvider::OpenAICodex,
+                "gpt-5.4-mini",
+                Some("low"),
+                Some(&record)
+            ),
+            Some("low".to_string())
+        );
+        assert_eq!(
+            reasoning_effort_for_request(
+                ThirdPartyProvider::OpenAICodex,
+                "gpt-5.4-mini",
+                Some("  "),
+                Some(&record)
+            ),
+            None
+        );
     }
 
     #[test]
