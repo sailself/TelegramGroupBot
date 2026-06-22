@@ -165,8 +165,6 @@ impl ToolRuntime {
         }
     }
 
-    // Consumed by the analytics lane (A4); allow until that task is committed.
-    #[allow(dead_code)]
     pub fn for_analytics(db: Database, chat_id: i64) -> Self {
         Self {
             db,
@@ -189,7 +187,6 @@ impl ToolRuntime {
         }
     }
 
-    #[allow(dead_code)] // Consumed by the analytics lane (A4)
     pub fn analytics_results(&self) -> &[Value] {
         &self.analytics_results
     }
