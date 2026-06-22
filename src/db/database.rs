@@ -2227,6 +2227,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, 4);
+
+        // Cross-table isolation: the llm_invocations SENTINEL_AUDIT text must NOT be counted.
+        let audit_probe: QuerySpec =
+            parse_lenient_json(r#"{"metric":"count","filters":{"term":"SENTINEL_AUDIT"}}"#)
+                .unwrap();
+        let r = db.run_chat_analytics(a, &audit_probe).await.unwrap();
+        assert_eq!(
+            r.first().and_then(|row| row.value_num),
+            Some(0.0),
+            "llm_invocations text leaked into analytics"
+        );
+
+        // Cross-chat isolation: chat B's message text must NOT be reachable from chat A.
+        let chatb_probe: QuerySpec = parse_lenient_json(
+            r#"{"metric":"count","filters":{"text_contains":"SENTINEL_CHATB"}}"#,
+        )
+        .unwrap();
+        let r2 = db.run_chat_analytics(a, &chatb_probe).await.unwrap();
+        assert_eq!(
+            r2.first().and_then(|row| row.value_num),
+            Some(0.0),
+            "chat B text leaked into chat A analytics"
+        );
     }
 
     // ─── focused per-metric / scope / date-range tests ───────────────────────
@@ -2562,6 +2585,42 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value_num, Some(2.0));
+    }
+
+    #[tokio::test]
+    async fn run_chat_analytics_avg_len_computes_mean_char_length() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-avglen").await;
+        let chat = -1001374348669_i64;
+        insert_count_message(
+            &db,
+            1,
+            chat,
+            Some(11),
+            Some("a"),
+            "abc",
+            at("2026-03-01T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await; // len 3
+        insert_count_message(
+            &db,
+            2,
+            chat,
+            Some(11),
+            Some("a"),
+            "abcdefg",
+            at("2026-03-02T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await; // len 7
+        let spec: QuerySpec =
+            parse_lenient_json(r#"{"metric":"avg_len","group_by":"none"}"#).unwrap();
+        let rows = db.run_chat_analytics(chat, &spec).await.unwrap();
+        assert_eq!(rows.first().and_then(|r| r.value_num), Some(5.0)); // (3+7)/2
     }
 
     #[tokio::test]
