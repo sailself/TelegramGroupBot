@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::config::CONFIG;
 use crate::db::models::{
-    ChatSearchHit, LlmInvocationInsert, LlmRequestInsert, MessageInsert, MessageRow,
+    AnalyticsRow, ChatSearchHit, LlmInvocationInsert, LlmRequestInsert, MessageInsert, MessageRow,
     ModelTokenStat, TokenUserStat,
 };
 use crate::db::search::{
@@ -356,6 +356,30 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
+    pub async fn run_chat_analytics(
+        &self,
+        chat_id: i64,
+        spec: &crate::llm::analytics::QuerySpec,
+    ) -> Result<Vec<AnalyticsRow>> {
+        use crate::llm::analytics::Bind;
+        let (sql, binds) = crate::llm::analytics::compile(spec, chat_id);
+        let mut q = sqlx::query_as::<_, AnalyticsRow>(&sql);
+        for b in binds {
+            q = match b {
+                Bind::Int(i) => q.bind(i),
+                Bind::Text(s) => q.bind(s),
+            };
+        }
+        // Per-query timeout so a leading-wildcard scan or a pathological grouping
+        // can't pin a connection.
+        let dur = std::time::Duration::from_secs(CONFIG.qc_analytics_query_timeout_secs);
+        match tokio::time::timeout(dur, q.fetch_all(&self.pool)).await {
+            Ok(res) => res.map_err(Into::into),
+            Err(_) => Err(anyhow::anyhow!("analytics query exceeded the time budget")),
+        }
     }
 
     pub async fn select_global_token_total(&self) -> Result<i64> {
@@ -2054,6 +2078,490 @@ mod tests {
             .await
             .expect("message queue should succeed");
         wait_for_message_row(db, chat_id, message_id).await;
+    }
+
+    // ─── analytics helpers ────────────────────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_count_message(
+        db: &Database,
+        message_id: i64,
+        chat_id: i64,
+        user_id: Option<i64>,
+        username: Option<&str>,
+        text: &str,
+        date: chrono::DateTime<chrono::Utc>,
+        is_command: bool,
+        is_synthetic: bool,
+    ) {
+        let insert = build_message_insert(
+            user_id,
+            username.map(|s| s.to_string()),
+            Some(text.to_string()),
+            Some("en".to_string()),
+            date,
+            None,
+            Some(chat_id),
+            Some(message_id),
+            None,
+            false,
+            None,
+            is_command,
+            is_synthetic,
+        );
+        db.queue_message_insert(insert).await.expect("queue");
+        wait_for_message_row(db, chat_id, message_id).await;
+    }
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    // ─── invariant property test (security gate) ─────────────────────────────
+
+    #[tokio::test]
+    async fn analytics_never_leaks_other_chats_tables_or_writes() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-invariant").await;
+        let a = -1001374348669_i64;
+        let b = -1002631835259_i64;
+        insert_count_message(
+            &db,
+            1,
+            a,
+            Some(11),
+            Some("alice"),
+            "hello",
+            at("2026-03-01T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            2,
+            a,
+            Some(11),
+            Some("alice"),
+            "world",
+            at("2026-03-02T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            3,
+            a,
+            Some(12),
+            Some("bob"),
+            "hi",
+            at("2026-03-03T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        // Sentinel in chat B — must never influence chat A results.
+        insert_count_message(
+            &db,
+            4,
+            b,
+            Some(11),
+            Some("alice"),
+            "SENTINEL_CHATB",
+            at("2026-03-04T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        // Seed an llm_invocations row with text "SENTINEL_AUDIT" (another table).
+        db.insert_llm_invocation(crate::db::models::LlmInvocationInsert {
+            trigger_kind: "command".to_string(),
+            trigger_name: "q".to_string(),
+            chat_id: a,
+            user_id: Some(11),
+            username: Some("alice".to_string()),
+            message_id: 999,
+            reply_to_message_id: None,
+            message_text: Some("SENTINEL_AUDIT".to_string()),
+            created_at: at("2026-03-01T00:00:00+00:00"),
+        })
+        .await
+        .expect("invocation insert");
+
+        // Adversarial / fuzzed specs the model might emit.
+        let specs = [
+            r#"{"metric":"count","group_by":"user"}"#,
+            r#"{"metric":"count","filters":{"text_contains":"SENTINEL"}}"#,
+            r#"{"metric":"count","filters":{"term":"SENTINEL_AUDIT"}}"#,
+            r#"{"metric":"max_date","filters":{"text_contains":"SENTINEL_CHATB"}}"#,
+            r#"{"metric":"count","chat_id":-1002631835259}"#, // unknown field must be ignored
+            r#"{"metric":"count","filters":{"text_contains":"x'; DROP TABLE messages;--"}}"#,
+            r#"{"metric":"count","filters":{"username":"a' UNION SELECT value FROM app_meta--"}}"#,
+            r#"{"metric":"count","filters":{"term":"search_tags:* OR 1=1"}}"#,
+        ];
+        for raw in specs {
+            let spec: QuerySpec = parse_lenient_json(raw).expect("spec parses");
+            let rows = db
+                .run_chat_analytics(a, &spec)
+                .await
+                .expect("query ok (inert, not executed SQL)");
+            for r in &rows {
+                assert_ne!(r.group_key.as_deref(), Some("SENTINEL_CHATB"));
+                assert!(!r.value_text.as_deref().unwrap_or("").contains("SENTINEL"));
+            }
+        }
+        // chat_id-in-spec is ignored: total count == chat A's 3 messages, never includes B.
+        let total: QuerySpec =
+            parse_lenient_json(r#"{"metric":"count","chat_id":-1002631835259}"#).unwrap();
+        assert_eq!(
+            db.run_chat_analytics(a, &total).await.unwrap()[0].value_num,
+            Some(3.0)
+        );
+        // Write-impossibility: messages table unchanged after injection attempts.
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(after, 4);
+    }
+
+    // ─── focused per-metric / scope / date-range tests ───────────────────────
+
+    #[tokio::test]
+    async fn run_chat_analytics_count_by_user_ranks_and_is_chat_scoped() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-count-user").await;
+        let chat_a = -1001374348669_i64;
+        let chat_b = -1002631835259_i64;
+        // alice: 3 messages in chat A; bob: 1 message in chat A; eve: 1 message in chat B (sentinel).
+        for mid in 1i64..=3 {
+            insert_count_message(
+                &db,
+                mid,
+                chat_a,
+                Some(11),
+                Some("alice"),
+                &format!("msg {mid}"),
+                at("2026-04-01T10:00:00+00:00"),
+                false,
+                false,
+            )
+            .await;
+        }
+        insert_count_message(
+            &db,
+            4,
+            chat_a,
+            Some(12),
+            Some("bob"),
+            "bob msg",
+            at("2026-04-01T11:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            5,
+            chat_b,
+            Some(99),
+            Some("eve"),
+            "sentinel",
+            at("2026-04-01T12:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+
+        let spec: QuerySpec =
+            parse_lenient_json(r#"{"metric":"count","group_by":"user","order":"value_desc"}"#)
+                .unwrap();
+        let rows = db
+            .run_chat_analytics(chat_a, &spec)
+            .await
+            .expect("query ok");
+
+        // Only chat A rows; alice first (3), bob second (1).
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].group_user_id, Some(11));
+        assert_eq!(rows[0].value_num, Some(3.0));
+        assert_eq!(rows[1].group_user_id, Some(12));
+        assert_eq!(rows[1].value_num, Some(1.0));
+        // eve (chat B) must not appear.
+        assert!(rows.iter().all(|r| r.group_user_id != Some(99)));
+    }
+
+    #[tokio::test]
+    async fn run_chat_analytics_term_filter_counts_matches_only() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-term").await;
+        let chat = -1001374348669_i64;
+        insert_count_message(
+            &db,
+            1,
+            chat,
+            Some(10),
+            Some("alice"),
+            "bitcoin rally today",
+            at("2026-04-01T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            2,
+            chat,
+            Some(10),
+            Some("alice"),
+            "ethereum news",
+            at("2026-04-02T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            3,
+            chat,
+            Some(11),
+            Some("bob"),
+            "bitcoin dip",
+            at("2026-04-03T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+
+        let spec: QuerySpec =
+            parse_lenient_json(r#"{"metric":"count","filters":{"term":"bitcoin"}}"#).unwrap();
+        let rows = db.run_chat_analytics(chat, &spec).await.expect("query ok");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value_num, Some(2.0));
+    }
+
+    #[tokio::test]
+    async fn run_chat_analytics_group_by_day_buckets_correctly() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-day").await;
+        let chat = -1001374348669_i64;
+        // 2 messages on day 1, 1 on day 2.
+        for mid in 1i64..=2 {
+            insert_count_message(
+                &db,
+                mid,
+                chat,
+                Some(10),
+                Some("alice"),
+                "day1 msg",
+                at("2026-05-01T09:00:00+00:00"),
+                false,
+                false,
+            )
+            .await;
+        }
+        insert_count_message(
+            &db,
+            3,
+            chat,
+            Some(10),
+            Some("alice"),
+            "day2 msg",
+            at("2026-05-02T09:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+
+        let spec: QuerySpec = parse_lenient_json(
+            r#"{"metric":"count","group_by":"day","order":"group_asc","limit":10}"#,
+        )
+        .unwrap();
+        let rows = db.run_chat_analytics(chat, &spec).await.expect("query ok");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].group_key.as_deref(), Some("2026-05-01"));
+        assert_eq!(rows[0].value_num, Some(2.0));
+        assert_eq!(rows[1].group_key.as_deref(), Some("2026-05-02"));
+        assert_eq!(rows[1].value_num, Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn run_chat_analytics_distinct_count_group_by_none() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-distinct").await;
+        let chat = -1001374348669_i64;
+        // 3 messages from 2 distinct users.
+        insert_count_message(
+            &db,
+            1,
+            chat,
+            Some(10),
+            Some("alice"),
+            "hello",
+            at("2026-06-01T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            2,
+            chat,
+            Some(10),
+            Some("alice"),
+            "world",
+            at("2026-06-02T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            3,
+            chat,
+            Some(11),
+            Some("bob"),
+            "hi",
+            at("2026-06-03T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+
+        let spec: QuerySpec =
+            parse_lenient_json(r#"{"metric":"distinct_count","group_by":"none"}"#).unwrap();
+        let rows = db.run_chat_analytics(chat, &spec).await.expect("query ok");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value_num, Some(2.0));
+        assert!(rows[0].group_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_chat_analytics_min_max_date_returns_value_text() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-minmax").await;
+        let chat = -1001374348669_i64;
+        insert_count_message(
+            &db,
+            1,
+            chat,
+            Some(10),
+            Some("alice"),
+            "early",
+            at("2026-01-15T08:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            2,
+            chat,
+            Some(10),
+            Some("alice"),
+            "late",
+            at("2026-06-20T22:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+
+        let min_spec: QuerySpec =
+            parse_lenient_json(r#"{"metric":"min_date","group_by":"none"}"#).unwrap();
+        let min_rows = db
+            .run_chat_analytics(chat, &min_spec)
+            .await
+            .expect("min_date ok");
+        assert_eq!(min_rows.len(), 1);
+        assert!(min_rows[0].value_text.is_some());
+        assert!(min_rows[0]
+            .value_text
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-01-15"));
+
+        let max_spec: QuerySpec =
+            parse_lenient_json(r#"{"metric":"max_date","group_by":"none"}"#).unwrap();
+        let max_rows = db
+            .run_chat_analytics(chat, &max_spec)
+            .await
+            .expect("max_date ok");
+        assert_eq!(max_rows.len(), 1);
+        assert!(max_rows[0]
+            .value_text
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-06-20"));
+    }
+
+    #[tokio::test]
+    async fn run_chat_analytics_date_range_excludes_out_of_range() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-daterange").await;
+        let chat = -1001374348669_i64;
+        // message before range
+        insert_count_message(
+            &db,
+            1,
+            chat,
+            Some(10),
+            Some("alice"),
+            "before",
+            at("2026-02-28T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        // 2 messages within range [2026-03-01, 2026-04-01)
+        for mid in 2i64..=3 {
+            insert_count_message(
+                &db,
+                mid,
+                chat,
+                Some(10),
+                Some("alice"),
+                "during",
+                at("2026-03-15T00:00:00+00:00"),
+                false,
+                false,
+            )
+            .await;
+        }
+        // message after range
+        insert_count_message(
+            &db,
+            4,
+            chat,
+            Some(10),
+            Some("alice"),
+            "after",
+            at("2026-04-05T00:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+
+        let spec: QuerySpec = parse_lenient_json(
+            r#"{"metric":"count","filters":{"date_from":"2026-03-01T00:00:00+00:00","date_to":"2026-04-01T00:00:00+00:00"}}"#,
+        )
+        .unwrap();
+        let rows = db.run_chat_analytics(chat, &spec).await.expect("query ok");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value_num, Some(2.0));
     }
 
     #[tokio::test]
