@@ -194,21 +194,30 @@ pub fn compile(spec: &QuerySpec, chat_id: i64) -> (String, Vec<Bind>) {
         // the FTS rowid form (perf + scope parity).
         // Use the table name directly (no alias) — FTS5 requires the virtual-table
         // name in the MATCH predicate; aliasing it confuses some SQLite builds.
-        sql.push_str(
-            " AND m.id IN (SELECT messages_fts.rowid FROM messages_fts WHERE messages_fts MATCH ?)",
-        );
-        binds.push(Bind::Text(to_fts_phrase(&term)));
+        // Skip terms that contain no alphanumeric content (e.g. only quotes/punctuation)
+        // to avoid producing a degenerate FTS phrase that SQLite would reject.
+        if term.chars().any(char::is_alphanumeric) {
+            // REVIEW (perf, deferred): a chat-scoped JOIN (as in `fetch_stage_hits`/`/s`) would
+            // prune cross-chat FTS matches earlier on large multi-chat DBs; the IN-subquery is
+            // correctness-correct and the per-query timeout bounds it.
+            sql.push_str(
+                " AND m.id IN (SELECT messages_fts.rowid FROM messages_fts WHERE messages_fts MATCH ?)",
+            );
+            binds.push(Bind::Text(to_fts_phrase(&term)));
+        }
     }
     if let Some(text) = nonempty(&spec.filters.text_contains) {
         sql.push_str(" AND m.text LIKE ? ESCAPE '\\'");
         binds.push(Bind::Text(format!("%{}%", escape_like(&text))));
     }
-    // REVIEW (SQL m3): mirror Plan B — drop an inverted/degenerate range.
+    // REVIEW (SQL m3): mirror Plan B — drop only a STRICTLY inverted range; equal bounds
+    // are kept (yields an honest possibly-empty filtered result rather than silently dropping
+    // a same-day window).
     let (df, dt) = match (
         nonempty(&spec.filters.date_from),
         nonempty(&spec.filters.date_to),
     ) {
-        (Some(f), Some(t)) if f >= t => (None, None),
+        (Some(f), Some(t)) if f > t => (None, None), // was f >= t
         (f, t) => (f, t),
     };
     if let Some(f) = df {
@@ -347,6 +356,23 @@ mod tests {
         );
         assert!(!sql.contains("m.date >="));
         assert_eq!(b.len(), 2); // chat_id + limit only
+    }
+    #[test]
+    fn equal_date_bounds_are_kept() {
+        let (sql, b) = compile(
+            &spec(
+                r#"{"metric":"count","filters":{"date_from":"2026-06-01","date_to":"2026-06-01"}}"#,
+            ),
+            1,
+        );
+        assert!(sql.contains("m.date >= ?") && sql.contains("m.date < ?"));
+        assert_eq!(b.len(), 4); // chat_id, date_from, date_to, limit
+    }
+    #[test]
+    fn term_with_no_alphanumerics_is_skipped() {
+        let (sql, b) = compile(&spec(r#"{"metric":"count","filters":{"term":"\"\""}}"#), 1);
+        assert!(!sql.contains("messages_fts"));
+        assert_eq!(b.len(), 2); // chat_id, limit only
     }
     #[test]
     fn validate_rejects_distinct_count_by_user() {
