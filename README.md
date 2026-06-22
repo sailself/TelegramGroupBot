@@ -204,6 +204,9 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `FACTCHECK_MAX_CLAIMS` - Max claims extracted and researched per `/factcheck`. Default: `5` (clamped 1-8).
 - `FACTCHECK_SEARCHES_PER_CLAIM` - Max web searches per claim. Default: `2` (clamped 1-3).
 - `FACTCHECK_CLAIM_CONCURRENCY` - Claims researched concurrently (network-bound; keep small on 1-CPU hosts). Default: `2` (clamped 1-4).
+- `QC_ANALYTICS_MAX_TOTAL_CALLS` - Total tool calls allowed in the `/qc` analytics lane. Default: `12` (clamped 4-24; keep ≥ `QC_ANALYTICS_MAX_QUERY_CALLS` + 2 or the total cap trips first).
+- `QC_ANALYTICS_MAX_QUERY_CALLS` - Max `chat_analytics` queries per `/qc` analytics request. Default: `10` (clamped 2-20).
+- `QC_ANALYTICS_QUERY_TIMEOUT_SECS` - Per-analytics-query timeout in seconds. Default: `2` (clamped 1-15).
 
 ### Access control
 - `WHITELIST_FILE_PATH` - Path to whitelist file. Default: `allowed_chat.txt`.

@@ -129,7 +129,6 @@ pub struct TokenUserStat {
     pub total_tokens: i64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, FromRow)]
 pub struct AnalyticsRow {
     pub group_user_id: Option<i64>,

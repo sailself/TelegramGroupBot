@@ -358,7 +358,6 @@ impl Database {
             .map_err(Into::into)
     }
 
-    #[allow(dead_code)]
     pub async fn run_chat_analytics(
         &self,
         chat_id: i64,

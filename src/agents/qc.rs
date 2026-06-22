@@ -120,7 +120,7 @@ async fn classify_lane(
 // ---------------------------------------------------------------------------
 
 const QC_ANALYTICS_GATHER: &str = "This is a statistics/analysis question about THIS chat. Use chat_analytics to compute exact numbers; refine the spec across calls (grouping, date range, term) until you have what you need. You may use chat_context_query at most once to fetch one example message. Then give a short final note; the system will render the authoritative numbers.";
-const QC_ANALYTICS_ADDENDUM: &str = "The <chat_analytics_results> block holds the EXACT results computed from this chat's database. You cannot call tools. Answer the user's question in their language using ONLY these numbers — never invent, recompute, or reorder them. State briefly that counts cover stored text messages only (media/stickers/service/commands not counted).";
+const QC_ANALYTICS_ADDENDUM: &str = "The <chat_analytics_results> block holds the EXACT results computed from this chat's database. You cannot call tools. Answer the user's question in their language using ONLY these numbers — never invent, recompute, or reorder them. State briefly that counts cover stored text messages only (media/stickers/service/commands not counted). If a <chat_examples> block is present you MAY quote at most one message from it (include its link) to illustrate, but every number must come from <chat_analytics_results>.";
 
 #[derive(Debug, Deserialize)]
 struct QcPlan {
@@ -289,8 +289,37 @@ async fn run_analytics_lane(
         block.push_str(&line);
     }
     let block = neutralize_closing_tag(&block, "chat_analytics_results");
-    let user_content =
+
+    // Surface up to 3 representative messages the model fetched, so it can quote one
+    // (with a verified link). Counts still come ONLY from <chat_analytics_results>.
+    let example_ids = runtime.accumulated_message_ids();
+    let examples = runtime.select_hits_by_message_ids(&example_ids, 3);
+    let mut examples_block = String::new();
+    for hit in &examples {
+        let body = if !hit.text.trim().is_empty() {
+            hit.text.trim()
+        } else {
+            hit.snippet.trim()
+        };
+        examples_block.push_str(&format!(
+            "- {} ({}): {}{}\n",
+            hit.username.as_deref().unwrap_or("unknown"),
+            hit.message_id,
+            truncate_chars(&body.replace('\n', " "), 200),
+            hit.link
+                .as_deref()
+                .map(|l| format!(" {l}"))
+                .unwrap_or_default(),
+        ));
+    }
+
+    let mut user_content =
         format!("{query}\n\n<chat_analytics_results>\n{block}\n</chat_analytics_results>");
+    if !examples_block.is_empty() {
+        let ex = neutralize_closing_tag(&examples_block, "chat_examples");
+        user_content.push_str(&format!("\n\n<chat_examples>\n{ex}\n</chat_examples>"));
+    }
+
     let final_sys = format!("{system_prompt}\n\n{QC_ANALYTICS_ADDENDUM}");
     let (answer, gemini_model_used) = compose_final_answer(
         model_name,
