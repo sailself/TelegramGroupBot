@@ -85,7 +85,7 @@ fn parse_lane(resp: &str) -> QcLane {
         lane: String,
     }
     match parse_lenient_json::<L>(resp) {
-        Some(l) if l.lane == "analytics" => QcLane::Analytics,
+        Some(l) if l.lane.eq_ignore_ascii_case("analytics") => QcLane::Analytics,
         _ => QcLane::Recall,
     }
 }
@@ -120,7 +120,7 @@ async fn classify_lane(
 // ---------------------------------------------------------------------------
 
 const QC_ANALYTICS_GATHER: &str = "This is a statistics/analysis question about THIS chat. Use chat_analytics to compute exact numbers; refine the spec across calls (grouping, date range, term) until you have what you need. You may use chat_context_query at most once to fetch one example message. Then give a short final note; the system will render the authoritative numbers.";
-const QC_ANALYTICS_ADDENDUM: &str = "The <chat_analytics_results> block holds the EXACT results computed from this chat's database. You cannot call tools. Answer the user's question in their language using ONLY these numbers — never invent, recompute, or reorder them. State briefly that counts cover stored text messages only (media/stickers/service/commands not counted). If the block is empty, say you could not compute it.";
+const QC_ANALYTICS_ADDENDUM: &str = "The <chat_analytics_results> block holds the EXACT results computed from this chat's database. You cannot call tools. Answer the user's question in their language using ONLY these numbers — never invent, recompute, or reorder them. State briefly that counts cover stored text messages only (media/stickers/service/commands not counted).";
 
 #[derive(Debug, Deserialize)]
 struct QcPlan {
@@ -172,7 +172,6 @@ pub enum QcPipelineResult {
 /// Compose the final answer using Gemini or a third-party model.
 /// This is the Gemini-vs-third-party branch that was previously inline in
 /// Phase D of `run_qc_pipeline`. Both recall and analytics lanes share it.
-#[allow(clippy::too_many_arguments)]
 async fn compose_final_answer(
     model_name: &str,
     system_prompt: &str,
@@ -221,8 +220,8 @@ async fn run_analytics_lane(
     query: &str,
     model_name: &str,
     system_prompt: &str,
-    media_files: &[MediaFile],
-    youtube_urls: &[String],
+    _media_files: &[MediaFile],
+    _youtube_urls: &[String],
     audit_context: Option<&LlmAuditContext>,
     progress: &mut ProgressReporter,
 ) -> Result<QcPipelineResult> {
@@ -234,7 +233,7 @@ async fn run_analytics_lane(
     );
 
     // Gather: let the model run/iterate queries. Its prose is discarded.
-    let _ = if model_name == crate::handlers::qa::MODEL_GEMINI {
+    let gather = if model_name == crate::handlers::qa::MODEL_GEMINI {
         call_gemini_with_tool_runtime(
             &gather_sys,
             query,
@@ -254,12 +253,16 @@ async fn run_analytics_lane(
             query,
             model_name,
             "Chat Analytics",
-            media_files,
+            &[],
             &mut runtime,
             audit_context,
         )
         .await
-    }?;
+    };
+    if let Err(e) = gather {
+        warn!("/qc analytics gather failed; using legacy loop: {e}");
+        return Ok(QcPipelineResult::UseLegacy("analytics gather failed"));
+    }
 
     // Require ≥1 successful analytics result; else fall back to legacy loop.
     if runtime.analytics_results().is_empty() {
@@ -267,15 +270,25 @@ async fn run_analytics_lane(
         return Ok(QcPipelineResult::UseLegacy("analytics produced no results"));
     }
 
-    // Authoritative block built in Rust from the actual tool results.
+    // Build the authoritative block newest-first so the most-refined results survive
+    // the length cap; cap each result so one large payload can't crowd out the others.
+    let results = runtime.analytics_results();
     let mut block = String::new();
-    for (i, res) in runtime.analytics_results().iter().enumerate() {
-        block.push_str(&format!("Result {}: {}\n", i + 1, res));
+    let mut used = 0usize;
+    for (i, res) in results.iter().enumerate().rev() {
+        let line = format!(
+            "Result {}: {}\n",
+            i + 1,
+            truncate_chars(&res.to_string(), 2_000)
+        );
+        let len = line.chars().count();
+        if used + len > 8_000 {
+            break;
+        }
+        used += len;
+        block.push_str(&line);
     }
-    let block = truncate_chars(
-        &neutralize_closing_tag(&block, "chat_analytics_results"),
-        8_000,
-    );
+    let block = neutralize_closing_tag(&block, "chat_analytics_results");
     let user_content =
         format!("{query}\n\n<chat_analytics_results>\n{block}\n</chat_analytics_results>");
     let final_sys = format!("{system_prompt}\n\n{QC_ANALYTICS_ADDENDUM}");
@@ -283,8 +296,8 @@ async fn run_analytics_lane(
         model_name,
         &final_sys,
         &user_content,
-        media_files,
-        youtube_urls,
+        &[],
+        &[],
         audit_context,
     )
     .await?;
