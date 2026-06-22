@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod audit;
 pub mod brave_search;
 pub mod codex_image;
