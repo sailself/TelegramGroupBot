@@ -720,15 +720,29 @@ impl ToolRuntime {
     async fn execute_analytics(&mut self, arguments: &Value) -> String {
         match self.run_analytics_query(arguments).await {
             Ok(payload) => self.success_payload("chat_analytics", payload),
-            Err(err) => self.error_payload("chat_analytics", "invalid_arguments", &err.to_string()),
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains(SEARCH_INDEX_REBUILDING_ERROR) {
+                    self.error_payload(
+                        "chat_analytics",
+                        SEARCH_INDEX_REBUILDING_ERROR,
+                        "The chat search index is still rebuilding; retry without a term filter or explain that full-text analytics is temporarily unavailable.",
+                    )
+                } else if msg.starts_with("invalid analytics arguments") {
+                    self.error_payload("chat_analytics", "invalid_arguments", &msg)
+                } else {
+                    self.error_payload("chat_analytics", "tool_execution_failed", &msg)
+                }
+            }
         }
     }
 
     pub async fn run_analytics_query(&mut self, arguments: &Value) -> Result<Value> {
-        use crate::llm::analytics::{normalize_stats_date, validate, QuerySpec};
+        use crate::llm::analytics::{normalize_stats_date, QuerySpec};
         let mut spec: QuerySpec = serde_json::from_value(arguments.clone())
             .map_err(|e| anyhow!("invalid analytics arguments: {e}"))?;
-        validate(&spec).map_err(|e| anyhow!(e))?;
+        crate::llm::analytics::validate(&spec)
+            .map_err(|e| anyhow!("invalid analytics arguments: {e}"))?;
         // Normalize date bounds so malformed dates don't silently match nothing.
         spec.filters.date_from = spec
             .filters
@@ -780,11 +794,10 @@ impl ToolRuntime {
             "rows": out,
             "note": "Counts cover stored TEXT messages only (media-only/stickers/service/edits/commands not stored); anonymous-admin and channel posts excluded. Times UTC.",
         });
-        // Byte-cap the accumulated results so the turn stays bounded.
-        let serialized = payload.to_string();
-        if serialized.len() <= 16_384 {
-            self.analytics_results.push(payload.clone());
-        }
+        // Accumulate every result for A4's authoritative answer composition (A4 bounds
+        // the rendered block length). The per-call budget caps how many accumulate, so
+        // memory stays bounded.
+        self.analytics_results.push(payload.clone());
         Ok(payload)
     }
 
@@ -1220,6 +1233,12 @@ mod tests {
             runtime.begin_tool_call(ToolName::ChatAnalytics).is_err(),
             "should fail once analytics budget exhausted"
         );
+        assert!(runtime.force_final_answer());
+        assert_eq!(
+            runtime.chat_analytics_query_calls,
+            runtime.budget.max_chat_analytics_query_calls
+        );
+        assert!(runtime.successful_calls < runtime.budget.max_total_successful_calls);
         assert!(runtime.force_final_answer());
     }
 
