@@ -365,6 +365,19 @@ impl Database {
         spec: &crate::llm::analytics::QuerySpec,
     ) -> Result<Vec<AnalyticsRow>> {
         use crate::llm::analytics::Bind;
+        crate::llm::analytics::validate(spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Term filters hit the FTS index; refuse while it's rebuilding (mirror search_chat_messages).
+        if spec
+            .filters
+            .term
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+            && !self.is_search_ready()
+        {
+            return Err(anyhow::anyhow!(
+                crate::db::search::SEARCH_INDEX_REBUILDING_ERROR
+            ));
+        }
         let (sql, binds) = crate::llm::analytics::compile(spec, chat_id);
         let mut q = sqlx::query_as::<_, AnalyticsRow>(&sql);
         for b in binds {
@@ -2212,6 +2225,11 @@ mod tests {
             for r in &rows {
                 assert_ne!(r.group_key.as_deref(), Some("SENTINEL_CHATB"));
                 assert!(!r.value_text.as_deref().unwrap_or("").contains("SENTINEL"));
+                // chat A has only 3 messages, so any count above that means a leak.
+                assert!(
+                    r.value_num.is_none_or(|v| v <= 3.0),
+                    "adversarial spec returned an impossible count (possible leak)"
+                );
             }
         }
         // chat_id-in-spec is ignored: total count == chat A's 3 messages, never includes B.
@@ -2621,6 +2639,58 @@ mod tests {
             parse_lenient_json(r#"{"metric":"avg_len","group_by":"none"}"#).unwrap();
         let rows = db.run_chat_analytics(chat, &spec).await.unwrap();
         assert_eq!(rows.first().and_then(|r| r.value_num), Some(5.0)); // (3+7)/2
+    }
+
+    #[tokio::test]
+    async fn run_chat_analytics_group_by_hour_of_day_buckets_in_utc() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-hour").await;
+        let chat = -1001374348669_i64;
+        insert_count_message(
+            &db,
+            1,
+            chat,
+            Some(11),
+            Some("a"),
+            "x",
+            at("2026-03-01T09:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            2,
+            chat,
+            Some(11),
+            Some("a"),
+            "y",
+            at("2026-03-02T09:30:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            3,
+            chat,
+            Some(12),
+            Some("b"),
+            "z",
+            at("2026-03-03T14:00:00+00:00"),
+            false,
+            false,
+        )
+        .await;
+        let spec: QuerySpec = parse_lenient_json(
+            r#"{"metric":"count","group_by":"hour_of_day","order":"value_desc"}"#,
+        )
+        .unwrap();
+        let rows = db.run_chat_analytics(chat, &spec).await.unwrap();
+        let top = rows.first().unwrap();
+        assert_eq!(top.group_key.as_deref(), Some("09")); // two messages in the 09:00 UTC hour
+        assert_eq!(top.value_num, Some(2.0));
     }
 
     #[tokio::test]
