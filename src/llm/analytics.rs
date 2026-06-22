@@ -189,7 +189,7 @@ pub fn compile(spec: &QuerySpec, chat_id: i64) -> (String, Vec<Bind>) {
     if let Some(term) = nonempty(&spec.filters.term) {
         // REVIEW (all reviewers): never bind a raw term into MATCH — it throws
         // on `c++`, quotes, `%`, operators. Wrap as a quoted FTS phrase, and use
-        // the JOIN form /s uses (perf + scope parity).
+        // the FTS rowid form (perf + scope parity).
         sql.push_str(" AND m.id IN (SELECT mf.rowid FROM messages_fts mf WHERE mf MATCH ?)");
         binds.push(Bind::Text(to_fts_phrase(&term)));
     }
@@ -359,5 +359,34 @@ mod tests {
             1,
         );
         assert_eq!(b[1], Bind::Text("%50\\%\\_off%".to_string()));
+    }
+
+    #[test]
+    fn avg_len_uses_length_and_value_num_ordering() {
+        let (sql, _) = compile(&spec(r#"{"metric":"avg_len","group_by":"day"}"#), 1);
+        assert!(sql.contains("AVG(LENGTH(m.text)) AS value_num"));
+        assert!(sql.contains("ORDER BY value_num DESC"));
+    }
+
+    #[test]
+    fn group_by_none_emits_no_group_by_clause() {
+        let (sql, _) = compile(&spec(r#"{"metric":"count"}"#), 1);
+        assert!(!sql.contains("GROUP BY"));
+        assert!(sql.contains("NULL AS group_key"));
+    }
+
+    #[test]
+    fn exclude_flags_toggle_clauses() {
+        let (on, _) = compile(&spec(r#"{"metric":"count"}"#), 1); // defaults: exclude on
+        assert!(on.contains("is_command = 0") && on.contains("is_synthetic_record = 0"));
+        let (off, _) = compile(
+            &spec(
+                r#"{"metric":"count","filters":{"exclude_commands":false,"exclude_synthetic":false,"exclude_ai_asks":true}}"#,
+            ),
+            1,
+        );
+        assert!(!off.contains("is_command = 0"));
+        assert!(!off.contains("is_synthetic_record = 0"));
+        assert!(off.contains("asks_ai = 0"));
     }
 }
