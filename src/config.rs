@@ -210,6 +210,8 @@ pub struct Config {
     pub factcheck_max_claims: usize,
     pub factcheck_searches_per_claim: usize,
     pub factcheck_claim_concurrency: usize,
+    pub qc_analytics_max_total_calls: usize,
+    pub qc_analytics_max_query_calls: usize,
     pub qc_analytics_query_timeout_secs: u64,
     pub telegraph_access_token: String,
     pub telegraph_author_name: String,
@@ -680,6 +682,10 @@ impl Config {
             factcheck_max_claims: env_usize("FACTCHECK_MAX_CLAIMS", 5).clamp(1, 8),
             factcheck_searches_per_claim: env_usize("FACTCHECK_SEARCHES_PER_CLAIM", 2).clamp(1, 3),
             factcheck_claim_concurrency: env_usize("FACTCHECK_CLAIM_CONCURRENCY", 2).clamp(1, 4),
+            qc_analytics_max_total_calls: env_usize("QC_ANALYTICS_MAX_TOTAL_CALLS", 12)
+                .clamp(4, 24),
+            qc_analytics_max_query_calls: env_usize("QC_ANALYTICS_MAX_QUERY_CALLS", 10)
+                .clamp(2, 20),
             qc_analytics_query_timeout_secs: env_u64("QC_ANALYTICS_QUERY_TIMEOUT_SECS", 2)
                 .clamp(1, 15),
             telegraph_access_token: env_string("TELEGRAPH_ACCESS_TOKEN", ""),

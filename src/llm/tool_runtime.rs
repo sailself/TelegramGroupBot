@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::config::CONFIG;
 use crate::db::database::Database;
 use crate::db::models::{ChatSearchHit, MessageRow};
 use crate::db::search::SEARCH_INDEX_REBUILDING_ERROR;
@@ -18,9 +19,11 @@ const MAX_CONTEXT_WINDOW: usize = 5;
 const MAX_WEB_RESULTS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // All three variants are "Chat*" by design
 pub enum ToolProfile {
     ChatQuestion,
     ChatSearch,
+    ChatAnalytics,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +31,7 @@ pub struct ToolBudgetConfig {
     pub max_total_successful_calls: usize,
     pub max_web_search_calls: usize,
     pub max_chat_context_query_calls: usize,
+    pub max_chat_analytics_query_calls: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -35,6 +39,7 @@ struct ToolBudgetSnapshot {
     total_remaining: usize,
     web_search_remaining: usize,
     chat_context_query_remaining: usize,
+    chat_analytics_query_remaining: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +47,7 @@ enum ToolBudgetErrorKind {
     Total,
     WebSearch,
     ChatContextQuery,
+    ChatAnalytics,
     Disabled,
 }
 
@@ -59,11 +65,14 @@ pub struct ToolRuntime {
     successful_calls: usize,
     web_search_calls: usize,
     chat_context_query_calls: usize,
+    chat_analytics_query_calls: usize,
     force_final_answer: bool,
     accumulated_hits: BTreeMap<i64, ChatSearchHit>,
     // Every message id surfaced to the model — search hits plus their context
     // windows plus window-op results — used to verify /qc citations are real.
     returned_message_ids: BTreeSet<i64>,
+    // Authoritative analytics results accumulated across tool calls (A3).
+    analytics_results: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,13 +130,16 @@ impl ToolRuntime {
                 max_total_successful_calls: 8,
                 max_web_search_calls: 3,
                 max_chat_context_query_calls: 5,
+                max_chat_analytics_query_calls: 0,
             },
             successful_calls: 0,
             web_search_calls: 0,
             chat_context_query_calls: 0,
+            chat_analytics_query_calls: 0,
             force_final_answer: false,
             accumulated_hits: BTreeMap::new(),
             returned_message_ids: BTreeSet::new(),
+            analytics_results: Vec::new(),
         }
     }
 
@@ -140,14 +152,46 @@ impl ToolRuntime {
                 max_total_successful_calls: 5,
                 max_web_search_calls: 0,
                 max_chat_context_query_calls: 5,
+                max_chat_analytics_query_calls: 0,
             },
             successful_calls: 0,
             web_search_calls: 0,
             chat_context_query_calls: 0,
+            chat_analytics_query_calls: 0,
             force_final_answer: false,
             accumulated_hits: BTreeMap::new(),
             returned_message_ids: BTreeSet::new(),
+            analytics_results: Vec::new(),
         }
+    }
+
+    // Consumed by the analytics lane (A4); allow until that task is committed.
+    #[allow(dead_code)]
+    pub fn for_analytics(db: Database, chat_id: i64) -> Self {
+        Self {
+            db,
+            chat_id,
+            profile: ToolProfile::ChatAnalytics,
+            budget: ToolBudgetConfig {
+                max_total_successful_calls: CONFIG.qc_analytics_max_total_calls,
+                max_web_search_calls: 0,
+                max_chat_context_query_calls: 1,
+                max_chat_analytics_query_calls: CONFIG.qc_analytics_max_query_calls,
+            },
+            successful_calls: 0,
+            web_search_calls: 0,
+            chat_context_query_calls: 0,
+            chat_analytics_query_calls: 0,
+            force_final_answer: false,
+            accumulated_hits: BTreeMap::new(),
+            returned_message_ids: BTreeSet::new(),
+            analytics_results: Vec::new(),
+        }
+    }
+
+    #[allow(dead_code)] // Consumed by the analytics lane (A4)
+    pub fn analytics_results(&self) -> &[Value] {
+        &self.analytics_results
     }
 
     pub fn force_final_answer(&self) -> bool {
@@ -169,6 +213,12 @@ impl ToolRuntime {
             }
             ToolProfile::ChatSearch => {
                 "Tool budgets for this request: use chat_context_query at most 5 times total. Search is keyword-based FTS, not semantic, so inspect snippets carefully and refine your query if needed.".to_string()
+            }
+            ToolProfile::ChatAnalytics => {
+                format!(
+                    "Tool budgets for this request: use chat_analytics for any counting/ranking/trend question (up to {} calls; refine the spec between calls). chat_context_query is limited to 1 small lookup to quote one example message.",
+                    self.budget.max_chat_analytics_query_calls
+                )
             }
         }
     }
@@ -197,6 +247,17 @@ impl ToolRuntime {
                         },
                         "required": ["query"]
                     }
+                }
+            }));
+        }
+
+        if self.profile == ToolProfile::ChatAnalytics {
+            tools.push(json!({
+                "type": "function",
+                "function": {
+                    "name": "chat_analytics",
+                    "description": "Run a structured analytics query over this chat's message history. Returns counts, rankings, trends, and date metrics. Never accesses other chats.",
+                    "parameters": crate::llm::analytics::query_spec_schema()
                 }
             }));
         }
@@ -274,6 +335,14 @@ impl ToolRuntime {
                     },
                     "required": ["query"]
                 }
+            }));
+        }
+
+        if self.profile == ToolProfile::ChatAnalytics {
+            declarations.push(json!({
+                "name": "chat_analytics",
+                "description": "Run a structured analytics query over this chat's message history. Returns counts, rankings, trends, and date metrics. Never accesses other chats.",
+                "parameters": crate::llm::analytics::query_spec_schema()
             }));
         }
 
@@ -384,6 +453,10 @@ impl ToolRuntime {
                 Ok(()) => self.execute_chat_context_query(arguments).await,
                 Err(err) => self.tool_budget_error_payload("chat_context_query", err),
             },
+            "chat_analytics" => match self.begin_tool_call(ToolName::ChatAnalytics) {
+                Ok(()) => self.execute_analytics(arguments).await,
+                Err(err) => self.tool_budget_error_payload("chat_analytics", err),
+            },
             _ => {
                 self.force_final_answer = true;
                 self.error_payload(
@@ -433,6 +506,15 @@ impl ToolRuntime {
                 }
                 self.chat_context_query_calls += 1;
             }
+            ToolName::ChatAnalytics => {
+                if self.chat_analytics_query_calls >= self.budget.max_chat_analytics_query_calls {
+                    self.force_final_answer = true;
+                    return Err(ToolBudgetError {
+                        kind: ToolBudgetErrorKind::ChatAnalytics,
+                    });
+                }
+                self.chat_analytics_query_calls += 1;
+            }
         }
 
         self.successful_calls += 1;
@@ -453,6 +535,10 @@ impl ToolRuntime {
                 .budget
                 .max_chat_context_query_calls
                 .saturating_sub(self.chat_context_query_calls),
+            chat_analytics_query_remaining: self
+                .budget
+                .max_chat_analytics_query_calls
+                .saturating_sub(self.chat_analytics_query_calls),
         }
     }
 
@@ -532,15 +618,21 @@ impl ToolRuntime {
                     ));
                 }
 
-                let limit = limit
-                    .unwrap_or(match self.profile {
-                        ToolProfile::ChatQuestion => DEFAULT_QC_SEARCH_LIMIT,
-                        ToolProfile::ChatSearch => DEFAULT_S_SEARCH_LIMIT,
-                    })
-                    .clamp(1, MAX_SEARCH_LIMIT);
+                let default_limit = match self.profile {
+                    ToolProfile::ChatQuestion => DEFAULT_QC_SEARCH_LIMIT,
+                    ToolProfile::ChatSearch => DEFAULT_S_SEARCH_LIMIT,
+                    ToolProfile::ChatAnalytics => 3, // Decision 1: only a representative quote
+                };
+                let mut limit = limit.unwrap_or(default_limit).clamp(1, MAX_SEARCH_LIMIT);
                 let offset = offset.unwrap_or(0).clamp(0, MAX_SEARCH_OFFSET);
-                let context_before = context_before.unwrap_or(0).clamp(0, MAX_CONTEXT_WINDOW);
-                let context_after = context_after.unwrap_or(0).clamp(0, MAX_CONTEXT_WINDOW);
+                let mut context_before = context_before.unwrap_or(0).clamp(0, MAX_CONTEXT_WINDOW);
+                let mut context_after = context_after.unwrap_or(0).clamp(0, MAX_CONTEXT_WINDOW);
+                // Hard cap for analytics profile: only a small representative quote.
+                if self.profile == ToolProfile::ChatAnalytics {
+                    limit = limit.min(3);
+                    context_before = 0;
+                    context_after = 0;
+                }
 
                 let hits = self
                     .db
@@ -625,6 +717,77 @@ impl ToolRuntime {
         }
     }
 
+    async fn execute_analytics(&mut self, arguments: &Value) -> String {
+        match self.run_analytics_query(arguments).await {
+            Ok(payload) => self.success_payload("chat_analytics", payload),
+            Err(err) => self.error_payload("chat_analytics", "invalid_arguments", &err.to_string()),
+        }
+    }
+
+    pub async fn run_analytics_query(&mut self, arguments: &Value) -> Result<Value> {
+        use crate::llm::analytics::{normalize_stats_date, validate, QuerySpec};
+        let mut spec: QuerySpec = serde_json::from_value(arguments.clone())
+            .map_err(|e| anyhow!("invalid analytics arguments: {e}"))?;
+        validate(&spec).map_err(|e| anyhow!(e))?;
+        // Normalize date bounds so malformed dates don't silently match nothing.
+        spec.filters.date_from = spec
+            .filters
+            .date_from
+            .as_deref()
+            .and_then(normalize_stats_date);
+        spec.filters.date_to = spec
+            .filters
+            .date_to
+            .as_deref()
+            .and_then(normalize_stats_date);
+
+        let rows = self.db.run_chat_analytics(self.chat_id, &spec).await?;
+        let label_map = crate::handlers::build_display_label_map(rows.iter().filter_map(|r| {
+            r.group_user_id
+                .map(|uid| (uid, r.group_key.as_deref().unwrap_or("Anonymous")))
+        }));
+        let out: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let group = match (r.group_user_id, &r.group_key) {
+                    (Some(uid), _) => label_map
+                        .get(&uid)
+                        .cloned()
+                        .unwrap_or_else(|| "Anonymous".into()),
+                    (None, Some(k)) => k.clone(),
+                    (None, None) => "all".into(),
+                };
+                let mut row = json!({ "group": group });
+                if let Some(v) = r.value_num {
+                    row["value"] = json!(v);
+                }
+                if let Some(t) = &r.value_text {
+                    row["value"] = json!(t);
+                }
+                row
+            })
+            .collect();
+
+        let payload = json!({
+            "operation": "analytics",
+            "scope": {
+                "chat": "active",
+                "date_from": spec.filters.date_from,
+                "date_to": spec.filters.date_to,
+                "timezone": "UTC"
+            },
+            "row_count": out.len(),
+            "rows": out,
+            "note": "Counts cover stored TEXT messages only (media-only/stickers/service/edits/commands not stored); anonymous-admin and channel posts excluded. Times UTC.",
+        });
+        // Byte-cap the accumulated results so the turn stays bounded.
+        let serialized = payload.to_string();
+        if serialized.len() <= 16_384 {
+            self.analytics_results.push(payload.clone());
+        }
+        Ok(payload)
+    }
+
     fn success_payload(&self, tool: &str, data: Value) -> String {
         json!({
             "ok": true,
@@ -666,6 +829,10 @@ fn tool_budget_error_parts(error: ToolBudgetError) -> (&'static str, &'static st
             "chat_context_query_budget_exhausted",
             "The chat_context_query budget for this request is exhausted. Answer using the evidence already gathered.",
         ),
+        ToolBudgetErrorKind::ChatAnalytics => (
+            "chat_analytics_budget_exhausted",
+            "The chat_analytics budget for this request is exhausted. Answer using the results already gathered.",
+        ),
         ToolBudgetErrorKind::Disabled => (
             "tool_disabled",
             "This tool is unavailable for the current request. Answer using the evidence already gathered.",
@@ -677,6 +844,7 @@ fn tool_budget_error_parts(error: ToolBudgetError) -> (&'static str, &'static st
 enum ToolName {
     WebSearch,
     ChatContextQuery,
+    ChatAnalytics,
 }
 
 fn message_row_to_tool_message(row: MessageRow) -> ToolMessage {
@@ -882,5 +1050,197 @@ mod tests {
         }
         assert!(runtime.begin_tool_call(ToolName::ChatContextQuery).is_err());
         assert!(runtime.force_final_answer());
+    }
+
+    /// Insert a message with an explicit user_id and username so analytics
+    /// group_by=user queries return meaningful rows.
+    async fn insert_user_message(
+        db: &Database,
+        message_id: i64,
+        chat_id: i64,
+        user_id: i64,
+        username: &str,
+    ) {
+        let insert = crate::db::database::build_message_insert(
+            Some(user_id),
+            Some(username.to_string()),
+            Some(format!("message from {username}")),
+            Some("en".to_string()),
+            Utc::now(),
+            None,
+            Some(chat_id),
+            Some(message_id),
+            None,
+            false,
+            None,
+            false,
+            false,
+        );
+        db.queue_message_insert(insert)
+            .await
+            .expect("message insert should queue");
+        // Wait for the async write queue to flush the row.
+        for _ in 0..200 {
+            if let Ok(Some(rows)) = db.get_message_window(chat_id, message_id, 0, 0).await {
+                if !rows.is_empty() {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("message {message_id} was not persisted in time");
+    }
+
+    #[test]
+    fn analytics_tool_ranks_users_and_accumulates_result() {
+        let rt = Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let db = init_test_db("analytics-ranks").await;
+            let chat_id = -1001374348669_i64;
+            // Alice sends 2 messages, Bob sends 1.
+            insert_user_message(&db, 1, chat_id, 11, "alice").await;
+            insert_user_message(&db, 2, chat_id, 11, "alice").await;
+            insert_user_message(&db, 3, chat_id, 12, "bob").await;
+
+            let mut rt = ToolRuntime::for_analytics(db, chat_id);
+            let args = serde_json::json!({"metric": "count", "group_by": "user"});
+            let payload = rt
+                .run_analytics_query(&args)
+                .await
+                .expect("analytics query should succeed");
+
+            assert_eq!(
+                payload.get("operation").and_then(Value::as_str),
+                Some("analytics")
+            );
+            let rows = payload["rows"].as_array().expect("rows array");
+            assert!(!rows.is_empty());
+            // First row should be alice (2 messages, highest count).
+            let first_val = rows[0]["value"].as_f64().unwrap_or(0.0);
+            assert!(first_val >= 2.0, "alice should have at least 2 messages");
+
+            // Authoritative result accumulated.
+            assert_eq!(rt.analytics_results().len(), 1);
+            // No message IDs accumulated (analytics doesn't retrieve chat messages).
+            assert!(rt.accumulated_message_ids().is_empty());
+        });
+    }
+
+    #[test]
+    fn analytics_through_tool_is_chat_scoped() {
+        let rt = Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let db = init_test_db("analytics-chat-scope").await;
+            let chat_a = -1001374348669_i64;
+            let chat_b = -1002631835259_i64;
+
+            insert_user_message(&db, 1, chat_a, 11, "alice").await;
+            insert_user_message(&db, 2, chat_a, 11, "alice").await;
+            // Sentinel in chat B — must never show up in chat A results.
+            insert_user_message(&db, 3, chat_b, 99, "sentinel").await;
+
+            let mut runtime = ToolRuntime::for_analytics(db, chat_a);
+            let args = serde_json::json!({"metric": "count"});
+            let payload = runtime
+                .run_analytics_query(&args)
+                .await
+                .expect("analytics query should succeed");
+
+            let rows = payload["rows"].as_array().expect("rows array");
+            // Total count for chat_a should be 2.
+            let total = rows[0]["value"].as_f64().unwrap_or(0.0);
+            assert_eq!(total, 2.0, "should count only chat A messages");
+            // No sentinel group key.
+            for row in rows {
+                assert_ne!(
+                    row["group"].as_str(),
+                    Some("sentinel"),
+                    "chat B user must not appear in chat A results"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn analytics_context_query_is_capped() {
+        let rt = Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let db = init_test_db("analytics-ctx-cap").await;
+            let chat_id = -1001374348669_i64;
+            // Insert enough messages that a limit=20 request would normally return many.
+            for i in 1..=15_i64 {
+                insert_test_message(&db, i, chat_id, "hello world analytics").await;
+            }
+
+            let mut runtime = ToolRuntime::for_analytics(db, chat_id);
+            // Simulate a model asking for limit=20 with context_after=5.
+            let result = runtime
+                .run_chat_context_query(ChatContextQueryArgs::Search {
+                    query: "hello".to_string(),
+                    limit: Some(20),
+                    offset: None,
+                    context_before: Some(0),
+                    context_after: Some(5),
+                })
+                .await
+                .expect("capped search should succeed");
+
+            let result_count = result["result_count"].as_u64().unwrap_or(99);
+            assert!(
+                result_count <= 3,
+                "analytics profile must cap results to ≤3, got {result_count}"
+            );
+            // No context messages should appear — context window is forced to 0.
+            let results = result["results"].as_array().expect("results array");
+            for hit in results {
+                let ctx = hit["context_messages"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                assert_eq!(ctx, 0, "analytics profile must suppress context window");
+            }
+        });
+    }
+
+    #[test]
+    fn analytics_budget_stops() {
+        let rt = Runtime::new().expect("tokio runtime");
+        let db = rt.block_on(init_test_db("analytics-budget"));
+        let mut runtime = ToolRuntime::for_analytics(db, -1001374348669);
+
+        // Exhaust the analytics query budget.
+        for _ in 0..runtime.budget.max_chat_analytics_query_calls {
+            assert!(
+                runtime.begin_tool_call(ToolName::ChatAnalytics).is_ok(),
+                "should succeed within budget"
+            );
+            // begin_tool_call increments successful_calls; make room if total budget is smaller.
+        }
+        assert!(
+            runtime.begin_tool_call(ToolName::ChatAnalytics).is_err(),
+            "should fail once analytics budget exhausted"
+        );
+        assert!(runtime.force_final_answer());
+    }
+
+    #[test]
+    fn invalid_spec_returns_invalid_arguments() {
+        let rt = Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let db = init_test_db("analytics-invalid-spec").await;
+            let mut runtime = ToolRuntime::for_analytics(db, -1001374348669);
+
+            // distinct_count + group_by=user is semantically invalid (validate rejects it).
+            let args = serde_json::json!({"metric": "distinct_count", "group_by": "user"});
+            // execute_analytics wraps run_analytics_query errors as error payloads.
+            let result_str = runtime.execute_analytics(&args).await;
+            let result: Value = serde_json::from_str(&result_str).expect("valid json");
+            assert_eq!(result["ok"].as_bool(), Some(false));
+            assert_eq!(
+                result["error_code"].as_str(),
+                Some("invalid_arguments"),
+                "validate rejection should produce invalid_arguments error code"
+            );
+        });
     }
 }

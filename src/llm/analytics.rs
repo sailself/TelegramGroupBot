@@ -3,9 +3,6 @@
 //! read-only SELECT over `messages`. `chat_id` is supplied by the caller and is
 //! always the first bind — never sourced from the model.
 
-// This module is consumed by later tasks (A2+); suppress dead_code until they land.
-#![allow(dead_code)]
-
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -281,6 +278,26 @@ fn escape_like(input: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// Normalize a date bound (YYYY-MM-DD or full RFC3339) to a canonical RFC3339
+/// UTC string comparable against the stored `date` column. None if unparseable.
+pub fn normalize_stats_date(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
+        return Some(dt.with_timezone(&chrono::Utc).to_rfc3339());
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+        let naive = d.and_hms_opt(0, 0, 0)?;
+        return Some(
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+                .to_rfc3339(),
+        );
+    }
+    None
+}
+
 pub fn query_spec_schema() -> Value {
     json!({
         "type": "object",
@@ -420,5 +437,26 @@ mod tests {
         assert!(!off.contains("is_command = 0"));
         assert!(!off.contains("is_synthetic_record = 0"));
         assert!(off.contains("asks_ai = 0"));
+    }
+
+    #[test]
+    fn normalize_stats_date_accepts_date_and_rfc3339() {
+        // YYYY-MM-DD → T00:00:00+00:00
+        let result = super::normalize_stats_date("2026-01-15");
+        assert_eq!(result, Some("2026-01-15T00:00:00+00:00".to_string()));
+
+        // Full RFC3339 passes through normalized to UTC
+        let result2 = super::normalize_stats_date("2026-01-15T12:34:56+05:30");
+        assert!(result2.is_some());
+        let s = result2.unwrap();
+        // Should be normalized to UTC; the offset +05:30 = -5h30m from UTC
+        assert!(s.ends_with("+00:00") || s.ends_with('Z'));
+        assert!(s.contains("07:04:56") || s.contains("2026-01-15T07:04:56"));
+
+        // Garbage → None
+        assert_eq!(super::normalize_stats_date("not-a-date"), None);
+        // Empty → None
+        assert_eq!(super::normalize_stats_date(""), None);
+        assert_eq!(super::normalize_stats_date("   "), None);
     }
 }
