@@ -160,9 +160,11 @@ pub fn compile(spec: &QuerySpec, chat_id: i64) -> (String, Vec<Bind>) {
         GroupBy::None => ("NULL AS group_user_id, NULL AS group_key", ""),
     };
     let (value_num, value_text) = match spec.metric {
-        Metric::Count => ("COUNT(*) AS value_num", "NULL AS value_text"),
+        // CAST to REAL so sqlx can decode into Option<f64> regardless of whether
+        // SQLite infers INTEGER or REAL affinity for the aggregate result.
+        Metric::Count => ("CAST(COUNT(*) AS REAL) AS value_num", "NULL AS value_text"),
         Metric::DistinctCount => (
-            "COUNT(DISTINCT m.user_id) AS value_num",
+            "CAST(COUNT(DISTINCT m.user_id) AS REAL) AS value_num",
             "NULL AS value_text",
         ),
         Metric::AvgLen => ("AVG(LENGTH(m.text)) AS value_num", "NULL AS value_text"),
@@ -190,7 +192,11 @@ pub fn compile(spec: &QuerySpec, chat_id: i64) -> (String, Vec<Bind>) {
         // REVIEW (all reviewers): never bind a raw term into MATCH — it throws
         // on `c++`, quotes, `%`, operators. Wrap as a quoted FTS phrase, and use
         // the FTS rowid form (perf + scope parity).
-        sql.push_str(" AND m.id IN (SELECT mf.rowid FROM messages_fts mf WHERE mf MATCH ?)");
+        // Use the table name directly (no alias) — FTS5 requires the virtual-table
+        // name in the MATCH predicate; aliasing it confuses some SQLite builds.
+        sql.push_str(
+            " AND m.id IN (SELECT messages_fts.rowid FROM messages_fts WHERE messages_fts MATCH ?)",
+        );
         binds.push(Bind::Text(to_fts_phrase(&term)));
     }
     if let Some(text) = nonempty(&spec.filters.text_contains) {

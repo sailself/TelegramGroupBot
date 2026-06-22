@@ -129,6 +129,15 @@ pub struct TokenUserStat {
     pub total_tokens: i64,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, FromRow)]
+pub struct AnalyticsRow {
+    pub group_user_id: Option<i64>,
+    pub group_key: Option<String>,
+    pub value_num: Option<f64>,
+    pub value_text: Option<String>,
+}
+
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct ModelTokenStat {
     pub provider: String,
