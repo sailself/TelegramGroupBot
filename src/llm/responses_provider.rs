@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -13,7 +15,9 @@ use crate::llm::audit::{
     log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
 };
 use crate::llm::openai_codex;
-use crate::llm::runtime_models::{selected_codex_model_record, CodexSelectedModelRecord};
+use crate::llm::runtime_models::{
+    selected_codex_model_record, CodexSelectedModelRecord, OPENAI_CODEX_SELECTED_MODEL_ID,
+};
 use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
@@ -22,6 +26,10 @@ use crate::utils::http::{get_http_client, get_http_client_no_compression};
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const RESPONSES_MAX_ATTEMPTS: usize = 3;
 const RESPONSES_RETRY_BASE_DELAY_MS: u64 = 900;
+const RESPONSES_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const MODELS_ETAG_HEADER: &str = "x-models-etag";
+const REQUEST_ID_HEADER: &str = "x-request-id";
 const CODEX_RESPONSE_STYLE_ADDENDUM: &str = r#"# Style
 Be direct, highly informative, and concise. Match depth to complexity.
 
@@ -50,10 +58,158 @@ struct ResponsesRequestDetails {
     display_name: &'static str,
     url: String,
     headers: Vec<(String, String)>,
+    session_id: String,
+    codex_account_id: Option<String>,
     payload: Value,
     streaming_sse: bool,
     request_timeout_secs: u64,
 }
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResponsesResponseMetadata {
+    pub(crate) request_id: Option<String>,
+    pub(crate) models_etag: Option<String>,
+    pub(crate) codex_account_id: Option<String>,
+    pub(crate) rate_limit_headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResponsesApiResult {
+    pub(crate) response: Value,
+    pub(crate) metadata: ResponsesResponseMetadata,
+}
+
+#[derive(Debug, Default)]
+struct CodexTurnState {
+    value: Option<String>,
+}
+
+fn observe_response_metadata(provider: ThirdPartyProvider, metadata: &ResponsesResponseMetadata) {
+    if provider != ThirdPartyProvider::OpenAICodex {
+        return;
+    }
+
+    let Some(models_etag) = metadata
+        .models_etag
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(account_id) = metadata
+        .codex_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        match crate::llm::runtime_models::refresh_selected_codex_model_for_etag(
+            &models_etag,
+            &account_id,
+        )
+        .await
+        {
+            Ok(true) => info!(
+                models_etag = %models_etag,
+                "Refreshed the selected Codex model metadata"
+            ),
+            Ok(false) => {}
+            Err(err) => warn!(
+                models_etag = %models_etag,
+                error = %err,
+                "Failed to refresh Codex model metadata"
+            ),
+        }
+    });
+}
+
+impl CodexTurnState {
+    fn capture(&mut self, headers: &reqwest::header::HeaderMap) {
+        if self.value.is_some() {
+            return;
+        }
+        self.value = headers
+            .get(CODEX_TURN_STATE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
+
+    fn apply(&self, headers: &mut Vec<(String, String)>) {
+        if let Some(value) = self.value.as_ref() {
+            headers.push((CODEX_TURN_STATE_HEADER.to_string(), value.clone()));
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResponseBodyReadError {
+    Transport(reqwest::Error),
+    TooLarge { limit: usize },
+}
+
+impl ResponseBodyReadError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
+impl fmt::Display for ResponseBodyReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(err) => write!(formatter, "response body decode failed: {err}"),
+            Self::TooLarge { limit } => {
+                write!(formatter, "response body exceeded the {limit}-byte limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResponseBodyReadError {}
+
+#[derive(Debug)]
+enum SseParseError {
+    InvalidPayload {
+        bytes: usize,
+        source: serde_json::Error,
+    },
+    MissingCompletion,
+    Incomplete(String),
+    Failed(String),
+}
+
+impl SseParseError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::InvalidPayload { .. } | Self::MissingCompletion)
+    }
+}
+
+impl fmt::Display for SseParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPayload { bytes, source } => {
+                write!(
+                    formatter,
+                    "invalid {bytes}-byte SSE event payload: {source}"
+                )
+            }
+            Self::MissingCompletion => {
+                formatter.write_str("SSE stream ended before response.completed")
+            }
+            Self::Incomplete(detail) => write!(formatter, "SSE response incomplete: {detail}"),
+            Self::Failed(detail) => write!(formatter, "SSE response failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for SseParseError {}
 
 #[derive(Debug, Clone)]
 struct ResponsesToolCall {
@@ -76,27 +232,39 @@ fn truncate_for_log(value: &str, limit: usize) -> String {
     format!("{truncated}... (truncated)")
 }
 
-fn summarize_error_body(body: &str) -> (Option<String>, String) {
+fn classify_incomplete_reason(value: Option<&str>) -> &'static str {
+    match value {
+        Some("max_output_tokens") => "max_output_tokens",
+        Some("content_filter") => "content_filter",
+        _ => "other",
+    }
+}
+
+fn summarize_error_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        return (None, "empty response body".to_string());
+        return "empty_response_body".to_string();
     }
 
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        let message = value
-            .pointer("/error/message")
-            .and_then(|v| v.as_str())
-            .map(|v| v.to_string())
-            .or_else(|| {
-                value
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string())
-            });
-        return (message, truncate_for_log(&value.to_string(), 2000));
+        let code_present = value
+            .pointer("/error/code")
+            .or_else(|| value.get("code"))
+            .is_some();
+        let type_present = value
+            .pointer("/error/type")
+            .or_else(|| value.get("type"))
+            .is_some();
+        let summary = format!(
+            "json_error(code_present={}, type_present={}, bytes={})",
+            code_present,
+            type_present,
+            body.len()
+        );
+        return summary;
     }
 
-    (None, truncate_for_log(trimmed, 2000))
+    format!("non_json_error(bytes={})", body.len())
 }
 
 fn summarize_responses_payload(payload: &Value) -> String {
@@ -204,31 +372,145 @@ fn summarize_response_headers(headers: &reqwest::header::HeaderMap) -> String {
         .join(", ")
 }
 
+fn is_codex_rate_limit_header(name: &str) -> bool {
+    name.starts_with("x-codex-")
+        && (name.contains("-primary-")
+            || name.contains("-secondary-")
+            || name.contains("-credits-")
+            || name.ends_with("-limit-name")
+            || name.ends_with("-rate-limit-reached-type"))
+}
+
+fn capture_response_metadata(
+    headers: &reqwest::header::HeaderMap,
+    codex_account_id: Option<&str>,
+) -> ResponsesResponseMetadata {
+    let header_string = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let rate_limit_headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str().to_ascii_lowercase();
+            if !is_codex_rate_limit_header(&name) {
+                return None;
+            }
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name, truncate_for_log(value, 200)))
+        })
+        .collect();
+
+    ResponsesResponseMetadata {
+        request_id: header_string(REQUEST_ID_HEADER),
+        models_etag: header_string(MODELS_ETAG_HEADER),
+        codex_account_id: codex_account_id.map(str::to_string),
+        rate_limit_headers,
+    }
+}
+
 async fn read_response_body_bytes(
+    response: reqwest::Response,
+    display_name: &str,
+    model: &str,
+    attempt: usize,
+    streaming_sse: bool,
+) -> std::result::Result<(Vec<u8>, String), ResponseBodyReadError> {
+    read_response_body_bytes_with_limit(
+        response,
+        display_name,
+        model,
+        attempt,
+        streaming_sse,
+        RESPONSES_MAX_BODY_BYTES,
+    )
+    .await
+}
+
+async fn read_response_body_bytes_with_limit(
     mut response: reqwest::Response,
     display_name: &str,
     model: &str,
     attempt: usize,
     streaming_sse: bool,
-) -> Result<(Vec<u8>, String)> {
+    max_body_bytes: usize,
+) -> std::result::Result<(Vec<u8>, String), ResponseBodyReadError> {
     let header_summary = summarize_response_headers(response.headers());
     let mut body = Vec::new();
 
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_body_bytes as u64)
+    {
+        error!(
+            "{} response body rejected: model={}, attempt={}/{}, streaming_sse={}, headers=[{}], limit_bytes={}",
+            display_name,
+            model,
+            attempt,
+            RESPONSES_MAX_ATTEMPTS,
+            streaming_sse,
+            header_summary,
+            max_body_bytes
+        );
+        return Err(ResponseBodyReadError::TooLarge {
+            limit: max_body_bytes,
+        });
+    }
+
     loop {
         match response.chunk().await {
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > max_body_bytes {
+                    error!(
+                        "{} response body rejected: model={}, attempt={}/{}, streaming_sse={}, headers=[{}], received_bytes={}, next_chunk_bytes={}, limit_bytes={}",
+                        display_name,
+                        model,
+                        attempt,
+                        RESPONSES_MAX_ATTEMPTS,
+                        streaming_sse,
+                        header_summary,
+                        body.len(),
+                        chunk.len(),
+                        max_body_bytes
+                    );
+                    return Err(ResponseBodyReadError::TooLarge {
+                        limit: max_body_bytes,
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
             Ok(None) => {
                 return Ok((body, header_summary));
             }
             Err(err) => {
-                let body_preview = truncate_for_log(&String::from_utf8_lossy(&body), 2000);
+                if streaming_sse
+                    && std::str::from_utf8(&body)
+                        .ok()
+                        .is_some_and(|partial| parse_sse_responses_body(partial).is_ok())
+                {
+                    warn!(
+                        "{} response framing ended after a valid response.completed event: model={}, attempt={}/{}, headers=[{}], bytes={}, error={}",
+                        display_name,
+                        model,
+                        attempt,
+                        RESPONSES_MAX_ATTEMPTS,
+                        header_summary,
+                        body.len(),
+                        err
+                    );
+                    return Ok((body, header_summary));
+                }
                 // A failure while streaming the body (e.g. an intermediary closing an
                 // idle chunked connection mid-reasoning) is transient and safe to retry,
                 // so log it as a warning while attempts remain and reserve `error!` for
                 // the final, give-up attempt.
                 let will_retry = attempt < RESPONSES_MAX_ATTEMPTS;
                 let log_message = format!(
-                    "{} response body decode failed: model={}, attempt={}/{}, streaming_sse={}, timeout={}, connect={}, headers=[{}], partial_bytes={}, retrying={}, partial_body={}, error={}",
+                    "{} response body decode failed: model={}, attempt={}/{}, streaming_sse={}, timeout={}, connect={}, headers=[{}], partial_bytes={}, retrying={}, error={}",
                     display_name,
                     model,
                     attempt,
@@ -239,7 +521,6 @@ async fn read_response_body_bytes(
                     header_summary,
                     body.len(),
                     will_retry,
-                    body_preview,
                     err
                 );
                 if will_retry {
@@ -247,11 +528,7 @@ async fn read_response_body_bytes(
                 } else {
                     error!("{log_message}");
                 }
-                return Err(anyhow!(
-                    "{} response body decode failed: {}",
-                    display_name,
-                    err
-                ));
+                return Err(ResponseBodyReadError::Transport(err));
             }
         }
     }
@@ -454,7 +731,7 @@ fn reasoning_effort_for_request(
     Some(requested.to_ascii_lowercase())
 }
 
-async fn build_request_details(
+fn build_request_details(
     model_config: &ThirdPartyModelConfig,
     instructions: &str,
     input_items: Vec<Value>,
@@ -462,6 +739,28 @@ async fn build_request_details(
     session_id: &str,
     reasoning_override: Option<&str>,
 ) -> Result<ResponsesRequestDetails> {
+    let selected_record = if model_config.provider == ThirdPartyProvider::OpenAICodex {
+        selected_codex_model_record()
+    } else {
+        None
+    };
+    let codex_account_id = if model_config.provider == ThirdPartyProvider::OpenAICodex {
+        let account_id = crate::llm::runtime_models::current_codex_account_id()
+            .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+        if model_config.id == OPENAI_CODEX_SELECTED_MODEL_ID {
+            let record = selected_record
+                .as_ref()
+                .filter(|record| record.slug == model_config.model)
+                .ok_or_else(|| anyhow!("The selected Codex model or account changed"))?;
+            if record.account_id.as_deref().map(str::trim) != Some(account_id.as_str()) {
+                return Err(anyhow!("The selected Codex model or account changed"));
+            }
+        }
+        Some(account_id)
+    } else {
+        None
+    };
+
     let (display_name, url, mut headers, streaming_sse) = match model_config.provider {
         ThirdPartyProvider::OpenAI => (
             "OpenAI",
@@ -478,15 +777,12 @@ async fn build_request_details(
             ],
             false,
         ),
-        ThirdPartyProvider::OpenAICodex => {
-            let auth = openai_codex::get_valid_auth_context().await?;
-            (
-                "OpenAI Codex",
-                openai_codex::codex_response_url(),
-                openai_codex::codex_headers(&auth, Some(session_id)),
-                true,
-            )
-        }
+        ThirdPartyProvider::OpenAICodex => (
+            "OpenAI Codex",
+            openai_codex::codex_response_url(),
+            Vec::new(),
+            true,
+        ),
         _ => {
             return Err(anyhow!(
                 "Unsupported responses provider {:?}",
@@ -518,7 +814,7 @@ async fn build_request_details(
         model_config.provider,
         &model_config.model,
         reasoning_override,
-        selected_codex_model_record().as_ref(),
+        selected_record.as_ref(),
     ) {
         payload["reasoning"] = json!({
             "effort": effort,
@@ -534,23 +830,45 @@ async fn build_request_details(
         display_name,
         url,
         headers,
+        session_id: session_id.to_string(),
+        codex_account_id,
         payload,
         streaming_sse,
         request_timeout_secs: responses_request_timeout_secs(model_config.provider),
     })
 }
 
-fn parse_sse_responses_body(body: &str) -> Result<Value> {
+async fn resolve_request_headers_for_attempt(
+    details: &ResponsesRequestDetails,
+) -> Result<Vec<(String, String)>> {
+    if details.provider != ThirdPartyProvider::OpenAICodex {
+        return Ok(details.headers.clone());
+    }
+
+    let auth = openai_codex::get_valid_auth_context().await?;
+    if details.codex_account_id.as_deref() != Some(auth.account_id.trim()) {
+        return Err(anyhow!(
+            "The active ChatGPT account changed while the Codex request was in progress"
+        ));
+    }
+    let mut headers = openai_codex::codex_headers(&auth, Some(&details.session_id));
+    headers.extend(details.headers.clone());
+    Ok(headers)
+}
+
+fn parse_sse_responses_body(body: &str) -> std::result::Result<Value, SseParseError> {
     let mut output_items: Vec<Value> = Vec::new();
     let mut current_data_lines: Vec<String> = Vec::new();
     let mut response_id: Option<String> = None;
     let mut usage: Option<Value> = None;
+    let mut completed = false;
 
     let flush_event = |lines: &mut Vec<String>,
                        output_items: &mut Vec<Value>,
                        response_id: &mut Option<String>,
-                       usage: &mut Option<Value>|
-     -> Result<()> {
+                       usage: &mut Option<Value>,
+                       completed: &mut bool|
+     -> std::result::Result<(), SseParseError> {
         if lines.is_empty() {
             return Ok(());
         }
@@ -560,12 +878,17 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
             return Ok(());
         }
 
-        let value: Value = serde_json::from_str(&payload).with_context(|| {
-            format!(
-                "Failed to parse SSE event payload: {}",
-                truncate_for_log(&payload, 500)
-            )
-        })?;
+        let value: Value =
+            serde_json::from_str(&payload).map_err(|source| SseParseError::InvalidPayload {
+                bytes: payload.len(),
+                source,
+            })?;
+        if response_id.is_none() {
+            *response_id = value
+                .pointer("/response/id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+        }
         match value.get("type").and_then(|value| value.as_str()) {
             Some("response.output_item.done") => {
                 if let Some(item) = value.get("item").cloned() {
@@ -573,12 +896,7 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
                 }
             }
             Some("response.completed") => {
-                if response_id.is_none() {
-                    *response_id = value
-                        .pointer("/response/id")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string());
-                }
+                *completed = true;
                 if usage.is_none() {
                     *usage = value.pointer("/response/usage").cloned();
                 }
@@ -592,8 +910,16 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
                     }
                 }
             }
+            Some("response.incomplete") => {
+                let reason = value
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(|value| value.as_str());
+                return Err(SseParseError::Incomplete(
+                    classify_incomplete_reason(reason).to_string(),
+                ));
+            }
             Some("response.failed") => {
-                let detail = value
+                let message_present = value
                     .pointer("/response/error/message")
                     .and_then(|value| value.as_str())
                     .or_else(|| {
@@ -601,8 +927,20 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
                             .pointer("/error/message")
                             .and_then(|value| value.as_str())
                     })
-                    .unwrap_or("unknown SSE failure");
-                return Err(anyhow!("Codex SSE request failed: {}", detail));
+                    .is_some();
+                return Err(SseParseError::Failed(format!(
+                    "response_failed(message_present={message_present})"
+                )));
+            }
+            Some("error") => {
+                let message_present = value
+                    .pointer("/error/message")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| value.get("message").and_then(|value| value.as_str()))
+                    .is_some();
+                return Err(SseParseError::Failed(format!(
+                    "error_event(message_present={message_present})"
+                )));
             }
             _ => {}
         }
@@ -617,6 +955,7 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
                 &mut output_items,
                 &mut response_id,
                 &mut usage,
+                &mut completed,
             )?;
             continue;
         }
@@ -629,7 +968,12 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
         &mut output_items,
         &mut response_id,
         &mut usage,
+        &mut completed,
     )?;
+
+    if !completed {
+        return Err(SseParseError::MissingCompletion);
+    }
 
     Ok(json!({
         "id": response_id,
@@ -642,14 +986,59 @@ async fn call_provider_api(
     details: &ResponsesRequestDetails,
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
-) -> Result<Value> {
+    turn_state: &mut CodexTurnState,
+) -> Result<ResponsesApiResult> {
+    let refresh_codex_auth = details.provider == ThirdPartyProvider::OpenAICodex;
+    let result = call_provider_api_with_auth_hooks(
+        details,
+        audit_context,
+        operation,
+        turn_state,
+        || resolve_request_headers_for_attempt(details),
+        move || async move {
+            if refresh_codex_auth {
+                openai_codex::force_refresh_auth_tokens().await?;
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    debug!(
+        "{} completed response metadata: request_id={:?}, models_etag={:?}, rate_limit_header_count={}",
+        details.display_name,
+        result.metadata.request_id,
+        result.metadata.models_etag,
+        result.metadata.rate_limit_headers.len()
+    );
+    Ok(result)
+}
+
+async fn call_provider_api_with_auth_hooks<
+    ResolveHeaders,
+    ResolveHeadersFuture,
+    RefreshAuth,
+    RefreshAuthFuture,
+>(
+    details: &ResponsesRequestDetails,
+    audit_context: Option<&LlmAuditContext>,
+    operation: &str,
+    turn_state: &mut CodexTurnState,
+    mut resolve_headers: ResolveHeaders,
+    mut refresh_auth: RefreshAuth,
+) -> Result<ResponsesApiResult>
+where
+    ResolveHeaders: FnMut() -> ResolveHeadersFuture,
+    ResolveHeadersFuture: Future<Output = Result<Vec<(String, String)>>>,
+    RefreshAuth: FnMut() -> RefreshAuthFuture,
+    RefreshAuthFuture: Future<Output = Result<()>>,
+{
     let model = details
         .payload
         .get("model")
         .and_then(|value| value.as_str())
         .unwrap_or("unknown");
     let started_at = chrono::Utc::now();
-    let metadata = json!({
+    let audit_metadata = json!({
         "request_summary": summarize_responses_payload(&details.payload),
         "streaming_sse": details.streaming_sse,
         "timeout_secs": details.request_timeout_secs
@@ -659,17 +1048,12 @@ async fn call_provider_api(
         model,
         operation,
         started_at,
-        Some(&metadata),
+        Some(&audit_metadata),
     );
     info!(
         "{} responses request starting: {}",
         details.display_name,
         summarize_responses_payload(&details.payload)
-    );
-    debug!(
-        "{} responses request payload: {}",
-        details.display_name,
-        truncate_for_log(&details.payload.to_string(), 2000)
     );
     let client = if details.streaming_sse {
         get_http_client_no_compression()
@@ -677,10 +1061,14 @@ async fn call_provider_api(
         get_http_client()
     };
     for attempt in 1..=RESPONSES_MAX_ATTEMPTS {
+        let mut attempt_headers = resolve_headers().await?;
+        if details.provider == ThirdPartyProvider::OpenAICodex {
+            turn_state.apply(&mut attempt_headers);
+        }
         let mut request = client
             .post(&details.url)
             .timeout(Duration::from_secs(details.request_timeout_secs));
-        for (name, value) in &details.headers {
+        for (name, value) in &attempt_headers {
             request = request.header(name, value);
         }
         if details.streaming_sse {
@@ -726,9 +1114,15 @@ async fn call_provider_api(
             }
         };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+        let status = response.status();
+        if details.provider == ThirdPartyProvider::OpenAICodex {
+            turn_state.capture(response.headers());
+        }
+        let response_metadata =
+            capture_response_metadata(response.headers(), details.codex_account_id.as_deref());
+        observe_response_metadata(details.provider, &response_metadata);
+
+        if !status.is_success() {
             if status == StatusCode::UNAUTHORIZED
                 && details.provider == ThirdPartyProvider::OpenAICodex
                 && attempt < RESPONSES_MAX_ATTEMPTS
@@ -740,14 +1134,40 @@ async fn call_provider_api(
                     attempt,
                     RESPONSES_MAX_ATTEMPTS
                 );
-                openai_codex::force_refresh_auth_tokens().await?;
+                refresh_auth().await?;
                 continue;
             }
-            let (message, body_summary) = summarize_error_body(&body);
+            let body = match read_response_body_bytes(
+                response,
+                details.display_name,
+                model,
+                attempt,
+                details.streaming_sse,
+            )
+            .await
+            {
+                Ok((bytes, _)) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(err) => {
+                    let should_retry = responses_should_retry_status(status)
+                        && err.is_retryable()
+                        && attempt < RESPONSES_MAX_ATTEMPTS;
+                    if should_retry {
+                        tokio::time::sleep(responses_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "{} request failed with status {} and its error body could not be read: {}",
+                        details.display_name,
+                        status,
+                        err
+                    ));
+                }
+            };
+            let body_summary = summarize_error_body(&body);
             let should_retry =
                 responses_should_retry_status(status) && attempt < RESPONSES_MAX_ATTEMPTS;
             let log_message = format!(
-                "{} responses API error: model={}, status={}, body={}, attempt={}/{}, retrying={}",
+                "{} responses API error: model={}, status={}, error_summary={}, attempt={}/{}, retrying={}",
                 details.display_name,
                 model,
                 status,
@@ -765,14 +1185,22 @@ async fn call_provider_api(
                 tokio::time::sleep(responses_retry_delay(attempt)).await;
                 continue;
             }
-            let detail = message.unwrap_or(body_summary);
             return Err(anyhow!(
                 "{} request failed with status {}: {}",
                 details.display_name,
                 status,
-                detail
+                body_summary
             ));
         }
+
+        debug!(
+            "{} response metadata: model={}, request_id={:?}, models_etag={:?}, rate_limit_headers={:?}",
+            details.display_name,
+            model,
+            response_metadata.request_id,
+            response_metadata.models_etag,
+            response_metadata.rate_limit_headers
+        );
 
         let (body_bytes, header_summary) = match read_response_body_bytes(
             response,
@@ -792,11 +1220,11 @@ async fn call_provider_api(
             // surfacing the failure to the user. `read_response_body_bytes` already
             // logged the diagnostics, including whether a retry would follow.
             Err(err) => {
-                if attempt < RESPONSES_MAX_ATTEMPTS {
+                if err.is_retryable() && attempt < RESPONSES_MAX_ATTEMPTS {
                     tokio::time::sleep(responses_retry_delay(attempt)).await;
                     continue;
                 }
-                return Err(err);
+                return Err(err.into());
             }
         };
         debug!(
@@ -807,16 +1235,23 @@ async fn call_provider_api(
             Ok(body) => body,
             Err(err) => {
                 let bytes = err.into_bytes();
-                error!(
-                    "{} response body was not valid UTF-8: model={}, attempt={}/{}, headers=[{}], bytes={}, body={}",
+                let should_retry = details.streaming_sse && attempt < RESPONSES_MAX_ATTEMPTS;
+                let log_message = format!(
+                    "{} response body was not valid UTF-8: model={}, attempt={}/{}, headers=[{}], bytes={}, retrying={}",
                     details.display_name,
                     model,
                     attempt,
                     RESPONSES_MAX_ATTEMPTS,
                     header_summary,
                     bytes.len(),
-                    truncate_for_log(&String::from_utf8_lossy(&bytes), 2000)
+                    should_retry
                 );
+                if should_retry {
+                    warn!("{log_message}");
+                    tokio::time::sleep(responses_retry_delay(attempt)).await;
+                    continue;
+                }
+                error!("{log_message}");
                 return Err(anyhow!(
                     "{} response body was not valid UTF-8",
                     details.display_name
@@ -828,16 +1263,24 @@ async fn call_provider_api(
             match parse_sse_responses_body(&body) {
                 Ok(value) => value,
                 Err(err) => {
-                    error!(
-                        "{} SSE parse failed: model={}, attempt={}/{}, headers=[{}], body={}",
+                    let should_retry = err.is_retryable() && attempt < RESPONSES_MAX_ATTEMPTS;
+                    let log_message = format!(
+                        "{} SSE response rejected: model={}, attempt={}/{}, headers=[{}], retrying={}, error={}",
                         details.display_name,
                         model,
                         attempt,
                         RESPONSES_MAX_ATTEMPTS,
                         header_summary,
-                        truncate_for_log(&body, 2000)
+                        should_retry,
+                        err
                     );
-                    return Err(err);
+                    if should_retry {
+                        warn!("{log_message}");
+                        tokio::time::sleep(responses_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    error!("{log_message}");
+                    return Err(err.into());
                 }
             }
         } else {
@@ -845,13 +1288,14 @@ async fn call_provider_api(
                 Ok(value) => value,
                 Err(err) => {
                     error!(
-                        "{} JSON parse failed: model={}, attempt={}/{}, headers=[{}], body={}",
+                        "{} JSON parse failed: model={}, attempt={}/{}, headers=[{}], bytes={}, error={}",
                         details.display_name,
                         model,
                         attempt,
                         RESPONSES_MAX_ATTEMPTS,
                         header_summary,
-                        truncate_for_log(&body, 2000)
+                        body.len(),
+                        err
                     );
                     return Err(anyhow!(
                         "{} response JSON parse failed: {}",
@@ -869,12 +1313,6 @@ async fn call_provider_api(
             output_items.len(),
             summarize_output_items(&output_items)
         );
-        debug!(
-            "{} responses received for model={}, raw_response={}",
-            details.display_name,
-            model,
-            truncate_for_log(&value.to_string(), 2000)
-        );
         let usage = extract_responses_usage(&value);
         record_llm_request_success(
             audit_context,
@@ -886,7 +1324,10 @@ async fn call_provider_api(
             usage,
         )
         .await;
-        return Ok(value);
+        return Ok(ResponsesApiResult {
+            response: value,
+            metadata: response_metadata,
+        });
     }
 
     unreachable!("responses provider retry loop exhausted")
@@ -1009,10 +1450,15 @@ fn extract_response_tool_calls(output_items: &[Value]) -> Vec<ResponsesToolCall>
 }
 
 async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> {
+    let argument_keys = arguments
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
     debug!(
-        "Responses tool call requested: name={}, arguments={}",
+        "Responses tool call requested: name={}, argument_keys={:?}, argument_bytes={}",
         name,
-        truncate_for_log(&arguments.to_string(), 500)
+        argument_keys,
+        arguments.to_string().len()
     );
     match name {
         "web_search" => {
@@ -1049,6 +1495,7 @@ async fn responses_completion_with_tools(
 ) -> Result<String> {
     let tools = build_responses_function_tools();
     let session_id = generate_session_id();
+    let mut turn_state = CodexTurnState::default();
     let model_label = debug_model_label(model_config);
     debug!(
         "Responses tool loop starting: model={}, session_id={}, tools_enabled={}",
@@ -1072,9 +1519,11 @@ async fn responses_completion_with_tools(
             Some(tools.clone()),
             &session_id,
             reasoning_override,
-        )
-        .await?;
-        let response = call_provider_api(&details, audit_context, operation).await?;
+        )?;
+        let ResponsesApiResult {
+            response,
+            metadata: _,
+        } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
         let output_items = extract_response_output_items(&response);
         let tool_calls = extract_response_tool_calls(&output_items);
         let content = extract_response_text(&output_items);
@@ -1116,9 +1565,11 @@ async fn responses_completion_with_tools(
                 None,
                 &session_id,
                 reasoning_override,
-            )
-            .await?;
-            let response = call_provider_api(&details, audit_context, operation).await?;
+            )?;
+            let ResponsesApiResult {
+                response,
+                metadata: _,
+            } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
             return Ok(extract_response_text(&extract_response_output_items(
                 &response,
             )));
@@ -1152,6 +1603,7 @@ async fn responses_completion_with_tool_runtime(
     }
     let mut tools_enabled = !tools.is_empty();
     let session_id = generate_session_id();
+    let mut turn_state = CodexTurnState::default();
     let mut final_answer_requested = false;
     debug!(
         "Responses runtime tool loop starting: model={}, session_id={}, tools_enabled={}, native_codex_web_search={}",
@@ -1176,9 +1628,11 @@ async fn responses_completion_with_tool_runtime(
             tools_enabled.then_some(tools.clone()),
             &session_id,
             reasoning_override,
-        )
-        .await?;
-        let response = call_provider_api(&details, audit_context, operation).await?;
+        )?;
+        let ResponsesApiResult {
+            response,
+            metadata: _,
+        } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
         let output_items = extract_response_output_items(&response);
         let tool_calls = if tools_enabled {
             extract_response_tool_calls(&output_items)
@@ -1225,9 +1679,11 @@ async fn responses_completion_with_tool_runtime(
         None,
         &session_id,
         reasoning_override,
-    )
-    .await?;
-    let response = call_provider_api(&details, audit_context, operation).await?;
+    )?;
+    let ResponsesApiResult {
+        response,
+        metadata: _,
+    } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
     Ok(extract_response_text(&extract_response_output_items(
         &response,
     )))
@@ -1278,6 +1734,7 @@ pub async fn call_responses_provider(
     }
 
     let session_id = generate_session_id();
+    let mut turn_state = CodexTurnState::default();
     let details = build_request_details(
         model_config,
         &instructions,
@@ -1285,9 +1742,11 @@ pub async fn call_responses_provider(
         native_codex_web_search_tool.map(|tool| vec![tool]),
         &session_id,
         reasoning_override,
-    )
-    .await?;
-    let response = call_provider_api(&details, audit_context, &operation).await?;
+    )?;
+    let ResponsesApiResult {
+        response,
+        metadata: _,
+    } = call_provider_api(&details, audit_context, &operation, &mut turn_state).await?;
     Ok(extract_response_text(&extract_response_output_items(
         &response,
     )))
@@ -1341,6 +1800,21 @@ mod tests {
     use super::*;
     use crate::config::ThirdPartyProvider;
 
+    fn read_http_request_headers(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let bytes_read = stream.read(&mut chunk).expect("read HTTP request");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes_read]);
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
     fn model_config(provider: ThirdPartyProvider, model: &str) -> ThirdPartyModelConfig {
         ThirdPartyModelConfig {
             id: format!("{}:{}", provider.as_str(), model),
@@ -1360,6 +1834,7 @@ mod tests {
         selected: Option<&str>,
     ) -> CodexSelectedModelRecord {
         CodexSelectedModelRecord {
+            account_id: None,
             slug: slug.to_string(),
             display_name: slug.to_string(),
             description: None,
@@ -1604,6 +2079,130 @@ data: {"type":"response.completed","response":{"id":"resp1","output":[],"usage":
         );
     }
 
+    #[test]
+    fn parse_sse_responses_body_rejects_clean_eof_without_completion() {
+        let body = r#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}}
+
+"#;
+
+        let err = parse_sse_responses_body(body).expect_err("completion is mandatory");
+        assert!(matches!(err, SseParseError::MissingCompletion));
+    }
+
+    #[test]
+    fn parse_sse_responses_body_reports_incomplete_terminal_event() {
+        let body = r#"event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp1","incomplete_details":{"reason":"max_output_tokens"}}}
+
+"#;
+
+        let err = parse_sse_responses_body(body).expect_err("incomplete is not success");
+        assert!(matches!(
+            err,
+            SseParseError::Incomplete(detail) if detail == "max_output_tokens"
+        ));
+    }
+
+    #[test]
+    fn incomplete_sse_does_not_retain_remote_error_message() {
+        let body = r#"event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp1","error":{"message":"secret APIKEY123"}}}
+
+"#;
+
+        let err = parse_sse_responses_body(body).expect_err("incomplete is not success");
+        assert!(matches!(
+            err,
+            SseParseError::Incomplete(detail) if detail == "other"
+        ));
+    }
+
+    #[test]
+    fn parse_sse_responses_body_reports_failed_terminal_event() {
+        let body = r#"event: response.failed
+data: {"type":"response.failed","response":{"id":"resp1","error":{"message":"backend rejected request"}}}
+
+"#;
+
+        let err = parse_sse_responses_body(body).expect_err("failed is not success");
+        assert!(matches!(
+            err,
+            SseParseError::Failed(detail) if detail == "response_failed(message_present=true)"
+        ));
+    }
+
+    #[test]
+    fn provider_error_summary_does_not_retain_remote_message_or_body() {
+        let secret = "user prompt and bearer token";
+        let json_body = format!(
+            r#"{{"error":{{"code":"rate_limit","type":"request_error","message":"{secret}"}}}}"#
+        );
+        let json_summary = summarize_error_body(&json_body);
+        let text_summary = summarize_error_body(secret);
+
+        assert_eq!(
+            json_summary,
+            format!(
+                "json_error(code_present=true, type_present=true, bytes={})",
+                json_body.len()
+            )
+        );
+        assert_eq!(
+            text_summary,
+            format!("non_json_error(bytes={})", secret.len())
+        );
+        assert!(!json_summary.contains(secret));
+        assert!(!text_summary.contains(secret));
+    }
+
+    #[test]
+    fn response_metadata_captures_observability_headers_without_turn_state() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(REQUEST_ID_HEADER, "req-123".parse().unwrap());
+        headers.insert(MODELS_ETAG_HEADER, "models-v2".parse().unwrap());
+        headers.insert(CODEX_TURN_STATE_HEADER, "sticky-secret".parse().unwrap());
+        headers.insert("x-codex-primary-used-percent", "41.5".parse().unwrap());
+
+        let metadata = capture_response_metadata(&headers, Some("acct-1"));
+
+        assert_eq!(metadata.request_id.as_deref(), Some("req-123"));
+        assert_eq!(metadata.models_etag.as_deref(), Some("models-v2"));
+        assert_eq!(metadata.codex_account_id.as_deref(), Some("acct-1"));
+        assert_eq!(
+            metadata
+                .rate_limit_headers
+                .get("x-codex-primary-used-percent")
+                .map(String::as_str),
+            Some("41.5")
+        );
+        assert!(!metadata
+            .rate_limit_headers
+            .contains_key(CODEX_TURN_STATE_HEADER));
+    }
+
+    #[test]
+    fn codex_turn_state_is_first_value_wins_and_fresh_state_is_empty() {
+        let mut first_headers = reqwest::header::HeaderMap::new();
+        first_headers.insert(CODEX_TURN_STATE_HEADER, "sticky-1".parse().unwrap());
+        let mut later_headers = reqwest::header::HeaderMap::new();
+        later_headers.insert(CODEX_TURN_STATE_HEADER, "sticky-2".parse().unwrap());
+
+        let mut turn_state = CodexTurnState::default();
+        turn_state.capture(&first_headers);
+        turn_state.capture(&later_headers);
+        let mut replay_headers = Vec::new();
+        turn_state.apply(&mut replay_headers);
+        assert_eq!(
+            replay_headers,
+            vec![(CODEX_TURN_STATE_HEADER.to_string(), "sticky-1".to_string())]
+        );
+
+        let mut next_turn_headers = Vec::new();
+        CodexTurnState::default().apply(&mut next_turn_headers);
+        assert!(next_turn_headers.is_empty());
+    }
+
     #[tokio::test]
     async fn read_response_body_bytes_errors_on_truncated_chunked_stream() {
         use std::io::{Read, Write};
@@ -1664,6 +2263,234 @@ data: {"type":"response.completed","response":{"id":"resp1","output":[],"usage":
     }
 
     #[tokio::test]
+    async fn read_response_body_accepts_completed_sse_before_truncated_chunk_terminator() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-complete\",\"output\":[]}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{}\r\n",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request headers should arrive");
+        let (body, _) = read_response_body_bytes(response, "Test", "test-model", 1, true)
+            .await
+            .expect("a semantically complete SSE body must not be retried");
+        let parsed = parse_sse_responses_body(std::str::from_utf8(&body).unwrap())
+            .expect("the buffered SSE body should be complete");
+        assert_eq!(parsed["id"], "resp-complete");
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_response_body_bytes_rejects_body_above_limit() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let response =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request headers should arrive");
+        let err = read_response_body_bytes_with_limit(response, "Test", "test-model", 1, true, 4)
+            .await
+            .expect_err("the configured body limit must be enforced");
+
+        assert!(matches!(err, ResponseBodyReadError::TooLarge { limit: 4 }));
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_provider_api_refreshes_headers_after_unauthorized() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request_headers(&mut stream).to_ascii_lowercase();
+                assert!(request.contains("authorization: bearer token-a"));
+                assert!(!request.contains(CODEX_TURN_STATE_HEADER));
+                let response = "HTTP/1.1 401 Unauthorized\r\nx-codex-turn-state: sticky-1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request_headers(&mut stream).to_ascii_lowercase();
+                assert!(request.contains("authorization: bearer token-b"));
+                assert!(request.contains("x-codex-turn-state: sticky-1"));
+                let body = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-auth\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"authenticated\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nx-request-id: req-auth\r\nx-models-etag: models-v2\r\nx-codex-primary-used-percent: 12.5\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let details = ResponsesRequestDetails {
+            provider: ThirdPartyProvider::OpenAICodex,
+            display_name: "OpenAI Codex",
+            url: format!("http://{addr}/responses"),
+            headers: Vec::new(),
+            session_id: "test-session".to_string(),
+            codex_account_id: None,
+            payload: json!({ "model": "gpt-5.5", "stream": true }),
+            streaming_sse: true,
+            request_timeout_secs: 30,
+        };
+        let tokens = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            "token-a", "token-b",
+        ])));
+        let resolve_tokens = Arc::clone(&tokens);
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_counter = Arc::clone(&refresh_calls);
+        let mut turn_state = CodexTurnState::default();
+
+        let result = call_provider_api_with_auth_hooks(
+            &details,
+            None,
+            "test:auth-refresh",
+            &mut turn_state,
+            move || {
+                let token = resolve_tokens
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("one token per attempt");
+                std::future::ready(Ok(vec![(
+                    "Authorization".to_string(),
+                    format!("Bearer {token}"),
+                )]))
+            },
+            move || {
+                refresh_counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .expect("the second attempt should use refreshed headers");
+
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            extract_response_text(&extract_response_output_items(&result.response)),
+            "authenticated"
+        );
+        assert_eq!(result.metadata.request_id.as_deref(), Some("req-auth"));
+        assert_eq!(result.metadata.models_etag.as_deref(), Some("models-v2"));
+        assert_eq!(
+            result
+                .metadata
+                .rate_limit_headers
+                .get("x-codex-primary-used-percent")
+                .map(String::as_str),
+            Some("12.5")
+        );
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_provider_api_retries_clean_eof_and_replays_turn_state() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request_headers(&mut stream).to_ascii_lowercase();
+                assert!(!request.contains(CODEX_TURN_STATE_HEADER));
+                let body = "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nx-codex-turn-state: sticky-eof\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request_headers(&mut stream).to_ascii_lowercase();
+                assert!(request.contains("x-codex-turn-state: sticky-eof"));
+                let body = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-retry\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"complete\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let details = ResponsesRequestDetails {
+            provider: ThirdPartyProvider::OpenAICodex,
+            display_name: "OpenAI Codex",
+            url: format!("http://{addr}/responses"),
+            headers: Vec::new(),
+            session_id: "test-session".to_string(),
+            codex_account_id: None,
+            payload: json!({ "model": "gpt-5.5", "stream": true }),
+            streaming_sse: true,
+            request_timeout_secs: 30,
+        };
+        let mut turn_state = CodexTurnState::default();
+        let result = call_provider_api_with_auth_hooks(
+            &details,
+            None,
+            "test:semantic-retry",
+            &mut turn_state,
+            || {
+                std::future::ready(Ok(vec![(
+                    "Authorization".to_string(),
+                    "Bearer test-token".to_string(),
+                )]))
+            },
+            || std::future::ready(Ok(())),
+        )
+        .await
+        .expect("a clean EOF without response.completed should retry");
+
+        assert_eq!(
+            extract_response_text(&extract_response_output_items(&result.response)),
+            "complete"
+        );
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn call_provider_api_retries_after_truncated_stream() {
         use std::io::{Read, Write};
 
@@ -1696,19 +2523,22 @@ data: {"type":"response.completed","response":{"id":"resp1","output":[],"usage":
         });
 
         let details = ResponsesRequestDetails {
-            provider: ThirdPartyProvider::OpenAICodex,
-            display_name: "OpenAI Codex",
+            provider: ThirdPartyProvider::OpenAI,
+            display_name: "OpenAI",
             url: format!("http://{addr}/responses"),
             headers: Vec::new(),
+            session_id: "test-session".to_string(),
+            codex_account_id: None,
             payload: json!({ "model": "gpt-5.5", "stream": true }),
             streaming_sse: true,
             request_timeout_secs: 30,
         };
 
-        let value = call_provider_api(&details, None, "test:qa")
+        let mut turn_state = CodexTurnState::default();
+        let result = call_provider_api(&details, None, "test:qa", &mut turn_state)
             .await
             .expect("the loop should recover from a single truncated stream by retrying");
-        let output = extract_response_output_items(&value);
+        let output = extract_response_output_items(&result.response);
         assert_eq!(extract_response_text(&output), "recovered");
         handle.join().unwrap();
     }

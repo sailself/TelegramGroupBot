@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 use teloxide::types::{FileId, MediaGroupId};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::CONFIG;
 use crate::db::database::Database;
@@ -90,6 +90,7 @@ pub struct PendingImageRequest {
 #[derive(Debug, Clone)]
 pub struct PendingCodexModelRequest {
     pub admin_user_id: i64,
+    pub account_id: String,
     pub chat_id: i64,
     pub selection_message_id: i64,
     pub timestamp: i64,
@@ -101,10 +102,11 @@ pub struct PendingCodexModelRequest {
 #[derive(Debug, Clone)]
 pub struct PendingCodexReasoningRequest {
     pub admin_user_id: i64,
+    pub account_id: String,
+    pub model_slug: String,
     pub chat_id: i64,
     pub selection_message_id: i64,
     pub timestamp: i64,
-    pub default_level: Option<String>,
     pub supported_levels: Vec<CodexReasoningEffortOption>,
 }
 
@@ -140,6 +142,7 @@ pub struct AppState {
     pub pending_codex_model_requests: Arc<Mutex<HashMap<String, PendingCodexModelRequest>>>,
     pub pending_codex_reasoning_requests: Arc<Mutex<HashMap<String, PendingCodexReasoningRequest>>>,
     pub active_codex_login: Arc<Mutex<Option<ActiveCodexLogin>>>,
+    pub codex_auth_flow_lock: Arc<AsyncMutex<()>>,
     pub media_groups: Arc<Mutex<HashMap<MediaGroupId, MediaGroupState>>>,
     pub heavy_command_semaphore: Arc<Semaphore>,
     pub heavy_command_waiters: Arc<AtomicUsize>,
@@ -156,6 +159,7 @@ impl AppState {
             pending_codex_model_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_codex_reasoning_requests: Arc::new(Mutex::new(HashMap::new())),
             active_codex_login: Arc::new(Mutex::new(None)),
+            codex_auth_flow_lock: Arc::new(AsyncMutex::new(())),
             media_groups: Arc::new(Mutex::new(HashMap::new())),
             heavy_command_semaphore: Arc::new(Semaphore::new(CONFIG.heavy_command_max_concurrency)),
             heavy_command_waiters: Arc::new(AtomicUsize::new(0)),

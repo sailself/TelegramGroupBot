@@ -2188,6 +2188,7 @@ mod tests {
     #[test]
     fn codex_selected_model_label_prefers_selected_reasoning_level() {
         let record = crate::llm::runtime_models::CodexSelectedModelRecord {
+            account_id: None,
             slug: "gpt-5.4".to_string(),
             display_name: "GPT-5.4".to_string(),
             description: None,
@@ -2208,6 +2209,7 @@ mod tests {
     #[test]
     fn codex_selected_model_label_falls_back_to_default_reasoning_level() {
         let mut record = crate::llm::runtime_models::CodexSelectedModelRecord {
+            account_id: None,
             slug: "gpt-5.4".to_string(),
             display_name: "GPT-5.4".to_string(),
             description: None,
