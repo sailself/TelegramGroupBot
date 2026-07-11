@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 /// NOTE: verify against this bot's stored rows (see A3 test) — best-effort filter.
 const GROUP_ANONYMOUS_BOT_ID: i64 = 1_087_968_824;
 pub const MAX_ANALYTICS_LIMIT: i64 = 50; // REVIEW: was 100; spec says 1..=50
+pub const MAX_ANALYTICS_FILTER_CHARS: usize = 256;
 const DEFAULT_ANALYTICS_LIMIT: i64 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -127,6 +128,18 @@ pub fn validate(spec: &QuerySpec) -> Result<(), String> {
 
 pub fn normalize_and_validate(mut spec: QuerySpec) -> Result<QuerySpec, String> {
     validate(&spec)?;
+
+    for (field, value) in [
+        ("term", spec.filters.term.as_deref()),
+        ("text_contains", spec.filters.text_contains.as_deref()),
+        ("username", spec.filters.username.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.chars().count() > MAX_ANALYTICS_FILTER_CHARS) {
+            return Err(format!(
+                "{field} must be at most {MAX_ANALYTICS_FILTER_CHARS} characters"
+            ));
+        }
+    }
 
     fn normalize_bound(field: &str, value: Option<String>) -> Result<Option<String>, String> {
         match value {
@@ -318,11 +331,11 @@ pub fn query_spec_schema() -> Value {
                 "description": "count=messages; distinct_count=distinct senders (use with group_by none/day, not user); min_date/max_date=earliest/latest matching message time; avg_len=avg message length." },
             "group_by": { "type": "string", "enum": ["user","day","hour_of_day","weekday","month","none"] },
             "filters": { "type": "object", "properties": {
-                "term": { "type": "string", "description": "Keyword/phrase matched via full-text search. Use for 'how many times X mentioned'." },
-                "text_contains": { "type": "string", "description": "Literal substring (LIKE). Prefer term for word matching." },
+                "term": { "type": "string", "maxLength": MAX_ANALYTICS_FILTER_CHARS, "description": "Keyword/phrase matched via full-text search. Use for 'how many times X mentioned'." },
+                "text_contains": { "type": "string", "maxLength": MAX_ANALYTICS_FILTER_CHARS, "description": "Literal substring (LIKE). Prefer term for word matching." },
                 "date_from": { "type": "string", "description": "Inclusive UTC lower bound, RFC3339 or YYYY-MM-DD." },
                 "date_to": { "type": "string", "description": "Exclusive UTC upper bound." },
-                "user_id": { "type": "integer" }, "username": { "type": "string" },
+                "user_id": { "type": "integer" }, "username": { "type": "string", "maxLength": MAX_ANALYTICS_FILTER_CHARS },
                 "exclude_commands": { "type": "boolean", "description": "default true" },
                 "exclude_synthetic": { "type": "boolean", "description": "default true" },
                 "exclude_ai_asks": { "type": "boolean", "description": "default false" }
@@ -495,5 +508,35 @@ mod tests {
             normalize_and_validate(raw).unwrap_err(),
             "term must contain at least one searchable token"
         );
+    }
+
+    #[test]
+    fn normalization_rejects_oversized_filter_strings() {
+        for field in ["term", "text_contains", "username"] {
+            let mut raw = spec(r#"{"metric":"count"}"#);
+            let oversized = "x".repeat(257);
+            match field {
+                "term" => raw.filters.term = Some(oversized),
+                "text_contains" => raw.filters.text_contains = Some(oversized),
+                "username" => raw.filters.username = Some(oversized),
+                _ => unreachable!(),
+            }
+
+            assert_eq!(
+                normalize_and_validate(raw).unwrap_err(),
+                format!("{field} must be at most 256 characters")
+            );
+        }
+    }
+
+    #[test]
+    fn query_schema_caps_filter_string_lengths() {
+        let schema = query_spec_schema();
+        for field in ["term", "text_contains", "username"] {
+            assert_eq!(
+                schema["properties"]["filters"]["properties"][field]["maxLength"],
+                256
+            );
+        }
     }
 }

@@ -121,6 +121,7 @@ async fn classify_lane(
 
 const QC_ANALYTICS_GATHER: &str = "This is a statistics/analysis question about THIS chat. Use chat_analytics to compute exact numbers; refine the spec across calls (grouping, date range, term) until you have what you need. You may use chat_context_query at most once to fetch one example message. Then give a short final note; the system will render the authoritative numbers.";
 const QC_ANALYTICS_ADDENDUM: &str = r#"The <chat_analytics_results> block contains authoritative database results for this active chat. Each result includes the normalized query that produced it. Answer in the user's language using only those results. Identify the metric and effective UTC range used for each numeric claim. Do not combine or compare results whose filters differ unless the answer explicitly explains that difference. Preserve the database row ordering and do not invent, recompute, or reorder values. State that coverage is limited to stored text messages and excludes media-only, sticker, voice, service, unrecorded edit, anonymous-admin, and channel-post activity. If <chat_examples> is present, quote at most one supplied message and use only its supplied link."#;
+const QC_ANALYTICS_RESULT_MAX_CHARS: usize = 2_000;
 
 #[derive(Debug, Deserialize)]
 struct QcPlan {
@@ -212,6 +213,73 @@ async fn compose_final_answer(
     }
 }
 
+fn require_authoritative_analytics(
+    gather: Result<()>,
+    successful_result_count: usize,
+) -> Result<()> {
+    gather.map_err(|error| anyhow::anyhow!("/qc analytics gathering failed: {error}"))?;
+    if successful_result_count == 0 {
+        return Err(anyhow::anyhow!(
+            "/qc analytics produced no authoritative database result"
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_analytics_result(result: &Value, max_chars: usize) -> Result<Value> {
+    let query = result
+        .get("query")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("analytics result is missing query provenance"))?;
+    let coverage = result
+        .get("coverage")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("analytics result is missing coverage provenance"))?;
+    let rows = result
+        .get("rows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("analytics result rows are not an array"))?;
+    let total_rows = rows.len();
+    let mut bounded = json!({
+        "operation": result.get("operation").cloned().unwrap_or_else(|| json!("analytics")),
+        "query": query,
+        "coverage": coverage,
+        "row_count": total_rows,
+        "returned_row_count": 0,
+        "omitted_row_count": total_rows,
+        "rows": [],
+        "note": result.get("note").cloned().unwrap_or(Value::Null)
+    });
+
+    if bounded.to_string().chars().count() > max_chars {
+        return Err(anyhow::anyhow!(
+            "analytics query and coverage exceed the composition budget"
+        ));
+    }
+
+    for row in rows {
+        bounded["rows"]
+            .as_array_mut()
+            .expect("bounded analytics rows must be an array")
+            .push(row.clone());
+        let returned = bounded["rows"].as_array().map_or(0, Vec::len);
+        bounded["returned_row_count"] = json!(returned);
+        bounded["omitted_row_count"] = json!(total_rows - returned);
+        if bounded.to_string().chars().count() > max_chars {
+            bounded["rows"]
+                .as_array_mut()
+                .expect("bounded analytics rows must be an array")
+                .pop();
+            let returned = bounded["rows"].as_array().map_or(0, Vec::len);
+            bounded["returned_row_count"] = json!(returned);
+            bounded["omitted_row_count"] = json!(total_rows - returned);
+            break;
+        }
+    }
+
+    Ok(bounded)
+}
+
 /// Run the analytics lane: model-driven gather loop then Rust-authoritative compose.
 #[allow(clippy::too_many_arguments)]
 async fn run_analytics_lane(
@@ -259,16 +327,7 @@ async fn run_analytics_lane(
         )
         .await
     };
-    if let Err(error) = gather {
-        return Err(anyhow::anyhow!("/qc analytics gathering failed: {error}"));
-    }
-
-    // Require at least one successful analytics result before final composition.
-    if runtime.analytics_results().is_empty() {
-        return Err(anyhow::anyhow!(
-            "/qc analytics produced no authoritative database result"
-        ));
-    }
+    require_authoritative_analytics(gather.map(|_| ()), runtime.analytics_results().len())?;
 
     // Build the authoritative block newest-first so the most-refined results survive
     // the length cap; cap each result so one large payload can't crowd out the others.
@@ -276,11 +335,8 @@ async fn run_analytics_lane(
     let mut block = String::new();
     let mut used = 0usize;
     for (i, res) in results.iter().enumerate().rev() {
-        let line = format!(
-            "Result {}: {}\n",
-            i + 1,
-            truncate_chars(&res.to_string(), 2_000)
-        );
+        let bounded = bounded_analytics_result(res, QC_ANALYTICS_RESULT_MAX_CHARS)?;
+        let line = format!("Result {}: {bounded}\n", i + 1);
         let len = line.chars().count();
         if used + len > 8_000 {
             break;
@@ -799,5 +855,82 @@ mod tests {
         assert!(input.contains("<chat_evidence>"));
         assert_eq!(input.matches("</chat_evidence>").count(), 1);
         assert!(input.trim_end().ends_with("</chat_evidence>"));
+    }
+
+    #[test]
+    fn bounded_analytics_result_keeps_provenance_and_reports_omitted_rows() {
+        let query = json!({
+            "metric": "count",
+            "group_by": "user",
+            "filters": {
+                "term": null,
+                "text_contains": null,
+                "date_from": null,
+                "date_to": null,
+                "user_id": null,
+                "username": null,
+                "exclude_commands": true,
+                "exclude_synthetic": true,
+                "exclude_ai_asks": false
+            },
+            "order": "value_desc",
+            "limit": 50
+        });
+        let coverage = json!({
+            "chat": "active",
+            "storage": "stored_text_messages",
+            "timezone": "UTC",
+            "anonymous_admin_and_channel_posts_excluded": true
+        });
+        let rows: Vec<Value> = (0..50)
+            .map(|index| {
+                json!({
+                    "group": format!("user-{index}-{}", "x".repeat(100)),
+                    "value": 50 - index
+                })
+            })
+            .collect();
+        let result = json!({
+            "operation": "analytics",
+            "query": query,
+            "coverage": coverage,
+            "row_count": rows.len(),
+            "rows": rows,
+            "note": "authoritative"
+        });
+
+        let bounded = bounded_analytics_result(&result, 2_000).expect("bounded result");
+        let encoded = bounded.to_string();
+        let parsed: Value = serde_json::from_str(&encoded).expect("valid bounded JSON");
+
+        assert!(encoded.chars().count() <= 2_000);
+        assert_eq!(parsed["query"], result["query"]);
+        assert_eq!(parsed["coverage"], result["coverage"]);
+        let returned = parsed["returned_row_count"].as_u64().unwrap();
+        let omitted = parsed["omitted_row_count"].as_u64().unwrap();
+        assert_eq!(returned as usize, parsed["rows"].as_array().unwrap().len());
+        assert!(returned > 0 && returned < 50);
+        assert_eq!(returned + omitted, 50);
+        assert_eq!(
+            parsed["rows"].as_array().unwrap(),
+            &result["rows"].as_array().unwrap()[..returned as usize]
+        );
+    }
+
+    #[test]
+    fn analytics_gather_decision_rejects_gather_error() {
+        let error = require_authoritative_analytics(Err(anyhow::anyhow!("boom")), 1)
+            .expect_err("gather errors must fail closed");
+        assert_eq!(error.to_string(), "/qc analytics gathering failed: boom");
+    }
+
+    #[test]
+    fn analytics_gather_decision_rejects_zero_results() {
+        let error = require_authoritative_analytics(Ok(()), 0)
+            .expect_err("empty authoritative results must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "/qc analytics produced no authoritative database result"
+        );
     }
 }
