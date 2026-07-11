@@ -20,6 +20,25 @@ pub struct MessageRow {
     pub is_synthetic_record: bool,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicWindowSpec {
+    pub date_from: DateTime<Utc>,
+    pub date_to: DateTime<Utc>,
+    pub user_id: Option<i64>,
+    pub exclude_commands: bool,
+    pub exclude_synthetic: bool,
+    pub limit: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct TopicWindow {
+    pub messages: Vec<MessageRow>,
+    pub total_eligible: i64,
+    pub capped: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageInsert {
     pub message_id: i64,

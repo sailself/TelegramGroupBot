@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::config::CONFIG;
 use crate::db::models::{
     AnalyticsRow, ChatSearchHit, LlmInvocationInsert, LlmRequestInsert, MessageInsert, MessageRow,
-    ModelTokenStat, TokenUserStat,
+    ModelTokenStat, TokenUserStat, TopicWindow, TopicWindowSpec,
 };
 use crate::db::search::{
     clean_text_for_display, normalize_message_document, normalize_search_query, SearchMatchStage,
@@ -394,6 +394,67 @@ impl Database {
             Ok(Err(error)) => Err(error.into()),
             Err(_) => Err(anyhow::anyhow!("analytics query exceeded the time budget")),
         }
+    }
+
+    #[allow(dead_code)]
+    pub async fn select_topic_window(
+        &self,
+        chat_id: i64,
+        spec: &TopicWindowSpec,
+    ) -> Result<TopicWindow> {
+        let mut where_sql = String::from(
+            " FROM messages m WHERE m.chat_id = ? \
+             AND m.date >= ? AND m.date < ? \
+             AND m.text IS NOT NULL AND TRIM(m.text) <> '' \
+             AND m.user_id IS NOT NULL AND m.user_id <> 1087968824",
+        );
+        if spec.exclude_commands {
+            where_sql.push_str(" AND m.is_command = 0");
+        }
+        if spec.exclude_synthetic {
+            where_sql.push_str(" AND m.is_synthetic_record = 0");
+        }
+        if spec.user_id.is_some() {
+            where_sql.push_str(" AND m.user_id = ?");
+        }
+
+        let count_sql = format!("SELECT COUNT(*){where_sql}");
+        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql)
+            .bind(chat_id)
+            .bind(spec.date_from.to_rfc3339())
+            .bind(spec.date_to.to_rfc3339());
+        if let Some(user_id) = spec.user_id {
+            count_query = count_query.bind(user_id);
+        }
+        let timeout = Duration::from_secs(CONFIG.qc_analytics_query_timeout_secs);
+        let total_eligible = tokio::time::timeout(timeout, count_query.fetch_one(&self.pool))
+            .await
+            .map_err(|_| anyhow!("topic count query exceeded the time budget"))??;
+
+        let select_sql = format!(
+            "SELECT m.id, m.message_id, m.chat_id, m.user_id, m.username, m.text, \
+             m.language, m.date, m.reply_to_message_id, m.asks_ai, m.ai_command, \
+             m.is_synthetic_record{where_sql} ORDER BY m.date DESC, m.message_id DESC LIMIT ?"
+        );
+        let mut select_query = sqlx::query_as::<_, MessageRow>(&select_sql)
+            .bind(chat_id)
+            .bind(spec.date_from.to_rfc3339())
+            .bind(spec.date_to.to_rfc3339());
+        if let Some(user_id) = spec.user_id {
+            select_query = select_query.bind(user_id);
+        }
+        let limit = spec.limit.max(1);
+        let mut messages =
+            tokio::time::timeout(timeout, select_query.bind(limit).fetch_all(&self.pool))
+                .await
+                .map_err(|_| anyhow!("topic window query exceeded the time budget"))??;
+        messages.reverse();
+
+        Ok(TopicWindow {
+            capped: total_eligible > messages.len() as i64,
+            total_eligible,
+            messages,
+        })
     }
 
     pub async fn select_global_token_total(&self) -> Result<i64> {
@@ -1419,7 +1480,7 @@ pub fn build_message_insert(
 mod tests {
     use super::*;
     use crate::db::models::{
-        LlmInvocationInsert, LlmInvocationRow, LlmRequestInsert, LlmRequestRow,
+        LlmInvocationInsert, LlmInvocationRow, LlmRequestInsert, LlmRequestRow, TopicWindowSpec,
     };
     use chrono::Utc;
     use std::path::PathBuf;
@@ -2113,6 +2174,125 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339(s)
             .expect("rfc3339")
             .with_timezone(&chrono::Utc)
+    }
+
+    #[tokio::test]
+    async fn topic_window_is_chat_scoped_excludes_non_topics_and_reports_cap() {
+        let db = init_test_db("topic-window").await;
+        let chat_a = -1001374348669_i64;
+        let chat_b = -1002631835259_i64;
+        let alice_id = 11_i64;
+
+        insert_count_message(
+            &db,
+            1,
+            chat_a,
+            Some(alice_id),
+            Some("alice"),
+            "eligible alice one",
+            at("2026-07-01T01:00:00Z"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            2,
+            chat_a,
+            Some(12),
+            Some("bob"),
+            "eligible bob",
+            at("2026-07-02T01:00:00Z"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            3,
+            chat_a,
+            Some(alice_id),
+            Some("alice"),
+            "eligible alice two",
+            at("2026-07-03T01:00:00Z"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            4,
+            chat_b,
+            Some(99),
+            Some("mallory"),
+            "cross-chat sentinel",
+            at("2026-07-04T01:00:00Z"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            5,
+            chat_a,
+            Some(alice_id),
+            Some("alice"),
+            "command sentinel",
+            at("2026-07-05T01:00:00Z"),
+            true,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            6,
+            chat_a,
+            Some(alice_id),
+            Some("alice"),
+            "synthetic sentinel",
+            at("2026-07-06T01:00:00Z"),
+            false,
+            true,
+        )
+        .await;
+
+        let spec = TopicWindowSpec {
+            date_from: at("2026-07-01T00:00:00Z"),
+            date_to: at("2026-07-08T00:00:00Z"),
+            user_id: None,
+            exclude_commands: true,
+            exclude_synthetic: true,
+            limit: 2,
+        };
+        let window = db.select_topic_window(chat_a, &spec).await.unwrap();
+
+        assert_eq!(window.total_eligible, 3);
+        assert_eq!(window.messages.len(), 2);
+        assert!(window.capped);
+        assert!(window.messages.iter().all(|row| row.chat_id == chat_a));
+        assert!(window.messages[0].date <= window.messages[1].date);
+        assert!(window.messages.iter().all(|row| {
+            !matches!(
+                row.text.as_deref(),
+                Some("cross-chat sentinel" | "command sentinel" | "synthetic sentinel")
+            )
+        }));
+
+        let alice_spec = TopicWindowSpec {
+            user_id: Some(alice_id),
+            limit: 10,
+            ..spec
+        };
+        let alice_window = db.select_topic_window(chat_a, &alice_spec).await.unwrap();
+
+        assert_eq!(alice_window.total_eligible, 2);
+        assert_eq!(alice_window.messages.len(), 2);
+        assert!(!alice_window.capped);
+        assert!(alice_window
+            .messages
+            .iter()
+            .all(|row| row.user_id == Some(alice_id)));
+        assert!(alice_window.messages[0].date <= alice_window.messages[1].date);
     }
 
     // ─── invariant property test (security gate) ─────────────────────────────
