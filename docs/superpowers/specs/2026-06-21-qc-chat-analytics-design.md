@@ -135,14 +135,14 @@ Dates use the same strict normalization as analytics. If the user provides no ra
 
 ### Chat-scoped message window
 
-The database exposes one purpose-built, read-only method that selects eligible text messages for the active `chat_id`, ordered newest first and bounded by the planned dates and configured maximum. It also performs a matching `COUNT(*)` so coverage is explicit.
+The database exposes one purpose-built, read-only method that selects eligible text messages for the active `chat_id`, ordered newest first and bounded by the planned dates and configured maximum. It also performs a matching `COUNT(*)` so coverage is explicit. The eligibility count and newest-message selection run on one SQLite read transaction/snapshot, with separate timeouts, and the transaction commits only after both reads succeed.
 
 The returned structure records:
 
 - total eligible messages in the requested range;
 - analyzed messages;
 - whether the window was capped;
-- the exact exclusions used.
+- the normalized user filter and exact exclusions used.
 
 When capped, the implementation analyzes the newest configured messages. It does not extrapolate them to the omitted history. The final answer says, for example, “Analyzed the newest 2,000 of 8,431 stored text messages in this range.”
 
@@ -174,7 +174,7 @@ Rust validates every cluster id, prevents a candidate from appearing in multiple
 
 These are LLM-assisted classifications over the analyzed window. The final response labels them accordingly and never calls them exact semantic counts.
 
-If the user explicitly asks how often a literal word or phrase appeared, that portion is delegated to `chat_analytics` and labeled an exact stored-text keyword match. Exact keyword counts and semantic topic classifications are displayed separately.
+If the user explicitly asks how often a literal word or phrase appeared, that portion is delegated to `chat_analytics` through `filters.text_contains`, not the normalized FTS `term` filter. The result is the number of eligible stored-text messages containing the escaped literal substring, not the number of occurrences within those messages. Literal-substring results and semantic topic classifications are displayed separately. If an optional literal-substring query fails or times out, validated semantic topic evidence remains usable and the literal result is represented as structured unavailable metadata; composition must not invent the missing count.
 
 ### Topic composition
 

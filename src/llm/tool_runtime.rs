@@ -679,8 +679,12 @@ impl ToolRuntime {
                 context_before,
                 context_after,
             } => {
-                let context_before = context_before.unwrap_or(2).clamp(0, MAX_CONTEXT_WINDOW);
-                let context_after = context_after.unwrap_or(2).clamp(0, MAX_CONTEXT_WINDOW);
+                let mut context_before = context_before.unwrap_or(2).clamp(0, MAX_CONTEXT_WINDOW);
+                let mut context_after = context_after.unwrap_or(2).clamp(0, MAX_CONTEXT_WINDOW);
+                if self.profile == ToolProfile::ChatAnalytics {
+                    context_before = 0;
+                    context_after = 0;
+                }
                 let Some(messages) = self
                     .db
                     .get_message_window(
@@ -1221,6 +1225,31 @@ mod tests {
                     .unwrap_or(0);
                 assert_eq!(ctx, 0, "analytics profile must suppress context window");
             }
+        });
+    }
+
+    #[test]
+    fn analytics_window_query_suppresses_requested_context() {
+        let rt = Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let db = init_test_db("analytics-window-context-cap").await;
+            let chat_id = -1001374348669_i64;
+            for (id, text) in [(10_i64, "before"), (11, "anchor"), (12, "after")] {
+                insert_test_message(&db, id, chat_id, text).await;
+            }
+
+            let mut runtime = ToolRuntime::for_analytics(db, chat_id);
+            let result = runtime
+                .run_chat_context_query(ChatContextQueryArgs::Window {
+                    message_id: 11,
+                    context_before: Some(5),
+                    context_after: Some(5),
+                })
+                .await
+                .expect("analytics window query should succeed");
+
+            assert_eq!(result["result_count"], 1);
+            assert_eq!(result["messages"][0]["message_id"], 11);
         });
     }
 

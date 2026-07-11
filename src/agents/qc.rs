@@ -119,6 +119,10 @@ async fn classify_lane(
     }
 }
 
+fn should_classify_qc_request(has_media: bool) -> bool {
+    !has_media
+}
+
 // ---------------------------------------------------------------------------
 // Analytics lane
 // ---------------------------------------------------------------------------
@@ -424,7 +428,7 @@ pub async fn run_qc_pipeline(
 
     // Phase 0: classify text-only questions. Media stays on the recall path so
     // the selected answer model receives the attachments unchanged.
-    let lane = if media_files.is_empty() {
+    let lane = if should_classify_qc_request(!media_files.is_empty()) {
         classify_lane(&step_model, query, audit_context).await
     } else {
         QcLane::Recall
@@ -823,6 +827,12 @@ mod tests {
         assert_eq!(parse_lane("not json"), QcLane::Recall);
         assert_eq!(parse_lane(r#"{"lane":"unknown"}"#), QcLane::Recall);
         assert_eq!(parse_lane(""), QcLane::Recall);
+    }
+
+    #[test]
+    fn media_requests_bypass_lane_classification() {
+        assert!(should_classify_qc_request(false));
+        assert!(!should_classify_qc_request(true));
     }
 
     fn hit(message_id: i64, text: &str) -> EvidenceHit {
