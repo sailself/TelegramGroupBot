@@ -526,7 +526,7 @@ assert!(window.messages.iter().all(|row| row.chat_id == chat_a));
 assert!(window.messages[0].date <= window.messages[1].date);
 ```
 
-Seed three eligible rows in `chat_a`, one cross-chat sentinel, one command, and one synthetic row with dates inside the range.
+Seed three eligible rows in `chat_a`, one cross-chat sentinel, one command, one synthetic row, one null-user/channel row, anonymous-admin id `1087968824`, and one blank-text row with dates inside the range. Assert the limited ids are exactly the newest eligible rows before their chronological presentation order is restored.
 
 - [ ] **Step 2: Run the test and observe the expected failure**
 
@@ -563,7 +563,7 @@ pub struct TopicWindow {
 
 - [ ] **Step 4: Implement the chat-scoped count and selection**
 
-Import the new types and add this method to `Database`:
+Import the new types and add this method to `Database`. Run the count and selection on one SQLite transaction/read snapshot, keep a separate timeout around each read, and commit only after both reads succeed:
 
 ```rust
 pub async fn select_topic_window(
@@ -587,6 +587,7 @@ pub async fn select_topic_window(
         where_sql.push_str(" AND m.user_id = ?");
     }
 
+    let mut transaction = self.pool.begin().await?;
     let mut count_query = sqlx::query_scalar::<_, i64>(&format!(
         "SELECT COUNT(*){where_sql}"
     ))
@@ -597,7 +598,7 @@ pub async fn select_topic_window(
         count_query = count_query.bind(user_id);
     }
     let timeout = std::time::Duration::from_secs(CONFIG.qc_analytics_query_timeout_secs);
-    let total_eligible = tokio::time::timeout(timeout, count_query.fetch_one(&self.pool))
+    let total_eligible = tokio::time::timeout(timeout, count_query.fetch_one(&mut *transaction))
         .await
         .map_err(|_| anyhow::anyhow!("topic count query exceeded the time budget"))??;
 
@@ -616,10 +617,11 @@ pub async fn select_topic_window(
     let limit = spec.limit.max(1);
     let mut messages = tokio::time::timeout(
         timeout,
-        select_query.bind(limit).fetch_all(&self.pool),
+        select_query.bind(limit).fetch_all(&mut *transaction),
     )
     .await
     .map_err(|_| anyhow::anyhow!("topic window query exceeded the time budget"))??;
+    transaction.commit().await?;
     messages.reverse();
 
     Ok(TopicWindow {
@@ -632,7 +634,7 @@ pub async fn select_topic_window(
 
 - [ ] **Step 5: Add cross-chat, exclusions, cap, and user-filter assertions**
 
-Extend the test to run once with `user_id: Some(alice_id)` and assert only Alice’s rows remain. Assert the cross-chat sentinel, command, and synthetic texts never appear in `window.messages` and never increase `total_eligible`.
+Extend the test to run once with `user_id: Some(alice_id)` and assert only Alice’s rows remain. Assert the cross-chat, command, synthetic, null-user/channel, anonymous-admin, and blank-text sentinels never appear in `window.messages` and never increase `total_eligible`.
 
 - [ ] **Step 6: Run focused tests**
 
@@ -1304,7 +1306,7 @@ json!({
     "metric": "count",
     "group_by": "none",
     "filters": {
-        "term": term,
+        "text_contains": term,
         "date_from": plan.window.date_from.to_rfc3339(),
         "date_to": plan.window.date_to.to_rfc3339(),
         "user_id": plan.window.user_id,
@@ -1317,7 +1319,7 @@ json!({
 })
 ```
 
-Place these self-describing envelopes under `exact_keyword_results`, separate from semantic topics.
+Wrap each successful envelope with the literal, `status: "available"`, and `matching_semantics: "eligible_messages_containing_literal_substring"`, then place it under `literal_substring_results`, separate from semantic topics. This is the number of eligible stored-text messages containing the escaped literal substring, not an FTS count and not the number of occurrences within messages. If an optional query fails or times out, log the failure and append a structured `status: "unavailable"` result without aborting validated semantic topic evidence.
 
 - [ ] **Step 6: Build coverage evidence and compose**
 
@@ -1339,18 +1341,21 @@ json!({
         "capped": window.capped,
         "selection": "newest_messages",
         "storage": "stored_text_messages",
-        "anonymous_admin_and_channel_posts_excluded": true
+        "anonymous_admin_and_channel_posts_excluded": true,
+        "user_id": plan.window.user_id,
+        "exclude_commands": plan.window.exclude_commands,
+        "exclude_synthetic": plan.window.exclude_synthetic
     },
     "classification_kind": "llm_assisted_message_assignment",
     "topics": final_topics,
-    "exact_keyword_results": exact_keyword_results
+    "literal_substring_results": literal_substring_results
 })
 ```
 
 Use this composition addendum:
 
 ```rust
-const TOPIC_COMPOSE_ADDENDUM: &str = r#"The <topic_evidence> JSON is the complete validated evidence for semantic topic discovery in the active chat. Answer in the user's language. State the effective UTC range. Describe topic counts and percentages as LLM-assisted message classifications, not exact semantic counts. If coverage.capped is true, say the analysis covers the newest selected_messages out of total_eligible_messages. If failed_chunks is nonzero, state successfully_mapped_messages and the partial-map limitation. Keep exact_keyword_results in a separate section and describe them as exact stored-text FTS matches under their normalized filters. Cite only example links present in topic_evidence; do not invent links or numbers."#;
+const TOPIC_COMPOSE_ADDENDUM: &str = r#"The <topic_evidence> JSON is the complete validated evidence for semantic topic discovery in the active chat. Answer in the user's language. State the effective UTC range. State any user filter and any non-default exclusions shown in coverage. Describe topic counts and percentages as LLM-assisted message classifications, not exact semantic counts. If coverage.capped is true, say the analysis covers the newest selected messages out of total_eligible_messages. If failed_chunks is nonzero, state successfully_mapped_messages and the partial-map limitation. Keep literal_substring_results in a separate section. Each available literal result is the number of eligible stored-text messages containing the literal substring, not an FTS count or a count of occurrences within messages. If a literal result has status unavailable, state that it is unavailable and do not invent a count. Cite only example links present in topic_evidence; do not invent links or numbers."#;
 ```
 
 Make `qc::compose_final_answer` `pub(super)` and call it with empty media/youtube arrays. Return `QcPipelineResult::Answer(QcAgentOutcome { answer, gemini_model_used, valid_message_ids })`.

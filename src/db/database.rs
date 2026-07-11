@@ -36,6 +36,10 @@ const TOKEN_TOTAL_EXPR: &str = "COALESCE(r.total_tokens, r.input_tokens + r.outp
 const DB_WRITE_RETRY_DELAY_MS: u64 = 100;
 const DB_WRITE_DEAD_LETTER_PATH: &str = "data/db_writer_dead_letters.jsonl";
 
+fn topic_window_is_capped(total_eligible: i64, selected_messages: usize) -> bool {
+    total_eligible > selected_messages as i64
+}
+
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
@@ -417,6 +421,7 @@ impl Database {
             where_sql.push_str(" AND m.user_id = ?");
         }
 
+        let mut transaction = self.pool.begin().await?;
         let count_sql = format!("SELECT COUNT(*){where_sql}");
         let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql)
             .bind(chat_id)
@@ -426,9 +431,10 @@ impl Database {
             count_query = count_query.bind(user_id);
         }
         let timeout = Duration::from_secs(CONFIG.qc_analytics_query_timeout_secs);
-        let total_eligible = tokio::time::timeout(timeout, count_query.fetch_one(&self.pool))
-            .await
-            .map_err(|_| anyhow!("topic count query exceeded the time budget"))??;
+        let total_eligible =
+            tokio::time::timeout(timeout, count_query.fetch_one(&mut *transaction))
+                .await
+                .map_err(|_| anyhow!("topic count query exceeded the time budget"))??;
 
         let select_sql = format!(
             "SELECT m.id, m.message_id, m.chat_id, m.user_id, m.username, m.text, \
@@ -443,14 +449,17 @@ impl Database {
             select_query = select_query.bind(user_id);
         }
         let limit = spec.limit.max(1);
-        let mut messages =
-            tokio::time::timeout(timeout, select_query.bind(limit).fetch_all(&self.pool))
-                .await
-                .map_err(|_| anyhow!("topic window query exceeded the time budget"))??;
+        let mut messages = tokio::time::timeout(
+            timeout,
+            select_query.bind(limit).fetch_all(&mut *transaction),
+        )
+        .await
+        .map_err(|_| anyhow!("topic window query exceeded the time budget"))??;
+        transaction.commit().await?;
         messages.reverse();
 
         Ok(TopicWindow {
-            capped: total_eligible > messages.len() as i64,
+            capped: topic_window_is_capped(total_eligible, messages.len()),
             total_eligible,
             messages,
         })
@@ -2175,6 +2184,13 @@ mod tests {
             .with_timezone(&chrono::Utc)
     }
 
+    #[test]
+    fn topic_window_coverage_invariants_match_selected_snapshot_rows() {
+        assert!(!topic_window_is_capped(0, 0));
+        assert!(!topic_window_is_capped(2, 2));
+        assert!(topic_window_is_capped(3, 2));
+    }
+
     #[tokio::test]
     async fn topic_window_is_chat_scoped_excludes_non_topics_and_reports_cap() {
         let db = init_test_db("topic-window").await;
@@ -2254,6 +2270,42 @@ mod tests {
             true,
         )
         .await;
+        insert_count_message(
+            &db,
+            7,
+            chat_a,
+            None,
+            Some("channel"),
+            "null-user channel sentinel",
+            at("2026-07-06T02:00:00Z"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            8,
+            chat_a,
+            Some(1_087_968_824),
+            Some("anonymous-admin"),
+            "anonymous-admin sentinel",
+            at("2026-07-06T03:00:00Z"),
+            false,
+            false,
+        )
+        .await;
+        insert_count_message(
+            &db,
+            9,
+            chat_a,
+            Some(alice_id),
+            Some("alice"),
+            "   ",
+            at("2026-07-06T04:00:00Z"),
+            false,
+            false,
+        )
+        .await;
 
         let spec = TopicWindowSpec {
             date_from: at("2026-07-01T00:00:00Z"),
@@ -2268,12 +2320,33 @@ mod tests {
         assert_eq!(window.total_eligible, 3);
         assert_eq!(window.messages.len(), 2);
         assert!(window.capped);
+        assert_eq!(
+            window
+                .messages
+                .iter()
+                .map(|row| row.message_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "the cap must retain the newest eligible rows before restoring chronological order"
+        );
+        assert!(window.total_eligible >= window.messages.len() as i64);
+        assert_eq!(
+            window.capped,
+            topic_window_is_capped(window.total_eligible, window.messages.len())
+        );
         assert!(window.messages.iter().all(|row| row.chat_id == chat_a));
         assert!(window.messages[0].date <= window.messages[1].date);
         assert!(window.messages.iter().all(|row| {
             !matches!(
                 row.text.as_deref(),
-                Some("cross-chat sentinel" | "command sentinel" | "synthetic sentinel")
+                Some(
+                    "cross-chat sentinel"
+                        | "command sentinel"
+                        | "synthetic sentinel"
+                        | "null-user channel sentinel"
+                        | "anonymous-admin sentinel"
+                        | "   "
+                )
             )
         }));
 
