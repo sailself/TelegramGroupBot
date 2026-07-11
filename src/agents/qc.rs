@@ -177,7 +177,7 @@ pub enum QcPipelineResult {
 /// Compose the final answer using Gemini or a third-party model.
 /// This is the Gemini-vs-third-party branch that was previously inline in
 /// Phase D of `run_qc_pipeline`. Both recall and analytics lanes share it.
-async fn compose_final_answer(
+pub(super) async fn compose_final_answer(
     model_name: &str,
     system_prompt: &str,
     user_content: &str,
@@ -429,19 +429,42 @@ pub async fn run_qc_pipeline(
     } else {
         QcLane::Recall
     };
-    if lane == QcLane::Analytics {
-        return run_analytics_lane(
-            db,
-            chat_id,
-            query,
-            model_name,
-            system_prompt,
-            media_files,
-            youtube_urls,
-            audit_context,
-            progress,
-        )
-        .await;
+    match lane {
+        QcLane::Analytics => {
+            return run_analytics_lane(
+                db,
+                chat_id,
+                query,
+                model_name,
+                system_prompt,
+                media_files,
+                youtube_urls,
+                audit_context,
+                progress,
+            )
+            .await;
+        }
+        QcLane::TopicDiscovery if CONFIG.enable_qc_topic_discovery => {
+            return crate::agents::qc_topics::run_topic_discovery_lane(
+                db,
+                chat_id,
+                query,
+                model_name,
+                system_prompt,
+                &step_model,
+                audit_context,
+                progress,
+            )
+            .await;
+        }
+        QcLane::TopicDiscovery => {
+            return Ok(QcPipelineResult::Answer(QcAgentOutcome {
+                answer: "Topic discovery is disabled by ENABLE_QC_TOPIC_DISCOVERY.".to_string(),
+                gemini_model_used: None,
+                valid_message_ids: Vec::new(),
+            }));
+        }
+        QcLane::Recall => {}
     }
 
     // Phase A: plan keyword queries.
