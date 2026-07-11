@@ -735,12 +735,24 @@ impl ToolRuntime {
     }
 
     pub async fn run_analytics_query(&mut self, arguments: &Value) -> Result<Value> {
-        use crate::llm::analytics::{normalize_and_validate, QuerySpec};
+        use crate::llm::analytics::QuerySpec;
         let spec: QuerySpec = serde_json::from_value(arguments.clone())
-            .map_err(|e| anyhow!("invalid analytics arguments: {e}"))?;
-        let spec = normalize_and_validate(spec)
             .map_err(|error| anyhow!("invalid analytics arguments: {error}"))?;
-        let (_, rows) = self.db.run_chat_analytics(self.chat_id, &spec).await?;
+        let (spec, rows) = self
+            .db
+            .run_chat_analytics(self.chat_id, &spec)
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("date_")
+                    || message.contains("term must")
+                    || message.contains("distinct_count is only meaningful")
+                {
+                    anyhow!("invalid analytics arguments: {message}")
+                } else {
+                    error
+                }
+            })?;
         let label_map = crate::handlers::build_display_label_map(rows.iter().filter_map(|r| {
             r.group_user_id
                 .map(|uid| (uid, r.group_key.as_deref().unwrap_or("Anonymous")))
@@ -769,15 +781,16 @@ impl ToolRuntime {
 
         let payload = json!({
             "operation": "analytics",
-            "scope": {
+            "query": spec,
+            "coverage": {
                 "chat": "active",
-                "date_from": spec.filters.date_from,
-                "date_to": spec.filters.date_to,
-                "timezone": "UTC"
+                "storage": "stored_text_messages",
+                "timezone": "UTC",
+                "anonymous_admin_and_channel_posts_excluded": true
             },
             "row_count": out.len(),
             "rows": out,
-            "note": "Counts cover stored TEXT messages only (media-only/stickers/service/edits/commands not stored); anonymous-admin and channel posts excluded. Times UTC.",
+            "note": "Rows are authoritative database results over stored text messages. Media-only, sticker, voice, service, unrecorded edits, anonymous-admin posts, and channel posts are absent or excluded."
         });
         // Accumulate every result for A4's authoritative answer composition (A4 bounds
         // the rendered block length). The per-call budget caps how many accumulate, so
@@ -1111,6 +1124,16 @@ mod tests {
                 payload.get("operation").and_then(Value::as_str),
                 Some("analytics")
             );
+            assert_eq!(payload["query"]["metric"], "count");
+            assert_eq!(payload["query"]["group_by"], "user");
+            assert_eq!(payload["query"]["limit"], 20);
+            assert_eq!(payload["query"]["filters"]["exclude_commands"], true);
+            assert_eq!(payload["coverage"]["chat"], "active");
+            assert_eq!(payload["coverage"]["storage"], "stored_text_messages");
+            assert_eq!(
+                payload["coverage"]["anonymous_admin_and_channel_posts_excluded"],
+                true
+            );
             let rows = payload["rows"].as_array().expect("rows array");
             assert!(!rows.is_empty());
             // First row should be alice (2 messages, highest count).
@@ -1245,6 +1268,26 @@ mod tests {
                 Some("invalid_arguments"),
                 "validate rejection should produce invalid_arguments error code"
             );
+        });
+    }
+
+    #[test]
+    fn analytics_invalid_date_returns_invalid_arguments_without_accumulating_result() {
+        let rt = Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let db = init_test_db("analytics-invalid-date").await;
+            let mut runtime = ToolRuntime::for_analytics(db, -1001374348669);
+            let args = serde_json::json!({
+                "metric": "count",
+                "filters": { "date_from": "last week" }
+            });
+
+            let result_str = runtime.execute_analytics(&args).await;
+            let result: Value = serde_json::from_str(&result_str).expect("valid json");
+
+            assert_eq!(result["ok"].as_bool(), Some(false));
+            assert_eq!(result["error_code"].as_str(), Some("invalid_arguments"));
+            assert!(runtime.analytics_results().is_empty());
         });
     }
 }

@@ -120,7 +120,7 @@ async fn classify_lane(
 // ---------------------------------------------------------------------------
 
 const QC_ANALYTICS_GATHER: &str = "This is a statistics/analysis question about THIS chat. Use chat_analytics to compute exact numbers; refine the spec across calls (grouping, date range, term) until you have what you need. You may use chat_context_query at most once to fetch one example message. Then give a short final note; the system will render the authoritative numbers.";
-const QC_ANALYTICS_ADDENDUM: &str = "The <chat_analytics_results> block holds the EXACT results computed from this chat's database. You cannot call tools. Answer the user's question in their language using ONLY these numbers — never invent, recompute, or reorder them. State briefly that counts cover stored text messages only (media/stickers/service/commands not counted). If a <chat_examples> block is present you MAY quote at most one message from it (include its link) to illustrate, but every number must come from <chat_analytics_results>.";
+const QC_ANALYTICS_ADDENDUM: &str = r#"The <chat_analytics_results> block contains authoritative database results for this active chat. Each result includes the normalized query that produced it. Answer in the user's language using only those results. Identify the metric and effective UTC range used for each numeric claim. Do not combine or compare results whose filters differ unless the answer explicitly explains that difference. Preserve the database row ordering and do not invent, recompute, or reorder values. State that coverage is limited to stored text messages and excludes media-only, sticker, voice, service, unrecorded edit, anonymous-admin, and channel-post activity. If <chat_examples> is present, quote at most one supplied message and use only its supplied link."#;
 
 #[derive(Debug, Deserialize)]
 struct QcPlan {
@@ -259,15 +259,15 @@ async fn run_analytics_lane(
         )
         .await
     };
-    if let Err(e) = gather {
-        warn!("/qc analytics gather failed; using legacy loop: {e}");
-        return Ok(QcPipelineResult::UseLegacy("analytics gather failed"));
+    if let Err(error) = gather {
+        return Err(anyhow::anyhow!("/qc analytics gathering failed: {error}"));
     }
 
-    // Require ≥1 successful analytics result; else fall back to legacy loop.
+    // Require at least one successful analytics result before final composition.
     if runtime.analytics_results().is_empty() {
-        info!("/qc analytics produced no query results; using legacy loop");
-        return Ok(QcPipelineResult::UseLegacy("analytics produced no results"));
+        return Err(anyhow::anyhow!(
+            "/qc analytics produced no authoritative database result"
+        ));
     }
 
     // Build the authoritative block newest-first so the most-refined results survive
