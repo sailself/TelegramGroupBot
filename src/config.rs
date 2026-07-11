@@ -156,6 +156,7 @@ pub struct Config {
     pub openai_codex_web_search_context_size: String,
     pub openai_codex_web_search_allowed_domains: Vec<String>,
     pub openai_codex_auth_path: String,
+    pub openai_codex_auth_storage: String,
     pub openai_codex_model_path: String,
     pub openai_codex_request_timeout_secs: u64,
     pub openai_codex_image_responses_model: String,
@@ -597,7 +598,7 @@ impl Config {
                 "https://chatgpt.com/backend-api/codex",
             ),
             openai_codex_originator: env_string("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs"),
-            openai_codex_client_version: env_string("OPENAI_CODEX_CLIENT_VERSION", "0.99.0"),
+            openai_codex_client_version: env_string("OPENAI_CODEX_CLIENT_VERSION", "0.144.0"),
             openai_codex_web_search_mode: env_string("OPENAI_CODEX_WEB_SEARCH_MODE", "live")
                 .to_lowercase(),
             openai_codex_web_search_context_size: env_string(
@@ -613,6 +614,8 @@ impl Config {
                 "OPENAI_CODEX_AUTH_PATH",
                 "data/openai_codex_auth.json",
             ),
+            openai_codex_auth_storage: env_string("OPENAI_CODEX_AUTH_STORAGE", "auto")
+                .to_lowercase(),
             openai_codex_model_path: env_string(
                 "OPENAI_CODEX_MODEL_PATH",
                 "data/openai_codex_model.json",

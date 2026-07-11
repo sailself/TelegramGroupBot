@@ -30,10 +30,11 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/portraitme` - Create a portrait prompt based on your history.
 - `/status` - Show a health snapshot (admin-only via whitelist).
 - `/diagnose` - Show extended diagnostics and recent log tails (admin-only via whitelist).
-- `/codexlogin` - Start ChatGPT Codex device-code login (admin-only via whitelist).
-- `/codexlogout` - Remove cached ChatGPT Codex credentials (admin-only via whitelist).
-- `/codexmodel` - Fetch the live Codex model catalog and choose the active Codex model (admin-only via whitelist).
-- `/codexreasoning` - Choose the active Codex reasoning level supported by the selected Codex model (admin-only via whitelist).
+- `/codexlogin` - Start ChatGPT Codex device-code login (whitelisted users in private chats only).
+- `/codexlogout` - Remove cached ChatGPT Codex credentials (whitelisted users in private chats only).
+- `/codexmodel` - Fetch the live Codex model catalog and choose the active Codex model (whitelisted users in private chats only).
+- `/codexreasoning` - Choose the active Codex reasoning level supported by the selected Codex model (whitelisted users in private chats only).
+- `/codexusage` - Show the current ChatGPT Codex plan and usage windows (whitelisted users in private chats only).
 - `/support` - Show support message and link.
 - `/help` - Show command help.
 
@@ -275,17 +276,18 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `ENABLE_OPENAI_CODEX` - Enable ChatGPT-backed Codex support. Default: `true`.
 - `OPENAI_CODEX_BASE_URL` - Default: `https://chatgpt.com/backend-api/codex`.
 - `OPENAI_CODEX_ORIGINATOR` - Request originator header. Default: `codex_cli_rs`.
-- `OPENAI_CODEX_CLIENT_VERSION` - Codex model-catalog compatibility version sent to `/models`. Default: `0.99.0`.
+- `OPENAI_CODEX_CLIENT_VERSION` - Codex model-catalog compatibility version sent to `/models`. Default: `0.144.0`.
 - `OPENAI_CODEX_WEB_SEARCH_MODE` - Native Codex web search mode: `live`, `cached`, or `disabled`. Default: `live`.
 - `OPENAI_CODEX_WEB_SEARCH_CONTEXT_SIZE` - Optional native Codex web search context size (for example `low`, `medium`, `high`).
 - `OPENAI_CODEX_WEB_SEARCH_ALLOWED_DOMAINS` - Optional comma-separated domain allowlist for native Codex web search.
-- `OPENAI_CODEX_AUTH_PATH` - Local auth cache path. Default: `data/openai_codex_auth.json`.
+- `OPENAI_CODEX_AUTH_STORAGE` - Credential storage mode: `auto` or `file`. Default: `auto`. On Windows, `auto` protects credentials with a current-user DPAPI envelope and migrates legacy JSON; on Unix, `auto` uses the same private `0600` JSON file as `file`. Use `file` explicitly for portable or Docker deployments.
+- `OPENAI_CODEX_AUTH_PATH` - Auth cache path used by the selected storage mode. Default: `data/openai_codex_auth.json`.
 - `OPENAI_CODEX_MODEL_PATH` - Local selected-model cache path. Default: `data/openai_codex_model.json`.
 - `OPENAI_CODEX_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `300`.
 - `OPENAI_CODEX_IMAGE_RESPONSES_MODEL` - Responses model used to invoke Codex image generation. Default: `gpt-5.5`.
 - `OPENAI_CODEX_IMAGE_MODEL` - Codex image-generation tool model offered in `/img` and `/image`, and used when `DEFAULT_IMAGE_MODEL=codex`. Default: `gpt-image-2`.
-- Login is managed with `/codexlogin` and `/codexlogout`.
-- The active Codex model is selected live with `/codexmodel` and exposed in the bot as the runtime alias `openai-codex:selected`.
+- Login and model-account administration are restricted to whitelisted users in private chats and managed with `/codexlogin` and `/codexlogout`.
+- The active Codex model is selected live with `/codexmodel`, bound to the current ChatGPT account, and exposed in the bot as the runtime alias `openai-codex:selected`.
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.
 - When the selected Codex model advertises native search support, the bot now uses Codex's built-in `web_search` Responses tool instead of the local external `web_search` function tool.
 - Codex requests also include a condensed response-style addendum tuned for direct answers and shorter Chinese output.

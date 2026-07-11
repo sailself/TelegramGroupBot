@@ -140,13 +140,117 @@ pub async fn check_access_control(bot: &Bot, message: &Message, command: &str) -
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::normalize_command_name;
+    use std::collections::HashSet;
+
+    use super::{codex_admin_access_decision, normalize_command_name, CodexAdminAccessDecision};
 
     #[test]
     fn normalize_command_name_trims_slash_and_case() {
         assert_eq!(normalize_command_name("/ProfileMe "), "profileme");
         assert_eq!(normalize_command_name("mysong"), "mysong");
     }
+
+    #[test]
+    fn codex_admin_requires_whitelisted_user_in_private_chat() {
+        let whitelist = HashSet::from([42, -100_123]);
+
+        assert_eq!(
+            codex_admin_access_decision(Some(&whitelist), Some(42), true),
+            CodexAdminAccessDecision::Allowed
+        );
+        assert_eq!(
+            codex_admin_access_decision(Some(&whitelist), Some(42), false),
+            CodexAdminAccessDecision::PrivateChatRequired
+        );
+        assert_eq!(
+            codex_admin_access_decision(Some(&whitelist), Some(7), true),
+            CodexAdminAccessDecision::UserNotWhitelisted
+        );
+    }
+
+    #[test]
+    fn codex_admin_does_not_accept_chat_only_whitelist_entry() {
+        let whitelist = HashSet::from([-100_123]);
+
+        assert_eq!(
+            codex_admin_access_decision(Some(&whitelist), Some(42), true),
+            CodexAdminAccessDecision::UserNotWhitelisted
+        );
+        assert_eq!(
+            codex_admin_access_decision(Some(&whitelist), None, true),
+            CodexAdminAccessDecision::MissingUser
+        );
+        assert_eq!(
+            codex_admin_access_decision(None, Some(42), true),
+            CodexAdminAccessDecision::WhitelistUnavailable
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexAdminAccessDecision {
+    Allowed,
+    WhitelistUnavailable,
+    PrivateChatRequired,
+    MissingUser,
+    UserNotWhitelisted,
+}
+
+fn codex_admin_access_decision(
+    whitelist: Option<&HashSet<i64>>,
+    user_id: Option<i64>,
+    is_private_chat: bool,
+) -> CodexAdminAccessDecision {
+    let Some(whitelist) = whitelist else {
+        return CodexAdminAccessDecision::WhitelistUnavailable;
+    };
+    if !is_private_chat {
+        return CodexAdminAccessDecision::PrivateChatRequired;
+    }
+    let Some(user_id) = user_id else {
+        return CodexAdminAccessDecision::MissingUser;
+    };
+    if !whitelist.contains(&user_id) {
+        return CodexAdminAccessDecision::UserNotWhitelisted;
+    }
+    CodexAdminAccessDecision::Allowed
+}
+
+pub async fn check_codex_admin_access(bot: &Bot, message: &Message, command: &str) -> bool {
+    if !WHITELIST_LOADED.load(Ordering::SeqCst) {
+        load_whitelist();
+    }
+
+    let whitelist = {
+        let cache = WHITELIST_CACHE.lock();
+        cache.clone()
+    };
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok());
+    let decision =
+        codex_admin_access_decision(whitelist.as_ref(), user_id, message.chat.is_private());
+
+    let denial_message = match decision {
+        CodexAdminAccessDecision::Allowed => return true,
+        CodexAdminAccessDecision::WhitelistUnavailable => {
+            "Codex admin commands are unavailable because no whitelist is configured. Add your user ID to the whitelist file and try again in a private chat."
+        }
+        CodexAdminAccessDecision::PrivateChatRequired => {
+            "For security, Codex account commands can only be used in a private chat with the bot."
+        }
+        CodexAdminAccessDecision::MissingUser | CodexAdminAccessDecision::UserNotWhitelisted => {
+            "This Codex command is restricted to whitelisted administrators."
+        }
+    };
+
+    let _ = bot
+        .send_message(message.chat.id, denial_message)
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await;
+    warn!("Codex admin command '{}' denied: {:?}", command, decision);
+    false
 }
 
 pub async fn check_admin_access(bot: &Bot, message: &Message, command: &str) -> bool {

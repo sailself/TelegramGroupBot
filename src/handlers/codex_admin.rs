@@ -7,9 +7,9 @@ use chrono::{Local, Utc};
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ReplyParameters};
 
-use crate::handlers::access::check_admin_access;
+use crate::handlers::access::check_codex_admin_access;
 use crate::llm::openai_codex::{self, CodexInputModality, CodexModelVisibility, CodexRemoteModel};
-use crate::llm::runtime_models::{self, CodexSelectedModelRecord};
+use crate::llm::runtime_models;
 use crate::state::{
     ActiveCodexLogin, AppState, PendingCodexModelRequest, PendingCodexReasoningRequest,
 };
@@ -19,6 +19,8 @@ pub const CODEX_MODEL_SELECT_CALLBACK_PREFIX: &str = "codex_model_select:";
 pub const CODEX_MODEL_PAGE_CALLBACK_PREFIX: &str = "codex_model_page:";
 pub const CODEX_REASONING_SELECT_CALLBACK_PREFIX: &str = "codex_reasoning_select:";
 const CODEX_MODEL_PAGE_SIZE: usize = 8;
+const CODEX_CALLBACK_INDEX_PREFIX: &str = "i:";
+const TELEGRAM_CALLBACK_DATA_LIMIT: usize = 64;
 
 fn now_unix_seconds() -> i64 {
     chrono::Utc::now().timestamp()
@@ -30,9 +32,75 @@ fn request_key(chat_id: ChatId, message_id: MessageId) -> String {
 
 fn format_login_message(verification_url: &str, user_code: &str) -> String {
     format!(
-        "Open this URL in your browser and complete ChatGPT sign-in:\n{}\n\nEnter this one-time code:\n{}\n\nThe bot will keep polling in the background. When login finishes, it will send a follow-up message here.",
+        "Open this URL in your browser and complete ChatGPT sign-in:\n{}\n\nEnter this one-time code (expires in 15 minutes):\n{}\n\nContinue only if you started this login in Codex. If a website or another person gave you this code, cancel.\n\nThe bot will keep polling in the background. When login finishes, it will send a follow-up message here.",
         verification_url, user_code
     )
+}
+
+fn login_request_matches_owner(login: &ActiveCodexLogin, admin_user_id: i64, chat_id: i64) -> bool {
+    login.admin_user_id == admin_user_id && login.chat_id == chat_id
+}
+
+fn clear_matching_active_login(
+    active: &mut Option<ActiveCodexLogin>,
+    cancel_flag: &Arc<AtomicBool>,
+) -> bool {
+    if active
+        .as_ref()
+        .is_some_and(|entry| Arc::ptr_eq(&entry.cancel_flag, cancel_flag))
+    {
+        *active = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn indexed_callback_data(prefix: &str, index: usize) -> String {
+    let callback = format!("{prefix}{CODEX_CALLBACK_INDEX_PREFIX}{index}");
+    debug_assert!(callback.len() <= TELEGRAM_CALLBACK_DATA_LIMIT);
+    callback
+}
+
+fn model_selection_callback_data(index: usize) -> String {
+    indexed_callback_data(CODEX_MODEL_SELECT_CALLBACK_PREFIX, index)
+}
+
+fn resolve_model_callback_token<'a>(
+    token: &str,
+    models: &'a [CodexRemoteModel],
+) -> Option<&'a CodexRemoteModel> {
+    let index = token
+        .trim()
+        .strip_prefix(CODEX_CALLBACK_INDEX_PREFIX)?
+        .parse::<usize>()
+        .ok()?;
+    models.get(index)
+}
+
+fn reasoning_selection_callback_data(index: usize) -> String {
+    indexed_callback_data(CODEX_REASONING_SELECT_CALLBACK_PREFIX, index)
+}
+
+fn current_account_id() -> Result<String> {
+    runtime_models::current_codex_account_id()
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))
+}
+
+async fn report_admin_failure(
+    bot: &Bot,
+    message: &Message,
+    action: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    warn!("Codex admin action '{}' failed: {:#}", action, error);
+    bot.send_message(
+        message.chat.id,
+        format!("Codex {action} failed. Check the bot logs and try again."),
+    )
+    .reply_parameters(ReplyParameters::new(message.id))
+    .await?;
+    Ok(())
 }
 
 fn filter_picker_models(mut models: Vec<CodexRemoteModel>) -> Vec<CodexRemoteModel> {
@@ -79,12 +147,13 @@ fn build_model_selection_keyboard(
     let page_models = &models[start..end];
 
     let mut rows = Vec::new();
-    for chunk in page_models.chunks(2) {
+    for (chunk_index, chunk) in page_models.chunks(2).enumerate() {
         let mut row = Vec::new();
-        for model in chunk {
+        for (offset, model) in chunk.iter().enumerate() {
+            let model_index = start + chunk_index * 2 + offset;
             row.push(InlineKeyboardButton::callback(
                 keyboard_model_label(model),
-                format!("{}{}", CODEX_MODEL_SELECT_CALLBACK_PREFIX, model.slug),
+                model_selection_callback_data(model_index),
             ));
         }
         rows.push(row);
@@ -112,42 +181,6 @@ fn build_model_selection_keyboard(
     InlineKeyboardMarkup::new(rows)
 }
 
-fn selected_model_record(
-    model: &CodexRemoteModel,
-    etag: Option<String>,
-) -> CodexSelectedModelRecord {
-    let previous_selection = runtime_models::selected_codex_model_record()
-        .and_then(|record| record.selected_reasoning_level)
-        .filter(|level| {
-            model
-                .supported_reasoning_levels
-                .iter()
-                .any(|option| option.effort == *level)
-        });
-
-    CodexSelectedModelRecord {
-        slug: model.slug.clone(),
-        display_name: model.display_name.clone(),
-        description: model.description.clone(),
-        input_modalities: model
-            .input_modalities
-            .iter()
-            .map(|modality| match modality {
-                CodexInputModality::Text => "text".to_string(),
-                CodexInputModality::Image => "image".to_string(),
-            })
-            .collect(),
-        priority: model.priority,
-        etag,
-        default_reasoning_level: model.default_reasoning_level.clone(),
-        supported_reasoning_levels: model.supported_reasoning_levels.clone(),
-        selected_reasoning_level: previous_selection,
-        web_search_tool_type: model.web_search_tool_type,
-        supports_search_tool: model.supports_search_tool,
-        fetched_at: Utc::now(),
-    }
-}
-
 fn build_reasoning_selection_text(
     display_name: &str,
     selected_level: Option<&str>,
@@ -167,9 +200,9 @@ fn build_reasoning_selection_keyboard(
     default_level: Option<&str>,
 ) -> InlineKeyboardMarkup {
     let mut rows = Vec::new();
-    for chunk in supported_levels.chunks(2) {
+    for (chunk_index, chunk) in supported_levels.chunks(2).enumerate() {
         let mut row = Vec::new();
-        for level in chunk {
+        for (offset, level) in chunk.iter().enumerate() {
             let mut label = level.effort.clone();
             if selected_level == Some(level.effort.as_str()) {
                 label.push_str(" *");
@@ -178,7 +211,7 @@ fn build_reasoning_selection_keyboard(
             }
             row.push(InlineKeyboardButton::callback(
                 label,
-                format!("{}{}", CODEX_REASONING_SELECT_CALLBACK_PREFIX, level.effort),
+                reasoning_selection_callback_data(chunk_index * 2 + offset),
             ));
         }
         rows.push(row);
@@ -326,7 +359,7 @@ async fn handle_model_selection_timeout(bot: Bot, state: AppState, request_id: S
 }
 
 pub async fn codex_login_handler(bot: Bot, state: AppState, message: Message) -> Result<()> {
-    if !check_admin_access(&bot, &message, "codexlogin").await {
+    if !check_codex_admin_access(&bot, &message, "codexlogin").await {
         return Ok(());
     }
 
@@ -336,18 +369,25 @@ pub async fn codex_login_handler(bot: Bot, state: AppState, message: Message) ->
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
 
+    let auth_flow_guard = state.codex_auth_flow_lock.lock().await;
     let existing_login = { state.active_codex_login.lock().clone() };
     if let Some(existing) = existing_login {
-        bot.send_message(
-            message.chat.id,
-            format_login_message(&existing.verification_url, &existing.user_code),
-        )
-        .reply_parameters(ReplyParameters::new(message.id))
-        .await?;
+        let text = if login_request_matches_owner(&existing, admin_user_id, message.chat.id.0) {
+            format_login_message(&existing.verification_url, &existing.user_code)
+        } else {
+            "A Codex login is already in progress. For security, its one-time code is only shown to the administrator who started it in the originating private chat."
+                .to_string()
+        };
+        bot.send_message(message.chat.id, text)
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await?;
         return Ok(());
     }
 
-    let start = openai_codex::request_device_code().await?;
+    let start = match openai_codex::request_device_code().await {
+        Ok(start) => start,
+        Err(err) => return report_admin_failure(&bot, &message, "login startup", &err).await,
+    };
     let status_message = bot
         .send_message(
             message.chat.id,
@@ -369,18 +409,16 @@ pub async fn codex_login_handler(bot: Bot, state: AppState, message: Message) ->
             cancel_flag: cancel_flag.clone(),
         });
     }
+    drop(auth_flow_guard);
 
     let bot_clone = bot.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
         let result = openai_codex::complete_device_code_login(&start, cancel_flag.clone()).await;
 
-        let active = state_clone.active_codex_login.lock().clone();
-        let should_clear = active
-            .as_ref()
-            .is_some_and(|entry| Arc::ptr_eq(&entry.cancel_flag, &cancel_flag));
-        if should_clear {
-            *state_clone.active_codex_login.lock() = None;
+        {
+            let mut active = state_clone.active_codex_login.lock();
+            clear_matching_active_login(&mut active, &cancel_flag);
         }
 
         if cancel_flag.load(Ordering::SeqCst) {
@@ -389,6 +427,7 @@ pub async fn codex_login_handler(bot: Bot, state: AppState, message: Message) ->
 
         match result {
             Ok(auth) => {
+                runtime_models::reload_runtime_models();
                 let plan_type = auth
                     .tokens
                     .as_ref()
@@ -409,7 +448,7 @@ pub async fn codex_login_handler(bot: Bot, state: AppState, message: Message) ->
                 let _ = bot_clone
                     .send_message(
                         ChatId(message.chat.id.0),
-                        format!("Codex login failed: {}", err),
+                        "Codex login failed. Check the bot logs and try again.",
                     )
                     .await;
             }
@@ -420,15 +459,20 @@ pub async fn codex_login_handler(bot: Bot, state: AppState, message: Message) ->
 }
 
 pub async fn codex_logout_handler(bot: Bot, state: AppState, message: Message) -> Result<()> {
-    if !check_admin_access(&bot, &message, "codexlogout").await {
+    if !check_codex_admin_access(&bot, &message, "codexlogout").await {
         return Ok(());
     }
 
+    let _auth_flow_guard = state.codex_auth_flow_lock.lock().await;
     if let Some(active) = state.active_codex_login.lock().take() {
         active.cancel_flag.store(true, Ordering::SeqCst);
     }
 
-    let removed = openai_codex::logout()?;
+    let removed = match openai_codex::logout().await {
+        Ok(removed) => removed,
+        Err(err) => return report_admin_failure(&bot, &message, "logout", &err).await,
+    };
+    runtime_models::reload_runtime_models();
     let text = if removed {
         "Codex auth credentials were removed."
     } else {
@@ -441,7 +485,7 @@ pub async fn codex_logout_handler(bot: Bot, state: AppState, message: Message) -
 }
 
 pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) -> Result<()> {
-    if !check_admin_access(&bot, &message, "codexmodel").await {
+    if !check_codex_admin_access(&bot, &message, "codexmodel").await {
         return Ok(());
     }
 
@@ -455,7 +499,11 @@ pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) ->
         return Ok(());
     }
 
-    let list = openai_codex::fetch_models().await?;
+    let list = match openai_codex::fetch_models().await {
+        Ok(list) => list,
+        Err(err) => return report_admin_failure(&bot, &message, "model catalog fetch", &err).await,
+    };
+    let account_id = list.account_id.clone();
     let models = filter_picker_models(list.models);
     if models.is_empty() {
         bot.send_message(
@@ -484,6 +532,7 @@ pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) ->
         request_id.clone(),
         PendingCodexModelRequest {
             admin_user_id,
+            account_id,
             chat_id: message.chat.id.0,
             selection_message_id: selection_message.id.0 as i64,
             timestamp: now_unix_seconds(),
@@ -503,9 +552,23 @@ pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) ->
 }
 
 pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message) -> Result<()> {
-    if !check_admin_access(&bot, &message, "codexreasoning").await {
+    if !check_codex_admin_access(&bot, &message, "codexreasoning").await {
         return Ok(());
     }
+
+    if !openai_codex::is_auth_ready() {
+        bot.send_message(
+            message.chat.id,
+            "Codex is not logged in yet. Run /codexlogin first.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
+    let account_id = match current_account_id() {
+        Ok(account_id) => account_id,
+        Err(err) => return report_admin_failure(&bot, &message, "reasoning selection", &err).await,
+    };
 
     let Some(mut record) = runtime_models::selected_codex_model_record() else {
         bot.send_message(
@@ -518,15 +581,41 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
     };
 
     if record.supported_reasoning_levels.is_empty() {
-        if let Ok(list) = openai_codex::fetch_models().await {
-            if let Some(model) = filter_picker_models(list.models)
-                .into_iter()
-                .find(|model| model.slug == record.slug)
-            {
-                let refreshed = selected_model_record(&model, list.etag);
-                let _ = runtime_models::save_selected_codex_model(&refreshed)?;
-                record = refreshed;
+        let list = match openai_codex::fetch_models().await {
+            Ok(list) => list,
+            Err(err) => {
+                return report_admin_failure(&bot, &message, "reasoning catalog refresh", &err)
+                    .await;
             }
+        };
+        if list.account_id != account_id {
+            bot.send_message(
+                message.chat.id,
+                "The active Codex account changed. Run /codexreasoning again.",
+            )
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await?;
+            return Ok(());
+        }
+        let list_etag = list.etag;
+        if let Some(model) = filter_picker_models(list.models)
+            .into_iter()
+            .find(|model| model.slug == record.slug)
+        {
+            record = match runtime_models::refresh_selected_codex_model_metadata(
+                &model,
+                list_etag,
+                &account_id,
+                &record.slug,
+            )
+            .await
+            {
+                Ok(record) => record,
+                Err(err) => {
+                    return report_admin_failure(&bot, &message, "reasoning catalog refresh", &err)
+                        .await;
+                }
+            };
         }
     }
 
@@ -566,10 +655,11 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
         request_id.clone(),
         PendingCodexReasoningRequest {
             admin_user_id,
+            account_id,
+            model_slug: record.slug.clone(),
             chat_id: message.chat.id.0,
             selection_message_id: selection_message.id.0 as i64,
             timestamp: now_unix_seconds(),
-            default_level: record.default_reasoning_level.clone(),
             supported_levels: record.supported_reasoning_levels.clone(),
         },
     );
@@ -604,7 +694,7 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
 }
 
 pub async fn codex_usage_handler(bot: Bot, message: Message) -> Result<()> {
-    if !check_admin_access(&bot, &message, "codexusage").await {
+    if !check_codex_admin_access(&bot, &message, "codexusage").await {
         return Ok(());
     }
 
@@ -618,7 +708,10 @@ pub async fn codex_usage_handler(bot: Bot, message: Message) -> Result<()> {
         return Ok(());
     }
 
-    let snapshot = openai_codex::fetch_usage_snapshot().await?;
+    let snapshot = match openai_codex::fetch_usage_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(err) => return report_admin_failure(&bot, &message, "usage fetch", &err).await,
+    };
     bot.send_message(message.chat.id, build_usage_report(&snapshot))
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
@@ -642,12 +735,18 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
     };
     let request_id = request_key(message.chat().id, message.id());
     let query_user_id = i64::try_from(query.from.id.0).unwrap_or_default();
+    let callback_account_id = runtime_models::current_codex_account_id();
 
     if data.starts_with(CODEX_REASONING_SELECT_CALLBACK_PREFIX) {
         enum ReasoningAction {
             Expired,
             Ignore,
-            Apply(Option<String>, Option<String>, Option<String>),
+            Apply {
+                level: Option<String>,
+                display_name: Option<String>,
+                account_id: String,
+                model_slug: String,
+            },
         }
 
         let action = {
@@ -655,6 +754,12 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
             match pending_map.get(&request_id) {
                 None => ReasoningAction::Expired,
                 Some(pending) if pending.admin_user_id != query_user_id => ReasoningAction::Ignore,
+                Some(pending)
+                    if callback_account_id.as_deref() != Some(pending.account_id.as_str()) =>
+                {
+                    pending_map.remove(&request_id);
+                    ReasoningAction::Expired
+                }
                 Some(pending)
                     if now_unix_seconds() - pending.timestamp
                         > crate::config::CONFIG.model_selection_timeout as i64 =>
@@ -668,21 +773,29 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                         .unwrap_or_default();
                     let level = if raw == "default" {
                         None
-                    } else if pending
-                        .supported_levels
-                        .iter()
-                        .any(|entry| entry.effort == raw)
-                    {
-                        Some(raw.to_string())
                     } else {
-                        return Err(anyhow!("invalid Codex reasoning selection"));
+                        let index = raw
+                            .strip_prefix(CODEX_CALLBACK_INDEX_PREFIX)
+                            .and_then(|value| value.parse::<usize>().ok());
+                        let Some(level) =
+                            index.and_then(|index| pending.supported_levels.get(index))
+                        else {
+                            return Err(anyhow!("invalid Codex reasoning selection"));
+                        };
+                        Some(level.effort.clone())
                     };
                     let selected_level = level.clone();
-                    let default_level = pending.default_level.clone();
+                    let account_id = pending.account_id.clone();
+                    let model_slug = pending.model_slug.clone();
                     let display_name = runtime_models::selected_codex_model_record()
                         .map(|record| record.display_name);
                     pending_map.remove(&request_id);
-                    ReasoningAction::Apply(selected_level, default_level, display_name)
+                    ReasoningAction::Apply {
+                        level: selected_level,
+                        display_name,
+                        account_id,
+                        model_slug,
+                    }
                 }
             }
         };
@@ -700,11 +813,37 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                 .await?;
             }
             ReasoningAction::Ignore => {}
-            ReasoningAction::Apply(level, default_level, display_name) => {
-                let updated = runtime_models::save_selected_codex_reasoning_level(level.clone())?;
+            ReasoningAction::Apply {
+                level,
+                display_name,
+                account_id,
+                model_slug,
+            } => {
+                let updated = match runtime_models::save_selected_codex_reasoning_level(
+                    level.clone(),
+                    &account_id,
+                    &model_slug,
+                )
+                .await
+                {
+                    Ok(updated) => updated,
+                    Err(err) => {
+                        warn!("Failed to save Codex reasoning selection: {:#}", err);
+                        bot.edit_message_text(
+                            message.chat().id,
+                            message.id(),
+                            "Codex reasoning update failed. Check the bot logs and try again.",
+                        )
+                        .reply_markup(InlineKeyboardMarkup::new(
+                            Vec::<Vec<InlineKeyboardButton>>::new(),
+                        ))
+                        .await?;
+                        return Ok(());
+                    }
+                };
                 let effective = level
                     .clone()
-                    .or_else(|| default_level.clone())
+                    .or_else(|| updated.default_reasoning_level.clone())
                     .unwrap_or_else(|| "backend default".to_string());
                 bot.edit_message_text(
                     message.chat().id,
@@ -736,6 +875,7 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
         SelectModel {
             model: CodexRemoteModel,
             etag: Option<String>,
+            account_id: String,
         },
     }
 
@@ -746,8 +886,9 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
             Some(pending) => {
                 if pending.admin_user_id != query_user_id {
                     CallbackAction::Ignore
-                } else if now_unix_seconds() - pending.timestamp
-                    > crate::config::CONFIG.model_selection_timeout as i64
+                } else if callback_account_id.as_deref() != Some(pending.account_id.as_str())
+                    || now_unix_seconds() - pending.timestamp
+                        > crate::config::CONFIG.model_selection_timeout as i64
                 {
                     pending_map.remove(&request_id);
                     CallbackAction::Expired
@@ -765,18 +906,22 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                         keyboard: build_model_selection_keyboard(&pending.models, pending.page),
                     }
                 } else {
-                    let Some(slug) = data.strip_prefix(CODEX_MODEL_SELECT_CALLBACK_PREFIX) else {
+                    let Some(token) = data.strip_prefix(CODEX_MODEL_SELECT_CALLBACK_PREFIX) else {
                         return Err(anyhow!("invalid Codex model callback payload"));
                     };
-                    let model = pending
-                        .models
-                        .iter()
-                        .find(|model| model.slug == slug)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("selected Codex model is no longer available"))?;
+                    let Some(model) = resolve_model_callback_token(token, &pending.models).cloned()
+                    else {
+                        pending_map.remove(&request_id);
+                        return Ok(());
+                    };
                     let etag = pending.etag.clone();
+                    let account_id = pending.account_id.clone();
                     pending_map.remove(&request_id);
-                    CallbackAction::SelectModel { model, etag }
+                    CallbackAction::SelectModel {
+                        model,
+                        etag,
+                        account_id,
+                    }
                 }
             }
         }
@@ -800,9 +945,40 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                 .reply_markup(keyboard)
                 .await?;
         }
-        CallbackAction::SelectModel { model, etag } => {
-            let record = selected_model_record(&model, etag);
-            let config = runtime_models::save_selected_codex_model(&record)?;
+        CallbackAction::SelectModel {
+            model,
+            etag,
+            account_id,
+        } => {
+            if runtime_models::current_codex_account_id().as_deref() != Some(account_id.as_str()) {
+                bot.edit_message_text(
+                    message.chat().id,
+                    message.id(),
+                    "This Codex model request has expired because the active account changed.",
+                )
+                .reply_markup(InlineKeyboardMarkup::new(
+                    Vec::<Vec<InlineKeyboardButton>>::new(),
+                ))
+                .await?;
+                return Ok(());
+            }
+            let config =
+                match runtime_models::save_codex_model_selection(&model, etag, &account_id).await {
+                    Ok((_record, config)) => config,
+                    Err(err) => {
+                        warn!("Failed to save Codex model selection: {:#}", err);
+                        bot.edit_message_text(
+                            message.chat().id,
+                            message.id(),
+                            "Codex model update failed. Check the bot logs and try again.",
+                        )
+                        .reply_markup(InlineKeyboardMarkup::new(
+                            Vec::<Vec<InlineKeyboardButton>>::new(),
+                        ))
+                        .await?;
+                        return Ok(());
+                    }
+                };
             let summary = modality_summary(&model);
             bot.edit_message_text(
                 message.chat().id,
@@ -823,4 +999,116 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::openai_codex::CodexWebSearchToolType;
+    use teloxide::types::InlineKeyboardButtonKind;
+
+    fn remote_model(slug: &str) -> CodexRemoteModel {
+        CodexRemoteModel {
+            slug: slug.to_string(),
+            display_name: "Test model".to_string(),
+            description: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: vec![],
+            visibility: CodexModelVisibility::List,
+            supported_in_api: true,
+            priority: 1,
+            web_search_tool_type: CodexWebSearchToolType::Text,
+            input_modalities: vec![CodexInputModality::Text],
+            supports_search_tool: false,
+        }
+    }
+
+    #[test]
+    fn login_prompt_includes_phishing_warning() {
+        let prompt = format_login_message("https://example.com/device", "ABCD-EFGH");
+
+        assert!(prompt.contains(
+            "Continue only if you started this login in Codex. If a website or another person gave you this code, cancel."
+        ));
+    }
+
+    #[test]
+    fn active_login_code_is_bound_to_initiating_user_and_chat() {
+        let login = ActiveCodexLogin {
+            admin_user_id: 42,
+            chat_id: 42,
+            status_message_id: 10,
+            verification_url: "https://example.com/device".to_string(),
+            user_code: "ABCD-EFGH".to_string(),
+            started_at: 0,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        };
+
+        assert!(login_request_matches_owner(&login, 42, 42));
+        assert!(!login_request_matches_owner(&login, 7, 42));
+        assert!(!login_request_matches_owner(&login, 42, 7));
+    }
+
+    #[test]
+    fn stale_login_completion_cannot_clear_a_new_login() {
+        let stale_flag = Arc::new(AtomicBool::new(false));
+        let current_flag = Arc::new(AtomicBool::new(false));
+        let mut active = Some(ActiveCodexLogin {
+            admin_user_id: 42,
+            chat_id: 42,
+            status_message_id: 11,
+            verification_url: "https://example.com/device".to_string(),
+            user_code: "NEW-CODE".to_string(),
+            started_at: 1,
+            cancel_flag: current_flag.clone(),
+        });
+
+        assert!(!clear_matching_active_login(&mut active, &stale_flag));
+        assert!(active.is_some());
+        assert!(clear_matching_active_login(&mut active, &current_flag));
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn model_callback_indices_are_bounded_and_unambiguous() {
+        let first = remote_model(&format!("remote-model-{}", "x".repeat(80)));
+        let second = remote_model("m:reserved-looking-slug");
+        let models = vec![first.clone(), second.clone()];
+
+        let callback = model_selection_callback_data(1);
+        let token = callback
+            .strip_prefix(CODEX_MODEL_SELECT_CALLBACK_PREFIX)
+            .unwrap();
+
+        assert!(callback.len() <= TELEGRAM_CALLBACK_DATA_LIMIT);
+        assert_eq!(token, "i:1");
+        assert_eq!(
+            resolve_model_callback_token(token, &models).map(|model| model.slug.as_str()),
+            Some(second.slug.as_str())
+        );
+        assert!(resolve_model_callback_token("m:reserved-looking-slug", &models).is_none());
+    }
+
+    #[test]
+    fn reasoning_callbacks_stay_bounded_for_long_remote_efforts() {
+        let levels = vec![openai_codex::CodexReasoningEffortOption {
+            effort: "reasoning-".repeat(20),
+            description: "Long remote value".to_string(),
+        }];
+        let keyboard = build_reasoning_selection_keyboard(&levels, None, None);
+        let callbacks = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(callbacks[0], "codex_reasoning_select:i:0");
+        assert!(callbacks
+            .iter()
+            .all(|callback| callback.len() <= TELEGRAM_CALLBACK_DATA_LIMIT));
+    }
 }

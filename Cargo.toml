@@ -28,6 +28,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 pulldown-cmark = "0.9"
 jieba-rs = "0.8"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
 [profile.dev]
 opt-level = 1
 debug = 0
