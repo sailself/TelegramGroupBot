@@ -746,6 +746,7 @@ impl ToolRuntime {
                 let message = error.to_string();
                 if message.contains("date_")
                     || message.contains("term must")
+                    || message.contains("must be at most")
                     || message.contains("distinct_count is only meaningful")
                 {
                     anyhow!("invalid analytics arguments: {message}")
@@ -1280,6 +1281,26 @@ mod tests {
             let args = serde_json::json!({
                 "metric": "count",
                 "filters": { "date_from": "last week" }
+            });
+
+            let result_str = runtime.execute_analytics(&args).await;
+            let result: Value = serde_json::from_str(&result_str).expect("valid json");
+
+            assert_eq!(result["ok"].as_bool(), Some(false));
+            assert_eq!(result["error_code"].as_str(), Some("invalid_arguments"));
+            assert!(runtime.analytics_results().is_empty());
+        });
+    }
+
+    #[test]
+    fn analytics_oversized_filter_returns_invalid_arguments_without_accumulating_result() {
+        let rt = Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let db = init_test_db("analytics-oversized-filter").await;
+            let mut runtime = ToolRuntime::for_analytics(db, -1001374348669);
+            let args = serde_json::json!({
+                "metric": "count",
+                "filters": { "text_contains": "x".repeat(257) }
             });
 
             let result_str = runtime.execute_analytics(&args).await;
