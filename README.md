@@ -14,7 +14,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/tldr` - Summarize recent chat history in the thread.
 - `/factcheck` - Fact-check a statement (text or reply).
 - `/q` - Ask a question (uses model selection when third-party models are configured).
-- `/qc` - Ask a question about this chat using chat-scoped retrieval plus web search when needed.
+- `/qc` - Ask about this chat through independently routed recall, exact stored-text analytics, or LLM-assisted topic discovery.
 - Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically.
 - `/qq` - Quick response using the configured default text model.
 - `/burn_baby_burn` - Show how many tokens you have used in the current chat.
@@ -191,10 +191,11 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `ENABLE_TLDR_INFOGRAPHIC` - When `true`, `/tldr` also runs the configured default image model for an infographic step. Default: `false`.
 
 ### Agentic pipelines
-`/factcheck` and `/qc` run as multi-phase pipelines (claim extraction → web research → synthesis; query planning → chat search → reflect → answer) with live progress edits on the processing message; `/tldr` switches to map-reduce chunk summarization above a threshold. Cheap orchestration steps use a configurable step model; the final answer keeps using the configured default/user-selected model. Each command still holds a single `HEAVY_COMMAND_MAX_CONCURRENCY` permit for its whole run.
+`/factcheck` and `/qc` run as multi-phase pipelines with live progress edits on the processing message, while `/tldr` switches to map-reduce chunk summarization above a threshold. `/qc` routes each request independently: recall uses chat-scoped search (plus web research when needed), exact analytics runs validated read-only queries over eligible stored text, and topic discovery uses LLM-assisted map/reduce classification over a bounded chat window. Topic labels and semantic counts are not exact database analytics; optional literal-keyword counts remain separate exact analytics results. Cheap orchestration steps use a configurable step model; the final answer keeps using the configured default/user-selected model. Each command still holds a single `HEAVY_COMMAND_MAX_CONCURRENCY` permit for its whole run.
 
 - `ENABLE_AGENTIC_FACTCHECK` - When `false`, `/factcheck` reverts to the legacy single-call flow. The legacy flow is also the automatic fallback when claim extraction fails or finds nothing check-worthy. Default: `true`.
-- `ENABLE_AGENTIC_QC` - When `false`, `/qc` reverts to the legacy monolithic tool loop (also the fallback when query planning fails). Default: `true`.
+- `ENABLE_AGENTIC_QC` - When `false`, `/qc` reverts to the legacy monolithic tool loop. In agentic mode, malformed lane classification takes the recall path; analytics and topic-discovery failures fail closed instead of silently using the legacy loop. Default: `true`.
+- `ENABLE_QC_TOPIC_DISCOVERY` - Enables semantic topic discovery for `/qc`. Default: `true`. Topic discovery analyzes at most `TLDR_MAX_MESSAGES` newest eligible stored text messages in the requested UTC range, using `TLDR_CHUNK_SIZE` chunks and up to four concurrent map calls. Results disclose capped and partial coverage and are LLM-assisted classifications, not exact semantic counts.
 - `AGENT_STEP_MODEL` - Model for cheap pipeline steps (claim extraction, query planning, reflection, chunk summaries). Accepts `gemini` or a runtime model id; `openai-codex:<slug>` works even for slugs not in the catalog (e.g. `openai-codex:gpt-5.4-mini`). Empty = derive automatically: a Codex/OpenAI final model runs steps on itself at `AGENT_STEP_REASONING`; a Gemini final model uses `GEMINI_LITE_MODEL`. Default: empty.
 - `AGENT_STEP_REASONING` - Per-call reasoning effort for step calls on Responses-provider models (validated against the selected Codex model's supported levels). Default: `low`.
 - `AGENT_MAX_WALL_CLOCK_SECS` - Soft time budget per pipeline run, checked between phases; when exceeded the pipeline stops gathering more evidence and answers with what it has. Default: `480`.
