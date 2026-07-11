@@ -146,13 +146,13 @@ The returned structure records:
 
 When capped, the implementation analyzes the newest configured messages. It does not extrapolate them to the omitted history. The final answer says, for example, “Analyzed the newest 2,000 of 8,431 stored text messages in this range.”
 
-The implementation reuses `TLDR_CHUNK_SIZE`, `TLDR_MAX_MESSAGES`, and the existing bounded chunk concurrency rather than adding duplicate tuning knobs. `ENABLE_QC_TOPIC_DISCOVERY` is the only new topic-specific switch.
+The implementation reuses `TLDR_CHUNK_SIZE` and `TLDR_MAX_MESSAGES` rather than adding duplicate size knobs. Topic map calls use a fixed concurrency of four; `/tldr` remains unchanged. `ENABLE_QC_TOPIC_DISCOVERY` is the only new topic-specific switch.
 
 ### Map phase
 
 Messages are formatted with stable message ids, UTC timestamps, display labels, and verified Telegram links, then divided into existing TLDR-sized chunks.
 
-Each map call returns structured JSON containing a small set of candidate topics. Each candidate contains:
+Up to four map calls run concurrently. Each returns structured JSON containing a small set of candidate topics. Each candidate contains:
 
 - a concise label;
 - a one-sentence description;
@@ -214,7 +214,7 @@ Add:
 
 - `ENABLE_QC_TOPIC_DISCOVERY` — default `true`; when false, topic requests return a clear unsupported message rather than being misrouted to exact analytics.
 
-Topic message/chunk limits reuse `TLDR_MAX_MESSAGES` and `TLDR_CHUNK_SIZE`. Parallelism reuses the bounded map concurrency already used by TLDR.
+Topic message/chunk limits reuse `TLDR_MAX_MESSAGES` and `TLDR_CHUNK_SIZE`. Topic mapping uses a fixed concurrency of four and does not change `/tldr` execution.
 
 ## Integration with current `main`
 
