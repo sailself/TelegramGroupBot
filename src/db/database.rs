@@ -396,7 +396,6 @@ impl Database {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn select_topic_window(
         &self,
         chat_id: i64,

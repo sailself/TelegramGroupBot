@@ -20,7 +20,6 @@ pub struct MessageRow {
     pub is_synthetic_record: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicWindowSpec {
     pub date_from: DateTime<Utc>,
@@ -31,7 +30,6 @@ pub struct TopicWindowSpec {
     pub limit: i64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TopicWindow {
     pub messages: Vec<MessageRow>,
