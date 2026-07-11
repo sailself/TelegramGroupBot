@@ -178,7 +178,7 @@ If the user explicitly asks how often a literal word or phrase appeared, that po
 
 ### Topic composition
 
-The final no-tools composition call receives only validated clusters, Rust-computed counts, coverage metadata, and curated examples. It summarizes the themes in the user’s language, identifies the analyzed range, discloses capped coverage, and may cite only the verified example links.
+The final no-tools composition call receives only validated clusters, Rust-computed counts, coverage metadata, and curated examples. Every answer summarizes the themes in the user’s language and states the effective UTC range, eligible stored text/caption source limitation, anonymous-admin/channel-post exclusion, active user scope, and command/synthetic inclusion state. It also discloses capped newest-selection and partial-map limitations when applicable, and may cite only the verified example links.
 
 If all map calls fail or no valid candidates survive, `/qc` reports that topic discovery could not produce supported themes. It does not invent a fallback summary.
 
@@ -254,7 +254,7 @@ Before feature implementation is considered complete, integrate current `main` i
 - Rust, not the model, computes final classified counts and percentages;
 - capped and partial-map coverage is disclosed;
 - representative citations are limited to selected active-chat message ids;
-- exact keyword counts are kept separate from semantic classifications.
+- literal-substring matching-message counts are kept separate from semantic classifications.
 
 ### Regression and delivery gates
 
