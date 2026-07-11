@@ -2622,6 +2622,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_chat_analytics_text_contains_treats_wildcards_literally_and_counts_messages() {
+        use crate::agents::step::parse_lenient_json;
+        use crate::llm::analytics::QuerySpec;
+        let db = init_test_db("analytics-literal-wildcards").await;
+        let chat = -1001374348669_i64;
+        for (message_id, text) in [
+            (1, "sale 50%_off now"),
+            (2, "50%_off repeated 50%_off"),
+            (3, "50percentXoff wildcard lookalike"),
+        ] {
+            insert_count_message(
+                &db,
+                message_id,
+                chat,
+                Some(10),
+                Some("alice"),
+                text,
+                at("2026-04-01T00:00:00+00:00"),
+                false,
+                false,
+            )
+            .await;
+        }
+
+        let spec: QuerySpec =
+            parse_lenient_json(r#"{"metric":"count","filters":{"text_contains":"50%_off"}}"#)
+                .unwrap();
+        let (_normalized_spec, rows) = db.run_chat_analytics(chat, &spec).await.expect("query ok");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].value_num,
+            Some(2.0),
+            "count matching messages once each; do not expand %/_ or count occurrences"
+        );
+    }
+
+    #[tokio::test]
     async fn run_chat_analytics_group_by_day_buckets_correctly() {
         use crate::agents::step::parse_lenient_json;
         use crate::llm::analytics::QuerySpec;
