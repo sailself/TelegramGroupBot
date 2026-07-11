@@ -997,11 +997,17 @@ mod tests {
         assert!(TOPIC_COMPOSE_ADDENDUM.contains("coverage.exclude_synthetic"));
         assert!(TOPIC_COMPOSE_ADDENDUM.contains("synthetic rows are included or excluded"));
         assert!(TOPIC_COMPOSE_ADDENDUM.contains("newest selected messages"));
+        assert!(TOPIC_COMPOSE_ADDENDUM.contains("total_eligible_messages"));
+        assert!(TOPIC_COMPOSE_ADDENDUM.contains("successfully_mapped_messages"));
         assert!(TOPIC_COMPOSE_ADDENDUM.contains("partial-map limitation"));
         assert!(TOPIC_COMPOSE_ADDENDUM.contains("not exact semantic counts"));
         assert!(TOPIC_COMPOSE_ADDENDUM.contains("literal substring"));
+        assert!(TOPIC_COMPOSE_ADDENDUM.contains("not an FTS count"));
+        assert!(TOPIC_COMPOSE_ADDENDUM.contains("a count of occurrences within messages"));
         assert!(TOPIC_COMPOSE_ADDENDUM.contains("status unavailable"));
         assert!(TOPIC_COMPOSE_ADDENDUM.contains("do not invent a count"));
+        assert!(TOPIC_COMPOSE_ADDENDUM.contains("Cite only example links present"));
+        assert!(TOPIC_COMPOSE_ADDENDUM.contains("do not invent links"));
     }
 
     #[test]
