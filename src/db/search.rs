@@ -167,6 +167,25 @@ pub fn normalize_search_query(query: &str) -> SearchQuery {
     }
 }
 
+pub fn build_and_match_expression(query: &SearchQuery) -> Option<String> {
+    let mut terms = query
+        .semantic_tokens
+        .iter()
+        .map(|token| token.trim())
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("search_text : {token}"))
+        .collect::<Vec<_>>();
+    terms.extend(
+        query
+            .tag_tokens
+            .iter()
+            .map(|token| token.trim())
+            .filter(|token| !token.is_empty())
+            .map(|token| format!("search_tags : {token}")),
+    );
+    (!terms.is_empty()).then(|| terms.join(" AND "))
+}
+
 pub fn clean_text_for_display(text: &str, is_synthetic_record: bool) -> String {
     clean_display_text(text, is_synthetic_record)
 }

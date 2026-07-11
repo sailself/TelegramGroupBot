@@ -362,9 +362,10 @@ impl Database {
         &self,
         chat_id: i64,
         spec: &crate::llm::analytics::QuerySpec,
-    ) -> Result<Vec<AnalyticsRow>> {
+    ) -> Result<(crate::llm::analytics::QuerySpec, Vec<AnalyticsRow>)> {
         use crate::llm::analytics::Bind;
-        crate::llm::analytics::validate(spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let spec = crate::llm::analytics::normalize_and_validate(spec.clone())
+            .map_err(anyhow::Error::msg)?;
         // Term filters hit the FTS index; refuse while it's rebuilding (mirror search_chat_messages).
         if spec
             .filters
@@ -377,7 +378,7 @@ impl Database {
                 crate::db::search::SEARCH_INDEX_REBUILDING_ERROR
             ));
         }
-        let (sql, binds) = crate::llm::analytics::compile(spec, chat_id);
+        let (sql, binds) = crate::llm::analytics::compile(&spec, chat_id);
         let mut q = sqlx::query_as::<_, AnalyticsRow>(&sql);
         for b in binds {
             q = match b {
@@ -389,7 +390,8 @@ impl Database {
         // can't pin a connection.
         let dur = std::time::Duration::from_secs(CONFIG.qc_analytics_query_timeout_secs);
         match tokio::time::timeout(dur, q.fetch_all(&self.pool)).await {
-            Ok(res) => res.map_err(Into::into),
+            Ok(Ok(rows)) => Ok((spec, rows)),
+            Ok(Err(error)) => Err(error.into()),
             Err(_) => Err(anyhow::anyhow!("analytics query exceeded the time budget")),
         }
     }
@@ -801,25 +803,7 @@ fn build_phrase_stage_query(query_spec: &crate::db::search::SearchQuery) -> Opti
 }
 
 fn build_and_stage_query(query_spec: &crate::db::search::SearchQuery) -> Option<String> {
-    let mut terms = query_spec
-        .semantic_tokens
-        .iter()
-        .map(|token| token.trim())
-        .filter(|token| !token.is_empty())
-        .map(|token| format!("search_text : {token}"))
-        .collect::<Vec<_>>();
-    terms.extend(
-        query_spec
-            .tag_tokens
-            .iter()
-            .map(|token| token.trim())
-            .filter(|token| !token.is_empty())
-            .map(|token| format!("search_tags : {token}")),
-    );
-    if terms.is_empty() {
-        return None;
-    }
-    Some(terms.join(" AND "))
+    crate::db::search::build_and_match_expression(query_spec)
 }
 
 fn build_or_prefix_stage_query(query_spec: &crate::db::search::SearchQuery) -> Option<String> {
@@ -2217,7 +2201,7 @@ mod tests {
         ];
         for raw in specs {
             let spec: QuerySpec = parse_lenient_json(raw).expect("spec parses");
-            let rows = db
+            let (_normalized_spec, rows) = db
                 .run_chat_analytics(a, &spec)
                 .await
                 .expect("query ok (inert, not executed SQL)");
@@ -2234,10 +2218,8 @@ mod tests {
         // chat_id-in-spec is ignored: total count == chat A's 3 messages, never includes B.
         let total: QuerySpec =
             parse_lenient_json(r#"{"metric":"count","chat_id":-1002631835259}"#).unwrap();
-        assert_eq!(
-            db.run_chat_analytics(a, &total).await.unwrap()[0].value_num,
-            Some(3.0)
-        );
+        let (_normalized_spec, rows) = db.run_chat_analytics(a, &total).await.unwrap();
+        assert_eq!(rows[0].value_num, Some(3.0));
         // Write-impossibility: messages table unchanged after injection attempts.
         let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
             .fetch_one(db.pool())
@@ -2249,7 +2231,7 @@ mod tests {
         let audit_probe: QuerySpec =
             parse_lenient_json(r#"{"metric":"count","filters":{"term":"SENTINEL_AUDIT"}}"#)
                 .unwrap();
-        let r = db.run_chat_analytics(a, &audit_probe).await.unwrap();
+        let (_normalized_spec, r) = db.run_chat_analytics(a, &audit_probe).await.unwrap();
         assert_eq!(
             r.first().and_then(|row| row.value_num),
             Some(0.0),
@@ -2261,7 +2243,7 @@ mod tests {
             r#"{"metric":"count","filters":{"text_contains":"SENTINEL_CHATB"}}"#,
         )
         .unwrap();
-        let r2 = db.run_chat_analytics(a, &chatb_probe).await.unwrap();
+        let (_normalized_spec, r2) = db.run_chat_analytics(a, &chatb_probe).await.unwrap();
         assert_eq!(
             r2.first().and_then(|row| row.value_num),
             Some(0.0),
@@ -2321,7 +2303,7 @@ mod tests {
         let spec: QuerySpec =
             parse_lenient_json(r#"{"metric":"count","group_by":"user","order":"value_desc"}"#)
                 .unwrap();
-        let rows = db
+        let (_normalized_spec, rows) = db
             .run_chat_analytics(chat_a, &spec)
             .await
             .expect("query ok");
@@ -2381,7 +2363,7 @@ mod tests {
 
         let spec: QuerySpec =
             parse_lenient_json(r#"{"metric":"count","filters":{"term":"bitcoin"}}"#).unwrap();
-        let rows = db.run_chat_analytics(chat, &spec).await.expect("query ok");
+        let (_normalized_spec, rows) = db.run_chat_analytics(chat, &spec).await.expect("query ok");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value_num, Some(2.0));
@@ -2425,7 +2407,7 @@ mod tests {
             r#"{"metric":"count","group_by":"day","order":"group_asc","limit":10}"#,
         )
         .unwrap();
-        let rows = db.run_chat_analytics(chat, &spec).await.expect("query ok");
+        let (_normalized_spec, rows) = db.run_chat_analytics(chat, &spec).await.expect("query ok");
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].group_key.as_deref(), Some("2026-05-01"));
@@ -2480,7 +2462,7 @@ mod tests {
 
         let spec: QuerySpec =
             parse_lenient_json(r#"{"metric":"distinct_count","group_by":"none"}"#).unwrap();
-        let rows = db.run_chat_analytics(chat, &spec).await.expect("query ok");
+        let (_normalized_spec, rows) = db.run_chat_analytics(chat, &spec).await.expect("query ok");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value_num, Some(2.0));
@@ -2520,7 +2502,7 @@ mod tests {
 
         let min_spec: QuerySpec =
             parse_lenient_json(r#"{"metric":"min_date","group_by":"none"}"#).unwrap();
-        let min_rows = db
+        let (_normalized_spec, min_rows) = db
             .run_chat_analytics(chat, &min_spec)
             .await
             .expect("min_date ok");
@@ -2534,7 +2516,7 @@ mod tests {
 
         let max_spec: QuerySpec =
             parse_lenient_json(r#"{"metric":"max_date","group_by":"none"}"#).unwrap();
-        let max_rows = db
+        let (_normalized_spec, max_rows) = db
             .run_chat_analytics(chat, &max_spec)
             .await
             .expect("max_date ok");
@@ -2598,7 +2580,7 @@ mod tests {
             r#"{"metric":"count","filters":{"date_from":"2026-03-01T00:00:00+00:00","date_to":"2026-04-01T00:00:00+00:00"}}"#,
         )
         .unwrap();
-        let rows = db.run_chat_analytics(chat, &spec).await.expect("query ok");
+        let (_normalized_spec, rows) = db.run_chat_analytics(chat, &spec).await.expect("query ok");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value_num, Some(2.0));
@@ -2636,7 +2618,7 @@ mod tests {
         .await; // len 7
         let spec: QuerySpec =
             parse_lenient_json(r#"{"metric":"avg_len","group_by":"none"}"#).unwrap();
-        let rows = db.run_chat_analytics(chat, &spec).await.unwrap();
+        let (_normalized_spec, rows) = db.run_chat_analytics(chat, &spec).await.unwrap();
         assert_eq!(rows.first().and_then(|r| r.value_num), Some(5.0)); // (3+7)/2
     }
 
@@ -2686,7 +2668,7 @@ mod tests {
             r#"{"metric":"count","group_by":"hour_of_day","order":"value_desc"}"#,
         )
         .unwrap();
-        let rows = db.run_chat_analytics(chat, &spec).await.unwrap();
+        let (_normalized_spec, rows) = db.run_chat_analytics(chat, &spec).await.unwrap();
         let top = rows.first().unwrap();
         assert_eq!(top.group_key.as_deref(), Some("09")); // two messages in the 09:00 UTC hour
         assert_eq!(top.value_num, Some(2.0));

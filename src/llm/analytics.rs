@@ -3,7 +3,7 @@
 //! read-only SELECT over `messages`. `chat_id` is supplied by the caller and is
 //! always the first bind — never sourced from the model.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Telegram service account for anonymous-admin posts; excluded from per-user
@@ -13,7 +13,7 @@ const GROUP_ANONYMOUS_BOT_ID: i64 = 1_087_968_824;
 pub const MAX_ANALYTICS_LIMIT: i64 = 50; // REVIEW: was 100; spec says 1..=50
 const DEFAULT_ANALYTICS_LIMIT: i64 = 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
     Count,
@@ -23,7 +23,7 @@ pub enum Metric {
     AvgLen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupBy {
     User,
@@ -34,7 +34,7 @@ pub enum GroupBy {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Order {
     ValueDesc,
@@ -43,7 +43,7 @@ pub enum Order {
     GroupDesc,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Filters {
     #[serde(default)]
     pub term: Option<String>,
@@ -87,7 +87,7 @@ impl Default for Filters {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QuerySpec {
     pub metric: Metric,
     #[serde(default = "default_group_by")]
@@ -125,8 +125,44 @@ pub fn validate(spec: &QuerySpec) -> Result<(), String> {
     Ok(())
 }
 
-/// Compile to `(sql, binds)`. `chat_id` is always the first bind. Call `validate`
-/// first. `date_from`/`date_to` are expected already-normalized (see callers).
+pub fn normalize_and_validate(mut spec: QuerySpec) -> Result<QuerySpec, String> {
+    validate(&spec)?;
+
+    fn normalize_bound(field: &str, value: Option<String>) -> Result<Option<String>, String> {
+        match value {
+            Some(value) => normalize_stats_date(&value)
+                .map(Some)
+                .ok_or_else(|| format!("{field} must be YYYY-MM-DD or RFC3339")),
+            None => Ok(None),
+        }
+    }
+
+    spec.filters.date_from = normalize_bound("date_from", spec.filters.date_from)?;
+    spec.filters.date_to = normalize_bound("date_to", spec.filters.date_to)?;
+    if matches!(
+        (&spec.filters.date_from, &spec.filters.date_to),
+        (Some(from), Some(to)) if from >= to
+    ) {
+        return Err("date_from must be earlier than date_to".to_string());
+    }
+
+    if let Some(term) = spec.filters.term.as_deref() {
+        let normalized = crate::db::search::normalize_search_query(term);
+        if crate::db::search::build_and_match_expression(&normalized).is_none() {
+            return Err("term must contain at least one searchable token".to_string());
+        }
+    }
+
+    spec.limit = Some(
+        spec.limit
+            .unwrap_or(DEFAULT_ANALYTICS_LIMIT)
+            .clamp(1, MAX_ANALYTICS_LIMIT),
+    );
+    Ok(spec)
+}
+
+/// Compile to `(sql, binds)`. `chat_id` is always the first bind. Call
+/// `normalize_and_validate` first; date bounds and the limit must be canonical.
 pub fn compile(spec: &QuerySpec, chat_id: i64) -> (String, Vec<Bind>) {
     let mut binds: Vec<Bind> = vec![Bind::Int(chat_id)];
 
@@ -186,42 +222,23 @@ pub fn compile(spec: &QuerySpec, chat_id: i64) -> (String, Vec<Bind>) {
     }
 
     if let Some(term) = nonempty(&spec.filters.term) {
-        // REVIEW (all reviewers): never bind a raw term into MATCH — it throws
-        // on `c++`, quotes, `%`, operators. Wrap as a quoted FTS phrase, and use
-        // the FTS rowid form (perf + scope parity).
-        // Use the table name directly (no alias) — FTS5 requires the virtual-table
-        // name in the MATCH predicate; aliasing it confuses some SQLite builds.
-        // Skip terms that contain no alphanumeric content (e.g. only quotes/punctuation)
-        // to avoid producing a degenerate FTS phrase that SQLite would reject.
-        if term.chars().any(char::is_alphanumeric) {
-            // REVIEW (perf, deferred): a chat-scoped JOIN (as in `fetch_stage_hits`/`/s`) would
-            // prune cross-chat FTS matches earlier on large multi-chat DBs; the IN-subquery is
-            // correctness-correct and the per-query timeout bounds it.
-            sql.push_str(
-                " AND m.id IN (SELECT messages_fts.rowid FROM messages_fts WHERE messages_fts MATCH ?)",
-            );
-            binds.push(Bind::Text(to_fts_phrase(&term)));
-        }
+        let normalized = crate::db::search::normalize_search_query(&term);
+        let expression = crate::db::search::build_and_match_expression(&normalized)
+            .expect("validated analytics term must contain search tokens");
+        sql.push_str(
+            " AND m.id IN (SELECT messages_fts.rowid FROM messages_fts WHERE messages_fts MATCH ?)",
+        );
+        binds.push(Bind::Text(expression));
     }
     if let Some(text) = nonempty(&spec.filters.text_contains) {
         sql.push_str(" AND m.text LIKE ? ESCAPE '\\'");
         binds.push(Bind::Text(format!("%{}%", escape_like(&text))));
     }
-    // REVIEW (SQL m3): mirror Plan B — drop only a STRICTLY inverted range; equal bounds
-    // are kept (yields an honest possibly-empty filtered result rather than silently dropping
-    // a same-day window).
-    let (df, dt) = match (
-        nonempty(&spec.filters.date_from),
-        nonempty(&spec.filters.date_to),
-    ) {
-        (Some(f), Some(t)) if f > t => (None, None), // was f >= t
-        (f, t) => (f, t),
-    };
-    if let Some(f) = df {
+    if let Some(f) = nonempty(&spec.filters.date_from) {
         sql.push_str(" AND m.date >= ?");
         binds.push(Bind::Text(f));
     }
-    if let Some(t) = dt {
+    if let Some(t) = nonempty(&spec.filters.date_to) {
         sql.push_str(" AND m.date < ?");
         binds.push(Bind::Text(t));
     }
@@ -265,11 +282,6 @@ fn nonempty(v: &Option<String>) -> Option<String> {
     v.as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-/// FTS5-safe phrase: wrap in quotes and neutralize embedded quotes, so arbitrary
-/// model text (incl. `c++`, `a:b`, `OR`) is a literal phrase, never an operator.
-fn to_fts_phrase(term: &str) -> String {
-    format!("\"{}\"", term.replace('"', " "))
 }
 fn escape_like(input: &str) -> String {
     input
@@ -347,14 +359,16 @@ mod tests {
         assert!(!sql.contains("llm_invocations") && !sql.contains("app_meta"));
     }
     #[test]
-    fn term_is_quoted_phrase_not_raw_operator() {
-        let (_, b) = compile(&spec(r#"{"metric":"count","filters":{"term":"c++"}}"#), 1);
-        assert_eq!(b[1], Bind::Text("\"c++\"".to_string())); // safe phrase, no FTS syntax error
-        let (_, b2) = compile(
-            &spec(r#"{"metric":"count","filters":{"term":"a\"b OR x"}}"#),
-            1,
+    fn term_uses_normalized_and_expression() {
+        let normalized = normalize_and_validate(spec(
+            r#"{"metric":"count","filters":{"term":"Bitcoin rally"}}"#,
+        ))
+        .unwrap();
+        let (_, binds) = compile(&normalized, 1);
+        assert_eq!(
+            binds[1],
+            Bind::Text("search_text : bitcoin AND search_text : rally".to_string())
         );
-        assert_eq!(b2[1], Bind::Text("\"a b OR x\"".to_string()));
     }
     #[test]
     fn date_metric_orders_by_value_text() {
@@ -362,34 +376,6 @@ mod tests {
         assert!(sql.contains("ORDER BY value_text DESC"));
         let (sql2, _) = compile(&spec(r#"{"metric":"count","group_by":"user"}"#), 1);
         assert!(sql2.contains("ORDER BY value_num DESC"));
-    }
-    #[test]
-    fn inverted_range_is_dropped() {
-        let (sql, b) = compile(
-            &spec(
-                r#"{"metric":"count","filters":{"date_from":"2026-06-01","date_to":"2026-05-01"}}"#,
-            ),
-            1,
-        );
-        assert!(!sql.contains("m.date >="));
-        assert_eq!(b.len(), 2); // chat_id + limit only
-    }
-    #[test]
-    fn equal_date_bounds_are_kept() {
-        let (sql, b) = compile(
-            &spec(
-                r#"{"metric":"count","filters":{"date_from":"2026-06-01","date_to":"2026-06-01"}}"#,
-            ),
-            1,
-        );
-        assert!(sql.contains("m.date >= ?") && sql.contains("m.date < ?"));
-        assert_eq!(b.len(), 4); // chat_id, date_from, date_to, limit
-    }
-    #[test]
-    fn term_with_no_alphanumerics_is_skipped() {
-        let (sql, b) = compile(&spec(r#"{"metric":"count","filters":{"term":"\"\""}}"#), 1);
-        assert!(!sql.contains("messages_fts"));
-        assert_eq!(b.len(), 2); // chat_id, limit only
     }
     #[test]
     fn validate_rejects_distinct_count_by_user() {
@@ -458,5 +444,56 @@ mod tests {
         // Empty → None
         assert_eq!(super::normalize_stats_date(""), None);
         assert_eq!(super::normalize_stats_date("   "), None);
+    }
+
+    #[test]
+    fn normalization_rejects_bad_or_non_increasing_dates() {
+        let bad = spec(r#"{"metric":"count","filters":{"date_from":"last week"}}"#);
+        assert_eq!(
+            normalize_and_validate(bad).unwrap_err(),
+            "date_from must be YYYY-MM-DD or RFC3339"
+        );
+
+        let equal = spec(
+            r#"{"metric":"count","filters":{"date_from":"2026-07-01","date_to":"2026-07-01"}}"#,
+        );
+        assert_eq!(
+            normalize_and_validate(equal).unwrap_err(),
+            "date_from must be earlier than date_to"
+        );
+
+        let inverted = spec(
+            r#"{"metric":"count","filters":{"date_from":"2026-07-02","date_to":"2026-07-01"}}"#,
+        );
+        assert_eq!(
+            normalize_and_validate(inverted).unwrap_err(),
+            "date_from must be earlier than date_to"
+        );
+    }
+
+    #[test]
+    fn normalization_canonicalizes_dates_and_limit() {
+        let raw = spec(
+            r#"{"metric":"count","filters":{"date_from":"2026-07-01","date_to":"2026-07-02T03:00:00+03:00"},"limit":999}"#,
+        );
+        let normalized = normalize_and_validate(raw).unwrap();
+        assert_eq!(
+            normalized.filters.date_from.as_deref(),
+            Some("2026-07-01T00:00:00+00:00")
+        );
+        assert_eq!(
+            normalized.filters.date_to.as_deref(),
+            Some("2026-07-02T00:00:00+00:00")
+        );
+        assert_eq!(normalized.limit, Some(MAX_ANALYTICS_LIMIT));
+    }
+
+    #[test]
+    fn normalization_rejects_term_without_search_tokens() {
+        let raw = spec(r#"{"metric":"count","filters":{"term":"!!!"}}"#);
+        assert_eq!(
+            normalize_and_validate(raw).unwrap_err(),
+            "term must contain at least one searchable token"
+        );
     }
 }

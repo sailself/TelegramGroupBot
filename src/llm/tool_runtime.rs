@@ -735,24 +735,12 @@ impl ToolRuntime {
     }
 
     pub async fn run_analytics_query(&mut self, arguments: &Value) -> Result<Value> {
-        use crate::llm::analytics::{normalize_stats_date, QuerySpec};
-        let mut spec: QuerySpec = serde_json::from_value(arguments.clone())
+        use crate::llm::analytics::{normalize_and_validate, QuerySpec};
+        let spec: QuerySpec = serde_json::from_value(arguments.clone())
             .map_err(|e| anyhow!("invalid analytics arguments: {e}"))?;
-        crate::llm::analytics::validate(&spec)
-            .map_err(|e| anyhow!("invalid analytics arguments: {e}"))?;
-        // Normalize date bounds so malformed dates don't silently match nothing.
-        spec.filters.date_from = spec
-            .filters
-            .date_from
-            .as_deref()
-            .and_then(normalize_stats_date);
-        spec.filters.date_to = spec
-            .filters
-            .date_to
-            .as_deref()
-            .and_then(normalize_stats_date);
-
-        let rows = self.db.run_chat_analytics(self.chat_id, &spec).await?;
+        let spec = normalize_and_validate(spec)
+            .map_err(|error| anyhow!("invalid analytics arguments: {error}"))?;
+        let (_, rows) = self.db.run_chat_analytics(self.chat_id, &spec).await?;
         let label_map = crate::handlers::build_display_label_map(rows.iter().filter_map(|r| {
             r.group_user_id
                 .map(|uid| (uid, r.group_key.as_deref().unwrap_or("Anonymous")))
