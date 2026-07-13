@@ -4,14 +4,14 @@
 
 **Goal:** Make catalog-selected Codex Responses Lite models such as `gpt-5.6-luna` use the transport contract advertised by their model metadata.
 
-**Architecture:** Carry `use_responses_lite` from remote catalog deserialization into the account-bound selected-model record. Build either the existing normal Responses payload or the official lite payload from that flag, and route lite web search through the bot's existing function-tool loop rather than the unsupported hosted tool.
+**Architecture:** Carry `use_responses_lite` and a metadata schema version from remote catalog deserialization into the account-bound selected-model record. Before either public selected-alias entry point chooses tools or builds a request, serialize and recheck catalog rehydration for legacy version-zero records, failing closed on error. Build either the existing normal Responses payload or the official lite payload from current metadata, normalize lite images recursively, and route lite web search through the bot's existing function-tool loop rather than the unsupported hosted tool.
 
 **Tech Stack:** Rust, Serde/serde_json, reqwest headers, Tokio, existing inline unit-test modules.
 
 ## Global Constraints
 
 - Do not hard-code GPT-5.6 model slugs; the remote catalog flag is authoritative.
-- Missing `use_responses_lite` fields must deserialize as `false` for backward compatibility.
+- Missing `use_responses_lite` fields must deserialize as `false`, and missing metadata versions as zero, for backward-compatible parsing followed by required request-time rehydration.
 - Normal Codex and public OpenAI Responses requests must remain structurally unchanged.
 - Add no dependency or environment variable.
 - Never log request bodies, prompts, access tokens, account identifiers, or remote error text.
@@ -31,7 +31,7 @@
 
 **Interfaces:**
 - Consumes: remote `/models` JSON field `use_responses_lite: bool`.
-- Produces: `CodexRemoteModel::use_responses_lite` and `CodexSelectedModelRecord::use_responses_lite`, defaulting to `false`.
+- Produces: `CodexRemoteModel::use_responses_lite`, `CodexSelectedModelRecord::use_responses_lite`, and a persisted current metadata version; legacy versions default to zero.
 
 - [ ] **Step 1: Write failing catalog and persistence tests**
 
@@ -429,6 +429,16 @@ git commit -m "fix: support Codex Responses Lite requests"
 ---
 
 ### Task 3: Verify the complete fix and update the execution log
+
+Before final verification, complete these final-review corrections using focused RED/GREEN cycles:
+
+- [ ] Add a serde-defaulted `metadata_version` sentinel to the selected record; write the current version whenever a catalog model is selected or refreshed.
+- [ ] Change refresh-decision logic so version-zero records refresh even when the observed ETag matches, while current records with matching ETags skip refresh.
+- [ ] Add a serialized request-time guard to both public Responses entry points. Validate the selected alias, account, and slug before and after acquiring the existing async refresh lock; fetch the current catalog once, persist the matched model metadata, and fail closed with a redacted actionable error on failure.
+- [ ] Before prepending lite developer items, recursively remove `detail` from every object whose type is `input_image`; do not normalize non-lite payloads.
+- [ ] When top-level tools are absent, summarize names from the leading lite `additional_tools` input item without including schemas, arguments, content, or bodies.
+- [ ] Cover empty lite instructions/tools, provider and slug rejection, the lite header in per-attempt header assembly, and rebuilding later tool iterations without duplicate developer prefixes.
+- [ ] Amend the design, this plan, and the originating ignored execution log with the corrected behavior and exact validation evidence.
 
 **Files:**
 - Modify: `agent_logs/20260712_210244_codex_luna_404.md` (ignored execution record)

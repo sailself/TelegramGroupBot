@@ -292,9 +292,16 @@ fn summarize_responses_payload(payload: &Value) -> String {
                 .count()
         })
         .unwrap_or(0);
-    let tool_names = payload
-        .get("tools")
-        .and_then(|value| value.as_array())
+    let tools = payload.get("tools").and_then(Value::as_array).or_else(|| {
+        payload
+            .get("input")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+            .and_then(|item| item.get("tools"))
+            .and_then(Value::as_array)
+    });
+    let tool_names = tools
         .map(|tools| {
             tools
                 .iter()
@@ -753,6 +760,25 @@ fn add_codex_responses_lite_header(headers: &mut Vec<(String, String)>, use_resp
     }
 }
 
+fn remove_input_image_details(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                remove_input_image_details(item);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("input_image") {
+                object.remove("detail");
+            }
+            for child in object.values_mut() {
+                remove_input_image_details(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_responses_payload(
     model_config: &ThirdPartyModelConfig,
@@ -766,6 +792,9 @@ fn build_responses_payload(
 ) -> (Value, bool) {
     let use_lite = selected_model_uses_responses_lite(model_config, selected_record);
     let mut payload = if use_lite {
+        for input_item in &mut input_items {
+            remove_input_image_details(input_item);
+        }
         let mut prefix = vec![json!({
             "type": "additional_tools",
             "role": "developer",
@@ -918,6 +947,14 @@ fn build_request_details(
     })
 }
 
+fn merge_request_headers_for_attempt(
+    mut attempt_headers: Vec<(String, String)>,
+    request_headers: &[(String, String)],
+) -> Vec<(String, String)> {
+    attempt_headers.extend(request_headers.iter().cloned());
+    attempt_headers
+}
+
 async fn resolve_request_headers_for_attempt(
     details: &ResponsesRequestDetails,
 ) -> Result<Vec<(String, String)>> {
@@ -931,9 +968,10 @@ async fn resolve_request_headers_for_attempt(
             "The active ChatGPT account changed while the Codex request was in progress"
         ));
     }
-    let mut headers = openai_codex::codex_headers(&auth, Some(&details.session_id));
-    headers.extend(details.headers.clone());
-    Ok(headers)
+    Ok(merge_request_headers_for_attempt(
+        openai_codex::codex_headers(&auth, Some(&details.session_id)),
+        &details.headers,
+    ))
 }
 
 fn parse_sse_responses_body(body: &str) -> std::result::Result<Value, SseParseError> {
@@ -1780,6 +1818,7 @@ pub async fn call_responses_provider(
     audit_context: Option<&LlmAuditContext>,
     reasoning_override: Option<&str>,
 ) -> Result<String> {
+    crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
     let native_codex_web_search_tool = supports_tools
         .then(|| build_native_codex_web_search_tool(model_config))
         .flatten();
@@ -1843,6 +1882,7 @@ pub async fn call_responses_provider_with_tool_runtime(
     audit_context: Option<&LlmAuditContext>,
     reasoning_override: Option<&str>,
 ) -> Result<String> {
+    crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
     let runtime_guidance = runtime.tool_limit_guidance();
     let instructions =
         build_responses_system_prompt(system_prompt, model_config, Some(&runtime_guidance));
@@ -1915,6 +1955,7 @@ mod tests {
         use_responses_lite: bool,
     ) -> CodexSelectedModelRecord {
         CodexSelectedModelRecord {
+            metadata_version: crate::llm::runtime_models::CODEX_SELECTED_MODEL_METADATA_VERSION,
             account_id: None,
             slug: slug.to_string(),
             display_name: slug.to_string(),
@@ -1974,6 +2015,173 @@ mod tests {
     }
 
     #[test]
+    fn responses_lite_empty_tools_and_instructions_keep_one_empty_prefix() {
+        let config = model_config(ThirdPartyProvider::OpenAICodex, "lite-model");
+        let record = codex_record("lite-model", &[], None, true);
+
+        let (payload, use_lite) = build_responses_payload(
+            &config,
+            "",
+            vec![json!({"type": "message", "role": "user", "content": []})],
+            Some(Vec::new()),
+            "session-1",
+            None,
+            true,
+            Some(&record),
+        );
+
+        let input = payload["input"].as_array().expect("input array");
+        assert!(use_lite);
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+                .count(),
+            1
+        );
+        assert_eq!(input[0]["tools"], json!([]));
+        assert!(!input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("developer")
+        }));
+    }
+
+    #[test]
+    fn responses_lite_requires_codex_provider_and_matching_slug() {
+        let record = codex_record("selected-model", &[], None, true);
+        let mismatched = model_config(ThirdPartyProvider::OpenAICodex, "other-model");
+        let public = model_config(ThirdPartyProvider::OpenAI, "selected-model");
+
+        assert!(!selected_model_uses_responses_lite(
+            &mismatched,
+            Some(&record)
+        ));
+        assert!(!selected_model_uses_responses_lite(&public, Some(&record)));
+    }
+
+    #[test]
+    fn responses_lite_rebuild_from_iteration_history_does_not_accumulate_prefixes() {
+        let config = model_config(ThirdPartyProvider::OpenAICodex, "lite-model");
+        let record = codex_record("lite-model", &[], None, true);
+        let mut history = vec![json!({"type": "message", "role": "user", "content": []})];
+
+        let (first, _) = build_responses_payload(
+            &config,
+            "instructions",
+            history.clone(),
+            Some(Vec::new()),
+            "session-1",
+            None,
+            true,
+            Some(&record),
+        );
+        history.push(json!({
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "result"
+        }));
+        let (second, _) = build_responses_payload(
+            &config,
+            "instructions",
+            history,
+            Some(Vec::new()),
+            "session-1",
+            None,
+            true,
+            Some(&record),
+        );
+
+        for payload in [&first, &second] {
+            assert_eq!(
+                payload["input"]
+                    .as_array()
+                    .expect("input array")
+                    .iter()
+                    .filter(
+                        |item| item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                    )
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn responses_lite_removes_detail_from_initial_input_images() {
+        let config = model_config(ThirdPartyProvider::OpenAICodex, "lite-model");
+        let record = codex_record("lite-model", &[], None, true);
+        let input = build_responses_user_input("describe", &[vec![1, 2, 3]]);
+
+        let (payload, use_lite) = build_responses_payload(
+            &config,
+            "instructions",
+            input,
+            None,
+            "session-1",
+            None,
+            true,
+            Some(&record),
+        );
+
+        assert!(use_lite);
+        assert_eq!(payload["input"][2]["content"][1]["type"], "input_image");
+        assert!(payload["input"][2]["content"][1].get("detail").is_none());
+    }
+
+    #[test]
+    fn responses_lite_removes_detail_from_nested_input_images() {
+        let config = model_config(ThirdPartyProvider::OpenAICodex, "lite-model");
+        let record = codex_record("lite-model", &[], None, true);
+        let input = vec![json!({
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": {
+                "structured": [{
+                    "type": "input_image",
+                    "detail": "high",
+                    "image_url": "data:image/png;base64,AA=="
+                }]
+            }
+        })];
+
+        let (payload, _) = build_responses_payload(
+            &config,
+            "",
+            input,
+            None,
+            "session-1",
+            None,
+            true,
+            Some(&record),
+        );
+
+        let image = &payload["input"][1]["output"]["structured"][0];
+        assert_eq!(image["type"], "input_image");
+        assert!(image.get("detail").is_none());
+    }
+
+    #[test]
+    fn normal_responses_preserve_input_image_detail() {
+        let config = model_config(ThirdPartyProvider::OpenAICodex, "normal-model");
+        let record = codex_record("normal-model", &[], None, false);
+        let input = build_responses_user_input("describe", &[vec![1, 2, 3]]);
+
+        let (payload, use_lite) = build_responses_payload(
+            &config,
+            "instructions",
+            input,
+            None,
+            "session-1",
+            None,
+            true,
+            Some(&record),
+        );
+
+        assert!(!use_lite);
+        assert_eq!(payload["input"][0]["content"][1]["detail"], "auto");
+    }
+
+    #[test]
     fn normal_responses_payload_keeps_top_level_contract() {
         let config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.5");
         let record = codex_record("gpt-5.5", &["medium"], Some("medium"), false);
@@ -2013,12 +2221,78 @@ mod tests {
     }
 
     #[test]
+    fn responses_lite_header_is_carried_by_every_retry_header_assembly() {
+        let mut request_headers = Vec::new();
+        add_codex_responses_lite_header(&mut request_headers, true);
+
+        for token in ["token-a", "token-b"] {
+            let headers = merge_request_headers_for_attempt(
+                vec![("Authorization".to_string(), format!("Bearer {token}"))],
+                &request_headers,
+            );
+            assert!(headers
+                .iter()
+                .any(|(name, value)| { name == CODEX_RESPONSES_LITE_HEADER && value == "true" }));
+        }
+    }
+
+    #[test]
+    fn responses_lite_summary_reads_redacted_tool_names_from_leading_input_item() {
+        let payload = json!({
+            "model": "lite-model",
+            "input": [{
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "web_search",
+                        "description": "secret-description",
+                        "parameters": {"secret-schema": true}
+                    },
+                    {"type": "computer"}
+                ]
+            }],
+            "stream": true
+        });
+
+        let summary = summarize_responses_payload(&payload);
+
+        assert!(summary.contains("tools=2, tool_names=[web_search,computer]"));
+        assert!(!summary.contains("secret-description"));
+        assert!(!summary.contains("secret-schema"));
+    }
+
+    #[test]
+    fn normal_responses_summary_keeps_top_level_tool_names() {
+        let payload = json!({
+            "model": "normal-model",
+            "input": [],
+            "tools": [{"type": "function", "name": "lookup"}],
+            "stream": false
+        });
+
+        let summary = summarize_responses_payload(&payload);
+
+        assert!(summary.contains("tools=1, tool_names=[lookup]"));
+    }
+
+    #[test]
     fn responses_lite_does_not_use_native_hosted_web_search() {
         let config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-luna");
         let mut record = codex_record("gpt-5.6-luna", &["medium"], Some("medium"), true);
         record.supports_search_tool = true;
 
         assert!(build_native_codex_web_search_tool_from_record(&config, &record).is_none());
+    }
+
+    #[tokio::test]
+    async fn selected_metadata_guard_leaves_public_openai_requests_unchanged() {
+        let config = model_config(ThirdPartyProvider::OpenAI, "public-model");
+
+        crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(&config)
+            .await
+            .expect("public OpenAI must not require Codex selected-model metadata");
     }
 
     #[test]

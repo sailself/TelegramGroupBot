@@ -21,9 +21,12 @@ use crate::llm::openai_codex::{
 };
 
 pub const OPENAI_CODEX_SELECTED_MODEL_ID: &str = "openai-codex:selected";
+pub(crate) const CODEX_SELECTED_MODEL_METADATA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodexSelectedModelRecord {
+    #[serde(default)]
+    pub metadata_version: u32,
     #[serde(default)]
     pub account_id: Option<String>,
     pub slug: String,
@@ -88,6 +91,40 @@ fn selected_model_matches_account(
 ) -> bool {
     normalized_account_id(record.account_id.as_deref()) == normalized_account_id(account_id)
         && normalized_account_id(account_id).is_some()
+}
+
+fn selected_codex_model_needs_metadata_refresh(
+    record: &CodexSelectedModelRecord,
+    new_etag: Option<&str>,
+) -> bool {
+    if record.metadata_version < CODEX_SELECTED_MODEL_METADATA_VERSION {
+        return true;
+    }
+
+    new_etag
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|new_etag| record.etag.as_deref().map(str::trim) != Some(new_etag))
+}
+
+fn validate_selected_codex_model_for_request(
+    model_config: &ThirdPartyModelConfig,
+    selected_record: Option<&CodexSelectedModelRecord>,
+    current_account_id: Option<&str>,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex
+        || model_config.id != OPENAI_CODEX_SELECTED_MODEL_ID
+    {
+        return Ok(None);
+    }
+
+    let current_account_id = normalized_account_id(current_account_id)
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    let record = selected_record
+        .filter(|record| record.slug == model_config.model)
+        .filter(|record| selected_model_matches_account(record, Some(current_account_id)))
+        .ok_or_else(|| anyhow!("The selected Codex model or account changed"))?;
+    Ok(Some(record.clone()))
 }
 
 pub fn current_codex_account_id() -> Option<String> {
@@ -284,6 +321,7 @@ fn build_codex_selected_model_record(
         });
 
     CodexSelectedModelRecord {
+        metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
         account_id: Some(account_id.trim().to_string()),
         slug: model.slug.clone(),
         display_name: model.display_name.clone(),
@@ -413,6 +451,86 @@ pub async fn refresh_selected_codex_model_metadata(
     .await
 }
 
+async fn refresh_selected_codex_model_from_catalog(
+    expected_account_id: &str,
+    selected_slug: &str,
+    fallback_etag: Option<&str>,
+) -> Result<()> {
+    let list = openai_codex::fetch_models().await?;
+    if list.account_id != expected_account_id {
+        return Err(anyhow!(
+            "The active ChatGPT account changed during model refresh"
+        ));
+    }
+    let model = list
+        .models
+        .iter()
+        .find(|model| model.slug == selected_slug)
+        .ok_or_else(|| anyhow!("The selected Codex model is absent from the refreshed catalog"))?;
+    let refreshed_etag = list
+        .etag
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            fallback_etag
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    refresh_selected_codex_model_metadata(
+        model,
+        refreshed_etag,
+        expected_account_id,
+        selected_slug,
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn ensure_selected_codex_model_metadata_current(
+    model_config: &ThirdPartyModelConfig,
+) -> Result<()> {
+    let current_account_id = current_codex_account_id();
+    let Some(record) = validate_selected_codex_model_for_request(
+        model_config,
+        selected_codex_model_record().as_ref(),
+        current_account_id.as_deref(),
+    )?
+    else {
+        return Ok(());
+    };
+    if !selected_codex_model_needs_metadata_refresh(&record, None) {
+        return Ok(());
+    }
+
+    let _refresh_guard = CODEX_MODEL_REFRESH_STATE.lock().await;
+    let current_account_id = current_codex_account_id();
+    let Some(record) = validate_selected_codex_model_for_request(
+        model_config,
+        selected_codex_model_record().as_ref(),
+        current_account_id.as_deref(),
+    )?
+    else {
+        return Ok(());
+    };
+    if !selected_codex_model_needs_metadata_refresh(&record, None) {
+        return Ok(());
+    }
+
+    let account_id = record
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("The selected Codex model or account changed"))?;
+    refresh_selected_codex_model_from_catalog(account_id, &record.slug, record.etag.as_deref())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "Failed to refresh selected Codex model metadata; retry the request or reselect it with /codexmodel"
+            )
+        })
+}
+
 pub async fn save_selected_codex_reasoning_level(
     level: Option<String>,
     expected_account_id: &str,
@@ -451,38 +569,13 @@ async fn refresh_selected_codex_model_for_etag_once(
     else {
         return Ok(false);
     };
-    if record.etag.as_deref().map(str::trim) == Some(new_etag) {
+    if !selected_codex_model_needs_metadata_refresh(&record, Some(new_etag)) {
         return Ok(false);
     }
 
     let selected_slug = record.slug.clone();
-    let list = openai_codex::fetch_models().await?;
-    if list.account_id != expected_account_id {
-        return Err(anyhow!(
-            "The active ChatGPT account changed during model refresh"
-        ));
-    }
-    let model = list
-        .models
-        .iter()
-        .find(|model| model.slug == selected_slug)
-        .ok_or_else(|| {
-            anyhow!(
-                "Selected Codex model '{}' is absent from the refreshed catalog",
-                selected_slug
-            )
-        })?;
-    let refreshed_etag = list
-        .etag
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| Some(new_etag.to_string()));
-    refresh_selected_codex_model_metadata(
-        model,
-        refreshed_etag,
-        expected_account_id,
-        &selected_slug,
-    )
-    .await?;
+    refresh_selected_codex_model_from_catalog(expected_account_id, &selected_slug, Some(new_etag))
+        .await?;
     Ok(true)
 }
 
@@ -548,6 +641,7 @@ mod tests {
     #[test]
     fn selected_model_config_maps_image_capability_from_modalities() {
         let record = CodexSelectedModelRecord {
+            metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
             account_id: Some("acct-1".to_string()),
             slug: "gpt-5.4".to_string(),
             display_name: "GPT-5.4".to_string(),
@@ -581,6 +675,7 @@ mod tests {
     #[test]
     fn codex_selected_model_label_prefers_selected_reasoning_level() {
         let record = CodexSelectedModelRecord {
+            metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
             account_id: Some("acct-1".to_string()),
             slug: "gpt-5.4".to_string(),
             display_name: "GPT-5.4".to_string(),
@@ -603,6 +698,7 @@ mod tests {
     #[test]
     fn selected_model_account_binding_fails_closed() {
         let record = CodexSelectedModelRecord {
+            metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
             account_id: Some("acct-1".to_string()),
             slug: "gpt-5.4".to_string(),
             display_name: "GPT-5.4".to_string(),
@@ -635,6 +731,7 @@ mod tests {
         let record: CodexSelectedModelRecord = serde_json::from_str(raw).unwrap();
 
         assert_eq!(record.account_id, None);
+        assert_eq!(record.metadata_version, 0);
         assert!(!record.use_responses_lite);
         assert!(!selected_model_matches_account(&record, Some("acct-1")));
     }
@@ -658,6 +755,92 @@ mod tests {
 
         let record = build_codex_selected_model_record(&model, None, "acct-1", None);
 
+        assert_eq!(
+            record.metadata_version,
+            CODEX_SELECTED_MODEL_METADATA_VERSION
+        );
         assert!(record.use_responses_lite);
+    }
+
+    #[test]
+    fn metadata_refresh_decision_rehydrates_legacy_record_even_when_etag_is_unchanged() {
+        let mut record = selected_model_record_for_test();
+        record.metadata_version = 0;
+        record.etag = Some("models-v1".to_string());
+
+        assert!(selected_codex_model_needs_metadata_refresh(
+            &record,
+            Some("models-v1")
+        ));
+    }
+
+    #[test]
+    fn metadata_refresh_decision_skips_current_record_when_etag_is_unchanged() {
+        let mut record = selected_model_record_for_test();
+        record.metadata_version = CODEX_SELECTED_MODEL_METADATA_VERSION;
+        record.etag = Some("models-v1".to_string());
+
+        assert!(!selected_codex_model_needs_metadata_refresh(
+            &record,
+            Some("models-v1")
+        ));
+    }
+
+    #[test]
+    fn selected_alias_rehydration_validation_fails_closed_for_slug_and_account_changes() {
+        let record = selected_model_record_for_test();
+        let mut config = dynamic_codex_model_config(&record);
+
+        assert!(
+            validate_selected_codex_model_for_request(&config, Some(&record), Some("acct-1"))
+                .unwrap()
+                .is_some()
+        );
+
+        config.model = "different-model".to_string();
+        assert!(
+            validate_selected_codex_model_for_request(&config, Some(&record), Some("acct-1"))
+                .is_err()
+        );
+
+        config.model = record.slug.clone();
+        assert!(
+            validate_selected_codex_model_for_request(&config, Some(&record), Some("acct-2"))
+                .is_err()
+        );
+        assert!(validate_selected_codex_model_for_request(&config, None, Some("acct-1")).is_err());
+    }
+
+    #[test]
+    fn selected_alias_rehydration_ignores_public_openai_provider() {
+        let record = selected_model_record_for_test();
+        let mut config = dynamic_codex_model_config(&record);
+        config.provider = ThirdPartyProvider::OpenAI;
+
+        assert!(
+            validate_selected_codex_model_for_request(&config, Some(&record), Some("acct-1"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn selected_model_record_for_test() -> CodexSelectedModelRecord {
+        CodexSelectedModelRecord {
+            metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
+            account_id: Some("acct-1".to_string()),
+            slug: "catalog-model".to_string(),
+            display_name: "Catalog Model".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: vec![],
+            selected_reasoning_level: None,
+            web_search_tool_type: CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            use_responses_lite: true,
+            fetched_at: Utc::now(),
+        }
     }
 }
