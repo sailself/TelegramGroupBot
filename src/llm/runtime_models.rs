@@ -46,6 +46,8 @@ pub struct CodexSelectedModelRecord {
     pub web_search_tool_type: CodexWebSearchToolType,
     #[serde(default)]
     pub supports_search_tool: bool,
+    #[serde(default)]
+    pub use_responses_lite: bool,
     pub fetched_at: DateTime<Utc>,
 }
 
@@ -301,6 +303,7 @@ fn build_codex_selected_model_record(
         selected_reasoning_level: previous_selection,
         web_search_tool_type: model.web_search_tool_type,
         supports_search_tool: model.supports_search_tool,
+        use_responses_lite: model.use_responses_lite,
         fetched_at: Utc::now(),
     }
 }
@@ -560,6 +563,7 @@ mod tests {
             selected_reasoning_level: None,
             web_search_tool_type: CodexWebSearchToolType::Text,
             supports_search_tool: false,
+            use_responses_lite: false,
             fetched_at: Utc::now(),
         };
 
@@ -589,6 +593,7 @@ mod tests {
             selected_reasoning_level: Some("high".to_string()),
             web_search_tool_type: CodexWebSearchToolType::Text,
             supports_search_tool: false,
+            use_responses_lite: false,
             fetched_at: Utc::now(),
         };
 
@@ -610,6 +615,7 @@ mod tests {
             selected_reasoning_level: None,
             web_search_tool_type: CodexWebSearchToolType::Text,
             supports_search_tool: false,
+            use_responses_lite: false,
             fetched_at: Utc::now(),
         };
 
@@ -629,6 +635,29 @@ mod tests {
         let record: CodexSelectedModelRecord = serde_json::from_str(raw).unwrap();
 
         assert_eq!(record.account_id, None);
+        assert!(!record.use_responses_lite);
         assert!(!selected_model_matches_account(&record, Some("acct-1")));
+    }
+
+    #[test]
+    fn selected_model_record_copies_responses_lite_capability() {
+        let model = CodexRemoteModel {
+            slug: "gpt-5.6-luna".to_string(),
+            display_name: "GPT-5.6-Luna".to_string(),
+            description: None,
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![],
+            visibility: crate::llm::openai_codex::CodexModelVisibility::List,
+            supported_in_api: true,
+            priority: 3,
+            web_search_tool_type: CodexWebSearchToolType::TextAndImage,
+            input_modalities: vec![CodexInputModality::Text],
+            supports_search_tool: true,
+            use_responses_lite: true,
+        };
+
+        let record = build_codex_selected_model_record(&model, None, "acct-1", None);
+
+        assert!(record.use_responses_lite);
     }
 }

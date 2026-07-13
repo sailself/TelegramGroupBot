@@ -1020,6 +1020,7 @@ mod tests {
             web_search_tool_type: CodexWebSearchToolType::Text,
             input_modalities: vec![CodexInputModality::Text],
             supports_search_tool: false,
+            use_responses_lite: false,
         }
     }
 

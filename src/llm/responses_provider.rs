@@ -1854,6 +1854,7 @@ mod tests {
             selected_reasoning_level: selected.map(str::to_string),
             web_search_tool_type: Default::default(),
             supports_search_tool: false,
+            use_responses_lite: false,
             fetched_at: chrono::Utc::now(),
         }
     }

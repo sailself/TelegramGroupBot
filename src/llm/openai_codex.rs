@@ -165,6 +165,8 @@ pub struct CodexRemoteModel {
     pub input_modalities: Vec<CodexInputModality>,
     #[serde(default)]
     pub supports_search_tool: bool,
+    #[serde(default)]
+    pub use_responses_lite: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1707,5 +1709,34 @@ mod tests {
                 .map(|window| window.used_percent),
             Some(66.0)
         );
+    }
+
+    #[test]
+    fn codex_remote_model_deserializes_responses_lite_capability() {
+        let model: CodexRemoteModel = serde_json::from_value(json!({
+            "slug": "gpt-5.6-luna",
+            "display_name": "GPT-5.6-Luna",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 3,
+            "use_responses_lite": true
+        }))
+        .expect("catalog model should deserialize");
+
+        assert!(model.use_responses_lite);
+    }
+
+    #[test]
+    fn codex_remote_model_defaults_responses_lite_to_false() {
+        let model: CodexRemoteModel = serde_json::from_value(json!({
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 7
+        }))
+        .expect("legacy catalog model should deserialize");
+
+        assert!(!model.use_responses_lite);
     }
 }

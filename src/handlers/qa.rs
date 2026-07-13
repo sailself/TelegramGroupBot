@@ -2200,6 +2200,7 @@ mod tests {
             selected_reasoning_level: Some("high".to_string()),
             web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
             supports_search_tool: false,
+            use_responses_lite: false,
             fetched_at: chrono::Utc::now(),
         };
 
@@ -2221,6 +2222,7 @@ mod tests {
             selected_reasoning_level: None,
             web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
             supports_search_tool: false,
+            use_responses_lite: false,
             fetched_at: chrono::Utc::now(),
         };
 
