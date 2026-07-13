@@ -28,6 +28,7 @@ const RESPONSES_MAX_ATTEMPTS: usize = 3;
 const RESPONSES_RETRY_BASE_DELAY_MS: u64 = 900;
 const RESPONSES_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const MODELS_ETAG_HEADER: &str = "x-models-etag";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const CODEX_RESPONSE_STYLE_ADDENDUM: &str = r#"# Style
@@ -638,13 +639,14 @@ fn build_responses_function_tools() -> Vec<Value> {
     })]
 }
 
-fn build_native_codex_web_search_tool(model_config: &ThirdPartyModelConfig) -> Option<Value> {
-    if model_config.provider != ThirdPartyProvider::OpenAICodex {
-        return None;
-    }
-
-    let record = selected_codex_model_record()?;
-    if record.slug != model_config.model {
+fn build_native_codex_web_search_tool_from_record(
+    model_config: &ThirdPartyModelConfig,
+    record: &CodexSelectedModelRecord,
+) -> Option<Value> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex
+        || record.slug != model_config.model
+        || record.use_responses_lite
+    {
         return None;
     }
 
@@ -655,6 +657,11 @@ fn build_native_codex_web_search_tool(model_config: &ThirdPartyModelConfig) -> O
         &CONFIG.openai_codex_web_search_allowed_domains,
         Some(&CONFIG.openai_codex_web_search_context_size),
     )
+}
+
+fn build_native_codex_web_search_tool(model_config: &ThirdPartyModelConfig) -> Option<Value> {
+    let record = selected_codex_model_record()?;
+    build_native_codex_web_search_tool_from_record(model_config, &record)
 }
 
 fn convert_openai_function_tools_to_responses(tools: Vec<Value>) -> Vec<Value> {
@@ -731,6 +738,97 @@ fn reasoning_effort_for_request(
     Some(requested.to_ascii_lowercase())
 }
 
+fn selected_model_uses_responses_lite(
+    model_config: &ThirdPartyModelConfig,
+    selected_record: Option<&CodexSelectedModelRecord>,
+) -> bool {
+    model_config.provider == ThirdPartyProvider::OpenAICodex
+        && selected_record
+            .is_some_and(|record| record.slug == model_config.model && record.use_responses_lite)
+}
+
+fn add_codex_responses_lite_header(headers: &mut Vec<(String, String)>, use_responses_lite: bool) {
+    if use_responses_lite {
+        headers.push((CODEX_RESPONSES_LITE_HEADER.to_string(), "true".to_string()));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_responses_payload(
+    model_config: &ThirdPartyModelConfig,
+    instructions: &str,
+    mut input_items: Vec<Value>,
+    tools: Option<Vec<Value>>,
+    session_id: &str,
+    reasoning_override: Option<&str>,
+    streaming_sse: bool,
+    selected_record: Option<&CodexSelectedModelRecord>,
+) -> (Value, bool) {
+    let use_lite = selected_model_uses_responses_lite(model_config, selected_record);
+    let mut payload = if use_lite {
+        let mut prefix = vec![json!({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": tools.unwrap_or_default(),
+        })];
+        if !instructions.is_empty() {
+            prefix.push(json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": instructions}],
+            }));
+        }
+        input_items.splice(0..0, prefix);
+        json!({
+            "model": model_config.model,
+            "input": input_items,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "store": false,
+            "stream": streaming_sse,
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": session_id,
+            "text": {"verbosity": "medium"},
+        })
+    } else {
+        let mut payload = json!({
+            "model": model_config.model,
+            "instructions": instructions,
+            "input": input_items,
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "store": false,
+            "stream": streaming_sse,
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": session_id,
+            "text": {"verbosity": "medium"},
+        });
+        if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+            payload["tools"] = Value::Array(tools);
+        }
+        payload
+    };
+
+    let effort = reasoning_effort_for_request(
+        model_config.provider,
+        &model_config.model,
+        reasoning_override,
+        selected_record,
+    );
+    if use_lite || effort.is_some() {
+        let mut reasoning = json!({});
+        if let Some(effort) = effort {
+            reasoning["effort"] = Value::String(effort);
+        }
+        if use_lite {
+            reasoning["context"] = Value::String("all_turns".to_string());
+        }
+        payload["reasoning"] = reasoning;
+    }
+
+    (payload, use_lite)
+}
+
 fn build_request_details(
     model_config: &ThirdPartyModelConfig,
     instructions: &str,
@@ -795,35 +893,17 @@ fn build_request_details(
         headers.push(("Accept".to_string(), "text/event-stream".to_string()));
     }
 
-    let mut payload = json!({
-        "model": model_config.model,
-        "instructions": instructions,
-        "input": input_items,
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "store": false,
-        "stream": streaming_sse,
-        "include": ["reasoning.encrypted_content"],
-        "prompt_cache_key": session_id,
-        "text": {
-            "verbosity": "medium"
-        },
-    });
-
-    if let Some(effort) = reasoning_effort_for_request(
-        model_config.provider,
-        &model_config.model,
+    let (payload, use_responses_lite) = build_responses_payload(
+        model_config,
+        instructions,
+        input_items,
+        tools,
+        session_id,
         reasoning_override,
+        streaming_sse,
         selected_record.as_ref(),
-    ) {
-        payload["reasoning"] = json!({
-            "effort": effort,
-        });
-    }
-
-    if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
-        payload["tools"] = Value::Array(tools);
-    }
+    );
+    add_codex_responses_lite_header(&mut headers, use_responses_lite);
 
     Ok(ResponsesRequestDetails {
         provider: model_config.provider,
@@ -1832,6 +1912,7 @@ mod tests {
         slug: &str,
         supported: &[&str],
         selected: Option<&str>,
+        use_responses_lite: bool,
     ) -> CodexSelectedModelRecord {
         CodexSelectedModelRecord {
             account_id: None,
@@ -1854,9 +1935,90 @@ mod tests {
             selected_reasoning_level: selected.map(str::to_string),
             web_search_tool_type: Default::default(),
             supports_search_tool: false,
-            use_responses_lite: false,
+            use_responses_lite,
             fetched_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn responses_lite_payload_uses_developer_input_contract() {
+        let config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-luna");
+        let record = codex_record("gpt-5.6-luna", &["medium", "max"], Some("max"), true);
+        let tools = vec![json!({
+            "type": "function",
+            "name": "web_search",
+            "parameters": {"type": "object"}
+        })];
+
+        let (payload, use_lite) = build_responses_payload(
+            &config,
+            "System instructions",
+            vec![json!({"type": "message", "role": "user", "content": []})],
+            Some(tools.clone()),
+            "session-1",
+            None,
+            true,
+            Some(&record),
+        );
+
+        assert!(use_lite);
+        assert!(payload.get("instructions").is_none());
+        assert!(payload.get("tools").is_none());
+        assert_eq!(payload["parallel_tool_calls"], false);
+        assert_eq!(payload["reasoning"]["effort"], "max");
+        assert_eq!(payload["reasoning"]["context"], "all_turns");
+        assert_eq!(payload["input"][0]["type"], "additional_tools");
+        assert_eq!(payload["input"][0]["tools"], Value::Array(tools));
+        assert_eq!(payload["input"][1]["role"], "developer");
+        assert_eq!(payload["input"][2]["role"], "user");
+    }
+
+    #[test]
+    fn normal_responses_payload_keeps_top_level_contract() {
+        let config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.5");
+        let record = codex_record("gpt-5.5", &["medium"], Some("medium"), false);
+        let tools = vec![json!({"type": "web_search"})];
+
+        let (payload, use_lite) = build_responses_payload(
+            &config,
+            "System instructions",
+            vec![json!({"type": "message", "role": "user", "content": []})],
+            Some(tools.clone()),
+            "session-1",
+            None,
+            true,
+            Some(&record),
+        );
+
+        assert!(!use_lite);
+        assert_eq!(payload["instructions"], "System instructions");
+        assert_eq!(payload["tools"], Value::Array(tools));
+        assert_eq!(payload["parallel_tool_calls"], true);
+        assert!(payload["reasoning"].get("context").is_none());
+        assert_eq!(payload["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn responses_lite_header_is_added_only_for_lite_requests() {
+        let mut lite_headers = Vec::new();
+        add_codex_responses_lite_header(&mut lite_headers, true);
+        assert_eq!(
+            lite_headers,
+            vec![(CODEX_RESPONSES_LITE_HEADER.to_string(), "true".to_string())]
+        );
+
+        let mut normal_headers = Vec::new();
+        add_codex_responses_lite_header(&mut normal_headers, false);
+        assert!(normal_headers.is_empty());
+    }
+
+    #[test]
+    fn responses_lite_does_not_use_native_hosted_web_search() {
+        let config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-luna");
+        let mut record = codex_record("gpt-5.6-luna", &["medium"], Some("medium"), true);
+        record.supports_search_tool = true;
+
+        assert!(build_native_codex_web_search_tool_from_record(&config, &record).is_none());
     }
 
     #[test]
@@ -1869,7 +2031,7 @@ mod tests {
 
     #[test]
     fn reasoning_without_override_uses_selected_record_level() {
-        let record = codex_record("gpt-5.5", &["low", "xhigh"], Some("xhigh"));
+        let record = codex_record("gpt-5.5", &["low", "xhigh"], Some("xhigh"), false);
         assert_eq!(
             reasoning_effort_for_request(
                 ThirdPartyProvider::OpenAICodex,
@@ -1887,7 +2049,7 @@ mod tests {
 
     #[test]
     fn reasoning_override_applies_when_supported() {
-        let record = codex_record("gpt-5.5", &["low", "medium", "xhigh"], Some("xhigh"));
+        let record = codex_record("gpt-5.5", &["low", "medium", "xhigh"], Some("xhigh"), false);
         assert_eq!(
             reasoning_effort_for_request(
                 ThirdPartyProvider::OpenAICodex,
@@ -1901,7 +2063,7 @@ mod tests {
 
     #[test]
     fn unsupported_reasoning_override_falls_back_to_selected_level() {
-        let record = codex_record("gpt-5.5", &["medium", "xhigh"], Some("xhigh"));
+        let record = codex_record("gpt-5.5", &["medium", "xhigh"], Some("xhigh"), false);
         assert_eq!(
             reasoning_effort_for_request(
                 ThirdPartyProvider::OpenAICodex,
@@ -1915,7 +2077,7 @@ mod tests {
 
     #[test]
     fn reasoning_override_passes_through_for_foreign_slugs() {
-        let record = codex_record("gpt-5.5", &["medium"], Some("medium"));
+        let record = codex_record("gpt-5.5", &["medium"], Some("medium"), false);
         assert_eq!(
             reasoning_effort_for_request(
                 ThirdPartyProvider::OpenAICodex,
