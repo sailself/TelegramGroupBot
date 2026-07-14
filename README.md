@@ -1,5 +1,7 @@
 # Telegram Group Helper Bot (Rust)
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sailself/TelegramGroupBot)
+
 A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resource usage. It keeps feature parity with the Python bot while using async Rust and SQLite by default.
 
 ## What it does
