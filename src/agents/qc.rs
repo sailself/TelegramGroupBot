@@ -214,7 +214,10 @@ pub(super) async fn compose_final_answer(
             "Answer about Chat",
             media_files,
             false,
-            audit_context,
+            crate::llm::ThirdPartyCallOptions::new(
+                audit_context,
+                crate::llm::CodexPromptStyle::FreeformAnswer,
+            ),
         )
         .await?;
         Ok((answer, None))
@@ -288,6 +291,21 @@ fn bounded_analytics_result(result: &Value, max_chars: usize) -> Result<Value> {
     Ok(bounded)
 }
 
+fn build_analytics_gather_system_prompt(
+    system_prompt: &str,
+    tool_guidance: Option<&str>,
+) -> String {
+    let mut prompt = format!("{system_prompt}\n\n{QC_ANALYTICS_GATHER}");
+    if let Some(guidance) = tool_guidance
+        .map(str::trim)
+        .filter(|guidance| !guidance.is_empty())
+    {
+        prompt.push_str("\n\n");
+        prompt.push_str(guidance);
+    }
+    prompt
+}
+
 /// Run the analytics lane: model-driven gather loop then Rust-authoritative compose.
 #[allow(clippy::too_many_arguments)]
 async fn run_analytics_lane(
@@ -303,10 +321,10 @@ async fn run_analytics_lane(
 ) -> Result<QcPipelineResult> {
     progress.update_now("Analyzing chat...").await;
     let mut runtime = ToolRuntime::for_analytics(db.clone(), chat_id);
-    let gather_sys = format!(
-        "{system_prompt}\n\n{QC_ANALYTICS_GATHER}\n\n{}",
-        runtime.tool_limit_guidance()
-    );
+    let runtime_guidance =
+        (model_name == crate::handlers::qa::MODEL_GEMINI).then(|| runtime.tool_limit_guidance());
+    let gather_sys =
+        build_analytics_gather_system_prompt(system_prompt, runtime_guidance.as_deref());
 
     // Gather: let the model run/iterate queries. Its prose is discarded.
     let gather = if model_name == crate::handlers::qa::MODEL_GEMINI {
@@ -331,7 +349,11 @@ async fn run_analytics_lane(
             "Chat Analytics",
             &[],
             &mut runtime,
-            audit_context,
+            crate::llm::ThirdPartyCallOptions::new(
+                audit_context,
+                crate::llm::CodexPromptStyle::TaskSpecific,
+            )
+            .with_reasoning_override(Some(CONFIG.agent_step_reasoning.as_str())),
         )
         .await
     };
@@ -795,6 +817,17 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analytics_gather_prompt_appends_optional_tool_guidance_once() {
+        let base = build_analytics_gather_system_prompt("Base prompt", None);
+        assert!(base.contains(QC_ANALYTICS_GATHER));
+        assert!(!base.contains("unique tool guidance"));
+
+        let gemini =
+            build_analytics_gather_system_prompt("Base prompt", Some("unique tool guidance"));
+        assert_eq!(gemini.matches("unique tool guidance").count(), 1);
+    }
 
     #[test]
     fn parse_lane_analytics() {

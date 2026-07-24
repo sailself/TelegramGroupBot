@@ -15,6 +15,13 @@ pub mod tool_prompts;
 pub mod tool_runtime;
 pub mod web_search;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CodexPromptStyle {
+    #[default]
+    TaskSpecific,
+    FreeformAnswer,
+}
+
 pub use audit::{audit_context_from_id, create_audit_context_from_message, LlmAuditContext};
 pub use codex_image::{generate_image_with_codex, CodexImageConfig};
 pub use gemini::{
@@ -24,4 +31,5 @@ pub use gemini::{
 pub use img2_image::generate_image_with_img2;
 pub use third_party::{
     call_third_party, call_third_party_with_reasoning_config, call_third_party_with_tool_runtime,
+    ThirdPartyCallOptions,
 };

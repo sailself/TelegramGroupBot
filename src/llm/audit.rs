@@ -29,6 +29,7 @@ pub struct LlmUsageRecord {
     pub total_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
     pub raw_usage_json: Option<String>,
 }
 
@@ -124,6 +125,7 @@ pub async fn record_llm_request_success(
         total_tokens: usage.total_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         cached_input_tokens: usage.cached_input_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
         raw_usage_json: usage.raw_usage_json,
     };
 

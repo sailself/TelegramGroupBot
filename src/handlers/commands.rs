@@ -229,7 +229,10 @@ pub(crate) async fn call_configured_text_model(
         response_title,
         &media_files,
         tools_enabled,
-        audit_context,
+        crate::llm::ThirdPartyCallOptions::new(
+            audit_context,
+            crate::llm::CodexPromptStyle::TaskSpecific,
+        ),
     )
     .await?;
     let model_used = default_text_model_display_name(&model_name, None);

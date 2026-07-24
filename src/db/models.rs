@@ -118,6 +118,7 @@ pub struct LlmRequestRow {
     pub total_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
     pub raw_usage_json: Option<String>,
 }
 
@@ -136,6 +137,7 @@ pub struct LlmRequestInsert {
     pub total_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
     pub raw_usage_json: Option<String>,
 }
 

@@ -239,6 +239,9 @@ fn usage_record_from_value(usage: &Value, response_id: Option<String>) -> LlmUsa
     let cached_input_tokens = usage
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(|value| value.as_i64());
+    let cache_write_tokens = usage
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .and_then(|value| value.as_i64());
 
     LlmUsageRecord {
         response_id,
@@ -247,6 +250,7 @@ fn usage_record_from_value(usage: &Value, response_id: Option<String>) -> LlmUsa
         total_tokens,
         reasoning_tokens,
         cached_input_tokens,
+        cache_write_tokens,
         raw_usage_json: Some(usage.to_string()),
     }
 }
@@ -734,7 +738,8 @@ mod tests {
                         "input_tokens": 10,
                         "output_tokens": 20,
                         "input_tokens_details": {
-                            "cached_tokens": 3
+                            "cached_tokens": 3,
+                            "cache_write_tokens": 4
                         },
                         "output_tokens_details": {
                             "reasoning_tokens": 7
@@ -762,6 +767,7 @@ mod tests {
         assert_eq!(result.usage.output_tokens, Some(20));
         assert_eq!(result.usage.total_tokens, Some(30));
         assert_eq!(result.usage.cached_input_tokens, Some(3));
+        assert_eq!(result.usage.cache_write_tokens, Some(4));
         assert_eq!(result.usage.reasoning_tokens, Some(7));
     }
 

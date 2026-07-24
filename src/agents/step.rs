@@ -235,8 +235,11 @@ pub async fn call_step_text(
                 response_title,
                 media_files,
                 false,
-                audit_context,
-                reasoning_override.as_deref(),
+                crate::llm::ThirdPartyCallOptions::new(
+                    audit_context,
+                    crate::llm::CodexPromptStyle::TaskSpecific,
+                )
+                .with_reasoning_override(reasoning_override.as_deref()),
             )
             .await
         }

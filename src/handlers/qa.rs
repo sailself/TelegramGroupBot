@@ -1356,7 +1356,11 @@ async fn run_chat_search_model(
             "Chat Search",
             &[],
             &mut runtime,
-            audit_context,
+            crate::llm::ThirdPartyCallOptions::new(
+                audit_context,
+                crate::llm::CodexPromptStyle::TaskSpecific,
+            )
+            .with_reasoning_override(Some(CONFIG.agent_step_reasoning.as_str())),
         )
         .await?;
         ChatSearchModelResponse {
@@ -1596,7 +1600,10 @@ async fn process_request(
                     "Answer to Your Question",
                     &request.media_files,
                     supports_tools,
-                    audit_context.as_ref(),
+                    crate::llm::ThirdPartyCallOptions::new(
+                        audit_context.as_ref(),
+                        crate::llm::CodexPromptStyle::FreeformAnswer,
+                    ),
                 )
                 .await
                 .map(|result| (result, None))
@@ -1664,7 +1671,10 @@ async fn process_request(
                         "Answer about Chat",
                         &request.media_files,
                         &mut runtime,
-                        audit_context.as_ref(),
+                        crate::llm::ThirdPartyCallOptions::new(
+                            audit_context.as_ref(),
+                            crate::llm::CodexPromptStyle::FreeformAnswer,
+                        ),
                     )
                     .await
                     .map(|result| (result, None))

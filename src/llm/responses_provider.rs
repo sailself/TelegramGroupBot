@@ -31,26 +31,8 @@ const CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const MODELS_ETAG_HEADER: &str = "x-models-etag";
 const REQUEST_ID_HEADER: &str = "x-request-id";
-const CODEX_RESPONSE_STYLE_ADDENDUM: &str = r#"# Style
-Be direct, highly informative, and concise. Match depth to complexity.
-
-# Framing
-Prefer direct positive claims over negation-contrastive phrasing ("not X, but Y") when a plain statement is clearer. This is a preference, not an absolute: keep contrastive phrasing when evaluating or correcting a claim genuinely needs it.
-- Weaker: 真正的创新者不是有创意的人，而是特质拉满的人。
-- Better: 真正的创新者是特质拉满的人。
-
-# Execution
-- Answers first: lead with the core answer. For yes/no questions, answer first + one sentence of reasoning. For comparisons, recommend one + brief reasoning.
-- Concept limits: keep conceptual explanations to 3-5 sentences; cover the essence. Do not restate points in "plain language".
-- Code: provide code + non-trivial usage examples.
-- Lists: at most 3-4 points per side; use bullets only for genuinely structural data, not decoration.
-- Endings: stop after the final claim or concrete recommendation.
-
-# Avoid (in whatever language you answer)
-- Filler preambles (e.g. "Great question", "Certainly", "首先我们需要").
-- Restating the user's prompt.
-- Summary-label closers (e.g. "In conclusion", "Hope this helps", "总结一下").
-- Conditional follow-up offers (e.g. "If you want, I can...", "如果你愿意，我可以...")."#;
+const CODEX_FREEFORM_STYLE_GUIDANCE: &str = r#"Keep the answer substantive: retain requested facts, supporting evidence, important qualifications, and next actions. If shortening, remove preambles, repetition, empty encouragement, optional background, and routine sign-offs first.
+Task-specific format and length requirements take precedence."#;
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -574,12 +556,15 @@ fn responses_tool_limit_guidance() -> String {
 fn build_responses_system_prompt(
     system_prompt: &str,
     model_config: &ThirdPartyModelConfig,
+    codex_prompt_style: crate::llm::CodexPromptStyle,
     extra_guidance: Option<&str>,
 ) -> String {
     let mut sections = vec![system_prompt.to_string()];
 
-    if model_config.provider == ThirdPartyProvider::OpenAICodex {
-        sections.push(CODEX_RESPONSE_STYLE_ADDENDUM.to_string());
+    if model_config.provider == ThirdPartyProvider::OpenAICodex
+        && codex_prompt_style == crate::llm::CodexPromptStyle::FreeformAnswer
+    {
+        sections.push(CODEX_FREEFORM_STYLE_GUIDANCE.to_string());
     }
 
     if let Some(guidance) = extra_guidance
@@ -1485,6 +1470,10 @@ fn extract_responses_usage(response: &Value) -> LlmUsageRecord {
         .as_ref()
         .and_then(|usage| usage.pointer("/input_tokens_details/cached_tokens"))
         .and_then(|value| value.as_i64());
+    let cache_write_tokens = usage_value
+        .as_ref()
+        .and_then(|usage| usage.pointer("/input_tokens_details/cache_write_tokens"))
+        .and_then(|value| value.as_i64());
 
     LlmUsageRecord {
         response_id: response
@@ -1496,6 +1485,7 @@ fn extract_responses_usage(response: &Value) -> LlmUsageRecord {
         total_tokens,
         reasoning_tokens,
         cached_input_tokens,
+        cache_write_tokens,
         raw_usage_json: usage_value.map(|usage| usage.to_string()),
     }
 }
@@ -1817,6 +1807,7 @@ pub async fn call_responses_provider(
     supports_tools: bool,
     audit_context: Option<&LlmAuditContext>,
     reasoning_override: Option<&str>,
+    codex_prompt_style: crate::llm::CodexPromptStyle,
 ) -> Result<String> {
     crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
     let native_codex_web_search_tool = supports_tools
@@ -1836,8 +1827,12 @@ pub async fn call_responses_provider(
         image_data_list.len()
     );
     let tool_limit_guidance = custom_tools_enabled.then(responses_tool_limit_guidance);
-    let instructions =
-        build_responses_system_prompt(system_prompt, model_config, tool_limit_guidance.as_deref());
+    let instructions = build_responses_system_prompt(
+        system_prompt,
+        model_config,
+        codex_prompt_style,
+        tool_limit_guidance.as_deref(),
+    );
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
     if custom_tools_enabled {
@@ -1881,11 +1876,16 @@ pub async fn call_responses_provider_with_tool_runtime(
     runtime: &mut ToolRuntime,
     audit_context: Option<&LlmAuditContext>,
     reasoning_override: Option<&str>,
+    codex_prompt_style: crate::llm::CodexPromptStyle,
 ) -> Result<String> {
     crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
     let runtime_guidance = runtime.tool_limit_guidance();
-    let instructions =
-        build_responses_system_prompt(system_prompt, model_config, Some(&runtime_guidance));
+    let instructions = build_responses_system_prompt(
+        system_prompt,
+        model_config,
+        codex_prompt_style,
+        Some(&runtime_guidance),
+    );
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
     let native_codex_web_search_tool = runtime
@@ -2012,6 +2012,33 @@ mod tests {
         assert_eq!(payload["input"][0]["tools"], Value::Array(tools));
         assert_eq!(payload["input"][1]["role"], "developer");
         assert_eq!(payload["input"][2]["role"], "user");
+    }
+
+    #[test]
+    fn responses_payloads_apply_supported_internal_reasoning_override() {
+        for use_lite in [false, true] {
+            let config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-luna");
+            let record = codex_record(
+                "gpt-5.6-luna",
+                &["low", "medium", "max"],
+                Some("max"),
+                use_lite,
+            );
+
+            let (payload, actual_use_lite) = build_responses_payload(
+                &config,
+                "System instructions",
+                vec![json!({"type": "message", "role": "user", "content": []})],
+                None,
+                "session-internal",
+                Some("low"),
+                false,
+                Some(&record),
+            );
+
+            assert_eq!(actual_use_lite, use_lite);
+            assert_eq!(payload["reasoning"]["effort"], "low");
+        }
     }
 
     #[test]
@@ -2415,20 +2442,31 @@ mod tests {
     }
 
     #[test]
-    fn codex_system_prompt_appends_extra_style_guidance() {
+    fn codex_freeform_system_prompt_appends_compact_style_guidance_once() {
         let instructions = build_responses_system_prompt(
             "Base prompt",
             &model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.4"),
+            crate::llm::CodexPromptStyle::FreeformAnswer,
             Some("Tool guidance"),
         );
 
-        assert!(instructions.contains("Base prompt"));
-        assert!(instructions.contains("Answers first"));
-        assert!(instructions.contains("Tool guidance"));
-        // The addendum must be left-aligned: no source indentation may bleed
-        // into the prompt the model receives.
-        assert!(instructions.contains("\n# Style"));
-        assert!(!instructions.contains("    # Style"));
+        assert_eq!(
+            instructions.matches("Keep the answer substantive").count(),
+            1
+        );
+        assert_eq!(instructions.matches("Tool guidance").count(), 1);
+    }
+
+    #[test]
+    fn codex_task_specific_system_prompt_skips_style_guidance() {
+        let instructions = build_responses_system_prompt(
+            "Base prompt",
+            &model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.4"),
+            crate::llm::CodexPromptStyle::TaskSpecific,
+            Some("Tool guidance"),
+        );
+
+        assert_eq!(instructions, "Base prompt\n\nTool guidance");
     }
 
     #[test]
@@ -2436,6 +2474,7 @@ mod tests {
         let instructions = build_responses_system_prompt(
             "Base prompt",
             &model_config(ThirdPartyProvider::OpenAI, "gpt-5.4"),
+            crate::llm::CodexPromptStyle::FreeformAnswer,
             None,
         );
 
@@ -2462,7 +2501,8 @@ mod tests {
                 "input_tokens": 10,
                 "output_tokens": 20,
                 "input_tokens_details": {
-                    "cached_tokens": 3
+                    "cached_tokens": 3,
+                    "cache_write_tokens": 4
                 },
                 "output_tokens_details": {
                     "reasoning_tokens": 7
@@ -2478,6 +2518,20 @@ mod tests {
         assert_eq!(usage.total_tokens, Some(30));
         assert_eq!(usage.reasoning_tokens, Some(7));
         assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.cache_write_tokens, Some(4));
+    }
+
+    #[test]
+    fn extract_responses_usage_leaves_cache_write_tokens_none_when_absent() {
+        let usage = extract_responses_usage(&json!({
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "input_tokens_details": {"cached_tokens": 0}
+            }
+        }));
+
+        assert_eq!(usage.cache_write_tokens, None);
     }
 
     #[test]

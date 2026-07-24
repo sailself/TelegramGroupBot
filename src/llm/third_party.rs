@@ -19,6 +19,7 @@ use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config
 use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
+use crate::llm::CodexPromptStyle;
 use crate::utils::http::get_http_client;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
@@ -26,6 +27,31 @@ const THIRD_PARTY_MAX_ATTEMPTS: usize = 3;
 const THIRD_PARTY_RETRY_BASE_DELAY_MS: u64 = 900;
 const OPENROUTER_REFERER: &str = "https://github.com/sailself/TelegramGroupHelperBot";
 const OPENROUTER_TITLE: &str = "TelegramGroupHelperBot";
+
+#[derive(Clone, Copy)]
+pub struct ThirdPartyCallOptions<'a> {
+    audit_context: Option<&'a LlmAuditContext>,
+    reasoning_override: Option<&'a str>,
+    codex_prompt_style: CodexPromptStyle,
+}
+
+impl<'a> ThirdPartyCallOptions<'a> {
+    pub(crate) fn new(
+        audit_context: Option<&'a LlmAuditContext>,
+        codex_prompt_style: CodexPromptStyle,
+    ) -> Self {
+        Self {
+            audit_context,
+            reasoning_override: None,
+            codex_prompt_style,
+        }
+    }
+
+    pub(crate) fn with_reasoning_override(mut self, reasoning_override: Option<&'a str>) -> Self {
+        self.reasoning_override = reasoning_override;
+        self
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ProviderRuntimeConfig {
@@ -598,6 +624,7 @@ fn extract_openai_compatible_usage(response: &Value) -> LlmUsageRecord {
         total_tokens,
         reasoning_tokens,
         cached_input_tokens,
+        cache_write_tokens: None,
         raw_usage_json: usage_value.map(|usage| usage.to_string()),
     }
 }
@@ -834,8 +861,13 @@ pub async fn call_third_party_with_tool_runtime(
     response_title: &str,
     media_files: &[MediaFile],
     runtime: &mut ToolRuntime,
-    audit_context: Option<&LlmAuditContext>,
+    options: ThirdPartyCallOptions<'_>,
 ) -> Result<String> {
+    let ThirdPartyCallOptions {
+        audit_context,
+        reasoning_override,
+        codex_prompt_style,
+    } = options;
     if model_id.trim().is_empty() {
         return Err(anyhow!("Model identifier is required"));
     }
@@ -858,7 +890,8 @@ pub async fn call_third_party_with_tool_runtime(
             &image_data_list,
             runtime,
             audit_context,
-            None,
+            reasoning_override,
+            codex_prompt_style,
         )
         .await;
     }
@@ -881,34 +914,7 @@ pub async fn call_third_party(
     response_title: &str,
     media_files: &[MediaFile],
     supports_tools: bool,
-    audit_context: Option<&LlmAuditContext>,
-) -> Result<String> {
-    call_third_party_with_reasoning(
-        system_prompt,
-        user_content,
-        model_id,
-        response_title,
-        media_files,
-        supports_tools,
-        audit_context,
-        None,
-    )
-    .await
-}
-
-/// Like [`call_third_party`], with a per-call reasoning-effort override that
-/// applies to Responses-provider models (OpenAI Codex). Other providers ignore
-/// the override.
-#[allow(clippy::too_many_arguments)]
-pub async fn call_third_party_with_reasoning(
-    system_prompt: &str,
-    user_content: &str,
-    model_id: &str,
-    response_title: &str,
-    media_files: &[MediaFile],
-    supports_tools: bool,
-    audit_context: Option<&LlmAuditContext>,
-    reasoning_override: Option<&str>,
+    options: ThirdPartyCallOptions<'_>,
 ) -> Result<String> {
     if model_id.trim().is_empty() {
         return Err(anyhow!("Model identifier is required"));
@@ -926,16 +932,14 @@ pub async fn call_third_party_with_reasoning(
         response_title,
         media_files,
         supports_tools,
-        audit_context,
-        reasoning_override,
+        options,
     )
     .await
 }
 
-/// Variant of [`call_third_party_with_reasoning`] that takes an already
-/// resolved model config, so callers can use synthesized configs that are not
-/// in the runtime catalog (e.g. a foreign Codex slug used as agent step model).
-#[allow(clippy::too_many_arguments)]
+/// Variant of [`call_third_party`] that takes an already resolved model config,
+/// so callers can use synthesized configs that are not in the runtime catalog
+/// (e.g. a foreign Codex slug used as agent step model).
 pub async fn call_third_party_with_reasoning_config(
     system_prompt: &str,
     user_content: &str,
@@ -943,9 +947,13 @@ pub async fn call_third_party_with_reasoning_config(
     response_title: &str,
     media_files: &[MediaFile],
     supports_tools: bool,
-    audit_context: Option<&LlmAuditContext>,
-    reasoning_override: Option<&str>,
+    options: ThirdPartyCallOptions<'_>,
 ) -> Result<String> {
+    let ThirdPartyCallOptions {
+        audit_context,
+        reasoning_override,
+        codex_prompt_style,
+    } = options;
     let model_config = model_config.clone();
     if matches!(
         model_config.provider,
@@ -961,6 +969,7 @@ pub async fn call_third_party_with_reasoning_config(
             supports_tools,
             audit_context,
             reasoning_override,
+            codex_prompt_style,
         )
         .await;
     }

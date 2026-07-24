@@ -281,8 +281,9 @@ impl Database {
                  total_tokens, \
                  reasoning_tokens, \
                  cached_input_tokens, \
+                 cache_write_tokens, \
                  raw_usage_json\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(insert.invocation_id)
         .bind(insert.provider)
@@ -297,6 +298,7 @@ impl Database {
         .bind(insert.total_tokens)
         .bind(insert.reasoning_tokens)
         .bind(insert.cached_input_tokens)
+        .bind(insert.cache_write_tokens)
         .bind(insert.raw_usage_json)
         .execute(&self.pool)
         .await?;
@@ -1081,12 +1083,14 @@ async fn ensure_llm_audit_schema(pool: &SqlitePool) -> Result<()> {
             total_tokens INTEGER,\
             reasoning_tokens INTEGER,\
             cached_input_tokens INTEGER,\
+            cache_write_tokens INTEGER,\
             raw_usage_json TEXT,\
             FOREIGN KEY(invocation_id) REFERENCES llm_invocations(id) ON DELETE CASCADE\
         );",
     )
     .execute(pool)
     .await?;
+    ensure_llm_requests_column(pool, "cache_write_tokens", "INTEGER").await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_llm_invocations_chat_message \
          ON llm_invocations(chat_id, message_id);",
@@ -1118,6 +1122,26 @@ async fn ensure_llm_audit_schema(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+async fn ensure_llm_requests_column(
+    pool: &SqlitePool,
+    column_name: &str,
+    column_sql: &str,
+) -> Result<()> {
+    let columns = sqlx::query_as::<_, TableInfoRow>("PRAGMA table_info(llm_requests)")
+        .fetch_all(pool)
+        .await?;
+    if columns.iter().any(|column| column.name == column_name) {
+        return Ok(());
+    }
+
+    sqlx::query(&format!(
+        "ALTER TABLE llm_requests ADD COLUMN {column_name} {column_sql}"
+    ))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1622,6 +1646,7 @@ mod tests {
             total_tokens: Some(46),
             reasoning_tokens: Some(5),
             cached_input_tokens: Some(3),
+            cache_write_tokens: Some(4),
             raw_usage_json: Some("{\"totalTokenCount\":46}".to_string()),
         })
         .await
@@ -1647,6 +1672,37 @@ mod tests {
         assert_eq!(request.total_tokens, Some(46));
         assert_eq!(request.reasoning_tokens, Some(5));
         assert_eq!(request.cached_input_tokens, Some(3));
+        assert_eq!(request.cache_write_tokens, Some(4));
+    }
+
+    #[tokio::test]
+    async fn llm_audit_schema_restores_cache_write_tokens_on_existing_table() {
+        let db = init_test_db("llm-audit-cache-write-migration").await;
+        let columns = sqlx::query_as::<_, TableInfoRow>("PRAGMA table_info(llm_requests)")
+            .fetch_all(db.pool())
+            .await
+            .expect("llm request columns should load");
+        if columns
+            .iter()
+            .any(|column| column.name == "cache_write_tokens")
+        {
+            sqlx::query("ALTER TABLE llm_requests DROP COLUMN cache_write_tokens")
+                .execute(db.pool())
+                .await
+                .expect("cache write column should be removable for the migration fixture");
+        }
+
+        ensure_llm_audit_schema(db.pool())
+            .await
+            .expect("audit schema should migrate");
+        let columns = sqlx::query_as::<_, TableInfoRow>("PRAGMA table_info(llm_requests)")
+            .fetch_all(db.pool())
+            .await
+            .expect("migrated llm request columns should load");
+
+        assert!(columns
+            .iter()
+            .any(|column| column.name == "cache_write_tokens"));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1691,6 +1747,7 @@ mod tests {
             total_tokens,
             reasoning_tokens: None,
             cached_input_tokens: None,
+            cache_write_tokens: None,
             raw_usage_json: None,
         })
         .await

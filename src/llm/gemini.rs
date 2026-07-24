@@ -450,6 +450,7 @@ fn extract_gemini_usage(value: &Value) -> LlmUsageRecord {
         cached_input_tokens: usage
             .as_ref()
             .and_then(|usage| usage.cached_content_token_count),
+        cache_write_tokens: None,
         raw_usage_json: usage_value.map(|usage| usage.to_string()),
     }
 }
