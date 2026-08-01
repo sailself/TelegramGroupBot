@@ -816,7 +816,9 @@ pub(crate) fn quick_reasoning_effort_for_request(
         return None;
     }
 
-    let record = record.filter(|record| record.slug == model)?;
+    let Some(record) = record.filter(|record| record.slug == model) else {
+        return reasoning_effort_for_request(provider, model, reasoning_override, None);
+    };
     let catalog_fallback = record
         .selected_reasoning_level
         .as_deref()

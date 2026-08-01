@@ -2715,6 +2715,20 @@ mod tests {
     }
 
     #[test]
+    fn codex_quick_result_label_preserves_a_foreign_model_override_without_catalog_metadata() {
+        let foreign_config = model(
+            ThirdPartyProvider::OpenAICodex,
+            "Configured Codex",
+            "configured-q-model",
+        );
+
+        assert_eq!(
+            codex_quick_result_label(&foreign_config, None, Some("low")),
+            "configured-q-model low"
+        );
+    }
+
+    #[test]
     fn quick_reasoning_catalog_fallback_is_reported_for_unsupported_and_empty_overrides() {
         let terra_config = model(
             ThirdPartyProvider::OpenAICodex,
