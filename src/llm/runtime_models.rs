@@ -66,6 +66,7 @@ struct RuntimeModelsState {
     models: Vec<ThirdPartyModelConfig>,
     models_by_id: HashMap<String, ThirdPartyModelConfig>,
     codex_selected_model: Option<CodexSelectedModelRecord>,
+    explicit_codex_configs_by_id: HashMap<String, ThirdPartyModelConfig>,
     explicit_codex_records_by_id: HashMap<String, CodexSelectedModelRecord>,
 }
 
@@ -282,6 +283,7 @@ fn build_runtime_models_state() -> RuntimeModelsState {
         models,
         models_by_id,
         codex_selected_model,
+        explicit_codex_configs_by_id: HashMap::new(),
         explicit_codex_records_by_id: HashMap::new(),
     }
 }
@@ -475,7 +477,12 @@ fn insert_explicit_codex_runtime_entry(
     record: CodexSelectedModelRecord,
 ) {
     let id = config.id.clone();
-    state.models_by_id.insert(id.clone(), config);
+    if !state.models.iter().any(|model| model.id == id) {
+        state.models_by_id.insert(id.clone(), config.clone());
+    }
+    state
+        .explicit_codex_configs_by_id
+        .insert(id.clone(), config);
     state.explicit_codex_records_by_id.insert(id, record);
 }
 
@@ -489,7 +496,7 @@ fn cached_explicit_codex_model_from_state(
         return None;
     }
 
-    let config = state.models_by_id.get(model_id)?;
+    let config = state.explicit_codex_configs_by_id.get(model_id)?;
     if config.id != model_id
         || config.provider != ThirdPartyProvider::OpenAICodex
         || config.model != slug
@@ -889,6 +896,7 @@ mod tests {
             models: vec![selected_config.clone()],
             models_by_id: HashMap::from([(selected_config.id.clone(), selected_config)]),
             codex_selected_model: Some(selected_record),
+            explicit_codex_configs_by_id: HashMap::new(),
             explicit_codex_records_by_id: HashMap::new(),
         };
         let (config, record) = build_explicit_codex_runtime_entry(
@@ -903,6 +911,9 @@ mod tests {
 
         assert!(state
             .models_by_id
+            .contains_key("openai-codex:gpt-5.6-terra"));
+        assert!(state
+            .explicit_codex_configs_by_id
             .contains_key("openai-codex:gpt-5.6-terra"));
         assert_eq!(state.models.len(), 1);
         assert_eq!(state.models[0].id, OPENAI_CODEX_SELECTED_MODEL_ID);
@@ -947,6 +958,7 @@ mod tests {
             models: vec![selected_config.clone()],
             models_by_id: HashMap::from([(selected_config.id.clone(), selected_config)]),
             codex_selected_model: Some(selected_record),
+            explicit_codex_configs_by_id: HashMap::new(),
             explicit_codex_records_by_id: HashMap::new(),
         };
 
@@ -974,6 +986,7 @@ mod tests {
             models: vec![static_config.clone()],
             models_by_id: HashMap::from([(static_config.id.clone(), static_config)]),
             codex_selected_model: None,
+            explicit_codex_configs_by_id: HashMap::new(),
             explicit_codex_records_by_id: HashMap::new(),
         };
 
@@ -983,6 +996,58 @@ mod tests {
             Some("acct-1")
         )
         .is_none());
+    }
+
+    #[test]
+    fn explicit_codex_install_preserves_a_configured_same_id_contract() {
+        let static_config = ThirdPartyModelConfig {
+            id: "openai-codex:gpt-5.6-terra".to_string(),
+            provider: ThirdPartyProvider::OpenAICodex,
+            name: "Static Terra".to_string(),
+            model: "gpt-5.6-terra".to_string(),
+            image: false,
+            video: false,
+            audio: false,
+            tools: false,
+        };
+        let (catalog_config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model(
+                "gpt-5.6-terra",
+                true,
+                true,
+                &[CodexInputModality::Text, CodexInputModality::Image],
+            ),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let mut state = RuntimeModelsState {
+            models: vec![static_config.clone()],
+            models_by_id: HashMap::from([(static_config.id.clone(), static_config)]),
+            codex_selected_model: None,
+            explicit_codex_configs_by_id: HashMap::new(),
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+
+        insert_explicit_codex_runtime_entry(&mut state, catalog_config, record);
+
+        assert_eq!(
+            state
+                .models_by_id
+                .get("openai-codex:gpt-5.6-terra")
+                .map(|config| config.name.as_str()),
+            Some("Static Terra")
+        );
+        let cached = cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-1"),
+        )
+        .expect("the Quick cache should retain the separate catalog config");
+        assert_eq!(cached.config.name, "GPT 5.6 Terra");
+        assert!(cached.config.image);
+        assert!(cached.config.tools);
     }
 
     #[test]
@@ -1041,6 +1106,7 @@ mod tests {
             models: vec![],
             models_by_id: HashMap::from([(config.id.clone(), config.clone())]),
             codex_selected_model: None,
+            explicit_codex_configs_by_id: HashMap::new(),
             explicit_codex_records_by_id: HashMap::new(),
         };
 
@@ -1087,6 +1153,10 @@ mod tests {
                 (terra_config.id.clone(), terra_config.clone()),
             ]),
             codex_selected_model: Some(selected_record),
+            explicit_codex_configs_by_id: HashMap::from([(
+                terra_config.id.clone(),
+                terra_config.clone(),
+            )]),
             explicit_codex_records_by_id: HashMap::from([(terra_config.id.clone(), terra_record)]),
         };
 
@@ -1347,6 +1417,7 @@ mod tests {
             models: vec![],
             models_by_id: HashMap::from([(config.id.clone(), config.clone())]),
             codex_selected_model: None,
+            explicit_codex_configs_by_id: HashMap::from([(config.id.clone(), config.clone())]),
             explicit_codex_records_by_id: HashMap::from([(config.id.clone(), record.clone())]),
         }
     }
