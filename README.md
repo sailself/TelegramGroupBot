@@ -180,7 +180,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `RATE_LIMIT_SECONDS` - Per-user cooldown in seconds. Default: `15`.
 - `MODEL_SELECTION_TIMEOUT` - Model selection UI timeout seconds. Default: `30`.
 - `DEFAULT_TEXT_MODEL` - Default text model for model-selection timeouts, `/tldr`, `/factcheck`, `/profileme`, and the prompt step for `/paintme`/`/portraitme`; it is also the inherited/fallback model for `/qq`. Use `gemini` or a runtime model such as `openai-codex:selected`/`openai-codex`. Default: `gemini`.
-- `DEFAULT_QUICK_TEXT_MODEL` - Optional dedicated `/qq` model. Empty or unset inherits `DEFAULT_TEXT_MODEL`; if the configured quick model is unavailable or cannot handle the attached media, `/qq` falls back once to the capable `DEFAULT_TEXT_MODEL` without opening a picker.
+- `DEFAULT_QUICK_TEXT_MODEL` - Optional dedicated `/qq` model. Empty or unset inherits `DEFAULT_TEXT_MODEL`. It accepts configured runtime IDs, `openai-codex:selected`, or an authenticated catalog slug such as `openai-codex:gpt-5.6-terra`; unavailable or incompatible models fall back once to the capable `DEFAULT_TEXT_MODEL` without opening a picker.
 - `QUICK_REASONING_EFFORT` - Per-request reasoning override for OpenAI Codex models used by `/qq`. Default: `low`. Public OpenAI and other providers keep their existing request contracts.
 - `DEFAULT_Q_MODEL` - Deprecated alias used only when `DEFAULT_TEXT_MODEL` is unset.
 - `DEFAULT_IMAGE_MODEL` - Default image model for `/img`, `/image` timeout/default generation, `/tldr` infographics, and `/paintme`/`/portraitme`. Use `gemini` or `codex`. Default: `gemini`.
@@ -292,7 +292,8 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OPENAI_CODEX_IMAGE_RESPONSES_MODEL` - Responses model used to invoke Codex image generation. Default: `gpt-5.5`.
 - `OPENAI_CODEX_IMAGE_MODEL` - Codex image-generation tool model offered in `/img` and `/image`, and used when `DEFAULT_IMAGE_MODEL=codex`. Default: `gpt-image-2`.
 - Login and model-account administration are restricted to whitelisted users in private chats and managed with `/codexlogin` and `/codexlogout`.
-- The active Codex model is selected live with `/codexmodel`, bound to the current ChatGPT account, and exposed in the bot as the runtime alias `openai-codex:selected`.
+- The active Codex model is selected live with `/codexmodel`, bound to the current ChatGPT account, and exposed in the bot as the runtime alias `openai-codex:selected`; ordinary `/q` continues to use this global selection.
+- An explicit Codex slug in `DEFAULT_QUICK_TEXT_MODEL` is resolved from the authenticated catalog only for `/qq`, without changing `/codexmodel`; an unavailable or incompatible slug falls back once to `DEFAULT_TEXT_MODEL`.
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.
 - When the selected Codex model advertises native search support, ordinary `/q` and other existing paths use Codex's built-in `web_search` Responses tool instead of the local external function tool. `/qq` deliberately disables native Codex search and uses the bounded local `web_search` runtime so its one-round limit is enforceable.
 - Codex requests also include a condensed response-style addendum tuned for direct answers and shorter Chinese output.
