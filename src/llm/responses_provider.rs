@@ -10,12 +10,17 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
-use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
+use crate::config::{
+    parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
+};
 use crate::llm::audit::{
     log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
 };
 use crate::llm::openai_codex;
-use crate::llm::runtime_models::{codex_model_record_for_request, CodexSelectedModelRecord};
+use crate::llm::runtime_models::{
+    codex_model_record_for_request, CodexSelectedModelRecord,
+    CODEX_SELECTED_MODEL_METADATA_VERSION, OPENAI_CODEX_SELECTED_MODEL_ID,
+};
 use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
@@ -44,6 +49,77 @@ struct ResponsesRequestDetails {
     payload: Value,
     streaming_sse: bool,
     request_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedCodexRequestContract {
+    model_config: ThirdPartyModelConfig,
+    pub(crate) record: CodexSelectedModelRecord,
+    account_id: String,
+    reasoning_effort: Option<String>,
+}
+
+impl PinnedCodexRequestContract {
+    pub(crate) fn model_config(&self) -> &ThirdPartyModelConfig {
+        &self.model_config
+    }
+
+    pub(crate) fn model_config_for_request(
+        &self,
+        model_id: &str,
+    ) -> Result<&ThirdPartyModelConfig> {
+        if self.model_config.id != model_id {
+            return Err(anyhow!("The pinned Codex model changed"));
+        }
+        Ok(&self.model_config)
+    }
+
+    pub(crate) fn result_label(&self) -> String {
+        self.reasoning_effort
+            .as_deref()
+            .map(|effort| format!("{} {effort}", self.record.slug))
+            .unwrap_or_else(|| self.record.slug.clone())
+    }
+}
+
+pub(crate) fn pin_quick_codex_request_contract(
+    model_config: &ThirdPartyModelConfig,
+    record: &CodexSelectedModelRecord,
+    current_account_id: Option<&str>,
+    requested_effort: Option<&str>,
+) -> Result<PinnedCodexRequestContract> {
+    let (provider, slug) = parse_third_party_model_id(&model_config.id)
+        .ok_or_else(|| anyhow!("Invalid explicit Codex model id"))?;
+    if provider != ThirdPartyProvider::OpenAICodex
+        || model_config.id == OPENAI_CODEX_SELECTED_MODEL_ID
+        || slug == "selected"
+        || model_config.model != slug
+        || record.slug != slug
+        || record.metadata_version < CODEX_SELECTED_MODEL_METADATA_VERSION
+    {
+        return Err(anyhow!(
+            "The explicit Codex model metadata is stale or mismatched"
+        ));
+    }
+    let account_id = current_account_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if record.account_id.as_deref().map(str::trim) != Some(account_id) {
+        return Err(anyhow!("The explicit Codex model or account changed"));
+    }
+
+    Ok(PinnedCodexRequestContract {
+        model_config: model_config.clone(),
+        record: record.clone(),
+        account_id: account_id.to_string(),
+        reasoning_effort: quick_reasoning_effort_for_request(
+            model_config.provider,
+            &model_config.model,
+            requested_effort,
+            Some(record),
+        ),
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -730,6 +806,52 @@ pub(crate) fn reasoning_effort_for_request(
     Some(requested.to_ascii_lowercase())
 }
 
+pub(crate) fn quick_reasoning_effort_for_request(
+    provider: ThirdPartyProvider,
+    model: &str,
+    reasoning_override: Option<&str>,
+    record: Option<&CodexSelectedModelRecord>,
+) -> Option<String> {
+    if provider != ThirdPartyProvider::OpenAICodex {
+        return None;
+    }
+
+    let record = record.filter(|record| record.slug == model)?;
+    let catalog_fallback = record
+        .selected_reasoning_level
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            record
+                .default_reasoning_level
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .map(str::to_ascii_lowercase);
+    let Some(requested) = reasoning_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return catalog_fallback;
+    };
+    let supported = record.supported_reasoning_levels.is_empty()
+        || record
+            .supported_reasoning_levels
+            .iter()
+            .any(|option| option.effort.eq_ignore_ascii_case(requested));
+    if supported {
+        Some(requested.to_ascii_lowercase())
+    } else {
+        warn!(
+            "Quick reasoning override '{}' is not supported by Codex model '{}'; using the catalog fallback",
+            requested, record.slug
+        );
+        catalog_fallback
+    }
+}
+
 fn selected_model_uses_responses_lite(
     model_config: &ThirdPartyModelConfig,
     selected_record: Option<&CodexSelectedModelRecord>,
@@ -768,10 +890,39 @@ fn remove_input_image_details(value: &mut Value) {
 fn build_responses_payload(
     model_config: &ThirdPartyModelConfig,
     instructions: &str,
-    mut input_items: Vec<Value>,
+    input_items: Vec<Value>,
     tools: Option<Vec<Value>>,
     session_id: &str,
     reasoning_override: Option<&str>,
+    streaming_sse: bool,
+    selected_record: Option<&CodexSelectedModelRecord>,
+) -> (Value, bool) {
+    let effective_reasoning_effort = reasoning_effort_for_request(
+        model_config.provider,
+        &model_config.model,
+        reasoning_override,
+        selected_record,
+    );
+    build_responses_payload_with_effective_reasoning(
+        model_config,
+        instructions,
+        input_items,
+        tools,
+        session_id,
+        effective_reasoning_effort.as_deref(),
+        streaming_sse,
+        selected_record,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_responses_payload_with_effective_reasoning(
+    model_config: &ThirdPartyModelConfig,
+    instructions: &str,
+    mut input_items: Vec<Value>,
+    tools: Option<Vec<Value>>,
+    session_id: &str,
+    effective_reasoning_effort: Option<&str>,
     streaming_sse: bool,
     selected_record: Option<&CodexSelectedModelRecord>,
 ) -> (Value, bool) {
@@ -823,12 +974,7 @@ fn build_responses_payload(
         payload
     };
 
-    let effort = reasoning_effort_for_request(
-        model_config.provider,
-        &model_config.model,
-        reasoning_override,
-        selected_record,
-    );
+    let effort = effective_reasoning_effort.map(str::to_string);
     if use_lite || effort.is_some() {
         let mut reasoning = json!({});
         if let Some(effort) = effort {
@@ -856,18 +1002,21 @@ fn codex_account_id_for_request(
         .map(str::trim)
         .filter(|account_id| !account_id.is_empty())
         .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
-    let record_account_id = codex_record
-        .and_then(|record| record.account_id.as_deref())
-        .map(str::trim)
-        .filter(|account_id| !account_id.is_empty())
-        .ok_or_else(|| anyhow!("The Codex model metadata is not bound to an account"))?;
-    if record_account_id != current_account_id {
-        return Err(anyhow!(
-            "The active ChatGPT account changed while constructing the Codex request"
-        ));
+    if let Some(record) = codex_record {
+        let record_account_id = record
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|account_id| !account_id.is_empty())
+            .ok_or_else(|| anyhow!("The Codex model metadata is not bound to an account"))?;
+        if record_account_id != current_account_id {
+            return Err(anyhow!(
+                "The active ChatGPT account changed while constructing the Codex request"
+            ));
+        }
     }
 
-    Ok(Some(record_account_id.to_string()))
+    Ok(Some(current_account_id.to_string()))
 }
 
 fn build_request_details(
@@ -877,17 +1026,54 @@ fn build_request_details(
     tools: Option<Vec<Value>>,
     session_id: &str,
     reasoning_override: Option<&str>,
+    pinned_codex: Option<&PinnedCodexRequestContract>,
 ) -> Result<ResponsesRequestDetails> {
-    let codex_record = codex_model_record_for_request(model_config)?;
     let current_codex_account_id = if model_config.provider == ThirdPartyProvider::OpenAICodex {
         crate::llm::runtime_models::current_codex_account_id()
     } else {
         None
     };
+    build_request_details_with_current_codex_account(
+        model_config,
+        instructions,
+        input_items,
+        tools,
+        session_id,
+        reasoning_override,
+        pinned_codex,
+        current_codex_account_id.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_request_details_with_current_codex_account(
+    model_config: &ThirdPartyModelConfig,
+    instructions: &str,
+    input_items: Vec<Value>,
+    tools: Option<Vec<Value>>,
+    session_id: &str,
+    reasoning_override: Option<&str>,
+    pinned_codex: Option<&PinnedCodexRequestContract>,
+    current_codex_account_id: Option<&str>,
+) -> Result<ResponsesRequestDetails> {
+    let codex_record = if let Some(pinned) = pinned_codex {
+        if model_config.provider != ThirdPartyProvider::OpenAICodex
+            || pinned.model_config.id != model_config.id
+            || pinned.record.slug != model_config.model
+            || pinned.account_id != current_codex_account_id.map(str::trim).unwrap_or_default()
+        {
+            return Err(anyhow!(
+                "The pinned Codex model or active ChatGPT account changed"
+            ));
+        }
+        Some(pinned.record.clone())
+    } else {
+        codex_model_record_for_request(model_config)?
+    };
     let codex_account_id = codex_account_id_for_request(
         model_config.provider,
         codex_record.as_ref(),
-        current_codex_account_id.as_deref(),
+        current_codex_account_id,
     )?;
 
     let (display_name, url, mut headers, streaming_sse) = match model_config.provider {
@@ -924,16 +1110,29 @@ fn build_request_details(
         headers.push(("Accept".to_string(), "text/event-stream".to_string()));
     }
 
-    let (payload, use_responses_lite) = build_responses_payload(
-        model_config,
-        instructions,
-        input_items,
-        tools,
-        session_id,
-        reasoning_override,
-        streaming_sse,
-        codex_record.as_ref(),
-    );
+    let (payload, use_responses_lite) = if let Some(pinned) = pinned_codex {
+        build_responses_payload_with_effective_reasoning(
+            model_config,
+            instructions,
+            input_items,
+            tools,
+            session_id,
+            pinned.reasoning_effort.as_deref(),
+            streaming_sse,
+            codex_record.as_ref(),
+        )
+    } else {
+        build_responses_payload(
+            model_config,
+            instructions,
+            input_items,
+            tools,
+            session_id,
+            reasoning_override,
+            streaming_sse,
+            codex_record.as_ref(),
+        )
+    };
     add_codex_responses_lite_header(&mut headers, use_responses_lite);
 
     Ok(ResponsesRequestDetails {
@@ -1617,6 +1816,7 @@ async fn responses_completion_with_tools(
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
     reasoning_override: Option<&str>,
+    pinned_codex: Option<&PinnedCodexRequestContract>,
 ) -> Result<String> {
     let tools = build_responses_function_tools();
     let session_id = generate_session_id();
@@ -1644,6 +1844,7 @@ async fn responses_completion_with_tools(
             Some(tools.clone()),
             &session_id,
             reasoning_override,
+            pinned_codex,
         )?;
         let ResponsesApiResult {
             response,
@@ -1690,6 +1891,7 @@ async fn responses_completion_with_tools(
                 None,
                 &session_id,
                 reasoning_override,
+                pinned_codex,
             )?;
             let ResponsesApiResult {
                 response,
@@ -1714,6 +1916,7 @@ async fn responses_completion_with_tool_runtime(
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
     reasoning_override: Option<&str>,
+    pinned_codex: Option<&PinnedCodexRequestContract>,
 ) -> Result<String> {
     let mut tools =
         convert_openai_function_tools_to_responses(runtime.build_openai_function_tools());
@@ -1753,6 +1956,7 @@ async fn responses_completion_with_tool_runtime(
             tools_enabled.then_some(tools.clone()),
             &session_id,
             reasoning_override,
+            pinned_codex,
         )?;
         let ResponsesApiResult {
             response,
@@ -1804,6 +2008,7 @@ async fn responses_completion_with_tool_runtime(
         None,
         &session_id,
         reasoning_override,
+        pinned_codex,
     )?;
     let ResponsesApiResult {
         response,
@@ -1824,6 +2029,7 @@ pub async fn call_responses_provider(
     supports_tools: bool,
     audit_context: Option<&LlmAuditContext>,
     reasoning_override: Option<&str>,
+    pinned_codex: Option<&PinnedCodexRequestContract>,
     codex_prompt_style: crate::llm::CodexPromptStyle,
 ) -> Result<String> {
     crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
@@ -1862,6 +2068,7 @@ pub async fn call_responses_provider(
             audit_context,
             &operation,
             reasoning_override,
+            pinned_codex,
         )
         .await;
     }
@@ -1875,6 +2082,7 @@ pub async fn call_responses_provider(
         native_codex_web_search_tool.map(|tool| vec![tool]),
         &session_id,
         reasoning_override,
+        pinned_codex,
     )?;
     let ResponsesApiResult {
         response,
@@ -1895,6 +2103,7 @@ pub async fn call_responses_provider_with_tool_runtime(
     runtime: &mut ToolRuntime,
     audit_context: Option<&LlmAuditContext>,
     reasoning_override: Option<&str>,
+    pinned_codex: Option<&PinnedCodexRequestContract>,
     codex_prompt_style: crate::llm::CodexPromptStyle,
 ) -> Result<String> {
     crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
@@ -1931,6 +2140,7 @@ pub async fn call_responses_provider_with_tool_runtime(
         audit_context,
         &operation,
         reasoning_override,
+        pinned_codex,
     )
     .await
 }
@@ -2111,6 +2321,128 @@ mod tests {
                 .expect("public OpenAI should not require Codex metadata"),
             None
         );
+    }
+
+    #[test]
+    fn pinned_quick_codex_turn_survives_runtime_metadata_loss_between_iterations() {
+        let mut source_config = Some(model_config(
+            ThirdPartyProvider::OpenAICodex,
+            "gpt-5.6-terra",
+        ));
+        source_config.as_mut().expect("config fixture").id =
+            "openai-codex:gpt-5.6-terra".to_string();
+        let mut source_record = Some(codex_record("gpt-5.6-terra", &["medium"], None, true));
+        let record = source_record.as_mut().expect("record fixture");
+        record.metadata_version = crate::llm::runtime_models::CODEX_SELECTED_MODEL_METADATA_VERSION;
+        record.account_id = Some("acct-1".to_string());
+        record.default_reasoning_level = Some("medium".to_string());
+
+        let pinned = pin_quick_codex_request_contract(
+            source_config.as_ref().expect("config fixture"),
+            record,
+            Some("acct-1"),
+            Some("low"),
+        )
+        .expect("the exact Quick record should pin");
+        source_config = None;
+        source_record = None;
+        assert!(
+            source_config.is_none(),
+            "simulated reload clears the config"
+        );
+        assert!(
+            source_record.is_none(),
+            "simulated runtime reload clears metadata"
+        );
+        let config = pinned.model_config();
+        assert_eq!(config.id, "openai-codex:gpt-5.6-terra");
+
+        for session_id in ["iteration-1", "iteration-2"] {
+            let details = build_request_details_with_current_codex_account(
+                config,
+                "instructions",
+                vec![json!({"type": "message", "role": "user", "content": []})],
+                Some(vec![json!({"type": "function", "name": "web_search"})]),
+                session_id,
+                Some("low"),
+                Some(&pinned),
+                Some("acct-1"),
+            )
+            .expect("the pinned turn must not consult cleared runtime metadata");
+
+            assert_eq!(details.codex_account_id.as_deref(), Some("acct-1"));
+            assert_eq!(details.payload["model"], "gpt-5.6-terra");
+            assert_eq!(details.payload["reasoning"]["effort"], "medium");
+            assert!(details
+                .headers
+                .iter()
+                .any(|(name, value)| { name == CODEX_RESPONSES_LITE_HEADER && value == "true" }));
+        }
+
+        assert!(pin_quick_codex_request_contract(
+            config,
+            &pinned.record,
+            Some("acct-2"),
+            Some("low")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn quick_reasoning_catalog_fallback_shapes_payload_for_an_empty_override() {
+        let mut config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-terra");
+        config.id = "openai-codex:gpt-5.6-terra".to_string();
+        let mut record = codex_record("gpt-5.6-terra", &["medium"], None, true);
+        record.account_id = Some("acct-1".to_string());
+        record.default_reasoning_level = Some("medium".to_string());
+        let pinned = pin_quick_codex_request_contract(&config, &record, Some("acct-1"), Some("  "))
+            .expect("the catalog default should produce a pinned contract");
+
+        let details = build_request_details_with_current_codex_account(
+            &config,
+            "",
+            vec![],
+            None,
+            "empty-override",
+            Some("  "),
+            Some(&pinned),
+            Some("acct-1"),
+        )
+        .expect("the empty Quick override should use the catalog fallback");
+
+        assert_eq!(details.payload["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn synthesized_and_configured_foreign_codex_requests_use_current_account_without_catalog_metadata(
+    ) {
+        let mut synthesized_agent_step =
+            model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.4-mini");
+        synthesized_agent_step.tools = false;
+        let configured_q_model =
+            model_config(ThirdPartyProvider::OpenAICodex, "configured-q-model");
+
+        for config in [&synthesized_agent_step, &configured_q_model] {
+            assert_eq!(
+                codex_account_id_for_request(config.provider, None, Some("acct-1"))
+                    .expect("foreign Codex requests should use the active account"),
+                Some("acct-1".to_string())
+            );
+
+            let (payload, use_lite) = build_responses_payload(
+                config,
+                "",
+                vec![],
+                None,
+                "foreign-session",
+                Some("low"),
+                true,
+                None,
+            );
+            assert_eq!(payload["model"], config.model);
+            assert_eq!(payload["reasoning"]["effort"], "low");
+            assert!(!use_lite);
+        }
     }
 
     #[test]

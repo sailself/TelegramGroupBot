@@ -13,7 +13,7 @@ use crate::llm::audit::{
 };
 use crate::llm::media::{MediaFile, MediaKind};
 use crate::llm::responses_provider::{
-    call_responses_provider, call_responses_provider_with_tool_runtime,
+    call_responses_provider, call_responses_provider_with_tool_runtime, PinnedCodexRequestContract,
 };
 use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config};
 use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
@@ -32,6 +32,7 @@ const OPENROUTER_TITLE: &str = "TelegramGroupHelperBot";
 pub struct ThirdPartyCallOptions<'a> {
     audit_context: Option<&'a LlmAuditContext>,
     reasoning_override: Option<&'a str>,
+    pinned_codex: Option<&'a PinnedCodexRequestContract>,
     codex_prompt_style: CodexPromptStyle,
 }
 
@@ -43,6 +44,7 @@ impl<'a> ThirdPartyCallOptions<'a> {
         Self {
             audit_context,
             reasoning_override: None,
+            pinned_codex: None,
             codex_prompt_style,
         }
     }
@@ -51,6 +53,29 @@ impl<'a> ThirdPartyCallOptions<'a> {
         self.reasoning_override = reasoning_override;
         self
     }
+
+    pub(crate) fn with_pinned_codex_request(
+        mut self,
+        pinned_codex: Option<&'a PinnedCodexRequestContract>,
+    ) -> Self {
+        self.pinned_codex = pinned_codex;
+        self
+    }
+}
+
+fn model_config_for_call(
+    model_id: &str,
+    pinned_codex: Option<&PinnedCodexRequestContract>,
+) -> Result<ThirdPartyModelConfig> {
+    if let Some(pinned) = pinned_codex {
+        return Ok(pinned.model_config_for_request(model_id)?.clone());
+    }
+
+    CONFIG
+        .get_third_party_model_config(model_id)
+        .cloned()
+        .or_else(|| runtime_model_config(model_id))
+        .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))
 }
 
 #[derive(Debug, Clone)]
@@ -866,17 +891,14 @@ pub async fn call_third_party_with_tool_runtime(
     let ThirdPartyCallOptions {
         audit_context,
         reasoning_override,
+        pinned_codex,
         codex_prompt_style,
     } = options;
     if model_id.trim().is_empty() {
         return Err(anyhow!("Model identifier is required"));
     }
 
-    let model_config = CONFIG
-        .get_third_party_model_config(model_id)
-        .cloned()
-        .or_else(|| runtime_model_config(model_id))
-        .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))?;
+    let model_config = model_config_for_call(model_id, pinned_codex)?;
     if matches!(
         model_config.provider,
         ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
@@ -891,6 +913,7 @@ pub async fn call_third_party_with_tool_runtime(
             runtime,
             audit_context,
             reasoning_override,
+            pinned_codex,
             codex_prompt_style,
         )
         .await;
@@ -920,11 +943,7 @@ pub async fn call_third_party(
         return Err(anyhow!("Model identifier is required"));
     }
 
-    let model_config = CONFIG
-        .get_third_party_model_config(model_id)
-        .cloned()
-        .or_else(|| runtime_model_config(model_id))
-        .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))?;
+    let model_config = model_config_for_call(model_id, options.pinned_codex)?;
     call_third_party_with_reasoning_config(
         system_prompt,
         user_content,
@@ -952,6 +971,7 @@ pub async fn call_third_party_with_reasoning_config(
     let ThirdPartyCallOptions {
         audit_context,
         reasoning_override,
+        pinned_codex,
         codex_prompt_style,
     } = options;
     let model_config = model_config.clone();
@@ -969,6 +989,7 @@ pub async fn call_third_party_with_reasoning_config(
             supports_tools,
             audit_context,
             reasoning_override,
+            pinned_codex,
             codex_prompt_style,
         )
         .await;

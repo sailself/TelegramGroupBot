@@ -56,6 +56,12 @@ pub struct CodexSelectedModelRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResolvedExplicitCodexModel {
+    pub config: ThirdPartyModelConfig,
+    pub record: CodexSelectedModelRecord,
+}
+
+#[derive(Debug, Clone)]
 struct RuntimeModelsState {
     models: Vec<ThirdPartyModelConfig>,
     models_by_id: HashMap<String, ThirdPartyModelConfig>,
@@ -145,6 +151,9 @@ fn validate_explicit_codex_model_for_request(
 
     let record = explicit_record
         .ok_or_else(|| anyhow!("The explicit Codex model metadata is unavailable"))?;
+    if record.metadata_version < CODEX_SELECTED_MODEL_METADATA_VERSION {
+        return Err(anyhow!("The explicit Codex model metadata is stale"));
+    }
     let current_account_id = normalized_account_id(current_account_id)
         .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
     if record.slug != model_config.model
@@ -362,7 +371,11 @@ fn codex_model_record_for_request_with_state(
         );
     }
 
-    explicit_codex_model_record_from_state(state, model_config, current_account_id)
+    // Non-selected Codex IDs are ordinary foreign/configured contracts unless
+    // the Quick resolver explicitly pins an account-bound catalog record for
+    // the call. Never infer Quick provenance from an ID or borrow cached
+    // metadata that may belong to a different request path.
+    Ok(None)
 }
 
 #[allow(dead_code)] // The full request selector delegates explicit IDs here.
@@ -380,10 +393,6 @@ pub fn codex_model_record_for_request(
     if model_config.provider != ThirdPartyProvider::OpenAICodex {
         return Ok(None);
     }
-    if model_config.id != OPENAI_CODEX_SELECTED_MODEL_ID {
-        return explicit_codex_model_record_for_request(model_config);
-    }
-
     let current_account_id = current_codex_account_id();
     let state = RUNTIME_MODELS.read();
     codex_model_record_for_request_with_state(&state, model_config, current_account_id.as_deref())
@@ -470,20 +479,59 @@ fn insert_explicit_codex_runtime_entry(
     state.explicit_codex_records_by_id.insert(id, record);
 }
 
-#[allow(dead_code)] // The Quick request path invokes this in Task 2.
-pub async fn ensure_explicit_codex_model(model_id: &str) -> Result<ThirdPartyModelConfig> {
-    if let Some(config) = runtime_model_config(model_id) {
-        return Ok(config);
-    }
-    let _guard = EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK.lock().await;
-    if let Some(config) = runtime_model_config(model_id) {
-        return Ok(config);
+fn cached_explicit_codex_model_from_state(
+    state: &RuntimeModelsState,
+    model_id: &str,
+    current_account_id: Option<&str>,
+) -> Option<ResolvedExplicitCodexModel> {
+    let (provider, slug) = parse_third_party_model_id(model_id)?;
+    if provider != ThirdPartyProvider::OpenAICodex || slug == "selected" {
+        return None;
     }
 
+    let config = state.models_by_id.get(model_id)?;
+    if config.id != model_id
+        || config.provider != ThirdPartyProvider::OpenAICodex
+        || config.model != slug
+    {
+        return None;
+    }
+    let record = explicit_codex_model_record_from_state(state, config, current_account_id)
+        .ok()
+        .flatten()?;
+    Some(ResolvedExplicitCodexModel {
+        config: config.clone(),
+        record,
+    })
+}
+
+#[allow(dead_code)] // The Quick request path invokes this in Task 2.
+pub async fn ensure_explicit_codex_model(model_id: &str) -> Result<ResolvedExplicitCodexModel> {
     let (provider, slug) = parse_third_party_model_id(model_id)
         .ok_or_else(|| anyhow!("Invalid explicit Codex model id"))?;
     if provider != ThirdPartyProvider::OpenAICodex || slug == "selected" {
         return Err(anyhow!("Model is not an explicit Codex slug"));
+    }
+
+    let active_account = current_codex_account_id()
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if let Some(cached) = cached_explicit_codex_model_from_state(
+        &RUNTIME_MODELS.read(),
+        model_id,
+        Some(&active_account),
+    ) {
+        return Ok(cached);
+    }
+
+    let _guard = EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK.lock().await;
+    let active_account = current_codex_account_id()
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if let Some(cached) = cached_explicit_codex_model_from_state(
+        &RUNTIME_MODELS.read(),
+        model_id,
+        Some(&active_account),
+    ) {
+        return Ok(cached);
     }
 
     let list = openai_codex::fetch_models().await?;
@@ -502,8 +550,8 @@ pub async fn ensure_explicit_codex_model(model_id: &str) -> Result<ThirdPartyMod
     let (config, record) =
         build_explicit_codex_runtime_entry(model_id, model, list.etag, &active_account)?;
     let mut state = RUNTIME_MODELS.write();
-    insert_explicit_codex_runtime_entry(&mut state, config.clone(), record);
-    Ok(config)
+    insert_explicit_codex_runtime_entry(&mut state, config.clone(), record.clone());
+    Ok(ResolvedExplicitCodexModel { config, record })
 }
 
 fn write_selected_codex_model_file(record: &CodexSelectedModelRecord) -> Result<()> {
@@ -891,6 +939,82 @@ mod tests {
     }
 
     #[test]
+    fn explicit_codex_exact_cache_does_not_alias_the_selected_slug() {
+        let mut selected_record = selected_model_record_for_test();
+        selected_record.slug = "gpt-5.6-terra".to_string();
+        let selected_config = dynamic_codex_model_config(&selected_record);
+        let state = RuntimeModelsState {
+            models: vec![selected_config.clone()],
+            models_by_id: HashMap::from([(selected_config.id.clone(), selected_config)]),
+            codex_selected_model: Some(selected_record),
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+
+        assert!(cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-1")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn explicit_codex_exact_cache_rejects_a_static_same_id_without_a_paired_record() {
+        let static_config = ThirdPartyModelConfig {
+            id: "openai-codex:gpt-5.6-terra".to_string(),
+            provider: ThirdPartyProvider::OpenAICodex,
+            name: "Static Terra".to_string(),
+            model: "gpt-5.6-terra".to_string(),
+            image: false,
+            video: false,
+            audio: false,
+            tools: true,
+        };
+        let state = RuntimeModelsState {
+            models: vec![static_config.clone()],
+            models_by_id: HashMap::from([(static_config.id.clone(), static_config)]),
+            codex_selected_model: None,
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+
+        assert!(cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-1")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn explicit_codex_exact_cache_reuses_only_the_exact_account_bound_pair() {
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let state = explicit_cache_state_for_test(&config, &record);
+
+        let cached = cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-1"),
+        )
+        .expect("the exact config and record should be reusable");
+
+        assert_eq!(cached.config.id, "openai-codex:gpt-5.6-terra");
+        assert_eq!(cached.record.slug, "gpt-5.6-terra");
+        assert!(cached.record.use_responses_lite);
+        assert!(cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-2")
+        )
+        .is_none());
+    }
+
+    #[test]
     fn explicit_codex_cached_record_lookup_rejects_account_mismatch() {
         let (config, record) = build_explicit_codex_runtime_entry(
             "openai-codex:gpt-5.6-terra",
@@ -905,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_model_record_for_request_with_state_rejects_missing_explicit_metadata() {
+    fn foreign_codex_requests_do_not_require_quick_catalog_metadata() {
         let (config, _) = build_explicit_codex_runtime_entry(
             "openai-codex:gpt-5.6-terra",
             &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
@@ -920,8 +1044,10 @@ mod tests {
             explicit_codex_records_by_id: HashMap::new(),
         };
 
-        assert!(
-            codex_model_record_for_request_with_state(&state, &config, Some("acct-1")).is_err()
+        assert_eq!(
+            codex_model_record_for_request_with_state(&state, &config, Some("acct-1"))
+                .expect("ordinary foreign Codex configs keep their legacy request contract"),
+            None
         );
     }
 
@@ -941,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_model_record_for_request_with_state_uses_metadata_for_the_exact_configured_model(
+    fn codex_model_record_for_request_with_state_uses_metadata_only_for_the_selected_alias(
     ) -> Result<()> {
         let mut selected_record = selected_model_record_for_test();
         selected_record.slug = "gpt-5.6-luna".to_string();
@@ -971,14 +1097,12 @@ mod tests {
             "gpt-5.6-luna"
         );
         assert_eq!(
-            codex_model_record_for_request_with_state(&state, &terra_config, Some("acct-1"))?
-                .unwrap()
-                .slug,
-            "gpt-5.6-terra"
+            codex_model_record_for_request_with_state(&state, &terra_config, Some("acct-1"))?,
+            None
         );
-        assert!(
-            codex_model_record_for_request_with_state(&state, &terra_config, Some("acct-2"))
-                .is_err()
+        assert_eq!(
+            codex_model_record_for_request_with_state(&state, &terra_config, Some("acct-2"))?,
+            None
         );
 
         Ok(())
