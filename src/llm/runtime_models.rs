@@ -143,9 +143,8 @@ fn validate_explicit_codex_model_for_request(
         return Ok(None);
     }
 
-    let Some(record) = explicit_record else {
-        return Ok(None);
-    };
+    let record = explicit_record
+        .ok_or_else(|| anyhow!("The explicit Codex model metadata is unavailable"))?;
     let current_account_id = normalized_account_id(current_account_id)
         .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
     if record.slug != model_config.model
@@ -903,6 +902,27 @@ mod tests {
         let state = explicit_cache_state_for_test(&config, &record);
 
         assert!(explicit_codex_model_record_from_state(&state, &config, Some("acct-2")).is_err());
+    }
+
+    #[test]
+    fn codex_model_record_for_request_with_state_rejects_missing_explicit_metadata() {
+        let (config, _) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("explicit Terra entry should map");
+        let state = RuntimeModelsState {
+            models: vec![],
+            models_by_id: HashMap::from([(config.id.clone(), config.clone())]),
+            codex_selected_model: None,
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+
+        assert!(
+            codex_model_record_for_request_with_state(&state, &config, Some("acct-1")).is_err()
+        );
     }
 
     #[test]

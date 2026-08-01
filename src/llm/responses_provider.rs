@@ -843,6 +843,33 @@ fn build_responses_payload(
     (payload, use_lite)
 }
 
+fn codex_account_id_for_request(
+    provider: ThirdPartyProvider,
+    codex_record: Option<&CodexSelectedModelRecord>,
+    current_account_id: Option<&str>,
+) -> Result<Option<String>> {
+    if provider != ThirdPartyProvider::OpenAICodex {
+        return Ok(None);
+    }
+
+    let current_account_id = current_account_id
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    let record_account_id = codex_record
+        .and_then(|record| record.account_id.as_deref())
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+        .ok_or_else(|| anyhow!("The Codex model metadata is not bound to an account"))?;
+    if record_account_id != current_account_id {
+        return Err(anyhow!(
+            "The active ChatGPT account changed while constructing the Codex request"
+        ));
+    }
+
+    Ok(Some(record_account_id.to_string()))
+}
+
 fn build_request_details(
     model_config: &ThirdPartyModelConfig,
     instructions: &str,
@@ -852,13 +879,16 @@ fn build_request_details(
     reasoning_override: Option<&str>,
 ) -> Result<ResponsesRequestDetails> {
     let codex_record = codex_model_record_for_request(model_config)?;
-    let codex_account_id = if model_config.provider == ThirdPartyProvider::OpenAICodex {
-        let account_id = crate::llm::runtime_models::current_codex_account_id()
-            .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
-        Some(account_id)
+    let current_codex_account_id = if model_config.provider == ThirdPartyProvider::OpenAICodex {
+        crate::llm::runtime_models::current_codex_account_id()
     } else {
         None
     };
+    let codex_account_id = codex_account_id_for_request(
+        model_config.provider,
+        codex_record.as_ref(),
+        current_codex_account_id.as_deref(),
+    )?;
 
     let (display_name, url, mut headers, streaming_sse) = match model_config.provider {
         ThirdPartyProvider::OpenAI => (
@@ -2063,6 +2093,24 @@ mod tests {
 
         assert!(!selected_actual_use_lite);
         assert!(explicit_actual_use_lite);
+    }
+
+    #[test]
+    fn request_construction_rejects_fresh_account_mismatch_from_validated_metadata() {
+        let mut record = codex_record("gpt-5.6-terra", &[], None, true);
+        record.account_id = Some("acct-1".to_string());
+
+        assert!(codex_account_id_for_request(
+            ThirdPartyProvider::OpenAICodex,
+            Some(&record),
+            Some("acct-2"),
+        )
+        .is_err());
+        assert_eq!(
+            codex_account_id_for_request(ThirdPartyProvider::OpenAI, None, None)
+                .expect("public OpenAI should not require Codex metadata"),
+            None
+        );
     }
 
     #[test]
