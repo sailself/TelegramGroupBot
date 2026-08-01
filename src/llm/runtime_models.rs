@@ -14,7 +14,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 
 use crate::config::{
-    qualify_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
+    parse_third_party_model_id, qualify_third_party_model_id, ThirdPartyModelConfig,
+    ThirdPartyProvider, CONFIG,
 };
 use crate::llm::openai_codex::{
     self, CodexInputModality, CodexReasoningEffortOption, CodexRemoteModel, CodexWebSearchToolType,
@@ -59,6 +60,7 @@ struct RuntimeModelsState {
     models: Vec<ThirdPartyModelConfig>,
     models_by_id: HashMap<String, ThirdPartyModelConfig>,
     codex_selected_model: Option<CodexSelectedModelRecord>,
+    explicit_codex_records_by_id: HashMap<String, CodexSelectedModelRecord>,
 }
 
 static RUNTIME_MODELS: Lazy<RwLock<RuntimeModelsState>> =
@@ -66,6 +68,9 @@ static RUNTIME_MODELS: Lazy<RwLock<RuntimeModelsState>> =
 static CODEX_MODEL_STATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static CODEX_MODEL_REFRESH_STATE: Lazy<AsyncMutex<CodexModelRefreshState>> =
     Lazy::new(|| AsyncMutex::new(CodexModelRefreshState::default()));
+#[allow(dead_code)] // Consumed by the explicit-model request path added in Task 2.
+static EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK: Lazy<AsyncMutex<()>> =
+    Lazy::new(|| AsyncMutex::new(()));
 static CODEX_MODEL_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const CODEX_MODEL_REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -233,6 +238,7 @@ fn build_runtime_models_state() -> RuntimeModelsState {
         models,
         models_by_id,
         codex_selected_model,
+        explicit_codex_records_by_id: HashMap::new(),
     }
 }
 
@@ -344,6 +350,81 @@ fn build_codex_selected_model_record(
         use_responses_lite: model.use_responses_lite,
         fetched_at: Utc::now(),
     }
+}
+
+fn build_explicit_codex_runtime_entry(
+    model_id: &str,
+    model: &CodexRemoteModel,
+    etag: Option<String>,
+    account_id: &str,
+) -> Result<(ThirdPartyModelConfig, CodexSelectedModelRecord)> {
+    let (provider, slug) = parse_third_party_model_id(model_id)
+        .ok_or_else(|| anyhow!("Invalid explicit Codex model id"))?;
+    if provider != ThirdPartyProvider::OpenAICodex || slug == "selected" {
+        return Err(anyhow!("Model is not an explicit Codex slug"));
+    }
+    if slug != model.slug || !model.supported_in_api {
+        return Err(anyhow!("Codex model '{}' is unavailable", slug));
+    }
+
+    let record = build_codex_selected_model_record(model, etag, account_id, None);
+    let config = ThirdPartyModelConfig {
+        id: model_id.to_string(),
+        provider: ThirdPartyProvider::OpenAICodex,
+        name: model.display_name.clone(),
+        model: model.slug.clone(),
+        image: model.input_modalities.contains(&CodexInputModality::Image),
+        video: false,
+        audio: false,
+        tools: true,
+    };
+    Ok((config, record))
+}
+
+fn insert_explicit_codex_runtime_entry(
+    state: &mut RuntimeModelsState,
+    config: ThirdPartyModelConfig,
+    record: CodexSelectedModelRecord,
+) {
+    let id = config.id.clone();
+    state.models_by_id.insert(id.clone(), config);
+    state.explicit_codex_records_by_id.insert(id, record);
+}
+
+#[allow(dead_code)] // The Quick request path invokes this in Task 2.
+pub async fn ensure_explicit_codex_model(model_id: &str) -> Result<ThirdPartyModelConfig> {
+    if let Some(config) = runtime_model_config(model_id) {
+        return Ok(config);
+    }
+    let _guard = EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK.lock().await;
+    if let Some(config) = runtime_model_config(model_id) {
+        return Ok(config);
+    }
+
+    let (provider, slug) = parse_third_party_model_id(model_id)
+        .ok_or_else(|| anyhow!("Invalid explicit Codex model id"))?;
+    if provider != ThirdPartyProvider::OpenAICodex || slug == "selected" {
+        return Err(anyhow!("Model is not an explicit Codex slug"));
+    }
+
+    let list = openai_codex::fetch_models().await?;
+    let active_account = current_codex_account_id()
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if list.account_id != active_account {
+        return Err(anyhow!(
+            "The active ChatGPT account changed during model resolution"
+        ));
+    }
+    let model = list
+        .models
+        .iter()
+        .find(|model| model.slug == slug)
+        .ok_or_else(|| anyhow!("Codex model '{}' is unavailable", slug))?;
+    let (config, record) =
+        build_explicit_codex_runtime_entry(model_id, model, list.etag, &active_account)?;
+    let mut state = RUNTIME_MODELS.write();
+    insert_explicit_codex_runtime_entry(&mut state, config.clone(), record);
+    Ok(config)
 }
 
 fn write_selected_codex_model_file(record: &CodexSelectedModelRecord) -> Result<()> {
@@ -639,6 +720,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_codex_catalog_entry_preserves_contract_metadata() {
+        let model = remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]);
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &model,
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+
+        assert_eq!(config.id, "openai-codex:gpt-5.6-terra");
+        assert_eq!(config.model, "gpt-5.6-terra");
+        assert_eq!(config.provider, ThirdPartyProvider::OpenAICodex);
+        assert!(config.tools);
+        assert!(!config.image);
+        assert!(record.use_responses_lite);
+        assert!(record.supports_search_tool);
+        assert_eq!(record.account_id.as_deref(), Some("acct-1"));
+    }
+
+    #[test]
+    fn explicit_codex_catalog_entry_rejects_non_api_model() {
+        let mut model = remote_model("gpt-5.6-terra", false, false, &[CodexInputModality::Text]);
+        model.supported_in_api = false;
+
+        assert!(build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &model,
+            None,
+            "acct-1",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_codex_cache_does_not_change_picker_or_selected_model() {
+        let selected_record = selected_model_record_for_test();
+        let selected_config = dynamic_codex_model_config(&selected_record);
+        let mut state = RuntimeModelsState {
+            models: vec![selected_config.clone()],
+            models_by_id: HashMap::from([(selected_config.id.clone(), selected_config)]),
+            codex_selected_model: Some(selected_record),
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+
+        insert_explicit_codex_runtime_entry(&mut state, config, record);
+
+        assert!(state
+            .models_by_id
+            .contains_key("openai-codex:gpt-5.6-terra"));
+        assert_eq!(state.models.len(), 1);
+        assert_eq!(state.models[0].id, OPENAI_CODEX_SELECTED_MODEL_ID);
+        assert_eq!(
+            state
+                .codex_selected_model
+                .as_ref()
+                .map(|record| record.slug.as_str()),
+            Some("catalog-model")
+        );
+        assert!(state
+            .explicit_codex_records_by_id
+            .contains_key("openai-codex:gpt-5.6-terra"));
+    }
+
+    #[test]
     fn selected_model_config_maps_image_capability_from_modalities() {
         let record = CodexSelectedModelRecord {
             metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
@@ -841,6 +994,31 @@ mod tests {
             supports_search_tool: false,
             use_responses_lite: true,
             fetched_at: Utc::now(),
+        }
+    }
+
+    fn remote_model(
+        slug: &str,
+        supports_search_tool: bool,
+        use_responses_lite: bool,
+        input_modalities: &[CodexInputModality],
+    ) -> CodexRemoteModel {
+        CodexRemoteModel {
+            slug: slug.to_string(),
+            display_name: "GPT 5.6 Terra".to_string(),
+            description: Some("Catalog model".to_string()),
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![CodexReasoningEffortOption {
+                effort: "medium".to_string(),
+                description: "Balanced".to_string(),
+            }],
+            visibility: crate::llm::openai_codex::CodexModelVisibility::List,
+            supported_in_api: true,
+            priority: 1,
+            web_search_tool_type: CodexWebSearchToolType::TextAndImage,
+            input_modalities: input_modalities.to_vec(),
+            supports_search_tool,
+            use_responses_lite,
         }
     }
 }
