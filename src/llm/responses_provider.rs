@@ -15,9 +15,7 @@ use crate::llm::audit::{
     log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
 };
 use crate::llm::openai_codex;
-use crate::llm::runtime_models::{
-    selected_codex_model_record, CodexSelectedModelRecord, OPENAI_CODEX_SELECTED_MODEL_ID,
-};
+use crate::llm::runtime_models::{codex_model_record_for_request, CodexSelectedModelRecord};
 use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
@@ -651,9 +649,11 @@ fn build_native_codex_web_search_tool_from_record(
     )
 }
 
-fn build_native_codex_web_search_tool(model_config: &ThirdPartyModelConfig) -> Option<Value> {
-    let record = selected_codex_model_record()?;
-    build_native_codex_web_search_tool_from_record(model_config, &record)
+fn build_native_codex_web_search_tool(
+    model_config: &ThirdPartyModelConfig,
+) -> Result<Option<Value>> {
+    Ok(codex_model_record_for_request(model_config)?
+        .and_then(|record| build_native_codex_web_search_tool_from_record(model_config, &record)))
 }
 
 fn convert_openai_function_tools_to_responses(tools: Vec<Value>) -> Vec<Value> {
@@ -687,12 +687,12 @@ fn responses_base_url(base_url: &str) -> String {
 /// Decide the `reasoning.effort` value for a request, if any.
 ///
 /// `reasoning_override` is a per-call request (e.g. cheap agent steps asking
-/// for "low"); it is validated against the selected Codex record's supported
+/// for "low"); it is validated against the exact Codex record's supported
 /// levels when that record matches the requested model, and passed through
 /// unvalidated for foreign slugs (the backend rejects unknown levels itself).
 /// With no override this reproduces the original behavior: the globally
 /// selected reasoning level of the matching Codex record.
-fn reasoning_effort_for_request(
+pub(crate) fn reasoning_effort_for_request(
     provider: ThirdPartyProvider,
     model: &str,
     reasoning_override: Option<&str>,
@@ -851,23 +851,10 @@ fn build_request_details(
     session_id: &str,
     reasoning_override: Option<&str>,
 ) -> Result<ResponsesRequestDetails> {
-    let selected_record = if model_config.provider == ThirdPartyProvider::OpenAICodex {
-        selected_codex_model_record()
-    } else {
-        None
-    };
+    let codex_record = codex_model_record_for_request(model_config)?;
     let codex_account_id = if model_config.provider == ThirdPartyProvider::OpenAICodex {
         let account_id = crate::llm::runtime_models::current_codex_account_id()
             .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
-        if model_config.id == OPENAI_CODEX_SELECTED_MODEL_ID {
-            let record = selected_record
-                .as_ref()
-                .filter(|record| record.slug == model_config.model)
-                .ok_or_else(|| anyhow!("The selected Codex model or account changed"))?;
-            if record.account_id.as_deref().map(str::trim) != Some(account_id.as_str()) {
-                return Err(anyhow!("The selected Codex model or account changed"));
-            }
-        }
         Some(account_id)
     } else {
         None
@@ -915,7 +902,7 @@ fn build_request_details(
         session_id,
         reasoning_override,
         streaming_sse,
-        selected_record.as_ref(),
+        codex_record.as_ref(),
     );
     add_codex_responses_lite_header(&mut headers, use_responses_lite);
 
@@ -1810,9 +1797,11 @@ pub async fn call_responses_provider(
     codex_prompt_style: crate::llm::CodexPromptStyle,
 ) -> Result<String> {
     crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
-    let native_codex_web_search_tool = supports_tools
-        .then(|| build_native_codex_web_search_tool(model_config))
-        .flatten();
+    let native_codex_web_search_tool = if supports_tools {
+        build_native_codex_web_search_tool(model_config)?
+    } else {
+        None
+    };
     let custom_tools_enabled =
         supports_tools && native_codex_web_search_tool.is_none() && web_search::is_search_enabled();
     let model_label = debug_model_label(model_config);
@@ -1888,10 +1877,11 @@ pub async fn call_responses_provider_with_tool_runtime(
     );
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
-    let native_codex_web_search_tool = runtime
-        .allows_native_web_search()
-        .then(|| build_native_codex_web_search_tool(model_config))
-        .flatten();
+    let native_codex_web_search_tool = if runtime.allows_native_web_search() {
+        build_native_codex_web_search_tool(model_config)?
+    } else {
+        None
+    };
     let model_label = debug_model_label(model_config);
     debug!(
         "Responses provider runtime selected: provider={}, model={}, response_title={}, native_codex_web_search={}, image_count={}",
@@ -2039,6 +2029,40 @@ mod tests {
             assert_eq!(actual_use_lite, use_lite);
             assert_eq!(payload["reasoning"]["effort"], "low");
         }
+    }
+
+    #[test]
+    fn explicit_codex_metadata_controls_responses_lite() {
+        let selected_luna_config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-luna");
+        let selected_luna_record = codex_record("gpt-5.6-luna", &[], None, false);
+        let mut explicit_terra_config =
+            model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-terra");
+        explicit_terra_config.id = "openai-codex:gpt-5.6-terra".to_string();
+        let explicit_terra_record = codex_record("gpt-5.6-terra", &[], None, true);
+
+        let (_, selected_actual_use_lite) = build_responses_payload(
+            &selected_luna_config,
+            "",
+            vec![],
+            None,
+            "session-selected",
+            None,
+            true,
+            Some(&selected_luna_record),
+        );
+        let (_, explicit_actual_use_lite) = build_responses_payload(
+            &explicit_terra_config,
+            "",
+            vec![],
+            None,
+            "session-explicit",
+            None,
+            true,
+            Some(&explicit_terra_record),
+        );
+
+        assert!(!selected_actual_use_lite);
+        assert!(explicit_actual_use_lite);
     }
 
     #[test]

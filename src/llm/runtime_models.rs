@@ -346,13 +346,48 @@ pub fn selected_codex_model_record() -> Option<CodexSelectedModelRecord> {
     selected_model_matches_account(&record, current_codex_account_id().as_deref()).then_some(record)
 }
 
-#[allow(dead_code)] // The Quick request path invokes this in Task 2.
+fn codex_model_record_for_request_with_state(
+    state: &RuntimeModelsState,
+    model_config: &ThirdPartyModelConfig,
+    current_account_id: Option<&str>,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex {
+        return Ok(None);
+    }
+
+    if model_config.id == OPENAI_CODEX_SELECTED_MODEL_ID {
+        return validate_selected_codex_model_for_request(
+            model_config,
+            state.codex_selected_model.as_ref(),
+            current_account_id,
+        );
+    }
+
+    explicit_codex_model_record_from_state(state, model_config, current_account_id)
+}
+
+#[allow(dead_code)] // The full request selector delegates explicit IDs here.
 pub(crate) fn explicit_codex_model_record_for_request(
     model_config: &ThirdPartyModelConfig,
 ) -> Result<Option<CodexSelectedModelRecord>> {
     let current_account_id = current_codex_account_id();
     let state = RUNTIME_MODELS.read();
     explicit_codex_model_record_from_state(&state, model_config, current_account_id.as_deref())
+}
+
+pub fn codex_model_record_for_request(
+    model_config: &ThirdPartyModelConfig,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex {
+        return Ok(None);
+    }
+    if model_config.id != OPENAI_CODEX_SELECTED_MODEL_ID {
+        return explicit_codex_model_record_for_request(model_config);
+    }
+
+    let current_account_id = current_codex_account_id();
+    let state = RUNTIME_MODELS.read();
+    codex_model_record_for_request_with_state(&state, model_config, current_account_id.as_deref())
 }
 
 fn build_codex_selected_model_record(
@@ -883,6 +918,50 @@ mod tests {
         config.model = "gpt-5.6-luna".to_string();
 
         assert!(explicit_codex_model_record_from_state(&state, &config, Some("acct-1")).is_err());
+    }
+
+    #[test]
+    fn codex_model_record_for_request_with_state_uses_metadata_for_the_exact_configured_model(
+    ) -> Result<()> {
+        let mut selected_record = selected_model_record_for_test();
+        selected_record.slug = "gpt-5.6-luna".to_string();
+        selected_record.use_responses_lite = false;
+        let selected_config = dynamic_codex_model_config(&selected_record);
+        let (terra_config, terra_record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("explicit Terra entry should map");
+        let state = RuntimeModelsState {
+            models: vec![selected_config.clone()],
+            models_by_id: HashMap::from([
+                (selected_config.id.clone(), selected_config.clone()),
+                (terra_config.id.clone(), terra_config.clone()),
+            ]),
+            codex_selected_model: Some(selected_record),
+            explicit_codex_records_by_id: HashMap::from([(terra_config.id.clone(), terra_record)]),
+        };
+
+        assert_eq!(
+            codex_model_record_for_request_with_state(&state, &selected_config, Some("acct-1"))?
+                .unwrap()
+                .slug,
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            codex_model_record_for_request_with_state(&state, &terra_config, Some("acct-1"))?
+                .unwrap()
+                .slug,
+            "gpt-5.6-terra"
+        );
+        assert!(
+            codex_model_record_for_request_with_state(&state, &terra_config, Some("acct-2"))
+                .is_err()
+        );
+
+        Ok(())
     }
 
     #[test]
