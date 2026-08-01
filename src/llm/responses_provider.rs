@@ -780,6 +780,21 @@ pub(crate) fn reasoning_effort_for_request(
 
     let matching_record = selected_record.filter(|record| record.slug == model);
     let recorded_level = matching_record.and_then(|record| record.selected_reasoning_level.clone());
+    let override_fallback = matching_record.and_then(|record| {
+        record
+            .selected_reasoning_level
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                record
+                    .default_reasoning_level
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .map(str::to_ascii_lowercase)
+    });
 
     let Some(requested) = reasoning_override
         .map(str::trim)
@@ -799,7 +814,7 @@ pub(crate) fn reasoning_effort_for_request(
                 "Reasoning override '{}' is not supported by Codex model '{}'; keeping the selected level",
                 requested, record.slug
             );
-            return recorded_level;
+            return override_fallback;
         }
     }
 
@@ -2779,6 +2794,22 @@ mod tests {
                 Some(&record)
             ),
             Some("xhigh".to_string())
+        );
+    }
+
+    #[test]
+    fn unsupported_reasoning_override_falls_back_to_catalog_default_when_selection_is_empty() {
+        let mut record = codex_record("gpt-5.5", &["medium"], None, false);
+        record.default_reasoning_level = Some("medium".to_string());
+
+        assert_eq!(
+            reasoning_effort_for_request(
+                ThirdPartyProvider::OpenAICodex,
+                "gpt-5.5",
+                Some("low"),
+                Some(&record)
+            ),
+            Some("medium".to_string())
         );
     }
 
