@@ -29,9 +29,11 @@ use crate::llm::audit::{
     audit_context_from_id, create_audit_context_from_message, LlmAuditContext,
     LLM_TRIGGER_KIND_AUTO_Q, LLM_TRIGGER_KIND_COMMAND,
 };
+use crate::llm::responses_provider::reasoning_effort_for_request;
 use crate::llm::runtime_models::{
-    codex_selected_model_label, is_runtime_provider_ready, resolve_runtime_model_identifier,
-    runtime_model_config, runtime_model_count, runtime_models, selected_codex_model_record,
+    codex_model_record_for_request, codex_selected_model_label, ensure_explicit_codex_model,
+    is_runtime_provider_ready, resolve_runtime_model_identifier, runtime_model_config,
+    runtime_model_count, runtime_models, selected_codex_model_record, CodexSelectedModelRecord,
     OPENAI_CODEX_SELECTED_MODEL_ID,
 };
 use crate::llm::tool_runtime::ToolRuntime;
@@ -316,12 +318,34 @@ fn configured_model_display_name(model_name: &str) -> String {
     }
 }
 
-fn result_model_display_name(model_name: &str, gemini_model_used: Option<&str>) -> String {
+fn codex_quick_result_label(
+    config: &ThirdPartyModelConfig,
+    record: Option<&CodexSelectedModelRecord>,
+    requested_effort: Option<&str>,
+) -> String {
+    reasoning_effort_for_request(config.provider, &config.model, requested_effort, record)
+        .map(|effort| format!("{} {effort}", config.model))
+        .unwrap_or_else(|| config.model.clone())
+}
+
+fn result_model_display_name(
+    model_name: &str,
+    gemini_model_used: Option<&str>,
+    mode: QaCommandMode,
+) -> String {
     if model_name == MODEL_GEMINI {
         gemini_model_used
             .unwrap_or(CONFIG.gemini_model.as_str())
             .to_string()
     } else if let Some(config) = runtime_model_config(model_name) {
+        if mode == QaCommandMode::Quick && config.provider == ThirdPartyProvider::OpenAICodex {
+            let record = codex_model_record_for_request(&config).ok().flatten();
+            return codex_quick_result_label(
+                &config,
+                record.as_ref(),
+                Some(&CONFIG.quick_reasoning_effort),
+            );
+        }
         if config.provider == ThirdPartyProvider::OpenAICodex {
             if let Some(record) = selected_codex_model_record() {
                 if record.slug == config.model {
@@ -858,6 +882,17 @@ fn resolve_quick_text_model_with_models(
     }
 }
 
+fn add_explicit_quick_model(
+    models: &mut Vec<ThirdPartyModelConfig>,
+    explicit: Option<ThirdPartyModelConfig>,
+) {
+    if let Some(config) = explicit {
+        if !models.iter().any(|model| model.id == config.id) {
+            models.push(config);
+        }
+    }
+}
+
 fn should_use_default_model_without_selection(
     mode: QaCommandMode,
     request: ModelRequestCapabilities,
@@ -875,13 +910,31 @@ fn should_use_default_model_without_selection(
         || (!request.has_video && runtime_model_count == 0)
 }
 
-fn resolve_quick_text_model_for_request(
+async fn resolve_quick_text_model_for_request(
     has_images: bool,
     has_video: bool,
     has_audio: bool,
     has_documents: bool,
 ) -> Result<String> {
-    let models = runtime_models();
+    let configured_model_id = CONFIG.default_quick_text_model.trim();
+    let explicit = match parse_third_party_model_id(configured_model_id) {
+        Some((ThirdPartyProvider::OpenAICodex, slug)) if !slug.eq_ignore_ascii_case("selected") => {
+            match ensure_explicit_codex_model(configured_model_id).await {
+                Ok(config) => Some(config),
+                Err(err) => {
+                    warn!(
+                        configured_model_id,
+                        error_chain = %format!("{err:#}"),
+                        "Failed to resolve explicit Codex quick model; falling back once"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let mut models = runtime_models();
+    add_explicit_quick_model(&mut models, explicit);
     let ready_providers = ready_runtime_providers(&models);
     resolve_quick_text_model_with_models(
         &CONFIG.default_quick_text_model,
@@ -1485,7 +1538,7 @@ async fn run_chat_search_model(
         .await?;
         ChatSearchModelResponse {
             text: response,
-            model_used: result_model_display_name(model_name, None),
+            model_used: result_model_display_name(model_name, None, QaCommandMode::ChatSearch),
         }
     };
 
@@ -1929,7 +1982,8 @@ async fn process_request(
     let mut response_text =
         append_quick_search_footer(response, request.mode, quick_search_attempted);
     if !model_name.is_empty() {
-        let display_model = result_model_display_name(model_name, gemini_model_used.as_deref());
+        let display_model =
+            result_model_display_name(model_name, gemini_model_used.as_deref(), request.mode);
         response_text.push_str(&format!("\n\nModel: {}", display_model));
     }
 
@@ -2456,6 +2510,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_quick_result_label_uses_explicit_model_requested_reasoning() {
+        let terra_config = model(
+            ThirdPartyProvider::OpenAICodex,
+            "GPT-5.6-Terra",
+            "gpt-5.6-terra",
+        );
+        let terra_record = crate::llm::runtime_models::CodexSelectedModelRecord {
+            metadata_version: crate::llm::runtime_models::CODEX_SELECTED_MODEL_METADATA_VERSION,
+            account_id: Some("acct-1".to_string()),
+            slug: "gpt-5.6-terra".to_string(),
+            display_name: "GPT-5.6-Terra".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: Some("etag-1".to_string()),
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![
+                crate::llm::openai_codex::CodexReasoningEffortOption {
+                    effort: "low".to_string(),
+                    description: "Low effort".to_string(),
+                },
+            ],
+            selected_reasoning_level: Some("medium".to_string()),
+            web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
+            supports_search_tool: true,
+            use_responses_lite: false,
+            fetched_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(
+            codex_quick_result_label(&terra_config, Some(&terra_record), Some("low")),
+            "gpt-5.6-terra low"
+        );
+    }
+
+    #[test]
     fn media_only_prompt_prefers_image_analysis() {
         let summary = MediaSummary {
             total: 1,
@@ -2550,6 +2640,45 @@ mod tests {
         );
 
         assert_eq!(result.as_deref(), Ok("openai:gpt-default"));
+    }
+
+    #[test]
+    fn explicit_codex_quick_model_does_not_fall_back_to_selected_default() {
+        let terra = model(
+            ThirdPartyProvider::OpenAICodex,
+            "GPT-5.6-Terra",
+            "gpt-5.6-terra",
+        );
+        let luna = model(ThirdPartyProvider::OpenAICodex, "GPT-5.6-Luna", "selected");
+        let mut models = vec![luna];
+        add_explicit_quick_model(&mut models, Some(terra));
+        let result = resolve_quick_text_model_with_models(
+            "openai-codex:gpt-5.6-terra",
+            "openai-codex:selected",
+            &models,
+            &[ThirdPartyProvider::OpenAICodex],
+            false,
+            ModelRequestCapabilities::default(),
+        );
+
+        assert_eq!(result.as_deref(), Ok("openai-codex:gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn missing_explicit_codex_quick_model_falls_back_once_to_selected_default() {
+        let luna = model(ThirdPartyProvider::OpenAICodex, "GPT-5.6-Luna", "selected");
+        let mut models = vec![luna];
+        add_explicit_quick_model(&mut models, None);
+        let result = resolve_quick_text_model_with_models(
+            "openai-codex:gpt-5.6-terra",
+            "openai-codex:selected",
+            &models,
+            &[ThirdPartyProvider::OpenAICodex],
+            false,
+            ModelRequestCapabilities::default(),
+        );
+
+        assert_eq!(result.as_deref(), Ok("openai-codex:selected"));
     }
 
     #[test]
@@ -3222,6 +3351,7 @@ async fn q_handler_internal(
     let direct_model = if must_use_default_model {
         let resolved = if mode == QaCommandMode::Quick {
             resolve_quick_text_model_for_request(has_images, has_video, has_audio, has_documents)
+                .await
                 .map(|model| (model, "default_quick_text_model"))
         } else {
             resolve_default_text_model_for_request(
