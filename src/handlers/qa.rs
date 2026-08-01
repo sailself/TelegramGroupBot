@@ -1184,6 +1184,24 @@ fn extract_youtube_urls_for_available_models(
     }
 }
 
+fn prepare_youtube_inputs_for_qa(
+    query_base: &str,
+    mode: QaCommandMode,
+    selected_model: Option<&str>,
+    gemini_available: bool,
+) -> (String, Vec<String>) {
+    let use_gemini_youtube_inputs = match mode {
+        QaCommandMode::Quick => {
+            gemini_available && selected_model.is_some_and(|model| model == MODEL_GEMINI)
+        }
+        QaCommandMode::Standard | QaCommandMode::ChatContext | QaCommandMode::ChatSearch => {
+            gemini_available
+        }
+    };
+
+    extract_youtube_urls_for_available_models(query_base, use_gemini_youtube_inputs)
+}
+
 fn video_request_has_capable_model(
     gemini_available: bool,
     third_party_video_model_available: bool,
@@ -2927,6 +2945,30 @@ mod tests {
     }
 
     #[test]
+    fn quick_third_party_youtube_query_preserves_original_url_when_gemini_is_available() {
+        let query = "watch this https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+        let (text, urls) = prepare_youtube_inputs_for_qa(
+            query,
+            QaCommandMode::Quick,
+            Some("openrouter:quick-model"),
+            true,
+        );
+
+        assert_eq!(text, query);
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn quick_gemini_youtube_query_keeps_existing_media_extraction() {
+        let query = "watch this https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+        let (text, urls) =
+            prepare_youtube_inputs_for_qa(query, QaCommandMode::Quick, Some(MODEL_GEMINI), true);
+
+        assert!(!text.contains("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert_eq!(urls, vec!["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]);
+    }
+
+    #[test]
     fn chat_search_mode_requires_custom_tools() {
         assert!(QaCommandMode::ChatSearch.requires_custom_tools());
         assert_eq!(qa_mode_label(QaCommandMode::ChatSearch), "chat_search");
@@ -3079,8 +3121,8 @@ async fn q_handler_internal(
         )
     };
 
-    let (query_text, youtube_urls) =
-        extract_youtube_urls_for_available_models(&query_base, CONFIG.gemini_api_available());
+    let (mut query_text, mut youtube_urls) =
+        prepare_youtube_inputs_for_qa(&query_base, mode, None, CONFIG.gemini_api_available());
 
     let user_language_code = message
         .from
@@ -3225,6 +3267,14 @@ async fn q_handler_internal(
     };
 
     if let Some((selected_model, timer_detail)) = direct_model {
+        if mode == QaCommandMode::Quick {
+            (query_text, youtube_urls) = prepare_youtube_inputs_for_qa(
+                &query_base,
+                mode,
+                Some(&selected_model),
+                CONFIG.gemini_api_available(),
+            );
+        }
         let display_name = configured_model_display_name(&selected_model);
         let processing_message_text = if has_video {
             format!(
