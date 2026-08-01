@@ -19,8 +19,8 @@ const MAX_CONTEXT_WINDOW: usize = 5;
 const MAX_WEB_RESULTS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)] // All three variants are "Chat*" by design
 pub enum ToolProfile {
+    QuickQuestion,
     ChatQuestion,
     ChatSearch,
     ChatAnalytics,
@@ -121,6 +121,28 @@ struct ToolSearchHit {
 }
 
 impl ToolRuntime {
+    pub fn for_quick(db: Database, chat_id: i64) -> Self {
+        Self {
+            db,
+            chat_id,
+            profile: ToolProfile::QuickQuestion,
+            budget: ToolBudgetConfig {
+                max_total_successful_calls: 1,
+                max_web_search_calls: 1,
+                max_chat_context_query_calls: 0,
+                max_chat_analytics_query_calls: 0,
+            },
+            successful_calls: 0,
+            web_search_calls: 0,
+            chat_context_query_calls: 0,
+            chat_analytics_query_calls: 0,
+            force_final_answer: false,
+            accumulated_hits: BTreeMap::new(),
+            returned_message_ids: BTreeSet::new(),
+            analytics_results: Vec::new(),
+        }
+    }
+
     pub fn for_qc(db: Database, chat_id: i64) -> Self {
         Self {
             db,
@@ -200,11 +222,29 @@ impl ToolRuntime {
     }
 
     pub fn allows_web_search(&self) -> bool {
+        matches!(
+            self.profile,
+            ToolProfile::QuickQuestion | ToolProfile::ChatQuestion
+        )
+    }
+
+    pub fn allows_native_web_search(&self) -> bool {
         self.profile == ToolProfile::ChatQuestion
+    }
+
+    pub fn web_search_attempted(&self) -> bool {
+        self.web_search_calls > 0
+    }
+
+    fn allows_chat_context_query(&self) -> bool {
+        self.profile != ToolProfile::QuickQuestion
     }
 
     pub fn tool_limit_guidance(&self) -> String {
         match self.profile {
+            ToolProfile::QuickQuestion => {
+                "Tool budget for quick mode: use web_search at most once. After that one call succeeds or fails, answer immediately without any more tools and recommend /q if deeper verification is needed.".to_string()
+            }
             ToolProfile::ChatQuestion => {
                 "Tool budgets for this request: use web_search at most 3 times and chat_context_query at most 5 times. Once a budget is exhausted, answer with the evidence you already have.".to_string()
             }
@@ -259,55 +299,57 @@ impl ToolRuntime {
             }));
         }
 
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "chat_context_query",
-                "description": "Retrieve messages from the current Telegram chat only. This tool never accesses other chats.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "operation": {
-                            "type": "string",
-                            "enum": ["search", "window"]
+        if self.allows_chat_context_query() {
+            tools.push(json!({
+                "type": "function",
+                "function": {
+                    "name": "chat_context_query",
+                    "description": "Retrieve messages from the current Telegram chat only. This tool never accesses other chats.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "operation": {
+                                "type": "string",
+                                "enum": ["search", "window"]
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "Plain text search intent for keyword/FTS search. Never send SQL or raw FTS syntax."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": MAX_SEARCH_LIMIT,
+                                "description": "Maximum number of hits to return."
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": MAX_SEARCH_OFFSET,
+                                "description": "Offset for additional pages of search hits."
+                            },
+                            "context_before": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": MAX_CONTEXT_WINDOW,
+                                "description": "Number of earlier messages to include around each hit."
+                            },
+                            "context_after": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": MAX_CONTEXT_WINDOW,
+                                "description": "Number of later messages to include around each hit."
+                            },
+                            "message_id": {
+                                "type": "integer",
+                                "description": "Target message ID for the window operation."
+                            }
                         },
-                        "query": {
-                            "type": "string",
-                            "description": "Plain text search intent for keyword/FTS search. Never send SQL or raw FTS syntax."
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": MAX_SEARCH_LIMIT,
-                            "description": "Maximum number of hits to return."
-                        },
-                        "offset": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": MAX_SEARCH_OFFSET,
-                            "description": "Offset for additional pages of search hits."
-                        },
-                        "context_before": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": MAX_CONTEXT_WINDOW,
-                            "description": "Number of earlier messages to include around each hit."
-                        },
-                        "context_after": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": MAX_CONTEXT_WINDOW,
-                            "description": "Number of later messages to include around each hit."
-                        },
-                        "message_id": {
-                            "type": "integer",
-                            "description": "Target message ID for the window operation."
-                        }
-                    },
-                    "required": ["operation"]
+                        "required": ["operation"]
+                    }
                 }
-            }
-        }));
+            }));
+        }
 
         tools
     }
@@ -343,46 +385,52 @@ impl ToolRuntime {
             }));
         }
 
-        declarations.push(json!({
-            "name": "chat_context_query",
-            "description": "Retrieve messages from the current Telegram chat only. This tool never accesses other chats.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": ["search", "window"]
+        if self.allows_chat_context_query() {
+            declarations.push(json!({
+                "name": "chat_context_query",
+                "description": "Retrieve messages from the current Telegram chat only. This tool never accesses other chats.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": ["search", "window"]
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Plain text search intent for keyword/FTS search. Never send SQL or raw FTS syntax."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of hits to return."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Offset for additional pages of search hits."
+                        },
+                        "context_before": {
+                            "type": "integer",
+                            "description": "Number of earlier messages to include around each hit."
+                        },
+                        "context_after": {
+                            "type": "integer",
+                            "description": "Number of later messages to include around each hit."
+                        },
+                        "message_id": {
+                            "type": "integer",
+                            "description": "Target message ID for the window operation."
+                        }
                     },
-                    "query": {
-                        "type": "string",
-                        "description": "Plain text search intent for keyword/FTS search. Never send SQL or raw FTS syntax."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of hits to return."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Offset for additional pages of search hits."
-                    },
-                    "context_before": {
-                        "type": "integer",
-                        "description": "Number of earlier messages to include around each hit."
-                    },
-                    "context_after": {
-                        "type": "integer",
-                        "description": "Number of later messages to include around each hit."
-                    },
-                    "message_id": {
-                        "type": "integer",
-                        "description": "Target message ID for the window operation."
-                    }
-                },
-                "required": ["operation"]
-            }
-        }));
+                    "required": ["operation"]
+                }
+            }));
+        }
 
-        vec![json!({ "functionDeclarations": declarations })]
+        if declarations.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({ "functionDeclarations": declarations })]
+        }
     }
 
     /// Message IDs that `chat_context_query` actually returned during this run.
@@ -480,7 +528,10 @@ impl ToolRuntime {
 
         match tool {
             ToolName::WebSearch => {
-                if self.profile != ToolProfile::ChatQuestion || !web_search::is_search_enabled() {
+                if !self.allows_web_search()
+                    || (self.profile != ToolProfile::QuickQuestion
+                        && !web_search::is_search_enabled())
+                {
                     self.force_final_answer = true;
                     return Err(ToolBudgetError {
                         kind: ToolBudgetErrorKind::Disabled,
@@ -495,6 +546,12 @@ impl ToolRuntime {
                 self.web_search_calls += 1;
             }
             ToolName::ChatContextQuery => {
+                if !self.allows_chat_context_query() {
+                    self.force_final_answer = true;
+                    return Err(ToolBudgetError {
+                        kind: ToolBudgetErrorKind::Disabled,
+                    });
+                }
                 if self.chat_context_query_calls >= self.budget.max_chat_context_query_calls {
                     self.force_final_answer = true;
                     return Err(ToolBudgetError {
@@ -504,6 +561,12 @@ impl ToolRuntime {
                 self.chat_context_query_calls += 1;
             }
             ToolName::ChatAnalytics => {
+                if self.profile != ToolProfile::ChatAnalytics {
+                    self.force_final_answer = true;
+                    return Err(ToolBudgetError {
+                        kind: ToolBudgetErrorKind::Disabled,
+                    });
+                }
                 if self.chat_analytics_query_calls >= self.budget.max_chat_analytics_query_calls {
                     self.force_final_answer = true;
                     return Err(ToolBudgetError {
@@ -616,6 +679,7 @@ impl ToolRuntime {
                 }
 
                 let default_limit = match self.profile {
+                    ToolProfile::QuickQuestion => DEFAULT_QC_SEARCH_LIMIT,
                     ToolProfile::ChatQuestion => DEFAULT_QC_SEARCH_LIMIT,
                     ToolProfile::ChatSearch => DEFAULT_S_SEARCH_LIMIT,
                     ToolProfile::ChatAnalytics => 3, // Decision 1: only a representative quote
@@ -1066,6 +1130,82 @@ mod tests {
         }
         assert!(runtime.begin_tool_call(ToolName::ChatContextQuery).is_err());
         assert!(runtime.force_final_answer());
+    }
+
+    #[test]
+    fn quick_profile_exposes_only_one_optional_web_search_round() {
+        let runtime = Runtime::new().expect("tokio runtime should initialize");
+        let db = runtime.block_on(init_test_db("quick-profile"));
+        let runtime = ToolRuntime::for_quick(db.clone(), -1001374348669);
+
+        assert_eq!(runtime.profile, ToolProfile::QuickQuestion);
+        assert_eq!(runtime.budget.max_total_successful_calls, 1);
+        assert_eq!(runtime.budget.max_web_search_calls, 1);
+        assert_eq!(runtime.budget.max_chat_context_query_calls, 0);
+        assert_eq!(runtime.budget.max_chat_analytics_query_calls, 0);
+        assert!(runtime.allows_web_search());
+        assert!(!runtime.allows_native_web_search());
+        assert!(ToolRuntime::for_qc(db, -1001374348669).allows_native_web_search());
+
+        let openai_tools = runtime.build_openai_function_tools();
+        let names = openai_tools
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"chat_context_query"));
+        assert!(!names.contains(&"chat_analytics"));
+
+        let gemini_tools = runtime.build_gemini_tools();
+        let gemini_names = gemini_tools
+            .iter()
+            .flat_map(|tool| {
+                tool.get("functionDeclarations")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(!gemini_names.contains(&"chat_context_query"));
+        assert!(!gemini_names.contains(&"chat_analytics"));
+    }
+
+    #[test]
+    fn quick_failed_or_parallel_extra_searches_exhaust_the_single_round() {
+        let tokio_runtime = Runtime::new().expect("tokio runtime should initialize");
+        let db = tokio_runtime.block_on(init_test_db("quick-budget"));
+        let mut tool_runtime = ToolRuntime::for_quick(db, -1001374348669);
+
+        let failed =
+            tokio_runtime.block_on(tool_runtime.execute_tool("web_search", &json!({"query": ""})));
+        let failed: Value =
+            serde_json::from_str(&failed).expect("failed tool response should be JSON");
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["error_code"], "invalid_arguments");
+        assert!(tool_runtime.web_search_attempted());
+
+        let extra = tokio_runtime.block_on(
+            tool_runtime.execute_tool("web_search", &json!({"query": "parallel extra search"})),
+        );
+        let extra: Value = serde_json::from_str(&extra).expect("budget response should be JSON");
+        assert_eq!(extra["ok"], false);
+        assert_eq!(extra["error_code"], "total_budget_exhausted");
+        assert!(tool_runtime.force_final_answer());
+    }
+
+    #[test]
+    fn quick_profile_rejects_chat_tools_even_when_called_directly() {
+        let tokio_runtime = Runtime::new().expect("tokio runtime should initialize");
+        let db = tokio_runtime.block_on(init_test_db("quick-chat-tools"));
+        let mut tool_runtime = ToolRuntime::for_quick(db, -1001374348669);
+
+        let result = tokio_runtime.block_on(tool_runtime.execute_tool(
+            "chat_context_query",
+            &json!({"operation": "search", "query": "secret history"}),
+        ));
+        let result: Value = serde_json::from_str(&result).expect("tool response should be JSON");
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error_code"], "tool_disabled");
     }
 
     /// Insert a message with an explicit user_id and username so analytics

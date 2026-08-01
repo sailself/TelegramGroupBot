@@ -3862,6 +3862,7 @@ TelegramGroupHelperBot 指令说明
 
 /qq - Quick Question（快问快答）
 用法：`/qq [你的问题]`
+跳过模型选择并优先简短回答；只在确有时效性需要时联网搜索一次。需要深入核实时请使用 `/q`。
 
 /burn_baby_burn - 查看你在当前聊天里烧掉了多少 tokens
 用法：`/burn_baby_burn`

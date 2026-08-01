@@ -16,6 +16,7 @@ use crate::utils::timing::CommandTimer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QaCommandMode {
     Standard,
+    Quick,
     ChatContext,
     ChatSearch,
 }

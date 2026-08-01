@@ -11,7 +11,8 @@ use teloxide::types::{
 use teloxide::RequestError;
 
 use crate::config::{
-    parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG, Q_SYSTEM_PROMPT,
+    parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
+    QUICK_Q_SYSTEM_PROMPT, Q_SYSTEM_PROMPT,
 };
 use crate::db::database::build_message_insert;
 use crate::handlers::access::{check_access_control, is_rate_limited};
@@ -51,6 +52,8 @@ const TELEGRAM_CALLBACK_DATA_LIMIT: usize = 64;
 const SEND_MESSAGE_RETRY_ATTEMPTS: usize = 3;
 const USER_ERROR_DETAIL_LIMIT: usize = 400;
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
+const QUICK_SEARCH_FOOTER: &str =
+    "_Quick mode used its one web-search round. Use /q for deeper verification or research._";
 const NO_VIDEO_CAPABLE_MODEL_MESSAGE: &str =
     "No video-capable AI model is available. Enable Gemini or configure a ready third-party model with video=true.";
 const CHAT_SEARCH_JSON_OUTPUT_PROMPT: &str = "Final response format: return only valid JSON with this shape: {\"selected_message_ids\":[123],\"note\":\"optional short note\"}. Do not wrap the JSON in Markdown. Do not include message IDs that were not returned by chat_context_query.";
@@ -335,6 +338,7 @@ fn result_model_display_name(model_name: &str, gemini_model_used: Option<&str>) 
 fn qa_mode_label(mode: QaCommandMode) -> &'static str {
     match mode {
         QaCommandMode::Standard => "standard",
+        QaCommandMode::Quick => "quick",
         QaCommandMode::ChatContext => "chat_context",
         QaCommandMode::ChatSearch => "chat_search",
     }
@@ -343,6 +347,7 @@ fn qa_mode_label(mode: QaCommandMode) -> &'static str {
 fn qa_mode_command_name(mode: QaCommandMode) -> &'static str {
     match mode {
         QaCommandMode::Standard => "q",
+        QaCommandMode::Quick => "qq",
         QaCommandMode::ChatContext => "qc",
         QaCommandMode::ChatSearch => "s",
     }
@@ -814,8 +819,47 @@ fn resolve_default_text_model_with_models(
     Ok(normalized)
 }
 
+fn resolve_quick_text_model_with_models(
+    quick_model: &str,
+    default_model: &str,
+    models: &[ThirdPartyModelConfig],
+    ready_providers: &[ThirdPartyProvider],
+    gemini_available: bool,
+    request: ModelRequestCapabilities,
+) -> std::result::Result<String, String> {
+    match resolve_default_text_model_with_models(
+        quick_model,
+        models,
+        ready_providers,
+        gemini_available,
+        request,
+    ) {
+        Ok(model) => Ok(model),
+        Err(quick_error) => {
+            if quick_model
+                .trim()
+                .eq_ignore_ascii_case(default_model.trim())
+            {
+                return Err(quick_error);
+            }
+            resolve_default_text_model_with_models(
+                default_model,
+                models,
+                ready_providers,
+                gemini_available,
+                request,
+            )
+            .map_err(|default_error| {
+                format!(
+                    "Quick text model fallback failed. Quick model: {quick_error} Default fallback: {default_error}"
+                )
+            })
+        }
+    }
+}
+
 fn should_use_default_model_without_selection(
-    force_default_gemini: bool,
+    mode: QaCommandMode,
     request: ModelRequestCapabilities,
     has_youtube_urls: bool,
     gemini_available: bool,
@@ -823,12 +867,37 @@ fn should_use_default_model_without_selection(
     runtime_model_count: usize,
     query_message_is_from_bot: bool,
 ) -> bool {
-    force_default_gemini
+    mode == QaCommandMode::Quick
         || query_message_is_from_bot
         || request.has_documents
         || (has_youtube_urls && gemini_available)
         || (!request.has_video && !third_party_models_available_for_request)
         || (!request.has_video && runtime_model_count == 0)
+}
+
+fn resolve_quick_text_model_for_request(
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+) -> Result<String> {
+    let models = runtime_models();
+    let ready_providers = ready_runtime_providers(&models);
+    resolve_quick_text_model_with_models(
+        &CONFIG.default_quick_text_model,
+        &CONFIG.default_text_model,
+        &models,
+        &ready_providers,
+        CONFIG.gemini_api_available(),
+        ModelRequestCapabilities {
+            has_images,
+            has_video,
+            has_audio,
+            has_documents,
+            require_tools: false,
+        },
+    )
+    .map_err(|message| anyhow!(message))
 }
 
 pub(crate) fn resolve_default_text_model_for_request(
@@ -1065,6 +1134,39 @@ fn build_prompt_from_template(template: &str, telegram_user_language_hint: Optio
 
 fn build_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
     build_prompt_from_template(Q_SYSTEM_PROMPT, telegram_user_language_hint)
+}
+
+fn build_quick_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
+    build_prompt_from_template(QUICK_Q_SYSTEM_PROMPT, telegram_user_language_hint)
+}
+
+fn reasoning_override_for_qa_mode(
+    mode: QaCommandMode,
+    provider: ThirdPartyProvider,
+    configured_effort: &str,
+) -> Option<&str> {
+    (mode == QaCommandMode::Quick && provider == ThirdPartyProvider::OpenAICodex)
+        .then(|| configured_effort.trim())
+        .filter(|effort| !effort.is_empty())
+}
+
+fn uses_quick_tool_runtime(mode: QaCommandMode, supports_tools: bool) -> bool {
+    mode == QaCommandMode::Quick && supports_tools
+}
+
+fn append_quick_search_footer(
+    mut response: String,
+    mode: QaCommandMode,
+    web_search_attempted: bool,
+) -> String {
+    if mode == QaCommandMode::Quick
+        && web_search_attempted
+        && !response.contains(QUICK_SEARCH_FOOTER)
+    {
+        response.push_str("\n\n");
+        response.push_str(QUICK_SEARCH_FOOTER);
+    }
+    response
 }
 
 fn build_chat_context_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
@@ -1507,6 +1609,9 @@ async fn process_request(
 
     let system_prompt = match request.mode {
         QaCommandMode::Standard => build_system_prompt(request.telegram_language_code.as_deref()),
+        QaCommandMode::Quick => {
+            build_quick_system_prompt(request.telegram_language_code.as_deref())
+        }
         QaCommandMode::ChatContext => {
             build_chat_context_system_prompt(request.telegram_language_code.as_deref())
         }
@@ -1562,6 +1667,7 @@ async fn process_request(
         start_chat_action_heartbeat(bot.clone(), ChatId(request.chat_id), ChatAction::Typing);
 
     let mut qc_valid_message_ids: Vec<i64> = Vec::new();
+    let mut quick_search_attempted = false;
     let response = match request.mode {
         QaCommandMode::ChatSearch => {
             return process_chat_search_request(
@@ -1604,6 +1710,77 @@ async fn process_request(
                         audit_context.as_ref(),
                         crate::llm::CodexPromptStyle::FreeformAnswer,
                     ),
+                )
+                .await
+                .map(|result| (result, None))
+            }
+        }
+        QaCommandMode::Quick => {
+            let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
+            if uses_quick_tool_runtime(request.mode, supports_tools) {
+                let mut runtime = ToolRuntime::for_quick(state.db.clone(), request.chat_id);
+                let result = if model_name == MODEL_GEMINI {
+                    call_gemini_with_tool_runtime(
+                        &system_prompt,
+                        &query,
+                        &mut runtime,
+                        use_pro,
+                        Some(request.media_files.clone()),
+                        Some(request.youtube_urls.clone()),
+                        Some("QUICK_Q_SYSTEM_PROMPT"),
+                        None,
+                        audit_context.as_ref(),
+                    )
+                    .await
+                    .map(|result| (result.text, Some(result.model_used)))
+                } else {
+                    let provider = runtime_model_config(model_name)
+                        .map(|config| config.provider)
+                        .unwrap_or(ThirdPartyProvider::OpenRouter);
+                    let reasoning_override = reasoning_override_for_qa_mode(
+                        request.mode,
+                        provider,
+                        &CONFIG.quick_reasoning_effort,
+                    );
+                    call_third_party_with_tool_runtime(
+                        &system_prompt,
+                        &query,
+                        model_name,
+                        "Quick Answer",
+                        &request.media_files,
+                        &mut runtime,
+                        crate::llm::ThirdPartyCallOptions::new(
+                            audit_context.as_ref(),
+                            crate::llm::CodexPromptStyle::FreeformAnswer,
+                        )
+                        .with_reasoning_override(reasoning_override),
+                    )
+                    .await
+                    .map(|result| (result, None))
+                };
+                quick_search_attempted = runtime.web_search_attempted();
+                result
+            } else {
+                let provider = runtime_model_config(model_name)
+                    .map(|config| config.provider)
+                    .unwrap_or(ThirdPartyProvider::OpenRouter);
+                let reasoning_override = reasoning_override_for_qa_mode(
+                    request.mode,
+                    provider,
+                    &CONFIG.quick_reasoning_effort,
+                );
+                call_third_party(
+                    &system_prompt,
+                    &query,
+                    model_name,
+                    "Quick Answer",
+                    &request.media_files,
+                    false,
+                    crate::llm::ThirdPartyCallOptions::new(
+                        audit_context.as_ref(),
+                        crate::llm::CodexPromptStyle::FreeformAnswer,
+                    )
+                    .with_reasoning_override(reasoning_override),
                 )
                 .await
                 .map(|result| (result, None))
@@ -1731,7 +1908,8 @@ async fn process_request(
         );
     }
 
-    let mut response_text = response;
+    let mut response_text =
+        append_quick_search_footer(response, request.mode, quick_search_attempted);
     if !model_name.is_empty() {
         let display_model = result_model_display_name(model_name, gemini_model_used.as_deref());
         response_text.push_str(&format!("\n\nModel: {}", display_model));
@@ -1783,6 +1961,22 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn quick_system_prompt_renders_bounded_answer_and_search_rules() {
+        let rendered = build_quick_system_prompt(Some("en"));
+
+        assert!(
+            !rendered.contains('{'),
+            "unresolved placeholder: {rendered}"
+        );
+        assert!(rendered.contains("minimum reasoning"));
+        assert!(rendered.contains("1–5 short sentences"));
+        assert!(rendered.contains("genuinely current or time-sensitive"));
+        assert!(rendered.contains("cite every factual claim supported by the search"));
+        assert!(rendered.contains("recommend /q"));
+        assert!(rendered.contains("unavailable, inconclusive, conflicting, or insufficient"));
     }
 
     #[test]
@@ -2322,9 +2516,132 @@ mod tests {
     }
 
     #[test]
+    fn quick_model_falls_back_once_to_capable_default_model() {
+        let models = vec![
+            model(ThirdPartyProvider::OpenRouter, "Quick", "quick/model"),
+            model(ThirdPartyProvider::OpenAI, "Default", "gpt-default"),
+        ];
+
+        let result = resolve_quick_text_model_with_models(
+            "openrouter:quick/model",
+            "openai:gpt-default",
+            &models,
+            &[ThirdPartyProvider::OpenAI],
+            false,
+            ModelRequestCapabilities::default(),
+        );
+
+        assert_eq!(result.as_deref(), Ok("openai:gpt-default"));
+    }
+
+    #[test]
+    fn quick_model_media_mismatch_falls_back_to_capable_default_model() {
+        let mut quick = model(ThirdPartyProvider::OpenRouter, "Quick", "quick/model");
+        quick.video = false;
+        let mut default = model(ThirdPartyProvider::OpenAI, "Default", "gpt-video");
+        default.video = true;
+
+        let result = resolve_quick_text_model_with_models(
+            "openrouter:quick/model",
+            "openai:gpt-video",
+            &[quick, default],
+            &[ThirdPartyProvider::OpenRouter, ThirdPartyProvider::OpenAI],
+            false,
+            ModelRequestCapabilities {
+                has_video: true,
+                ..ModelRequestCapabilities::default()
+            },
+        );
+
+        assert_eq!(result.as_deref(), Ok("openai:gpt-video"));
+    }
+
+    #[test]
+    fn quick_mode_always_skips_model_selection() {
+        for (request, gemini_available, third_party_available, runtime_count) in [
+            (ModelRequestCapabilities::default(), false, true, 3),
+            (
+                ModelRequestCapabilities {
+                    has_video: true,
+                    ..ModelRequestCapabilities::default()
+                },
+                true,
+                true,
+                4,
+            ),
+            (
+                ModelRequestCapabilities {
+                    has_video: true,
+                    ..ModelRequestCapabilities::default()
+                },
+                false,
+                true,
+                4,
+            ),
+        ] {
+            assert!(should_use_default_model_without_selection(
+                QaCommandMode::Quick,
+                request,
+                false,
+                gemini_available,
+                third_party_available,
+                runtime_count,
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn quick_reasoning_override_is_codex_only() {
+        assert_eq!(
+            reasoning_override_for_qa_mode(
+                QaCommandMode::Quick,
+                ThirdPartyProvider::OpenAICodex,
+                "low"
+            ),
+            Some("low")
+        );
+        assert_eq!(
+            reasoning_override_for_qa_mode(QaCommandMode::Quick, ThirdPartyProvider::OpenAI, "low"),
+            None
+        );
+        assert_eq!(
+            reasoning_override_for_qa_mode(
+                QaCommandMode::Standard,
+                ThirdPartyProvider::OpenAICodex,
+                "low"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn quick_tool_runtime_is_used_only_for_tool_capable_models() {
+        assert!(uses_quick_tool_runtime(QaCommandMode::Quick, true));
+        assert!(!uses_quick_tool_runtime(QaCommandMode::Quick, false));
+        assert!(!uses_quick_tool_runtime(QaCommandMode::Standard, true));
+    }
+
+    #[test]
+    fn quick_search_footer_is_conditional_and_deduplicated() {
+        let plain = append_quick_search_footer("Answer".to_string(), QaCommandMode::Quick, false);
+        assert_eq!(plain, "Answer");
+
+        let searched = append_quick_search_footer("Answer".to_string(), QaCommandMode::Quick, true);
+        assert_eq!(searched.matches(QUICK_SEARCH_FOOTER).count(), 1);
+
+        let repeated = append_quick_search_footer(searched, QaCommandMode::Quick, true);
+        assert_eq!(repeated.matches(QUICK_SEARCH_FOOTER).count(), 1);
+
+        let standard =
+            append_quick_search_footer("Answer".to_string(), QaCommandMode::Standard, true);
+        assert_eq!(standard, "Answer");
+    }
+
+    #[test]
     fn audio_request_with_audio_capable_third_party_model_uses_picker() {
         assert!(!should_use_default_model_without_selection(
-            false,
+            QaCommandMode::Standard,
             ModelRequestCapabilities {
                 has_audio: true,
                 ..ModelRequestCapabilities::default()
@@ -2340,7 +2657,7 @@ mod tests {
     #[test]
     fn bot_query_message_uses_default_model_without_selection() {
         assert!(should_use_default_model_without_selection(
-            false,
+            QaCommandMode::Standard,
             ModelRequestCapabilities::default(),
             false,
             true,
@@ -2633,7 +2950,6 @@ async fn q_handler_internal(
     state: AppState,
     message: Message,
     query: Option<String>,
-    force_gemini: bool,
     command_name: &str,
     mode: QaCommandMode,
 ) -> Result<()> {
@@ -2847,14 +3163,13 @@ async fn q_handler_internal(
         return Ok(());
     }
 
-    let force_default_gemini = force_gemini && CONFIG.gemini_api_available() && !has_video;
     let query_message_is_from_bot = message
         .from
         .as_ref()
         .map(|user| user.is_bot)
         .unwrap_or(false);
     let must_use_default_model = should_use_default_model_without_selection(
-        force_default_gemini,
+        mode,
         request_capabilities,
         !youtube_urls.is_empty(),
         CONFIG.gemini_api_available(),
@@ -2863,14 +3178,21 @@ async fn q_handler_internal(
         query_message_is_from_bot,
     );
     let direct_model = if must_use_default_model {
-        match resolve_default_text_model_for_request(
-            has_images,
-            has_video,
-            has_audio,
-            has_documents,
-            require_tools,
-        ) {
-            Ok(model) => Some((model, "default_text_model")),
+        let resolved = if mode == QaCommandMode::Quick {
+            resolve_quick_text_model_for_request(has_images, has_video, has_audio, has_documents)
+                .map(|model| (model, "default_quick_text_model"))
+        } else {
+            resolve_default_text_model_for_request(
+                has_images,
+                has_video,
+                has_audio,
+                has_documents,
+                require_tools,
+            )
+            .map(|model| (model, "default_text_model"))
+        };
+        match resolved {
+            Ok(model) => Some(model),
             Err(err) => {
                 send_message_with_retry(
                     &bot,
@@ -3078,7 +3400,6 @@ pub async fn q_handler(
     state: AppState,
     message: Message,
     query: Option<String>,
-    force_gemini: bool,
     command_name: &str,
 ) -> Result<()> {
     q_handler_internal(
@@ -3086,7 +3407,6 @@ pub async fn q_handler(
         state,
         message,
         query,
-        force_gemini,
         command_name,
         QaCommandMode::Standard,
     )
@@ -3099,16 +3419,7 @@ pub async fn qc_handler(
     message: Message,
     query: Option<String>,
 ) -> Result<()> {
-    q_handler_internal(
-        bot,
-        state,
-        message,
-        query,
-        false,
-        "qc",
-        QaCommandMode::ChatContext,
-    )
-    .await
+    q_handler_internal(bot, state, message, query, "qc", QaCommandMode::ChatContext).await
 }
 
 pub async fn s_handler(
@@ -3184,7 +3495,7 @@ pub async fn s_handler(
     let third_party_models_available_for_request =
         has_available_third_party_models_for_request(false, false, false, false, true);
     let must_use_default_model = should_use_default_model_without_selection(
-        false,
+        QaCommandMode::ChatSearch,
         request_capabilities,
         false,
         CONFIG.gemini_api_available(),
@@ -3302,7 +3613,7 @@ pub async fn qq_handler(
     message: Message,
     query: Option<String>,
 ) -> Result<()> {
-    q_handler(bot, state, message, query, true, "qq").await
+    q_handler_internal(bot, state, message, query, "qq", QaCommandMode::Quick).await
 }
 
 pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String) {

@@ -18,7 +18,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/q` - Ask a question (uses model selection when third-party models are configured).
 - `/qc` - Ask about this chat through independently routed recall, analytics whose results are exact only for the normalized query over eligible stored-text rows, or LLM-assisted topic discovery.
 - Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically.
-- `/qq` - Quick response using the configured default text model.
+- `/qq` - Provider-neutral quick answer: skips model selection, stays brief, and may use one bounded web-search round for genuinely current facts. Use `/q` for deeper verification or research.
 - `/burn_baby_burn` - Show how many tokens you have used in the current chat.
 - `/token_devourers [n]` - Show the top token consumers in the current group chat.
 - `/token_stats [model|user]` - Show bot-wide token usage totals (admin-only).
@@ -179,7 +179,9 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `HEAVY_COMMAND_MAX_CONCURRENCY` - Max number of heavy commands (`/q`, `/qc`, `/tldr`, generation commands, etc.) running at once. Default: `5`.
 - `RATE_LIMIT_SECONDS` - Per-user cooldown in seconds. Default: `15`.
 - `MODEL_SELECTION_TIMEOUT` - Model selection UI timeout seconds. Default: `30`.
-- `DEFAULT_TEXT_MODEL` - Default text model for `/qq`, model-selection timeouts, `/tldr`, `/factcheck`, `/profileme`, and the prompt step for `/paintme`/`/portraitme`. Use `gemini` or a runtime model such as `openai-codex:selected`/`openai-codex`. Default: `gemini`.
+- `DEFAULT_TEXT_MODEL` - Default text model for model-selection timeouts, `/tldr`, `/factcheck`, `/profileme`, and the prompt step for `/paintme`/`/portraitme`; it is also the inherited/fallback model for `/qq`. Use `gemini` or a runtime model such as `openai-codex:selected`/`openai-codex`. Default: `gemini`.
+- `DEFAULT_QUICK_TEXT_MODEL` - Optional dedicated `/qq` model. Empty or unset inherits `DEFAULT_TEXT_MODEL`; if the configured quick model is unavailable or cannot handle the attached media, `/qq` falls back once to the capable `DEFAULT_TEXT_MODEL` without opening a picker.
+- `QUICK_REASONING_EFFORT` - Per-request reasoning override for OpenAI Codex models used by `/qq`. Default: `low`. Public OpenAI and other providers keep their existing request contracts.
 - `DEFAULT_Q_MODEL` - Deprecated alias used only when `DEFAULT_TEXT_MODEL` is unset.
 - `DEFAULT_IMAGE_MODEL` - Default image model for `/img`, `/image` timeout/default generation, `/tldr` infographics, and `/paintme`/`/portraitme`. Use `gemini` or `codex`. Default: `gemini`.
 - `TELEGRAM_MAX_LENGTH` - Max message length before truncation or Telegraph. Default: `4000`.
@@ -292,7 +294,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - Login and model-account administration are restricted to whitelisted users in private chats and managed with `/codexlogin` and `/codexlogout`.
 - The active Codex model is selected live with `/codexmodel`, bound to the current ChatGPT account, and exposed in the bot as the runtime alias `openai-codex:selected`.
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.
-- When the selected Codex model advertises native search support, the bot now uses Codex's built-in `web_search` Responses tool instead of the local external `web_search` function tool.
+- When the selected Codex model advertises native search support, ordinary `/q` and other existing paths use Codex's built-in `web_search` Responses tool instead of the local external function tool. `/qq` deliberately disables native Codex search and uses the bounded local `web_search` runtime so its one-round limit is enforceable.
 - Codex requests also include a condensed response-style addendum tuned for direct answers and shorter Chinese output.
 
 ### Hidden Img2 image generation (optional)

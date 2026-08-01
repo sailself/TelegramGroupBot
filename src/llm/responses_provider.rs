@@ -1889,7 +1889,7 @@ pub async fn call_responses_provider_with_tool_runtime(
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
     let native_codex_web_search_tool = runtime
-        .allows_web_search()
+        .allows_native_web_search()
         .then(|| build_native_codex_web_search_tool(model_config))
         .flatten();
     let model_label = debug_model_label(model_config);

@@ -50,7 +50,7 @@ enum Command {
     #[command(description = "询问本群聊里的历史内容，可检索当前聊天记录并在需要时联网搜索")]
     Qc(String),
     #[command(
-        description = "Quick Question（快问快答），小喵会用Gemini的低思考级别尽量快捷地回答你的问题"
+        description = "Quick Question（快问快答），跳过模型选择并用简短回答，必要时最多联网搜索一次"
     )]
     Qq(String),
     #[command(
@@ -365,7 +365,7 @@ async fn handle_command(
             let message = message.clone();
             let arg = optional_arg(arg);
             tokio::spawn(async move {
-                if let Err(err) = qa::q_handler(bot, state, message, arg, false, "q").await {
+                if let Err(err) = qa::q_handler(bot, state, message, arg, "q").await {
                     error!("q handler failed: {err}");
                 }
             });
@@ -665,7 +665,7 @@ async fn handle_text_message(bot: Bot, state: AppState, message: Message) -> Han
         let state = state.clone();
         let message = message.clone();
         tokio::spawn(async move {
-            if let Err(err) = qa::q_handler(bot, state, message, query, false, "q").await {
+            if let Err(err) = qa::q_handler(bot, state, message, query, "q").await {
                 error!("auto q handler failed: {err}");
             }
         });
