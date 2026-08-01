@@ -132,6 +132,42 @@ fn validate_selected_codex_model_for_request(
     Ok(Some(record.clone()))
 }
 
+fn validate_explicit_codex_model_for_request(
+    model_config: &ThirdPartyModelConfig,
+    explicit_record: Option<&CodexSelectedModelRecord>,
+    current_account_id: Option<&str>,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex
+        || model_config.id == OPENAI_CODEX_SELECTED_MODEL_ID
+    {
+        return Ok(None);
+    }
+
+    let Some(record) = explicit_record else {
+        return Ok(None);
+    };
+    let current_account_id = normalized_account_id(current_account_id)
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if record.slug != model_config.model
+        || !selected_model_matches_account(record, Some(current_account_id))
+    {
+        return Err(anyhow!("The explicit Codex model or account changed"));
+    }
+    Ok(Some(record.clone()))
+}
+
+fn explicit_codex_model_record_from_state(
+    state: &RuntimeModelsState,
+    model_config: &ThirdPartyModelConfig,
+    current_account_id: Option<&str>,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    validate_explicit_codex_model_for_request(
+        model_config,
+        state.explicit_codex_records_by_id.get(&model_config.id),
+        current_account_id,
+    )
+}
+
 pub fn current_codex_account_id() -> Option<String> {
     openai_codex::auth_summary()
         .account_id
@@ -308,6 +344,15 @@ pub fn resolve_runtime_model_identifier(identifier: &str) -> Option<String> {
 pub fn selected_codex_model_record() -> Option<CodexSelectedModelRecord> {
     let record = RUNTIME_MODELS.read().codex_selected_model.clone()?;
     selected_model_matches_account(&record, current_codex_account_id().as_deref()).then_some(record)
+}
+
+#[allow(dead_code)] // The Quick request path invokes this in Task 2.
+pub(crate) fn explicit_codex_model_record_for_request(
+    model_config: &ThirdPartyModelConfig,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    let current_account_id = current_codex_account_id();
+    let state = RUNTIME_MODELS.read();
+    explicit_codex_model_record_from_state(&state, model_config, current_account_id.as_deref())
 }
 
 fn build_codex_selected_model_record(
@@ -792,6 +837,55 @@ mod tests {
     }
 
     #[test]
+    fn explicit_codex_cached_record_lookup_returns_the_matching_account_record() {
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let state = explicit_cache_state_for_test(&config, &record);
+
+        let returned = explicit_codex_model_record_from_state(&state, &config, Some("acct-1"))
+            .expect("matching cache entry should validate")
+            .expect("matching cache entry should be returned");
+
+        assert_eq!(returned.slug, "gpt-5.6-terra");
+        assert!(returned.supports_search_tool);
+        assert!(returned.use_responses_lite);
+    }
+
+    #[test]
+    fn explicit_codex_cached_record_lookup_rejects_account_mismatch() {
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let state = explicit_cache_state_for_test(&config, &record);
+
+        assert!(explicit_codex_model_record_from_state(&state, &config, Some("acct-2")).is_err());
+    }
+
+    #[test]
+    fn explicit_codex_cached_record_lookup_rejects_slug_mismatch() {
+        let (mut config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let state = explicit_cache_state_for_test(&config, &record);
+        config.model = "gpt-5.6-luna".to_string();
+
+        assert!(explicit_codex_model_record_from_state(&state, &config, Some("acct-1")).is_err());
+    }
+
+    #[test]
     fn selected_model_config_maps_image_capability_from_modalities() {
         let record = CodexSelectedModelRecord {
             metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
@@ -1019,6 +1113,18 @@ mod tests {
             input_modalities: input_modalities.to_vec(),
             supports_search_tool,
             use_responses_lite,
+        }
+    }
+
+    fn explicit_cache_state_for_test(
+        config: &ThirdPartyModelConfig,
+        record: &CodexSelectedModelRecord,
+    ) -> RuntimeModelsState {
+        RuntimeModelsState {
+            models: vec![],
+            models_by_id: HashMap::from([(config.id.clone(), config.clone())]),
+            codex_selected_model: None,
+            explicit_codex_records_by_id: HashMap::from([(config.id.clone(), record.clone())]),
         }
     }
 }
