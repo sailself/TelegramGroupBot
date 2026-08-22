@@ -133,11 +133,24 @@ pub(crate) fn get_http_client_no_redirect() -> &'static Client {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use super::*;
     use crate::config::CONFIG;
     use crate::tools::twitter_extractor::test_support::{
         chunked_response, response_with_content_length, ExpectedRequest, TestServer,
     };
+
+    fn join_with_timeout(server: TestServer) -> Result<Result<(), String>, &'static str> {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(server.join());
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "TestServer::join timed out")
+    }
 
     #[test]
     fn provider_names_round_trip_without_aliases() {
@@ -226,7 +239,9 @@ mod tests {
             "/never-requested",
             response_with_content_length(0, Vec::new()),
         )]);
-        let error = server.join().unwrap_err();
+        let error = join_with_timeout(server)
+            .expect("missing-expectation join must terminate")
+            .unwrap_err();
         assert!(error.contains("unmet"));
     }
 
@@ -237,7 +252,9 @@ mod tests {
         client.get(server.url("/first")).send().await.unwrap();
         let extra = client.get(server.url("/extra")).send().await.unwrap();
         assert_eq!(extra.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-        let error = server.join().unwrap_err();
+        let error = join_with_timeout(server)
+            .expect("extra-request join must terminate")
+            .unwrap_err();
         assert!(error.contains("unexpected extra request"));
     }
 }
