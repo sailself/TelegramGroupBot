@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Result};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Response;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -83,6 +83,12 @@ struct AbortOnDropLauncher {
     handle: Option<JoinHandle<()>>,
 }
 
+struct ActiveRequestGuard {
+    permit: Option<OwnedSemaphorePermit>,
+    launcher_abort: AbortHandle,
+    armed: bool,
+}
+
 impl AbortOnDropLauncher {
     fn new(handle: JoinHandle<()>) -> Self {
         Self {
@@ -90,10 +96,18 @@ impl AbortOnDropLauncher {
         }
     }
 
+    fn abort_handle(&self) -> AbortHandle {
+        self.handle
+            .as_ref()
+            .expect("launcher handle should remain owned until finish")
+            .abort_handle()
+    }
+
     async fn finish(mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.as_mut() {
             let _ = handle.await;
         }
+        self.handle.take();
     }
 }
 
@@ -101,6 +115,29 @@ impl Drop for AbortOnDropLauncher {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
+        }
+    }
+}
+
+impl ActiveRequestGuard {
+    fn new(permit: OwnedSemaphorePermit, launcher_abort: AbortHandle) -> Self {
+        Self {
+            permit: Some(permit),
+            launcher_abort,
+            armed: true,
+        }
+    }
+
+    fn disarm_and_release(mut self) {
+        self.armed = false;
+        drop(self.permit.take());
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.launcher_abort.abort();
         }
     }
 }
@@ -440,6 +477,7 @@ where
         let Ok((request, response, permit)) = receiver.await else {
             continue;
         };
+        let active_request = ActiveRequestGuard::new(permit, launcher.abort_handle());
         if let Some((index, file)) =
             process_response_with_fallback(request, response, budget, |fallback| async move {
                 start_request(&fallback).await
@@ -448,7 +486,7 @@ where
         {
             collected.push((index, file));
         }
-        drop(permit);
+        active_request.disarm_and_release();
     }
     launcher.finish().await;
     collected.sort_by_key(|(index, _)| *index);
@@ -567,6 +605,7 @@ pub async fn download_twitter_media(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver, Sender};
@@ -575,6 +614,8 @@ mod tests {
     use super::*;
     use crate::tools::twitter_extractor::test_support::{redirect_response, TestServer};
     use crate::utils::http::get_http_client_no_redirect;
+
+    const SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     fn controlled_body_server() -> (
         url::Url,
@@ -788,7 +829,10 @@ mod tests {
             .unwrap();
         let read = read_external_media_response(response, 100, &budget);
         tokio::pin!(read);
-        first_ready.await.unwrap();
+        tokio::time::timeout(SIGNAL_TIMEOUT, first_ready)
+            .await
+            .expect("controlled first chunk should become ready")
+            .unwrap();
         let first_reserved = async {
             loop {
                 if budget.remaining() == 20 {
@@ -806,7 +850,10 @@ mod tests {
         .await
         .expect("first 30-byte chunk should reserve before the gate");
         release_first.send(()).unwrap();
-        assert!(read.await.is_err());
+        assert!(tokio::time::timeout(SIGNAL_TIMEOUT, read)
+            .await
+            .expect("controlled read should finish after release")
+            .is_err());
         assert_eq!(budget.remaining(), 50);
         first_worker.join().unwrap();
 
@@ -1026,10 +1073,14 @@ mod tests {
             1,
         );
         tokio::pin!(collection);
-        tokio::select! {
-            _ = &mut body_ready => {}
-            _ = &mut collection => panic!("collection completed before the controlled body was released"),
-        }
+        tokio::time::timeout(SIGNAL_TIMEOUT, async {
+            tokio::select! {
+                result = &mut body_ready => result.expect("controlled body readiness sender dropped"),
+                _ = &mut collection => panic!("collection completed before the controlled body was released"),
+            }
+        })
+        .await
+        .expect("controlled body should become ready");
         assert_eq!(started.load(Ordering::SeqCst), 1);
         release_body.send(()).unwrap();
         let files = tokio::time::timeout(std::time::Duration::from_secs(2), collection)
@@ -1041,12 +1092,91 @@ mod tests {
         fast.join().unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_request_guard_aborts_launcher_before_releasing_permit() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let waiter_semaphore = semaphore.clone();
+        let (queued_sender, queued_receiver) = tokio::sync::oneshot::channel();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let launcher = AbortOnDropLauncher::new(tokio::spawn(async move {
+            let acquire = waiter_semaphore.acquire_owned();
+            tokio::pin!(acquire);
+            let mut queued_sender = Some(queued_sender);
+            std::future::poll_fn(|context| match acquire.as_mut().poll(context) {
+                std::task::Poll::Pending => {
+                    let _ = queued_sender.take().unwrap().send(());
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Ready(_) => {
+                    panic!("queued launcher unexpectedly acquired the active permit")
+                }
+            })
+            .await;
+            let _permit = acquire.await.unwrap();
+            let _ = started_sender.send(());
+        }));
+        let active_request = ActiveRequestGuard::new(permit, launcher.abort_handle());
+
+        tokio::time::timeout(SIGNAL_TIMEOUT, queued_receiver)
+            .await
+            .expect("launcher should queue behind the active permit")
+            .unwrap();
+        drop(active_request);
+        tokio::time::timeout(SIGNAL_TIMEOUT, launcher.finish())
+            .await
+            .expect("aborted launcher should stop");
+
+        assert!(!matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), started_receiver).await,
+            Ok(Ok(()))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_launcher_finish_still_aborts_the_launcher() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let launcher = AbortOnDropLauncher::new(tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_sender));
+            let _ = ready_sender.send(());
+            std::future::pending::<()>().await;
+        }));
+        tokio::time::timeout(SIGNAL_TIMEOUT, ready_receiver)
+            .await
+            .expect("launcher should start")
+            .unwrap();
+
+        let mut finish = Box::pin(launcher.finish());
+        std::future::poll_fn(|context| match finish.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(()) => panic!("launcher unexpectedly finished"),
+        })
+        .await;
+        drop(finish);
+
+        tokio::time::timeout(SIGNAL_TIMEOUT, dropped_receiver)
+            .await
+            .expect("cancelling finish should abort the launcher")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelling_parent_stops_unsent_starts_and_refunds_open_body() {
         let (slow_url, body_ready, closed, slow_worker) = cancellation_body_server();
         let started = Arc::new(AtomicUsize::new(0));
-        let second_started = Arc::new(tokio::sync::Notify::new());
-        let second_started_for_start = second_started.clone();
+        let (second_started_sender, mut second_started_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         let started_for_start = started.clone();
         let requests = (0..4)
             .map(|index| ExternalMediaRequest {
@@ -1068,11 +1198,11 @@ mod tests {
                 move |request| {
                     let slow_url = slow_url.clone();
                     let started_for_start = started_for_start.clone();
-                    let second_started = second_started_for_start.clone();
+                    let second_started_sender = second_started_sender.clone();
                     async move {
                         started_for_start.fetch_add(1, Ordering::SeqCst);
                         if request.index > 0 {
-                            second_started.notify_waiters();
+                            let _ = second_started_sender.send(request.index);
                             return None;
                         }
                         get_http_client_no_redirect()
@@ -1086,7 +1216,10 @@ mod tests {
             )
             .await
         });
-        body_ready.await.unwrap();
+        tokio::time::timeout(SIGNAL_TIMEOUT, body_ready)
+            .await
+            .expect("controlled cancellation body should become ready")
+            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if observed_budget.remaining() == 9 {
@@ -1097,8 +1230,11 @@ mod tests {
         })
         .await
         .expect("first body chunk should reserve before cancellation");
-        let second_wait = second_started.notified();
         parent.abort();
+        tokio::time::timeout(SIGNAL_TIMEOUT, parent)
+            .await
+            .expect("cancelled collector should stop")
+            .expect_err("aborted collector unexpectedly completed normally");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if observed_budget.remaining() == 10 {
@@ -1109,17 +1245,27 @@ mod tests {
         })
         .await
         .expect("parent cancellation should refund the partial reservation");
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(250), second_wait)
-                .await
-                .is_err()
-        );
+        assert!(!matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                second_started_receiver.recv(),
+            )
+            .await,
+            Ok(Some(_))
+        ));
         tokio::time::timeout(std::time::Duration::from_secs(1), closed)
             .await
             .expect("controlled response should observe client disconnect")
             .unwrap();
         assert_eq!(started.load(Ordering::SeqCst), 1);
-        slow_worker.join().unwrap();
+        tokio::time::timeout(
+            SIGNAL_TIMEOUT,
+            tokio::task::spawn_blocking(move || slow_worker.join()),
+        )
+        .await
+        .expect("controlled response worker should stop")
+        .expect("controlled response join task should run")
+        .unwrap();
     }
 
     #[tokio::test]
