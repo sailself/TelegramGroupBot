@@ -46,6 +46,18 @@ impl<'a> TwitterExtractor<'a> {
             let attempt_started = tokio::time::Instant::now();
             match self.fetch_provider(*provider, &identity, timeout).await {
                 Ok(post) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::debug!(
+                            target: "tools.twitter",
+                            provider = provider.as_str(),
+                            status_id = %identity.id,
+                            elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                            result = "deadline_exhausted",
+                            "Twitter provider attempt"
+                        );
+                        failures.push(ProviderError::deadline(*provider));
+                        break;
+                    }
                     let (media_images, media_videos) = post.media.iter().fold(
                         (0_u64, 0_u64),
                         |(images, videos), media| match media {
@@ -59,6 +71,7 @@ impl<'a> TwitterExtractor<'a> {
                         status_id = %identity.id,
                         elapsed_ms = attempt_started.elapsed().as_millis() as u64,
                         result = "success",
+                        http_status = 200_u16,
                         media_images,
                         media_videos,
                         "Twitter provider attempt"
@@ -308,7 +321,6 @@ mod tests {
         );
         let jina = TestServer::expect_no_requests();
         let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
-        config.providers = vec![TwitterProvider::FxTwitter, TwitterProvider::VxTwitter];
         config.total_timeout = Duration::from_millis(30);
         config.provider_timeout = Duration::from_millis(15);
         let started = tokio::time::Instant::now();
@@ -319,8 +331,8 @@ mod tests {
             .to_string();
         assert!(error.contains("deadline"));
         assert!(started.elapsed() < Duration::from_millis(80));
-        fx.join_allowing_client_disconnect();
-        vx.join_allowing_client_disconnect();
+        fx.join_allowing_client_disconnect().unwrap();
+        vx.join_allowing_client_disconnect().unwrap();
         jina.join().unwrap();
     }
 
@@ -361,6 +373,82 @@ mod tests {
         assert!(!error.contains("jina body secret"));
         assert!(!error.contains("custom-endpoint-secret"));
         assert!(!error.contains("secret-bearer-value"));
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_falls_back_after_fxtwitter_timeout() {
+        let fx = TestServer::single_delayed(
+            "GET",
+            "/i/status/123",
+            Duration::from_millis(100),
+            200,
+            br#"{}"#,
+        );
+        let vx = TestServer::single_json(
+            "GET",
+            "/Twitter/status/123",
+            include_bytes!("twitter_extractor/fixtures/vxtwitter_photo_quote.json"),
+        );
+        let jina = TestServer::expect_no_requests();
+        let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
+        config.provider_timeout = Duration::from_millis(15);
+        let content = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+            .fetch("https://x.com/a/status/123")
+            .await
+            .unwrap();
+        assert!(content.text_content.contains("root text"));
+        fx.join_allowing_client_disconnect().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_falls_back_after_fxtwitter_body_too_large() {
+        let fx = TestServer::single_json("GET", "/i/status/123", &vec![b'x'; 2_048]);
+        let vx = TestServer::single_json(
+            "GET",
+            "/Twitter/status/123",
+            include_bytes!("twitter_extractor/fixtures/vxtwitter_photo_quote.json"),
+        );
+        let jina = TestServer::expect_no_requests();
+        let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
+        config.response_max_bytes = 1_024;
+        let content = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+            .fetch("https://x.com/a/status/123")
+            .await
+            .unwrap();
+        assert!(content.text_content.contains("root text"));
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_falls_back_after_fxtwitter_transport_failure() {
+        let fx = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
+                "GET",
+                "/i/status/123",
+                Vec::new(),
+            ),
+        ]);
+        let vx = TestServer::single_json(
+            "GET",
+            "/Twitter/status/123",
+            include_bytes!("twitter_extractor/fixtures/vxtwitter_photo_quote.json"),
+        );
+        let jina = TestServer::expect_no_requests();
+        let content = TwitterExtractor::new(
+            providers::get_http_client_no_redirect(),
+            test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
+        )
+        .fetch("https://x.com/a/status/123")
+        .await
+        .unwrap();
+        assert!(content.text_content.contains("root text"));
         fx.join().unwrap();
         vx.join().unwrap();
         jina.join().unwrap();

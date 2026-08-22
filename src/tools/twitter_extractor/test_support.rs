@@ -18,7 +18,6 @@ pub(crate) struct ExpectedRequest {
     absent_headers: Vec<String>,
     response: Vec<u8>,
     delay: Option<std::time::Duration>,
-    allow_client_disconnect: bool,
 }
 
 impl ExpectedRequest {
@@ -30,7 +29,6 @@ impl ExpectedRequest {
             absent_headers: Vec::new(),
             response,
             delay: None,
-            allow_client_disconnect: false,
         }
     }
 
@@ -42,7 +40,6 @@ impl ExpectedRequest {
             absent_headers: Vec::new(),
             response,
             delay: None,
-            allow_client_disconnect: false,
         }
     }
 
@@ -59,7 +56,6 @@ impl ExpectedRequest {
 
     pub(crate) fn delayed(mut self, delay: std::time::Duration) -> Self {
         self.delay = Some(delay);
-        self.allow_client_disconnect = true;
         self
     }
 }
@@ -67,6 +63,7 @@ impl ExpectedRequest {
 pub(crate) struct TestServer {
     address: std::net::SocketAddr,
     shutdown: Arc<AtomicBool>,
+    allow_client_disconnect: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<(), String>>>,
 }
 
@@ -119,10 +116,20 @@ impl TestServer {
         let address = listener.local_addr().expect("test server address");
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
-        let worker = thread::spawn(move || serve(listener, expected, worker_shutdown));
+        let allow_client_disconnect = Arc::new(AtomicBool::new(false));
+        let worker_allow_client_disconnect = Arc::clone(&allow_client_disconnect);
+        let worker = thread::spawn(move || {
+            serve(
+                listener,
+                expected,
+                worker_shutdown,
+                worker_allow_client_disconnect,
+            )
+        });
         Self {
             address,
             shutdown,
+            allow_client_disconnect,
             worker: Some(worker),
         }
     }
@@ -132,17 +139,32 @@ impl TestServer {
     }
 
     pub(crate) fn join(mut self) -> Result<(), String> {
-        self.shutdown.store(true, Ordering::Release);
-        let _ = TcpStream::connect(self.address);
-        let worker = self.worker.take().expect("test server already joined");
-        match worker.join() {
-            Ok(result) => result,
-            Err(_) => Err("test server worker panicked".to_string()),
-        }
+        self.join_inner(false)
     }
 
-    pub(crate) fn join_allowing_client_disconnect(self) {
-        let _ = self.join();
+    pub(crate) fn join_allowing_client_disconnect(mut self) -> Result<(), String> {
+        self.join_inner(true)
+    }
+
+    fn join_inner(&mut self, allow_client_disconnect: bool) -> Result<(), String> {
+        self.allow_client_disconnect
+            .store(allow_client_disconnect, Ordering::Release);
+        self.shutdown.store(true, Ordering::Release);
+        if let Ok(mut stream) = TcpStream::connect(self.address) {
+            let _ = stream.write_all(
+                b"GET /__test_server_shutdown__ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            );
+        }
+        let worker = self.worker.take().expect("test server already joined");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(worker.join());
+        });
+        match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("test server worker panicked".to_string()),
+            Err(_) => Err("test server join timed out".to_string()),
+        }
     }
 }
 
@@ -150,20 +172,26 @@ fn serve(
     listener: TcpListener,
     expected: Vec<ExpectedRequest>,
     shutdown: Arc<AtomicBool>,
+    allow_client_disconnect: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut expected = VecDeque::from(expected);
     let mut first_error = None;
     loop {
         let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
-        if shutdown.load(Ordering::Acquire) {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+        let request = read_request(&mut stream);
+        if shutdown.load(Ordering::Acquire)
+            && request
+                .as_ref()
+                .is_ok_and(|request| request.path == "/__test_server_shutdown__")
+        {
             break;
         }
 
         let expectation = expected.pop_front();
         match expectation {
             Some(expectation) => {
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
-                match read_request(&mut stream).and_then(|request| expectation.verify(&request)) {
+                match request.and_then(|request| expectation.verify(&request)) {
                     Ok(()) => {}
                     Err(error) => {
                         first_error.get_or_insert(error);
@@ -177,13 +205,15 @@ fn serve(
                     .and_then(|_| stream.flush())
                     .map_err(|error| error.to_string())
                 {
-                    if !expectation.allow_client_disconnect {
+                    if !allow_client_disconnect.load(Ordering::Acquire)
+                        || expectation.delay.is_none()
+                    {
                         first_error.get_or_insert(error);
                     }
                 }
             }
             None => {
-                let error = read_request(&mut stream)
+                let error = request
                     .map(|request| {
                         format!(
                             "unexpected extra request: {} {}",

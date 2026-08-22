@@ -320,4 +320,21 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("unexpected extra request"));
     }
+
+    #[tokio::test]
+    async fn delayed_join_still_surfaces_request_mismatch() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/expected",
+            response_with_content_length(0, Vec::new()),
+        )
+        .delayed(Duration::from_millis(1))]);
+        reqwest::Client::new()
+            .get(server.url("/wrong"))
+            .send()
+            .await
+            .unwrap();
+        let error = server.join_allowing_client_disconnect().unwrap_err();
+        assert!(error.contains("expected path"));
+    }
 }

@@ -239,6 +239,23 @@ pub(crate) async fn fetch(
     identity: &XStatusIdentity,
     timeout: Duration,
 ) -> Result<XPost, ProviderError> {
+    fetch_with_parser(client, config, identity, timeout, |body, identity| {
+        parse(&body, &identity)
+    })
+    .await
+}
+
+async fn fetch_with_parser<F>(
+    client: &NoRedirectClient,
+    config: &TwitterFetchConfig,
+    identity: &XStatusIdentity,
+    timeout: Duration,
+    parser: F,
+) -> Result<XPost, ProviderError>
+where
+    F: FnOnce(Vec<u8>, XStatusIdentity) -> Result<XPost, ProviderError> + Send + 'static,
+{
+    let identity = identity.clone();
     let future = async {
         if identity.id.is_empty() || !identity.id.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(error(
@@ -275,7 +292,23 @@ pub(crate) async fn fetch(
             config.response_max_bytes,
         )
         .await?;
-        parse(&body, identity)
+        tokio::task::spawn_blocking(move || match parser(body, identity) {
+            Ok(post) => Ok(post),
+            Err(mut error) => {
+                if error.status.is_none() {
+                    error.status = Some(status);
+                }
+                Err(error)
+            }
+        })
+        .await
+        .map_err(|_| {
+            error(
+                ProviderErrorKind::Incomplete,
+                "provider parser failed",
+                None,
+            )
+        })?
     };
     tokio::time::timeout(timeout, future).await.map_err(|_| {
         error(
@@ -371,6 +404,49 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::HttpStatus);
         assert_eq!(error.status, Some(reqwest::StatusCode::FOUND));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fxtwitter_fetch_times_out_while_blocking_parser_is_running() {
+        let server = TestServer::single_json(
+            "GET",
+            "/i/status/123",
+            include_bytes!("../fixtures/fxtwitter_photo_quote.json"),
+        );
+        let config = test_config_with_fx_base(server.base_url());
+        let started = std::time::Instant::now();
+        let error = fetch_with_parser(
+            super::super::get_http_client_no_redirect(),
+            &config,
+            &identity("123"),
+            Duration::from_millis(20),
+            |_body, _identity| {
+                std::thread::sleep(Duration::from_millis(250));
+                Err(error(ProviderErrorKind::Incomplete, "slow parser", None))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Timeout);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fxtwitter_fetch_preserves_success_status_for_decode_errors() {
+        let server = TestServer::single_json("GET", "/i/status/123", b"not json");
+        let config = test_config_with_fx_base(server.base_url());
+        let error = fetch(
+            super::super::get_http_client_no_redirect(),
+            &config,
+            &identity("123"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Decode);
+        assert_eq!(error.status, Some(reqwest::StatusCode::OK));
         server.join().unwrap();
     }
 
