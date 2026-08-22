@@ -20,6 +20,7 @@ static LINK_REGEX: Lazy<Regex> =
 static EMPTY_LINK_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[\s*\]\((https?://[^\)]+)\)").unwrap());
 static WHITESPACE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+type MediaBuckets = (Vec<String>, Vec<String>, Vec<String>);
 
 fn error(
     kind: ProviderErrorKind,
@@ -51,7 +52,7 @@ pub(crate) fn parse(body: &[u8], identity: &XStatusIdentity) -> Result<XPost, Pr
         )
     })?;
     let lines = collect_relevant_lines(&text[marker_idx + marker.len()..]);
-    let (cleaned, images, videos) = clean_lines_and_media(&lines);
+    let (cleaned, images, videos) = clean_lines_and_media(&lines)?;
     if cleaned.is_empty() && images.is_empty() && videos.is_empty() {
         return Err(error(
             ProviderErrorKind::Incomplete,
@@ -117,6 +118,23 @@ pub(crate) async fn fetch(
     identity: &XStatusIdentity,
     timeout: Duration,
 ) -> Result<XPost, ProviderError> {
+    fetch_with_parser(client, config, identity, timeout, |body, identity| {
+        parse(&body, &identity)
+    })
+    .await
+}
+
+async fn fetch_with_parser<F>(
+    client: &NoRedirectClient,
+    config: &TwitterFetchConfig,
+    identity: &XStatusIdentity,
+    timeout: Duration,
+    parser: F,
+) -> Result<XPost, ProviderError>
+where
+    F: FnOnce(Vec<u8>, XStatusIdentity) -> Result<XPost, ProviderError> + Send + 'static,
+{
+    let identity = identity.clone();
     let future = async {
         if identity.id.is_empty() || !identity.id.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(error(
@@ -157,7 +175,15 @@ pub(crate) async fn fetch(
         }
         let body =
             read_limited_body(TwitterProvider::Jina, response, config.response_max_bytes).await?;
-        parse(&body, identity)
+        tokio::task::spawn_blocking(move || parser(body, identity))
+            .await
+            .map_err(|_| {
+                error(
+                    ProviderErrorKind::Incomplete,
+                    "provider parser failed",
+                    None,
+                )
+            })?
     };
     tokio::time::timeout(timeout, future).await.map_err(|_| {
         error(
@@ -240,7 +266,24 @@ fn collect_relevant_lines(block: &str) -> Vec<String> {
         }
         out.push(line.to_owned());
     }
-    out
+    if !out.is_empty() {
+        return out;
+    }
+    let mut fallback = Vec::new();
+    for line in block.lines() {
+        let stripped = line.trim();
+        let lowered = stripped.to_lowercase();
+        if stripped.is_empty() {
+            continue;
+        }
+        if stops.contains(&lowered.as_str())
+            || prefixes.iter().any(|prefix| lowered.starts_with(prefix))
+        {
+            break;
+        }
+        fallback.push(line.to_owned());
+    }
+    fallback
 }
 
 fn normalize_media_url(raw: &str) -> Option<String> {
@@ -262,7 +305,7 @@ fn normalize_media_url(raw: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
+fn clean_lines_and_media(lines: &[String]) -> Result<MediaBuckets, ProviderError> {
     let profile = [
         "profile_images",
         "profile_banners",
@@ -278,14 +321,18 @@ fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<Str
     for line in lines {
         let mut working = line.clone();
         for caps in MEDIA_REGEX.captures_iter(&working) {
-            let Some(url) = normalize_media_url(&caps[1]) else {
-                continue;
-            };
-            if url.to_ascii_lowercase().contains(".svg")
-                || profile.iter().any(|token| url.contains(token))
-            {
+            let raw = caps[1].trim();
+            let raw_lower = raw.to_ascii_lowercase();
+            if raw_lower.contains(".svg") || profile.iter().any(|token| raw.contains(token)) {
                 continue;
             }
+            let Some(url) = normalize_media_url(raw) else {
+                return Err(error(
+                    ProviderErrorKind::Incomplete,
+                    "provider response announced unusable media",
+                    None,
+                ));
+            };
             if video_ext.iter().any(|ext| url.ends_with(ext)) || url.contains("video.twimg.com") {
                 if !videos.contains(&url) {
                     videos.push(url);
@@ -320,7 +367,7 @@ fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<Str
         }
         cleaned.push(working);
     }
-    (cleaned, images, videos)
+    Ok((cleaned, images, videos))
 }
 
 fn extract_metadata(lines: &[String]) -> (Option<String>, Option<String>, Option<usize>) {
@@ -382,6 +429,29 @@ mod tests {
         assert!(matches!(post.media[0], XMedia::Image { .. }));
     }
 
+    #[test]
+    fn parses_jina_markdown_without_conversation_heading() {
+        let post = parse(
+            include_bytes!("../fixtures/jina_no_conversation.txt"),
+            &identity("123"),
+        )
+        .unwrap();
+        assert!(post
+            .text
+            .contains("legacy body without conversation heading"));
+    }
+
+    #[test]
+    fn rejects_jina_disallowed_announced_media() {
+        let error = parse(
+            include_bytes!("../fixtures/jina_disallowed_media.txt"),
+            &identity("123"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Incomplete);
+        assert!(!error.detail.contains("evil.example"));
+    }
+
     fn config(endpoint: url::Url, key: Option<&str>) -> TwitterFetchConfig {
         TwitterFetchConfig {
             providers: vec![TwitterProvider::Jina],
@@ -433,6 +503,52 @@ mod tests {
         )
         .await
         .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn jina_fetch_omits_whitespace_bearer_header() {
+        let body = include_bytes!("../fixtures/jina_photo.txt");
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/https://x.com/i/status/123",
+            response_with_content_length(body.len(), body.to_vec()),
+        )
+        .without_header("authorization")]);
+        fetch(
+            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            &config(server.base_url(), Some("   ")),
+            &identity("123"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn jina_fetch_times_out_while_blocking_parser_is_running() {
+        let body = include_bytes!("../fixtures/jina_photo.txt");
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/https://x.com/i/status/123",
+            response_with_content_length(body.len(), body.to_vec()),
+        )]);
+        let started = std::time::Instant::now();
+        let error = fetch_with_parser(
+            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            &config(server.base_url(), None),
+            &identity("123"),
+            Duration::from_millis(20),
+            |_body, _identity| {
+                std::thread::sleep(Duration::from_millis(250));
+                Err(error(ProviderErrorKind::Incomplete, "slow parser", None))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Timeout);
+        assert!(started.elapsed() < Duration::from_millis(200));
         server.join().unwrap();
     }
 }
