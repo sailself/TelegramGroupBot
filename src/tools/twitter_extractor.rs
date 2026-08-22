@@ -9,21 +9,15 @@ use tracing::{debug, info};
 
 use crate::utils::http::get_http_client;
 
+pub(crate) mod model;
 pub(crate) mod url;
+pub use model::TwitterContent;
+#[allow(unused_imports)]
+pub(crate) use model::VideoThumbnailFallback;
 #[allow(unused_imports)]
 pub(crate) use url::{
     canonical_status_key, is_supported_status_url, parse_status_identity, XStatusIdentity,
 };
-
-#[derive(Debug, Clone)]
-pub struct TwitterContent {
-    #[allow(dead_code)]
-    pub url: String,
-    pub text_content: String,
-    pub image_urls: Vec<String>,
-    pub video_urls: Vec<String>,
-    pub formatted_content: String,
-}
 
 const REQUEST_TIMEOUT: u64 = 20;
 const USER_AGENT: &str =
@@ -432,55 +426,48 @@ pub async fn extract_twitter_content(url: &str) -> Result<TwitterContent> {
     let body_lines = strip_indices(&cleaned_lines, &[handle_idx, display_index, timestamp_idx]);
     let body_text = body_lines.join("\n").trim().to_string();
 
-    let mut header_parts = Vec::new();
-    if let Some(name) = display_name.clone() {
-        header_parts.push(name);
-    }
-    if let Some(handle_value) = handle.clone() {
-        if !header_parts.contains(&handle_value) {
-            header_parts.push(handle_value);
-        }
-    }
+    let media = image_urls
+        .into_iter()
+        .filter_map(|url| {
+            crate::tools::twitter_extractor::model::parse_allowed_media_url(&url)
+                .ok()
+                .map(
+                    |url| crate::tools::twitter_extractor::model::XMedia::Image {
+                        url,
+                        alt_text: None,
+                    },
+                )
+        })
+        .chain(video_urls.into_iter().filter_map(|url| {
+            crate::tools::twitter_extractor::model::parse_allowed_media_url(&url)
+                .ok()
+                .map(
+                    |url| crate::tools::twitter_extractor::model::XMedia::Video {
+                        url: Some(url),
+                        thumbnail_url: None,
+                        alt_text: None,
+                        bitrate: None,
+                    },
+                )
+        }))
+        .collect();
 
-    let mut header_text = String::new();
-    if !header_parts.is_empty() {
-        header_text = format!("Tweet by {}", header_parts.join(" "));
-    }
-    if let Some(timestamp) = timestamp_text.clone() {
-        if header_text.is_empty() {
-            header_text = format!("Tweet at {}", timestamp);
-        } else {
-            header_text = format!("{} at {}", header_text, timestamp);
-        }
-    }
+    let author = match (display_name, handle) {
+        (None, None) => None,
+        (display_name, handle) => Some(crate::tools::twitter_extractor::model::XAuthor {
+            display_name,
+            handle,
+        }),
+    };
+    let identity = parse_status_identity(&normalized_url)?;
+    let post = crate::tools::twitter_extractor::model::XPost {
+        id: identity.id.clone(),
+        author,
+        text: body_text,
+        created_at: timestamp_text,
+        media,
+        quote: None,
+    };
 
-    let mut sections = Vec::new();
-    if !header_text.trim().is_empty() {
-        sections.push(header_text.trim().to_string());
-    }
-    if !body_text.trim().is_empty() {
-        sections.push(body_text.clone());
-    }
-    sections.push(format!("Original link: {}", normalized_url));
-
-    let text_content = sections.join("\n\n");
-    let mut formatted_content = format!("\n\n--- Twitter Content ---\n{}", text_content);
-    if !image_urls.is_empty() {
-        formatted_content.push_str(&format!(
-            "\n\nImages attached: {} image(s)",
-            image_urls.len()
-        ));
-    }
-    if !video_urls.is_empty() {
-        formatted_content.push_str(&format!("\nVideos attached: {} video(s)", video_urls.len()));
-    }
-    formatted_content.push_str("\n--- End Twitter Content ---\n\n");
-
-    Ok(TwitterContent {
-        url: normalized_url,
-        text_content,
-        image_urls,
-        video_urls,
-        formatted_content,
-    })
+    crate::tools::twitter_extractor::model::build_twitter_content(&identity, post)
 }
