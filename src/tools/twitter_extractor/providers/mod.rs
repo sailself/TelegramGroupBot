@@ -1,7 +1,10 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
 use reqwest::Response;
+use tokio::sync::Semaphore;
+use tokio::task::{JoinError, JoinHandle};
 use url::Url;
 
 use crate::config::Config;
@@ -12,6 +15,66 @@ use crate::utils::http::{
 pub(crate) mod fxtwitter;
 pub(crate) mod jina;
 pub(crate) mod vxtwitter;
+
+static BLOCKING_PARSER_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
+
+struct AbortOnDropParser<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropParser<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<T, JoinError> {
+        let result = self
+            .handle
+            .as_mut()
+            .expect("parser handle should remain owned until join")
+            .await;
+        self.handle.take();
+        result
+    }
+}
+
+impl<T> Drop for AbortOnDropParser<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+async fn run_blocking_parser<F, T>(parser: F) -> Result<T, JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    run_blocking_parser_with_semaphore(BLOCKING_PARSER_SEMAPHORE.clone(), parser).await
+}
+
+async fn run_blocking_parser_with_semaphore<F, T>(
+    semaphore: Arc<Semaphore>,
+    parser: F,
+) -> Result<T, JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .expect("static parser semaphore must remain open");
+    AbortOnDropParser::new(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        parser()
+    }))
+    .join()
+    .await
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TwitterProvider {

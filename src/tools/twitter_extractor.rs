@@ -11,9 +11,9 @@ pub(crate) mod providers;
 pub(crate) mod test_support;
 pub(crate) mod url;
 pub(crate) use model::parse_allowed_media_url;
-pub use model::TwitterContent;
 #[allow(unused_imports)]
-pub(crate) use model::VideoThumbnailFallback;
+pub(crate) use model::TwitterAttachment;
+pub use model::TwitterContent;
 #[allow(unused_imports)]
 pub(crate) use url::{
     canonical_status_key, is_supported_status_url, parse_status_identity, XStatusIdentity,

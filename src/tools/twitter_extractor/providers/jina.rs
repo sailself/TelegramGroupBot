@@ -4,10 +4,12 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 use super::{
-    read_limited_body, ProviderError, ProviderErrorKind, TwitterFetchConfig, TwitterProvider,
+    read_limited_body, run_blocking_parser, ProviderError, ProviderErrorKind, TwitterFetchConfig,
+    TwitterProvider,
 };
 use crate::tools::twitter_extractor::model::{
-    parse_allowed_media_url, validate_complete_post, XAuthor, XMedia, XPost,
+    is_usable_direct_video_url, is_usable_pbs_image_url, parse_allowed_media_url,
+    validate_complete_post, XAuthor, XMedia, XPost,
 };
 use crate::tools::twitter_extractor::url::XStatusIdentity;
 use crate::utils::http::NoRedirectClient;
@@ -70,23 +72,37 @@ pub(crate) fn parse(body: &[u8], identity: &XStatusIdentity) -> Result<XPost, Pr
         .join("\n")
         .trim()
         .to_owned();
+    let advertised_media = !images.is_empty() || !videos.is_empty();
     let media = images
         .into_iter()
         .filter_map(|raw| {
-            parse_allowed_media_url(&raw).ok().map(|url| XMedia::Image {
-                url,
-                alt_text: None,
-            })
+            parse_allowed_media_url(&raw)
+                .ok()
+                .filter(is_usable_pbs_image_url)
+                .map(|url| XMedia::Image {
+                    url,
+                    alt_text: None,
+                })
         })
         .chain(videos.into_iter().filter_map(|raw| {
-            parse_allowed_media_url(&raw).ok().map(|url| XMedia::Video {
-                url: Some(url),
-                thumbnail_url: None,
-                alt_text: None,
-                bitrate: None,
-            })
+            parse_allowed_media_url(&raw)
+                .ok()
+                .filter(is_usable_direct_video_url)
+                .map(|url| XMedia::Video {
+                    url: Some(url),
+                    thumbnail_url: None,
+                    alt_text: None,
+                    bitrate: None,
+                })
         }))
-        .collect();
+        .collect::<Vec<_>>();
+    if advertised_media && media.is_empty() {
+        return Err(error(
+            ProviderErrorKind::Incomplete,
+            "provider response announced unusable media",
+            None,
+        ));
+    }
     let author = match (display_name, handle) {
         (None, None) => None,
         (display_name, handle) => Some(XAuthor {
@@ -175,7 +191,7 @@ where
         }
         let body =
             read_limited_body(TwitterProvider::Jina, response, config.response_max_bytes).await?;
-        tokio::task::spawn_blocking(move || parser(body, identity))
+        run_blocking_parser(move || parser(body, identity))
             .await
             .map_err(|_| {
                 error(
@@ -450,6 +466,13 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::Incomplete);
         assert!(!error.detail.contains("evil.example"));
+    }
+
+    #[test]
+    fn rejects_jina_hls_only_media_even_when_root_text_exists() {
+        let body = b"Title: fixture\nMarkdown Content:\nConversation\n\nAlice\n@alice\nroot text\n![video](https://video.twimg.com/video/list.m3u8)\n";
+        let error = parse(body, &identity("123")).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Incomplete);
     }
 
     fn config(endpoint: url::Url, key: Option<&str>) -> TwitterFetchConfig {

@@ -14,13 +14,18 @@ pub struct TwitterContent {
     pub video_urls: Vec<String>,
     pub formatted_content: String,
     #[allow(dead_code)]
-    pub(crate) video_thumbnail_fallbacks: Vec<VideoThumbnailFallback>,
+    pub(crate) attachment_plan: Vec<TwitterAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VideoThumbnailFallback {
-    pub video_url: String,
-    pub thumbnail_url: String,
+pub(crate) enum TwitterAttachment {
+    Image {
+        url: String,
+    },
+    Video {
+        url: String,
+        thumbnail_url: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,17 +105,24 @@ pub(crate) fn validate_complete_post(post: &XPost) -> Result<()> {
 
 fn media_is_usable(media: &XMedia) -> bool {
     match media {
-        XMedia::Image { url, .. } => parse_allowed_media_url(url.as_str()).is_ok(),
+        XMedia::Image { url, .. } => is_usable_pbs_image_url(url),
         XMedia::Video {
             url, thumbnail_url, ..
         } => {
-            url.as_ref()
-                .is_some_and(|url| parse_allowed_media_url(url.as_str()).is_ok())
-                || thumbnail_url
-                    .as_ref()
-                    .is_some_and(|url| parse_allowed_media_url(url.as_str()).is_ok())
+            url.as_ref().is_some_and(is_usable_direct_video_url)
+                || thumbnail_url.as_ref().is_some_and(is_usable_pbs_image_url)
         }
     }
+}
+
+pub(crate) fn is_usable_pbs_image_url(url: &Url) -> bool {
+    parse_allowed_media_url(url.as_str()).is_ok() && url.host_str() == Some("pbs.twimg.com")
+}
+
+pub(crate) fn is_usable_direct_video_url(url: &Url) -> bool {
+    parse_allowed_media_url(url.as_str()).is_ok()
+        && url.host_str() == Some("video.twimg.com")
+        && url.path().to_ascii_lowercase().ends_with(".mp4")
 }
 
 pub(crate) fn build_twitter_content(
@@ -119,9 +131,7 @@ pub(crate) fn build_twitter_content(
 ) -> Result<TwitterContent> {
     validate_complete_post(&post)?;
 
-    let mut image_urls = Vec::new();
-    let mut video_urls = Vec::new();
-    let mut video_thumbnail_fallbacks = Vec::new();
+    let mut attachment_plan = Vec::new();
     let mut seen_urls = HashSet::new();
     let mut image_descriptions = Vec::new();
     let mut thumbnail_only_video = false;
@@ -130,9 +140,7 @@ pub(crate) fn build_twitter_content(
     append_post_text(&post, &mut text_sections, false);
     append_media(
         &post.media,
-        &mut image_urls,
-        &mut video_urls,
-        &mut video_thumbnail_fallbacks,
+        &mut attachment_plan,
         &mut image_descriptions,
         &mut thumbnail_only_video,
         &mut seen_urls,
@@ -143,9 +151,7 @@ pub(crate) fn build_twitter_content(
         append_post_text(quote, &mut quote_sections, true);
         append_media(
             &quote.media,
-            &mut image_urls,
-            &mut video_urls,
-            &mut video_thumbnail_fallbacks,
+            &mut attachment_plan,
             &mut image_descriptions,
             &mut thumbnail_only_video,
             &mut seen_urls,
@@ -162,11 +168,37 @@ pub(crate) fn build_twitter_content(
     if thumbnail_only_video {
         text_sections.push("Video present; thumbnail attached".to_owned());
     }
+    let image_urls = attachment_plan
+        .iter()
+        .filter_map(|attachment| match attachment {
+            TwitterAttachment::Image { url } => Some(url.clone()),
+            TwitterAttachment::Video { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let video_urls = attachment_plan
+        .iter()
+        .filter_map(|attachment| match attachment {
+            TwitterAttachment::Image { .. } => None,
+            TwitterAttachment::Video { url, .. } => Some(url.clone()),
+        })
+        .collect::<Vec<_>>();
+    let video_thumbnail_fallback_count = attachment_plan
+        .iter()
+        .filter(|attachment| {
+            matches!(
+                attachment,
+                TwitterAttachment::Video {
+                    thumbnail_url: Some(_),
+                    ..
+                }
+            )
+        })
+        .count();
     if !video_urls.is_empty() {
         text_sections.push(format!(
             "Videos detected: {} video(s); thumbnail fallback available for {}",
             video_urls.len(),
-            video_thumbnail_fallbacks.len()
+            video_thumbnail_fallback_count
         ));
     }
 
@@ -179,7 +211,10 @@ pub(crate) fn build_twitter_content(
         ));
     }
     if !video_urls.is_empty() {
-        formatted_content.push_str(&format!("\nVideos attached: {} video(s)", video_urls.len()));
+        formatted_content.push_str(&format!(
+            "\nVideos available: {} video(s)",
+            video_urls.len()
+        ));
     }
     formatted_content.push_str("\n--- End Twitter Content ---\n\n");
 
@@ -189,7 +224,7 @@ pub(crate) fn build_twitter_content(
         image_urls,
         video_urls,
         formatted_content,
-        video_thumbnail_fallbacks,
+        attachment_plan,
     })
 }
 
@@ -234,33 +269,14 @@ fn append_post_text(post: &XPost, sections: &mut Vec<String>, quote: bool) {
 
 fn append_media(
     media: &[XMedia],
-    image_urls: &mut Vec<String>,
-    video_urls: &mut Vec<String>,
-    video_thumbnail_fallbacks: &mut Vec<VideoThumbnailFallback>,
+    attachment_plan: &mut Vec<TwitterAttachment>,
     image_descriptions: &mut Vec<String>,
     thumbnail_only_video: &mut bool,
     seen_urls: &mut HashSet<String>,
 ) {
-    let mut videos = Vec::new();
-    for item in media {
-        match item {
-            XMedia::Image { url, alt_text } => {
-                let Some(url) = allowed_url(url) else {
-                    continue;
-                };
-                let url = url.to_string();
-                if seen_urls.insert(url.clone()) {
-                    image_urls.push(url);
-                    append_alt_text(image_descriptions, alt_text.as_deref());
-                }
-            }
-            XMedia::Video { .. } => videos.push(item),
-        }
-    }
-
-    let mut selected_videos: Vec<&XMedia> = Vec::new();
+    let mut selected_videos: Vec<(usize, &XMedia)> = Vec::new();
     let mut selected_by_thumbnail = std::collections::HashMap::<String, usize>::new();
-    let valid_direct_thumbnail_keys = videos
+    let valid_direct_thumbnail_keys = media
         .iter()
         .filter_map(|item| {
             let XMedia::Video {
@@ -271,14 +287,14 @@ fn append_media(
             else {
                 return None;
             };
-            if allowed_direct_mp4_url(url).is_some() {
-                allowed_url(thumbnail_url).map(|url| url.to_string())
+            if is_usable_direct_video_url(url) {
+                usable_pbs_url(thumbnail_url).map(|url| url.to_string())
             } else {
                 None
             }
         })
         .collect::<HashSet<_>>();
-    for item in videos {
+    for (media_index, item) in media.iter().enumerate() {
         let XMedia::Video {
             url,
             thumbnail_url,
@@ -290,87 +306,87 @@ fn append_media(
         };
         let key = thumbnail_url
             .as_ref()
-            .and_then(allowed_url)
+            .and_then(usable_pbs_url)
             .map(|url| url.to_string());
         if key.as_ref().is_some_and(|key| {
             valid_direct_thumbnail_keys.contains(key)
-                && url.as_ref().and_then(allowed_direct_mp4_url).is_none()
+                && !url.as_ref().is_some_and(is_usable_direct_video_url)
         }) {
             continue;
         }
         if let Some(key) = key {
             if let Some(index) = selected_by_thumbnail.get(&key).copied() {
-                let current_bitrate = match selected_videos[index] {
+                let current_bitrate = match selected_videos[index].1 {
                     XMedia::Video { bitrate, .. } => bitrate.unwrap_or(0),
                     XMedia::Image { .. } => 0,
                 };
                 if bitrate.unwrap_or(0) > current_bitrate {
-                    selected_videos[index] = item;
+                    selected_videos[index].1 = item;
                 }
             } else {
                 selected_by_thumbnail.insert(key, selected_videos.len());
-                selected_videos.push(item);
+                selected_videos.push((media_index, item));
             }
         } else {
-            selected_videos.push(item);
+            selected_videos.push((media_index, item));
         }
     }
 
-    for item in selected_videos {
-        let XMedia::Video {
-            url,
-            thumbnail_url,
-            alt_text,
-            ..
-        } = item
-        else {
-            continue;
-        };
-        let direct_url = url
-            .as_ref()
-            .and_then(allowed_direct_mp4_url)
-            .map(|url| url.to_string());
-        let thumbnail = thumbnail_url
-            .as_ref()
-            .and_then(allowed_url)
-            .map(|url| url.to_string());
-        append_alt_text(image_descriptions, alt_text.as_deref());
-        match (direct_url, thumbnail) {
-            (Some(video_url), thumbnail) => {
-                if seen_urls.insert(video_url.clone()) {
-                    video_urls.push(video_url.clone());
-                    if let Some(thumbnail_url) = thumbnail {
-                        video_thumbnail_fallbacks.push(VideoThumbnailFallback {
-                            video_url,
-                            thumbnail_url,
-                        });
+    let selected_videos = selected_videos
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    for (media_index, item) in media.iter().enumerate() {
+        match item {
+            XMedia::Image { url, alt_text } => {
+                let Some(url) = usable_pbs_url(url) else {
+                    continue;
+                };
+                let url = url.to_string();
+                if seen_urls.insert(url.clone()) {
+                    attachment_plan.push(TwitterAttachment::Image { url });
+                    append_alt_text(image_descriptions, alt_text.as_deref());
+                }
+            }
+            XMedia::Video { .. } => {
+                let Some(XMedia::Video {
+                    url,
+                    thumbnail_url,
+                    alt_text,
+                    ..
+                }) = selected_videos.get(&media_index).copied()
+                else {
+                    continue;
+                };
+                let direct_url = url
+                    .as_ref()
+                    .filter(|url| is_usable_direct_video_url(url))
+                    .map(ToString::to_string);
+                let thumbnail = thumbnail_url
+                    .as_ref()
+                    .and_then(usable_pbs_url)
+                    .map(ToString::to_string);
+                append_alt_text(image_descriptions, alt_text.as_deref());
+                match (direct_url, thumbnail) {
+                    (Some(url), thumbnail_url) => {
+                        if seen_urls.insert(url.clone()) {
+                            attachment_plan.push(TwitterAttachment::Video { url, thumbnail_url });
+                        }
                     }
+                    (None, Some(url)) => {
+                        if seen_urls.insert(url.clone()) {
+                            attachment_plan.push(TwitterAttachment::Image { url });
+                        }
+                        *thumbnail_only_video = true;
+                    }
+                    (None, None) => {}
                 }
             }
-            (None, Some(thumbnail_url)) => {
-                if seen_urls.insert(thumbnail_url.clone()) {
-                    image_urls.push(thumbnail_url);
-                }
-                *thumbnail_only_video = true;
-            }
-            (None, None) => {}
         }
     }
 }
 
-fn allowed_url(url: &Url) -> Option<&Url> {
-    if parse_allowed_media_url(url.as_str()).is_ok() {
-        Some(url)
-    } else {
-        None
-    }
-}
-
-fn allowed_direct_mp4_url(url: &Url) -> Option<&Url> {
-    let url = allowed_url(url)?;
-    if url.host_str() == Some("video.twimg.com")
-        && url.path().to_ascii_lowercase().ends_with(".mp4")
-    {
+fn usable_pbs_url(url: &Url) -> Option<&Url> {
+    if is_usable_pbs_image_url(url) {
         Some(url)
     } else {
         None
@@ -491,6 +507,23 @@ mod tests {
     }
 
     #[test]
+    fn completeness_rejects_security_allowed_but_semantically_unusable_media() {
+        let video_host_image = post_with_image("https://video.twimg.com/video/not-an-image.jpg");
+        assert!(validate_complete_post(&video_host_image).is_err());
+
+        let mut video_host_thumbnail = empty_post();
+        video_host_thumbnail.media.push(XMedia::Video {
+            url: None,
+            thumbnail_url: Some(
+                ::url::Url::parse("https://video.twimg.com/video/not-a-thumbnail.jpg").unwrap(),
+            ),
+            alt_text: None,
+            bitrate: None,
+        });
+        assert!(validate_complete_post(&video_host_thumbnail).is_err());
+    }
+
+    #[test]
     fn formatter_preserves_markers_and_flattens_one_quote_level() {
         let mut root = post_with_text("root text");
         root.author = Some(author("Alice", "alice"));
@@ -520,12 +553,16 @@ mod tests {
         );
         assert!(content.image_urls.is_empty());
         assert_eq!(
-            content.video_thumbnail_fallbacks,
-            vec![VideoThumbnailFallback {
-                video_url: "https://video.twimg.com/video/high.mp4".into(),
-                thumbnail_url: "https://pbs.twimg.com/media/thumb.jpg".into(),
+            content.attachment_plan,
+            vec![TwitterAttachment::Video {
+                url: "https://video.twimg.com/video/high.mp4".into(),
+                thumbnail_url: Some("https://pbs.twimg.com/media/thumb.jpg".into()),
             }]
         );
+        assert!(content
+            .formatted_content
+            .contains("Videos available: 1 video(s)"));
+        assert!(!content.formatted_content.contains("Videos attached:"));
     }
 
     #[test]

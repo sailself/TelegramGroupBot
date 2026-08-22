@@ -1011,7 +1011,7 @@ mod tests {
                         image_urls: Vec::new(),
                         video_urls: Vec::new(),
                         formatted_content: String::new(),
-                        video_thumbnail_fallbacks: Vec::new(),
+                        attachment_plan: Vec::new(),
                     },
                 },
             );

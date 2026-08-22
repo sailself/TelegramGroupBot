@@ -5,10 +5,12 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::{
-    read_limited_body, ProviderError, ProviderErrorKind, TwitterFetchConfig, TwitterProvider,
+    read_limited_body, run_blocking_parser, ProviderError, ProviderErrorKind, TwitterFetchConfig,
+    TwitterProvider,
 };
 use crate::tools::twitter_extractor::model::{
-    parse_allowed_media_url, validate_complete_post, XAuthor, XMedia, XPost,
+    is_usable_direct_video_url, is_usable_pbs_image_url, parse_allowed_media_url,
+    validate_complete_post, XAuthor, XMedia, XPost,
 };
 use crate::tools::twitter_extractor::url::XStatusIdentity;
 use crate::utils::http::NoRedirectClient;
@@ -35,7 +37,30 @@ struct VxStatus {
     #[serde(default, alias = "mediaExtended", alias = "media_extended")]
     media_extended: Option<Vec<VxMedia>>,
     #[serde(default, rename = "qrt", alias = "quote")]
-    quote: Option<Box<VxStatus>>,
+    quote: Option<Box<serde_json::value::RawValue>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VxQuoteStatus {
+    #[serde(default, rename = "tweetID", alias = "tweet_id", alias = "id")]
+    id: Option<String>,
+    #[serde(default)]
+    text: String,
+    #[serde(default, alias = "userName")]
+    user_name: Option<String>,
+    #[serde(default, alias = "userScreenName")]
+    user_screen_name: Option<String>,
+    #[serde(default, alias = "created_at", alias = "createdAt")]
+    date: Option<String>,
+    #[serde(
+        default,
+        rename = "mediaURLs",
+        alias = "media_urls",
+        alias = "mediaUrls"
+    )]
+    media_urls: Option<Vec<String>>,
+    #[serde(default, alias = "mediaExtended", alias = "media_extended")]
+    media_extended: Option<Vec<VxMedia>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,7 +96,7 @@ pub(crate) fn parse(body: &[u8], identity: &XStatusIdentity) -> Result<XPost, Pr
             None,
         )
     })?;
-    let post = map_status(status, identity, true)?;
+    let post = map_status(status, identity)?;
     validate_complete_post(&post).map_err(|_| {
         error(
             ProviderErrorKind::Incomplete,
@@ -82,20 +107,14 @@ pub(crate) fn parse(body: &[u8], identity: &XStatusIdentity) -> Result<XPost, Pr
     Ok(post)
 }
 
-fn map_status(
-    status: VxStatus,
-    identity: &XStatusIdentity,
-    root: bool,
-) -> Result<XPost, ProviderError> {
-    if root {
-        if let Some(id) = status.id.as_deref().filter(|id| !id.trim().is_empty()) {
-            if id != identity.id {
-                return Err(error(
-                    ProviderErrorKind::Incomplete,
-                    "provider returned a conflicting status ID",
-                    None,
-                ));
-            }
+fn map_status(status: VxStatus, identity: &XStatusIdentity) -> Result<XPost, ProviderError> {
+    if let Some(id) = status.id.as_deref().filter(|id| !id.trim().is_empty()) {
+        if id != identity.id {
+            return Err(error(
+                ProviderErrorKind::Incomplete,
+                "provider returned a conflicting status ID",
+                None,
+            ));
         }
     }
     let (media, advertised) = map_media(status.media_extended, status.media_urls);
@@ -106,15 +125,10 @@ fn map_status(
             None,
         ));
     }
-    let quote = if root {
-        status
-            .quote
-            .map(|quote| map_status(*quote, identity, false))
-            .transpose()?
-            .map(Box::new)
-    } else {
-        None
-    };
+    let quote = status
+        .quote
+        .as_deref()
+        .and_then(|quote| map_quote(quote, identity));
     Ok(XPost {
         id: status
             .id
@@ -133,6 +147,55 @@ fn map_status(
     })
 }
 
+fn map_quote(
+    raw_quote: &serde_json::value::RawValue,
+    identity: &XStatusIdentity,
+) -> Option<Box<XPost>> {
+    let quote: VxQuoteStatus = match serde_json::from_str(raw_quote.get()) {
+        Ok(quote) => quote,
+        Err(_) => {
+            trace_quote_omitted(identity, ProviderErrorKind::Decode);
+            return None;
+        }
+    };
+    let (media, advertised) = map_media(quote.media_extended, quote.media_urls);
+    if advertised && media.is_empty() {
+        trace_quote_omitted(identity, ProviderErrorKind::Incomplete);
+        return None;
+    }
+    let post = XPost {
+        id: quote
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_default(),
+        author: (quote.user_name.is_some() || quote.user_screen_name.is_some()).then_some(
+            XAuthor {
+                display_name: quote.user_name,
+                handle: quote.user_screen_name,
+            },
+        ),
+        text: quote.text,
+        created_at: quote.date,
+        media,
+        quote: None,
+    };
+    if validate_complete_post(&post).is_err() {
+        trace_quote_omitted(identity, ProviderErrorKind::Incomplete);
+        return None;
+    }
+    Some(Box::new(post))
+}
+
+fn trace_quote_omitted(identity: &XStatusIdentity, category: ProviderErrorKind) {
+    tracing::debug!(
+        target: "tools.twitter",
+        provider = TwitterProvider::VxTwitter.as_str(),
+        status_id = %identity.id,
+        category = category.as_str(),
+        "Twitter quote omitted"
+    );
+}
+
 fn map_media(extended: Option<Vec<VxMedia>>, urls: Option<Vec<String>>) -> (Vec<XMedia>, bool) {
     let advertised = extended.as_ref().is_some_and(|items| !items.is_empty())
         || urls.as_ref().is_some_and(|items| !items.is_empty());
@@ -145,14 +208,12 @@ fn map_media(extended: Option<Vec<VxMedia>>, urls: Option<Vec<String>>) -> (Vec<
                     .url
                     .as_deref()
                     .and_then(|raw| parse_allowed_media_url(raw).ok())
-                    .filter(|url| {
-                        url.host_str() == Some("video.twimg.com")
-                            && url.path().to_ascii_lowercase().ends_with(".mp4")
-                    });
+                    .filter(is_usable_direct_video_url);
                 let thumb = item
                     .thumbnail_url
                     .as_deref()
-                    .and_then(|raw| parse_allowed_media_url(raw).ok());
+                    .and_then(|raw| parse_allowed_media_url(raw).ok())
+                    .filter(is_usable_pbs_image_url);
                 if direct.is_some() || thumb.is_some() {
                     mapped.push(XMedia::Video {
                         url: direct,
@@ -165,6 +226,7 @@ fn map_media(extended: Option<Vec<VxMedia>>, urls: Option<Vec<String>>) -> (Vec<
                 .url
                 .as_deref()
                 .and_then(|raw| parse_allowed_media_url(raw).ok())
+                .filter(is_usable_pbs_image_url)
             {
                 mapped.push(XMedia::Image {
                     url,
@@ -189,16 +251,14 @@ fn map_media(extended: Option<Vec<VxMedia>>, urls: Option<Vec<String>>) -> (Vec<
             if represented {
                 continue;
             }
-            if url.host_str() == Some("video.twimg.com")
-                && url.path().to_ascii_lowercase().ends_with(".mp4")
-            {
+            if is_usable_direct_video_url(&url) {
                 mapped.push(XMedia::Video {
                     url: Some(url),
                     thumbnail_url: None,
                     alt_text: None,
                     bitrate: None,
                 });
-            } else {
+            } else if is_usable_pbs_image_url(&url) {
                 mapped.push(XMedia::Image {
                     url,
                     alt_text: None,
@@ -268,7 +328,7 @@ where
             config.response_max_bytes,
         )
         .await?;
-        tokio::task::spawn_blocking(move || match parser(body, identity) {
+        run_blocking_parser(move || match parser(body, identity) {
             Ok(post) => Ok(post),
             Err(mut error) => {
                 if error.status.is_none() {
@@ -365,6 +425,40 @@ mod tests {
             thumbnail_url.as_ref().unwrap().as_str(),
             "https://pbs.twimg.com/media/vx-thumb.jpg"
         );
+    }
+
+    #[test]
+    fn rejects_vxtwitter_hls_only_video_without_thumbnail() {
+        let body = br#"{"tweetID":"123","text":"root","media_extended":[{"type":"video","url":"https://video.twimg.com/video/list.m3u8"}]}"#;
+        assert_eq!(
+            parse(body, &identity("123")).unwrap_err().kind,
+            ProviderErrorKind::Incomplete
+        );
+    }
+
+    #[test]
+    fn malformed_vxtwitter_quote_does_not_erase_valid_root() {
+        let body = br#"{"tweetID":"123","text":"root survives","qrt":{"tweetID":"456","text":{"unexpected":"object"}}}"#;
+        let post = parse(body, &identity("123")).unwrap();
+        assert_eq!(post.text, "root survives");
+        assert!(post.quote.is_none());
+    }
+
+    #[test]
+    fn invalid_vxtwitter_quote_media_does_not_erase_valid_root() {
+        let body = br#"{"tweetID":"123","text":"root survives","qrt":{"tweetID":"456","media_extended":[{"type":"image","url":"https://evil.example/secret.jpg"}]}}"#;
+        let post = parse(body, &identity("123")).unwrap();
+        assert_eq!(post.text, "root survives");
+        assert!(post.quote.is_none());
+    }
+
+    #[test]
+    fn vxtwitter_keeps_one_quote_level_without_decoding_deeper_quote() {
+        let body = br#"{"tweetID":"123","text":"root","qrt":{"tweetID":"456","text":"first quote","qrt":{"tweetID":"789","text":{"unexpected":"object"}}}}"#;
+        let post = parse(body, &identity("123")).unwrap();
+        let quote = post.quote.expect("first quote should be retained");
+        assert_eq!(quote.text, "first quote");
+        assert!(quote.quote.is_none());
     }
 
     #[tokio::test]

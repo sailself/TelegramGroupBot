@@ -14,7 +14,7 @@ use url::Url;
 use crate::config::CONFIG;
 use crate::llm::media::{detect_mime_type, MediaFile, MediaKind};
 use crate::tools::telegraph_extractor::TelegraphContent;
-use crate::tools::twitter_extractor::{parse_allowed_media_url, TwitterContent};
+use crate::tools::twitter_extractor::{parse_allowed_media_url, TwitterAttachment, TwitterContent};
 use crate::utils::http::get_http_client_no_redirect;
 
 #[derive(Clone, Debug)]
@@ -608,36 +608,30 @@ pub async fn download_twitter_media(
     max_files: usize,
     budget: &ExternalMediaBudget,
 ) -> Vec<MediaFile> {
+    collect_external_media(twitter_media_requests(contents), max_files, budget).await
+}
+
+fn twitter_media_requests(contents: &[TwitterContent]) -> Vec<ExternalMediaRequest> {
     let mut requests = Vec::new();
     let mut index = 0;
     for content in contents {
-        for url in &content.image_urls {
-            if requests.len() >= max_files {
-                break;
+        for attachment in &content.attachment_plan {
+            match attachment {
+                TwitterAttachment::Image { url } => requests.push(ExternalMediaRequest {
+                    index,
+                    url: url.clone(),
+                    kind: ExternalMediaKind::Image("twitter"),
+                    source: "twitter",
+                    thumbnail_url: None,
+                }),
+                TwitterAttachment::Video { url, thumbnail_url } => {
+                    requests.push(twitter_video_request(index, url, thumbnail_url.as_deref()))
+                }
             }
-            requests.push(ExternalMediaRequest {
-                index,
-                url: url.clone(),
-                kind: ExternalMediaKind::Image("twitter"),
-                source: "twitter",
-                thumbnail_url: None,
-            });
-            index += 1;
-        }
-        for url in &content.video_urls {
-            if requests.len() >= max_files {
-                break;
-            }
-            let thumbnail_url = content
-                .video_thumbnail_fallbacks
-                .iter()
-                .find(|fallback| fallback.video_url == *url)
-                .map(|fallback| fallback.thumbnail_url.as_str());
-            requests.push(twitter_video_request(index, url, thumbnail_url));
             index += 1;
         }
     }
-    collect_external_media(requests, max_files, budget).await
+    requests
 }
 
 #[cfg(test)]
@@ -649,10 +643,70 @@ mod tests {
     use std::thread::JoinHandle;
 
     use super::*;
+    use crate::tools::twitter_extractor::model::{build_twitter_content, XMedia, XPost};
     use crate::tools::twitter_extractor::test_support::{redirect_response, TestServer};
+    use crate::tools::twitter_extractor::url::XStatusIdentity;
     use crate::utils::http::get_http_client_no_redirect;
 
     const SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn twitter_content_with_video(thumbnail_url: Option<&str>) -> TwitterContent {
+        build_twitter_content(
+            &XStatusIdentity {
+                id: "123".to_owned(),
+                canonical_url: Url::parse("https://x.com/i/status/123").unwrap(),
+            },
+            XPost {
+                id: "123".to_owned(),
+                author: None,
+                text: "root video".to_owned(),
+                created_at: None,
+                media: vec![XMedia::Video {
+                    url: Some(Url::parse("https://video.twimg.com/video/root.mp4").unwrap()),
+                    thumbnail_url: thumbnail_url.map(|url| Url::parse(url).unwrap()),
+                    alt_text: None,
+                    bitrate: Some(1_000),
+                }],
+                quote: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn twitter_content_with_root_video_and_quoted_image() -> TwitterContent {
+        build_twitter_content(
+            &XStatusIdentity {
+                id: "123".to_owned(),
+                canonical_url: Url::parse("https://x.com/i/status/123").unwrap(),
+            },
+            XPost {
+                id: "123".to_owned(),
+                author: None,
+                text: "root video".to_owned(),
+                created_at: None,
+                media: vec![XMedia::Video {
+                    url: Some(Url::parse("https://video.twimg.com/video/root.mp4").unwrap()),
+                    thumbnail_url: Some(
+                        Url::parse("https://pbs.twimg.com/media/root-thumb.jpg").unwrap(),
+                    ),
+                    alt_text: None,
+                    bitrate: Some(1_000),
+                }],
+                quote: Some(Box::new(XPost {
+                    id: "456".to_owned(),
+                    author: None,
+                    text: "quoted image".to_owned(),
+                    created_at: None,
+                    media: vec![XMedia::Image {
+                        url: Url::parse("https://pbs.twimg.com/media/quoted.jpg").unwrap(),
+                        alt_text: None,
+                    }],
+                    quote: None,
+                })),
+            },
+        )
+        .unwrap()
+    }
 
     fn controlled_body_server() -> (
         url::Url,
@@ -959,6 +1013,143 @@ mod tests {
         assert_eq!(file.kind, MediaKind::Image);
         assert_eq!(budget.remaining(), 97);
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn thumbnail_fallback_does_not_make_prompt_claim_video_was_attached() {
+        let server = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_status(
+                    500,
+                    Vec::new(),
+                ),
+            ),
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_content_length(
+                    3,
+                    b"img".to_vec(),
+                ),
+            ),
+        ]);
+        let content =
+            twitter_content_with_video(Some("https://pbs.twimg.com/media/root-thumb.jpg"));
+        let request = twitter_video_request(
+            0,
+            &content.video_urls[0],
+            Some("https://pbs.twimg.com/media/root-thumb.jpg"),
+        );
+        let direct = get_http_client_no_redirect()
+            .get(server.url("/direct"))
+            .send()
+            .await
+            .unwrap();
+        let fallback_url = server.url("/fallback");
+        let budget = ExternalMediaBudget::new(100);
+        let (_, file) =
+            process_response_with_fallback(request, Some(direct), &budget, move |_| async move {
+                get_http_client_no_redirect()
+                    .get(fallback_url)
+                    .send()
+                    .await
+                    .ok()
+            })
+            .await
+            .expect("thumbnail fallback should produce an image");
+        assert_eq!(file.kind, MediaKind::Image);
+        assert!(content.formatted_content.contains("Videos available:"));
+        assert!(!content.formatted_content.contains("Videos attached:"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_direct_video_download_keeps_pre_download_prompt_truthful() {
+        let server = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                3,
+                b"vid".to_vec(),
+            ),
+        );
+        let content = twitter_content_with_video(None);
+        let request = twitter_video_request(0, &content.video_urls[0], None);
+        let direct = get_http_client_no_redirect()
+            .get(server.url("/direct"))
+            .send()
+            .await
+            .unwrap();
+        let budget = ExternalMediaBudget::new(100);
+        let (_, file) =
+            process_response_with_fallback(request, Some(direct), &budget, |_| async { None })
+                .await
+                .expect("direct video should produce a file");
+        assert_eq!(file.kind, MediaKind::Video);
+        assert!(content.formatted_content.contains("Videos available:"));
+        assert!(!content.formatted_content.contains("Videos attached:"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_video_without_fallback_keeps_prompt_truthful() {
+        let server = TestServer::single_status("GET", "/direct", 500);
+        let content = twitter_content_with_video(None);
+        let request = twitter_video_request(0, &content.video_urls[0], None);
+        let direct = get_http_client_no_redirect()
+            .get(server.url("/direct"))
+            .send()
+            .await
+            .unwrap();
+        let budget = ExternalMediaBudget::new(100);
+        let result =
+            process_response_with_fallback(request, Some(direct), &budget, |_| async { None })
+                .await;
+        assert!(result.is_none());
+        assert!(content.formatted_content.contains("Videos available:"));
+        assert!(!content.formatted_content.contains("Videos attached:"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn twitter_max_one_prefers_slow_root_video_over_fast_quoted_image() {
+        let slow = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_content_length(
+                    4,
+                    b"root".to_vec(),
+                ),
+            )
+            .delayed(std::time::Duration::from_millis(50)),
+        ]);
+        let fast = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_content_length(
+                    5,
+                    b"quote".to_vec(),
+                ),
+            )
+            .delayed(std::time::Duration::from_millis(1)),
+        ]);
+        let content = twitter_content_with_root_video_and_quoted_image();
+        let requests = twitter_media_requests(&[content]);
+        let slow_url = slow.url("/root");
+        let fast_url = fast.url("/quote");
+        let budget = ExternalMediaBudget::new(100);
+        let files = collect_external_media_with_starts(requests, 1, &budget, move |request| {
+            let slow_url = slow_url.clone();
+            let fast_url = fast_url.clone();
+            async move {
+                let url = if request.url.contains("root.mp4") {
+                    slow_url
+                } else {
+                    fast_url
+                };
+                get_http_client_no_redirect().get(url).send().await.ok()
+            }
+        })
+        .await;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].kind, MediaKind::Video);
+        assert_eq!(files[0].bytes(), b"root");
+        slow.join().unwrap();
+        fast.join().unwrap();
     }
 
     #[tokio::test]

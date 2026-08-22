@@ -7,10 +7,12 @@ use serde::Deserialize;
 use url::Url;
 
 use super::{
-    read_limited_body, ProviderError, ProviderErrorKind, TwitterFetchConfig, TwitterProvider,
+    read_limited_body, run_blocking_parser, ProviderError, ProviderErrorKind, TwitterFetchConfig,
+    TwitterProvider,
 };
 use crate::tools::twitter_extractor::model::{
-    parse_allowed_media_url, validate_complete_post, XAuthor, XMedia, XPost,
+    is_usable_direct_video_url, is_usable_pbs_image_url, parse_allowed_media_url,
+    validate_complete_post, XAuthor, XMedia, XPost,
 };
 use crate::tools::twitter_extractor::url::XStatusIdentity;
 use crate::utils::http::NoRedirectClient;
@@ -34,7 +36,21 @@ struct FxStatus {
     #[serde(default)]
     media: Option<FxMedia>,
     #[serde(default)]
-    quote: Option<Box<FxStatus>>,
+    quote: Option<Box<serde_json::value::RawValue>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FxQuoteStatus {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    author: Option<FxAuthor>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    media: Option<FxMedia>,
 }
 #[derive(Debug, Deserialize)]
 struct FxAuthor {
@@ -108,7 +124,7 @@ pub(crate) fn parse(body: &[u8], identity: &XStatusIdentity) -> Result<XPost, Pr
             None,
         )
     })?;
-    let post = map_status(status, identity, true)?;
+    let post = map_status(status, identity)?;
     validate_complete_post(&post).map_err(|_| {
         error(
             ProviderErrorKind::Incomplete,
@@ -119,32 +135,21 @@ pub(crate) fn parse(body: &[u8], identity: &XStatusIdentity) -> Result<XPost, Pr
     Ok(post)
 }
 
-fn map_status(
-    status: FxStatus,
-    identity: &XStatusIdentity,
-    root: bool,
-) -> Result<XPost, ProviderError> {
-    if root {
-        if let Some(id) = status.id.as_deref().filter(|id| !id.trim().is_empty()) {
-            if id != identity.id {
-                return Err(error(
-                    ProviderErrorKind::Incomplete,
-                    "provider returned a conflicting status ID",
-                    None,
-                ));
-            }
+fn map_status(status: FxStatus, identity: &XStatusIdentity) -> Result<XPost, ProviderError> {
+    if let Some(id) = status.id.as_deref().filter(|id| !id.trim().is_empty()) {
+        if id != identity.id {
+            return Err(error(
+                ProviderErrorKind::Incomplete,
+                "provider returned a conflicting status ID",
+                None,
+            ));
         }
     }
     let (media, advertised) = map_media(status.media)?;
-    let quote = if root {
-        status
-            .quote
-            .map(|quote| map_status(*quote, identity, false))
-            .transpose()?
-            .map(Box::new)
-    } else {
-        None
-    };
+    let quote = status
+        .quote
+        .as_deref()
+        .and_then(|quote| map_quote(quote, identity));
     let author = status.author.map(|author| XAuthor {
         display_name: author.name,
         handle: author.screen_name,
@@ -170,6 +175,59 @@ fn map_status(
     Ok(post)
 }
 
+fn map_quote(
+    raw_quote: &serde_json::value::RawValue,
+    identity: &XStatusIdentity,
+) -> Option<Box<XPost>> {
+    let quote: FxQuoteStatus = match serde_json::from_str(raw_quote.get()) {
+        Ok(quote) => quote,
+        Err(_) => {
+            trace_quote_omitted(identity, ProviderErrorKind::Decode);
+            return None;
+        }
+    };
+    let (media, advertised) = match map_media(quote.media) {
+        Ok(media) => media,
+        Err(error) => {
+            trace_quote_omitted(identity, error.kind);
+            return None;
+        }
+    };
+    if advertised && media.is_empty() {
+        trace_quote_omitted(identity, ProviderErrorKind::Incomplete);
+        return None;
+    }
+    let post = XPost {
+        id: quote
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_default(),
+        author: quote.author.map(|author| XAuthor {
+            display_name: author.name,
+            handle: author.screen_name,
+        }),
+        text: quote.text,
+        created_at: quote.created_at,
+        media,
+        quote: None,
+    };
+    if validate_complete_post(&post).is_err() {
+        trace_quote_omitted(identity, ProviderErrorKind::Incomplete);
+        return None;
+    }
+    Some(Box::new(post))
+}
+
+fn trace_quote_omitted(identity: &XStatusIdentity, category: ProviderErrorKind) {
+    tracing::debug!(
+        target: "tools.twitter",
+        provider = TwitterProvider::FxTwitter.as_str(),
+        status_id = %identity.id,
+        category = category.as_str(),
+        "Twitter quote omitted"
+    );
+}
+
 fn map_media(media: Option<FxMedia>) -> Result<(Vec<XMedia>, bool), ProviderError> {
     let Some(media) = media else {
         return Ok((Vec::new(), false));
@@ -179,6 +237,9 @@ fn map_media(media: Option<FxMedia>) -> Result<(Vec<XMedia>, bool), ProviderErro
     for photo in media.photos {
         if let Some(raw) = photo.url.as_deref() {
             if let Ok(url) = parse_allowed_media_url(raw) {
+                if !is_usable_pbs_image_url(&url) {
+                    continue;
+                }
                 mapped.push(XMedia::Image {
                     url,
                     alt_text: photo.alt_text,
@@ -190,15 +251,13 @@ fn map_media(media: Option<FxMedia>) -> Result<(Vec<XMedia>, bool), ProviderErro
         let thumb = video
             .thumbnail_url
             .as_deref()
-            .and_then(|raw| parse_allowed_media_url(raw).ok());
+            .and_then(|raw| parse_allowed_media_url(raw).ok())
+            .filter(is_usable_pbs_image_url);
         let direct = video
             .url
             .as_deref()
             .and_then(|raw| parse_allowed_media_url(raw).ok())
-            .filter(|url| {
-                url.host_str() == Some("video.twimg.com")
-                    && url.path().to_ascii_lowercase().ends_with(".mp4")
-            });
+            .filter(is_usable_direct_video_url);
         let selected = video
             .variants
             .into_iter()
@@ -212,9 +271,7 @@ fn map_media(media: Option<FxMedia>) -> Result<(Vec<XMedia>, bool), ProviderErro
                     return None;
                 }
                 let url = parse_allowed_media_url(&raw).ok()?;
-                if url.host_str() != Some("video.twimg.com")
-                    || !url.path().to_ascii_lowercase().ends_with(".mp4")
-                {
+                if !is_usable_direct_video_url(&url) {
                     return None;
                 }
                 Some((url, variant.bitrate))
@@ -292,7 +349,7 @@ where
             config.response_max_bytes,
         )
         .await?;
-        tokio::task::spawn_blocking(move || match parser(body, identity) {
+        run_blocking_parser(move || match parser(body, identity) {
             Ok(post) => Ok(post),
             Err(mut error) => {
                 if error.status.is_none() {
@@ -365,6 +422,88 @@ mod tests {
         assert_eq!(bitrate, &Some(2_176_000));
     }
 
+    #[test]
+    fn parses_fxtwitter_tweet_envelope_alias() {
+        let post = parse(
+            br#"{"tweet":{"id":"123","text":"alias root","media":{"photos":[],"videos":[]}}}"#,
+            &identity("123"),
+        )
+        .unwrap();
+        assert_eq!(post.text, "alias root");
+    }
+
+    #[test]
+    fn fxtwitter_accepts_absent_root_id_and_rejects_conflicting_root_id() {
+        let without_id = parse(
+            br#"{"status":{"text":"root","media":{"photos":[],"videos":[]}}}"#,
+            &identity("123"),
+        )
+        .unwrap();
+        assert_eq!(without_id.id, "123");
+
+        let error = parse(
+            br#"{"status":{"id":"999","text":"root","media":{"photos":[],"videos":[]}}}"#,
+            &identity("123"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Incomplete);
+    }
+
+    #[test]
+    fn rejects_fxtwitter_announced_media_with_only_invalid_urls() {
+        let error = parse(
+            br#"{"status":{"id":"123","text":"root","media":{"photos":[{"url":"https://evil.example/a.jpg"}],"videos":[]}}}"#,
+            &identity("123"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Incomplete);
+        assert!(!error.detail.contains("evil.example"));
+    }
+
+    #[test]
+    fn rejects_fxtwitter_hls_only_video_without_thumbnail() {
+        let error = parse(
+            br#"{"status":{"id":"123","text":"root","media":{"photos":[],"videos":[{"url":"https://video.twimg.com/video/list.m3u8"}]}}}"#,
+            &identity("123"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Incomplete);
+    }
+
+    #[test]
+    fn malformed_fxtwitter_quote_does_not_erase_valid_root() {
+        let post = parse(
+            br#"{"status":{"id":"123","text":"root survives","quote":{"id":"456","text":{"unexpected":"object"}}}}"#,
+            &identity("123"),
+        )
+        .unwrap();
+        assert_eq!(post.text, "root survives");
+        assert!(post.quote.is_none());
+    }
+
+    #[test]
+    fn invalid_fxtwitter_quote_media_does_not_erase_valid_root() {
+        let post = parse(
+            br#"{"status":{"id":"123","text":"root survives","quote":{"id":"456","media":{"photos":[{"url":"https://evil.example/secret.jpg"}],"videos":[]}}}}"#,
+            &identity("123"),
+        )
+        .unwrap();
+        assert_eq!(post.text, "root survives");
+        assert!(post.quote.is_none());
+    }
+
+    #[test]
+    fn fxtwitter_keeps_one_quote_level_without_decoding_deeper_quote() {
+        let post = parse(
+            br#"{"status":{"id":"123","text":"root","quote":{"id":"456","text":"first quote","quote":{"id":"789","text":{"unexpected":"object"}}}}}"#,
+            &identity("123"),
+        )
+        .unwrap();
+        let quote = post.quote.expect("first quote should be retained");
+        assert_eq!(quote.text, "first quote");
+        assert!(quote.quote.is_none());
+    }
+
     #[tokio::test]
     async fn fxtwitter_fetch_uses_status_endpoint_and_body_limit() {
         let server = TestServer::single_json(
@@ -384,6 +523,68 @@ mod tests {
         .unwrap();
         assert_eq!(post.text, "root text");
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fxtwitter_fetch_rejects_adapter_local_oversized_response() {
+        let server = TestServer::single_json("GET", "/i/status/123", &vec![b'x'; 2_048]);
+        let mut config = test_config_with_fx_base(server.base_url());
+        config.response_max_bytes = 1_024;
+        let error = fetch(
+            super::super::get_http_client_no_redirect(),
+            &config,
+            &identity("123"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::BodyTooLarge);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn timed_out_parser_waiter_never_starts_after_running_parser_releases_capacity() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let (first_started_sender, first_started_receiver) = tokio::sync::oneshot::channel();
+            let (release_sender, release_receiver) = std::sync::mpsc::channel();
+            let second_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let first_semaphore = semaphore.clone();
+            let first = tokio::spawn(async move {
+                super::super::run_blocking_parser_with_semaphore(first_semaphore, move || {
+                    let _ = first_started_sender.send(());
+                    let _ = release_receiver.recv_timeout(Duration::from_secs(1));
+                    "first"
+                })
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), first_started_receiver)
+                .await
+                .expect("first parser should start")
+                .unwrap();
+
+            let second_started_in_parser = second_started.clone();
+            let second = tokio::time::timeout(
+                Duration::from_millis(30),
+                super::super::run_blocking_parser_with_semaphore(semaphore, move || {
+                    second_started_in_parser.store(true, std::sync::atomic::Ordering::SeqCst);
+                }),
+            )
+            .await;
+            assert!(second.is_err());
+            assert!(!second_started.load(std::sync::atomic::Ordering::SeqCst));
+
+            release_sender.send(()).unwrap();
+            assert_eq!(first.await.unwrap().unwrap(), "first");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!second_started.load(std::sync::atomic::Ordering::SeqCst));
+        });
     }
 
     #[tokio::test]
