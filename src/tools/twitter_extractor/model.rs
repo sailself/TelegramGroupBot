@@ -260,8 +260,27 @@ fn append_media(
 
     let mut selected_videos: Vec<&XMedia> = Vec::new();
     let mut selected_by_thumbnail = std::collections::HashMap::<String, usize>::new();
+    let valid_direct_thumbnail_keys = videos
+        .iter()
+        .filter_map(|item| {
+            let XMedia::Video {
+                url: Some(url),
+                thumbnail_url: Some(thumbnail_url),
+                ..
+            } = item
+            else {
+                return None;
+            };
+            if allowed_direct_mp4_url(url).is_some() {
+                allowed_url(thumbnail_url).map(|url| url.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<HashSet<_>>();
     for item in videos {
         let XMedia::Video {
+            url,
             thumbnail_url,
             bitrate,
             ..
@@ -273,6 +292,12 @@ fn append_media(
             .as_ref()
             .and_then(allowed_url)
             .map(|url| url.to_string());
+        if key.as_ref().is_some_and(|key| {
+            valid_direct_thumbnail_keys.contains(key)
+                && url.as_ref().and_then(allowed_direct_mp4_url).is_none()
+        }) {
+            continue;
+        }
         if let Some(key) = key {
             if let Some(index) = selected_by_thumbnail.get(&key).copied() {
                 let current_bitrate = match selected_videos[index] {
@@ -303,7 +328,7 @@ fn append_media(
         };
         let direct_url = url
             .as_ref()
-            .and_then(allowed_url)
+            .and_then(allowed_direct_mp4_url)
             .map(|url| url.to_string());
         let thumbnail = thumbnail_url
             .as_ref()
@@ -335,6 +360,17 @@ fn append_media(
 
 fn allowed_url(url: &Url) -> Option<&Url> {
     if parse_allowed_media_url(url.as_str()).is_ok() {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+fn allowed_direct_mp4_url(url: &Url) -> Option<&Url> {
+    let url = allowed_url(url)?;
+    if url.host_str() == Some("video.twimg.com")
+        && url.path().to_ascii_lowercase().ends_with(".mp4")
+    {
         Some(url)
     } else {
         None
@@ -489,6 +525,31 @@ mod tests {
                 video_url: "https://video.twimg.com/video/high.mp4".into(),
                 thumbnail_url: "https://pbs.twimg.com/media/thumb.jpg".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn formatter_ignores_hls_variant_when_selecting_direct_mp4() {
+        let thumbnail = ::url::Url::parse("https://pbs.twimg.com/media/thumb.jpg").unwrap();
+        let mut post = post_with_text("video");
+        post.media.push(XMedia::Video {
+            url: Some(::url::Url::parse("https://video.twimg.com/video/low.mp4?tag=12").unwrap()),
+            thumbnail_url: Some(thumbnail.clone()),
+            alt_text: None,
+            bitrate: Some(100),
+        });
+        post.media.push(XMedia::Video {
+            url: Some(::url::Url::parse("https://video.twimg.com/video/high.m3u8").unwrap()),
+            thumbnail_url: Some(thumbnail),
+            alt_text: None,
+            bitrate: Some(500),
+        });
+
+        let content = build_twitter_content(&identity("123"), post).unwrap();
+
+        assert_eq!(
+            content.video_urls,
+            vec!["https://video.twimg.com/video/low.mp4?tag=12"]
         );
     }
 
