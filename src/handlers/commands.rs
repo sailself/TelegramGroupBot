@@ -15,8 +15,8 @@ use teloxide::RequestError;
 
 use crate::agents::factcheck::{run_factcheck_pipeline, FactcheckOutcome};
 use crate::config::{
-    ThirdPartyProvider, CONFIG, FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY, PAINTME_SYSTEM_PROMPT,
-    PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
+    Config, ThirdPartyProvider, CONFIG, FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY,
+    PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
 };
 use crate::db::models::{ModelTokenStat, TokenUserStat};
 use crate::handlers::access::{check_access_control, check_admin_access, is_rate_limited};
@@ -872,6 +872,23 @@ fn append_log_tail(report: &mut String, base_name: &str, title: &str, max_lines:
     }
 }
 
+fn format_twitter_fetch_diagnostics(config: &Config) -> String {
+    format!(
+        "twitter_fetch_providers_order: {}\n\
+twitter_fetch_total_timeout_secs: {}\n\
+twitter_provider_timeout_secs: {}\n\
+twitter_response_max_bytes: {}\n\
+external_media_max_bytes: {}\n\
+external_media_total_max_bytes: {}\n",
+        config.twitter_fetch_providers.join(", "),
+        config.twitter_fetch_total_timeout_secs,
+        config.twitter_provider_timeout_secs,
+        config.twitter_response_max_bytes,
+        config.external_media_max_bytes,
+        config.external_media_total_max_bytes,
+    )
+}
+
 async fn build_status_report(state: &AppState) -> String {
     let db_result = state.db.health_check().await;
     let db_status = if db_result.is_ok() { "ok" } else { "error" };
@@ -1138,6 +1155,8 @@ async fn build_diagnose_report(state: &AppState) -> String {
         "OPENAI_CODEX_MODEL_FILE_present: {}\n",
         bool_label(Path::new(&CONFIG.openai_codex_model_path).exists())
     ));
+    report.push_str("\nTwitter fetch diagnostics (sanitized)\n");
+    report.push_str(&format_twitter_fetch_diagnostics(&CONFIG));
 
     append_log_tail(
         &mut report,
@@ -4152,6 +4171,24 @@ pub async fn handle_media_group(state: AppState, message: Message) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn twitter_fetch_diagnostics_are_sanitized_and_complete() {
+        let config = Config::load().expect("test config should load");
+        let report = format_twitter_fetch_diagnostics(&config);
+
+        assert!(report.contains("twitter_fetch_providers_order: fxtwitter, vxtwitter, jina"));
+        assert!(report.contains("twitter_fetch_total_timeout_secs: 20"));
+        assert!(report.contains("twitter_provider_timeout_secs: 8"));
+        assert!(report.contains("twitter_response_max_bytes: 2097152"));
+        assert!(report.contains("external_media_max_bytes: 20971520"));
+        assert!(report.contains("external_media_total_max_bytes: 52428800"));
+        assert!(!report.contains("JINA_AI_API_KEY"));
+        assert!(!report.contains("test-jina-bearer"));
+        assert!(!report.contains("https://api.fxtwitter.com"));
+        assert!(!report.contains("https://api.vxtwitter.com"));
+        assert!(!report.contains("https://r.jina.ai"));
+    }
 
     #[test]
     fn factcheck_prompt_renders_without_placeholders() {
