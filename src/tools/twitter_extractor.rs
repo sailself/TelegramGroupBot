@@ -10,6 +10,9 @@ use tracing::{debug, info};
 use crate::utils::http::get_http_client;
 
 pub(crate) mod model;
+pub(crate) mod providers;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod url;
 pub use model::TwitterContent;
 #[allow(unused_imports)]
