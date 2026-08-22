@@ -245,6 +245,10 @@ pub(crate) fn response_with_content_length(declared_length: usize, body: Vec<u8>
     response
 }
 
+pub(crate) fn redirect_response(location: &str) -> Vec<u8> {
+    format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+}
+
 pub(crate) fn chunked_response(chunks: Vec<Vec<u8>>) -> Vec<u8> {
     let mut response =
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();

@@ -13,6 +13,7 @@ use crate::tools::twitter_extractor::model::{
     parse_allowed_media_url, validate_complete_post, XAuthor, XMedia, XPost,
 };
 use crate::tools::twitter_extractor::url::XStatusIdentity;
+use crate::utils::http::NoRedirectClient;
 
 #[derive(Debug, Deserialize)]
 struct Envelope {
@@ -233,7 +234,7 @@ fn map_media(media: Option<FxMedia>) -> Result<(Vec<XMedia>, bool), ProviderErro
 }
 
 pub(crate) async fn fetch(
-    client: &reqwest::Client,
+    client: &NoRedirectClient,
     config: &TwitterFetchConfig,
     identity: &XStatusIdentity,
     timeout: Duration,
@@ -289,7 +290,9 @@ pub(crate) async fn fetch(
 mod tests {
     use super::*;
     use crate::tools::twitter_extractor::model::XMedia;
-    use crate::tools::twitter_extractor::test_support::TestServer;
+    use crate::tools::twitter_extractor::test_support::{
+        redirect_response, ExpectedRequest, TestServer,
+    };
     use crate::tools::twitter_extractor::url::XStatusIdentity;
 
     fn identity(id: &str) -> XStatusIdentity {
@@ -339,7 +342,7 @@ mod tests {
         let mut config = test_config_with_fx_base(server.base_url());
         config.response_max_bytes = 1024 * 1024;
         let post = fetch(
-            &reqwest::Client::new(),
+            super::super::get_http_client_no_redirect(),
             &config,
             &identity("123"),
             Duration::from_secs(1),
@@ -347,6 +350,27 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(post.text, "root text");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fxtwitter_fetch_rejects_redirect_without_following_location() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/i/status/123",
+            redirect_response("/target"),
+        )]);
+        let config = test_config_with_fx_base(server.base_url());
+        let error = fetch(
+            super::super::get_http_client_no_redirect(),
+            &config,
+            &identity("123"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::HttpStatus);
+        assert_eq!(error.status, Some(reqwest::StatusCode::FOUND));
         server.join().unwrap();
     }
 

@@ -1,5 +1,6 @@
-﻿use once_cell::sync::Lazy;
+use once_cell::sync::Lazy;
 use reqwest::Client;
+use std::ops::Deref;
 use std::time::Duration;
 
 // Send TCP keepalive probes so long-lived (especially streaming SSE) connections
@@ -27,15 +28,29 @@ static HTTP_CLIENT_NO_COMPRESSION: Lazy<Client> = Lazy::new(|| {
         .expect("Failed to build HTTP client without compression")
 });
 
-#[allow(dead_code)]
-static HTTP_CLIENT_NO_REDIRECT: Lazy<Client> = Lazy::new(|| {
-    Client::builder()
-        .timeout(Duration::from_secs(30))
-        .tcp_keepalive(TCP_KEEPALIVE)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("Failed to build no-redirect HTTP client")
-});
+pub struct NoRedirectClient(Client);
+
+impl NoRedirectClient {
+    fn build() -> Self {
+        Self(
+            Client::builder()
+                .timeout(Duration::from_secs(30))
+                .tcp_keepalive(TCP_KEEPALIVE)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("Failed to build no-redirect HTTP client"),
+        )
+    }
+}
+
+impl Deref for NoRedirectClient {
+    type Target = Client;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+static NO_REDIRECT_CLIENT: Lazy<NoRedirectClient> = Lazy::new(NoRedirectClient::build);
 
 pub fn get_http_client() -> &'static Client {
     &HTTP_CLIENT
@@ -46,6 +61,6 @@ pub fn get_http_client_no_compression() -> &'static Client {
 }
 
 #[allow(dead_code)]
-pub fn get_http_client_no_redirect() -> &'static Client {
-    &HTTP_CLIENT_NO_REDIRECT
+pub fn get_http_client_no_redirect() -> &'static NoRedirectClient {
+    &NO_REDIRECT_CLIENT
 }

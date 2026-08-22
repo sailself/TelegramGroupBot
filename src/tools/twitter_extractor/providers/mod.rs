@@ -1,11 +1,13 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use reqwest::{Client, Response};
+use reqwest::Response;
 use url::Url;
 
 use crate::config::Config;
-use crate::utils::http::get_http_client_no_redirect as shared_http_client_no_redirect;
+use crate::utils::http::{
+    get_http_client_no_redirect as shared_http_client_no_redirect, NoRedirectClient,
+};
 
 pub(crate) mod fxtwitter;
 
@@ -129,7 +131,7 @@ pub(crate) async fn read_limited_body(
 }
 
 #[allow(dead_code)]
-pub(crate) fn get_http_client_no_redirect() -> &'static Client {
+pub(crate) fn get_http_client_no_redirect() -> &'static NoRedirectClient {
     shared_http_client_no_redirect()
 }
 
