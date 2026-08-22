@@ -10,6 +10,7 @@ pub(crate) mod providers;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod url;
+pub(crate) use model::parse_allowed_media_url;
 pub use model::TwitterContent;
 #[allow(unused_imports)]
 pub(crate) use model::VideoThumbnailFallback;

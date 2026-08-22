@@ -46,6 +46,7 @@ use crate::llm::{
     call_third_party_with_tool_runtime,
 };
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
+use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::{build_message_link, start_chat_action_heartbeat};
 use crate::utils::timing::{complete_command_timer, start_command_timer, CommandTimer};
@@ -3694,14 +3695,17 @@ async fn q_handler_internal(
     };
 
     let mut remaining = max_files.saturating_sub(media_files.len());
+    let external_media_budget = ExternalMediaBudget::new(CONFIG.external_media_total_max_bytes);
     if remaining > 0 {
-        let telegraph_files = download_telegraph_media(&telegraph_contents, remaining).await;
+        let telegraph_files =
+            download_telegraph_media(&telegraph_contents, remaining, &external_media_budget).await;
         remaining = remaining.saturating_sub(telegraph_files.len());
         media_files.extend(telegraph_files);
     }
 
     if remaining > 0 {
-        let twitter_files = download_twitter_media(&twitter_contents, remaining).await;
+        let twitter_files =
+            download_twitter_media(&twitter_contents, remaining, &external_media_budget).await;
         media_files.extend(twitter_files);
     }
     let audit_context = create_q_audit_context(&state, &message, command_name).await;

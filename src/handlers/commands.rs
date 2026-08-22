@@ -48,6 +48,7 @@ use crate::state::{
     AppState, ImageGenerationModel, MediaGroupItem, PendingImageCommand, PendingImageRequest,
 };
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
+use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::logging::read_recent_log_lines;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::start_chat_action_heartbeat;
@@ -3082,17 +3083,25 @@ pub async fn factcheck_handler(
     let mut media_files = collected_media.files;
 
     let mut remaining = max_files.saturating_sub(media_files.len());
+    let external_media_budget = ExternalMediaBudget::new(CONFIG.external_media_total_max_bytes);
     if remaining > 0 {
-        let telegraph_files =
-            crate::handlers::content::download_telegraph_media(&telegraph_contents, remaining)
-                .await;
+        let telegraph_files = crate::handlers::content::download_telegraph_media(
+            &telegraph_contents,
+            remaining,
+            &external_media_budget,
+        )
+        .await;
         remaining = remaining.saturating_sub(telegraph_files.len());
         media_files.extend(telegraph_files);
     }
 
     if remaining > 0 {
-        let twitter_files =
-            crate::handlers::content::download_twitter_media(&twitter_contents, remaining).await;
+        let twitter_files = crate::handlers::content::download_twitter_media(
+            &twitter_contents,
+            remaining,
+            &external_media_budget,
+        )
+        .await;
         media_files.extend(twitter_files);
     }
 

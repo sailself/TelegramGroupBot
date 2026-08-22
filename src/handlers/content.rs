@@ -6,7 +6,6 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 use regex::Regex;
-use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde_json::json;
 use teloxide::types::{MessageEntityKind, MessageEntityRef};
@@ -15,9 +14,15 @@ use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use crate::config::CONFIG;
-use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
+use crate::llm::media::MediaFile;
+use crate::tools::external_media::{
+    download_telegraph_media as download_external_telegraph_media,
+    download_twitter_media as download_external_twitter_media, ExternalMediaBudget,
+};
 use crate::tools::telegraph_extractor::{extract_telegraph_content, TelegraphContent};
-use crate::tools::twitter_extractor::{extract_twitter_content, TwitterContent};
+use crate::tools::twitter_extractor::{
+    canonical_status_key, extract_twitter_content, is_supported_status_url, TwitterContent,
+};
 use crate::utils::http::get_http_client;
 
 const EXTRACTION_CACHE_TTL: Duration = Duration::from_secs(900);
@@ -32,12 +37,8 @@ static YOUTUBE_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
 static TELEGRAPH_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"https?://(?:telegra\.ph|t\.me)/[^\s\)>"]+"#).expect("valid telegraph url regex")
 });
-static TWITTER_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r#"(https?://(?:www\.)?(?:x\.com|twitter\.com|mobile\.twitter\.com|m\.twitter\.com|fxtwitter\.com|vxtwitter\.com|fixupx\.com|fixvx\.com|twittpr\.com|pxtwitter\.com|tweetpik\.com)/[^\s\)>"]+)"#,
-    )
-    .expect("valid twitter url regex")
-});
+static HTTP_URL_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"https?://[^\s<>\"']+"#).expect("valid HTTP URL regex"));
 static MARKDOWN_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"\[[^\]]*\]\((https?://[^)]+)\)"#).expect("valid markdown link regex")
 });
@@ -54,12 +55,6 @@ struct TelegraphCacheEntry {
 struct TwitterCacheEntry {
     stored_at: Instant,
     content: TwitterContent,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ExternalMediaKind {
-    Image(&'static str),
-    Video,
 }
 
 static TELEGRAPH_CACHE: Lazy<Mutex<HashMap<String, TelegraphCacheEntry>>> =
@@ -615,6 +610,19 @@ fn clean_url_candidate(url: &str) -> &str {
     })
 }
 
+pub(crate) fn twitter_cache_key(url: &str) -> anyhow::Result<String> {
+    canonical_status_key(url)
+}
+
+pub(crate) fn discover_supported_status_urls(text: &str) -> Vec<String> {
+    HTTP_URL_REGEX
+        .find_iter(text)
+        .map(|matched| clean_url_candidate(matched.as_str()))
+        .filter(|candidate| is_supported_status_url(candidate))
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn is_telegraph_url(url: &str) -> bool {
     let lowered = url.to_lowercase();
     lowered.contains("telegra.ph") || lowered.contains("t.me/")
@@ -677,24 +685,29 @@ async fn extract_cached_telegraph_content(url: &str) -> anyhow::Result<Telegraph
 }
 
 async fn extract_cached_twitter_content(url: &str) -> anyhow::Result<TwitterContent> {
+    let cache_key = twitter_cache_key(url).ok();
     {
         let mut cache = TWITTER_CACHE.lock();
         prune_twitter_cache(&mut cache);
-        if let Some(entry) = cache.get(url) {
-            return Ok(entry.content.clone());
+        if let Some(cache_key) = cache_key.as_ref() {
+            if let Some(entry) = cache.get(cache_key) {
+                return Ok(entry.content.clone());
+            }
         }
     }
 
     let content = extract_twitter_content(url).await?;
-    let mut cache = TWITTER_CACHE.lock();
-    prune_twitter_cache(&mut cache);
-    cache.insert(
-        url.to_string(),
-        TwitterCacheEntry {
-            stored_at: Instant::now(),
-            content: content.clone(),
-        },
-    );
+    if let Some(cache_key) = cache_key {
+        let mut cache = TWITTER_CACHE.lock();
+        prune_twitter_cache(&mut cache);
+        cache.insert(
+            cache_key,
+            TwitterCacheEntry {
+                stored_at: Instant::now(),
+                content: content.clone(),
+            },
+        );
+    }
     Ok(content)
 }
 
@@ -827,30 +840,12 @@ pub async fn extract_twitter_urls_and_content(
                 _ => continue,
             };
             let candidate = clean_url_candidate(candidate);
-            if TWITTER_URL_REGEX.is_match(candidate) {
+            if is_supported_status_url(candidate) {
                 urls.push(candidate.to_string());
             }
         }
     }
-    for m in TWITTER_URL_REGEX.find_iter(text) {
-        urls.push(m.as_str().to_string());
-    }
-    for caps in MARKDOWN_LINK_REGEX.captures_iter(text) {
-        if let Some(url) = caps.get(1) {
-            let candidate = clean_url_candidate(url.as_str());
-            if TWITTER_URL_REGEX.is_match(candidate) {
-                urls.push(candidate.to_string());
-            }
-        }
-    }
-    for caps in HTML_LINK_REGEX.captures_iter(text) {
-        if let Some(url) = caps.get(1) {
-            let candidate = clean_url_candidate(url.as_str());
-            if TWITTER_URL_REGEX.is_match(candidate) {
-                urls.push(candidate.to_string());
-            }
-        }
-    }
+    urls.extend(discover_supported_status_urls(text));
     urls.sort();
     urls.dedup();
 
@@ -909,299 +904,20 @@ pub async fn extract_twitter_urls_and_content(
     (new_text, extracted)
 }
 
-fn display_name_from_url(url: &str) -> Option<String> {
-    let trimmed = url.split('?').next().unwrap_or(url);
-    trimmed
-        .rsplit('/')
-        .next()
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-}
-
-fn image_mime_from_url(url: &str) -> Option<&'static str> {
-    let lowered = url.to_ascii_lowercase();
-    if lowered.contains("format=png") || lowered.ends_with(".png") {
-        Some("image/png")
-    } else if lowered.contains("format=jpg")
-        || lowered.contains("format=jpeg")
-        || lowered.ends_with(".jpg")
-        || lowered.ends_with(".jpeg")
-    {
-        Some("image/jpeg")
-    } else if lowered.contains("format=webp") || lowered.ends_with(".webp") {
-        Some("image/webp")
-    } else if lowered.ends_with(".heic") {
-        Some("image/heic")
-    } else if lowered.ends_with(".heif") {
-        Some("image/heif")
-    } else {
-        None
-    }
-}
-
-async fn download_image_with_content_type(url: &str, source: &str) -> Option<(Vec<u8>, String)> {
-    let client = get_http_client();
-    let response = match client.get(url).send().await {
-        Ok(resp) => resp,
-        Err(err) => {
-            warn!(
-                target: "content.extract",
-                source = source,
-                media_url = %url,
-                error = %err,
-                "Failed to fetch image"
-            );
-            return None;
-        }
-    };
-
-    if !response.status().is_success() {
-        warn!(
-            target: "content.extract",
-            source = source,
-            media_url = %url,
-            status = %response.status(),
-            "Image download failed"
-        );
-        return None;
-    }
-
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(';')
-                .next()
-                .unwrap_or(value)
-                .trim()
-                .to_ascii_lowercase()
-        })
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            let inferred = image_mime_from_url(url).map(|value| value.to_string());
-            if let Some(mime_type) = inferred.as_deref() {
-                debug!(
-                    target: "content.extract",
-                    source = source,
-                    media_url = %url,
-                    mime_type = %mime_type,
-                    "Inferred image Content-Type from URL"
-                );
-            }
-            inferred
-        });
-
-    let Some(content_type) = content_type else {
-        warn!(
-            target: "content.extract",
-            source = source,
-            media_url = %url,
-            reason = "missing_content_type",
-            "Skipping image without Content-Type or URL MIME hint"
-        );
-        return None;
-    };
-
-    if !content_type.starts_with("image/") {
-        warn!(
-            target: "content.extract",
-            source = source,
-            media_url = %url,
-            content_type = %content_type,
-            reason = "non_image_content_type",
-            "Skipping non-image content"
-        );
-        return None;
-    }
-
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes.to_vec(),
-        Err(err) => {
-            warn!(
-                target: "content.extract",
-                source = source,
-                media_url = %url,
-                error = %err,
-                "Failed to read image bytes"
-            );
-            return None;
-        }
-    };
-
-    Some((bytes, content_type))
-}
-
-async fn fetch_external_media(url: String, kind: ExternalMediaKind) -> Option<MediaFile> {
-    match kind {
-        ExternalMediaKind::Image(source) => {
-            if url.to_ascii_lowercase().contains(".svg") {
-                warn!(
-                    target: "content.extract",
-                    source = source,
-                    media_url = %url,
-                    reason = "svg",
-                    "Skipping image media"
-                );
-                return None;
-            }
-
-            let (bytes, mime_type) = download_image_with_content_type(&url, source).await?;
-            if mime_type == "image/svg+xml" {
-                warn!(
-                    target: "content.extract",
-                    source = source,
-                    media_url = %url,
-                    content_type = %mime_type,
-                    reason = "svg",
-                    "Skipping image media"
-                );
-                return None;
-            }
-            Some(MediaFile::new(
-                bytes,
-                mime_type,
-                MediaKind::Image,
-                display_name_from_url(&url),
-            ))
-        }
-        ExternalMediaKind::Video => {
-            let bytes = download_media(&url).await?;
-            let mime_type = video_mime_from_url(&url)
-                .map(|value| value.to_string())
-                .or_else(|| detect_mime_type(&bytes))
-                .unwrap_or_else(|| "video/mp4".to_string());
-            Some(MediaFile::new(
-                bytes,
-                mime_type,
-                MediaKind::Video,
-                display_name_from_url(&url),
-            ))
-        }
-    }
-}
-
-async fn collect_external_media(
-    requests: Vec<(usize, String, ExternalMediaKind)>,
-    max_files: usize,
-) -> Vec<MediaFile> {
-    if requests.is_empty() || max_files == 0 {
-        return Vec::new();
-    }
-
-    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
-    let mut join_set = JoinSet::new();
-
-    for (index, url, kind) in requests {
-        let semaphore = semaphore.clone();
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("external enrich semaphore should remain open");
-            (index, fetch_external_media(url, kind).await)
-        });
-    }
-
-    let mut collected = Vec::new();
-    while let Some(result) = join_set.join_next().await {
-        if let Ok((index, Some(file))) = result {
-            collected.push((index, file));
-        }
-    }
-
-    collected.sort_by_key(|(index, _)| *index);
-    collected
-        .into_iter()
-        .take(max_files)
-        .map(|(_, file)| file)
-        .collect()
-}
-
-fn video_mime_from_url(url: &str) -> Option<&'static str> {
-    let lowered = url.to_ascii_lowercase();
-    if lowered.ends_with(".m3u8") {
-        Some("application/x-mpegURL")
-    } else if lowered.ends_with(".mpd") {
-        Some("application/dash+xml")
-    } else if lowered.ends_with(".webm") {
-        Some("video/webm")
-    } else if lowered.ends_with(".mp4") {
-        Some("video/mp4")
-    } else {
-        None
-    }
-}
-
 pub async fn download_telegraph_media(
     contents: &[TelegraphContent],
     max_files: usize,
+    budget: &ExternalMediaBudget,
 ) -> Vec<MediaFile> {
-    if max_files == 0 {
-        return Vec::new();
-    }
-
-    let mut requests = Vec::new();
-    let mut request_index = 0usize;
-    for content in contents {
-        for url in &content.image_urls {
-            if requests.len() >= max_files {
-                break;
-            }
-            requests.push((
-                request_index,
-                url.clone(),
-                ExternalMediaKind::Image("telegraph"),
-            ));
-            request_index += 1;
-        }
-
-        for url in &content.video_urls {
-            if requests.len() >= max_files {
-                break;
-            }
-            requests.push((request_index, url.clone(), ExternalMediaKind::Video));
-            request_index += 1;
-        }
-    }
-
-    collect_external_media(requests, max_files).await
+    download_external_telegraph_media(contents, max_files, budget).await
 }
 
 pub async fn download_twitter_media(
     contents: &[TwitterContent],
     max_files: usize,
+    budget: &ExternalMediaBudget,
 ) -> Vec<MediaFile> {
-    if max_files == 0 {
-        return Vec::new();
-    }
-
-    let mut requests = Vec::new();
-    let mut request_index = 0usize;
-    for content in contents {
-        for url in &content.image_urls {
-            if requests.len() >= max_files {
-                break;
-            }
-            requests.push((
-                request_index,
-                url.clone(),
-                ExternalMediaKind::Image("twitter"),
-            ));
-            request_index += 1;
-        }
-
-        for url in &content.video_urls {
-            if requests.len() >= max_files {
-                break;
-            }
-            requests.push((request_index, url.clone(), ExternalMediaKind::Video));
-            request_index += 1;
-        }
-    }
-
-    collect_external_media(requests, max_files).await
+    download_external_twitter_media(contents, max_files, budget).await
 }
 
 #[cfg(test)]
@@ -1236,5 +952,26 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(tags, vec!["p", "ul", "p"]);
+    }
+
+    #[test]
+    fn twitter_cache_key_deduplicates_hosts_and_tracking_parameters() {
+        assert_eq!(
+            twitter_cache_key("https://x.com/a/status/123?s=20").unwrap(),
+            twitter_cache_key("https://mobile.twitter.com/a/status/123/photo/1").unwrap()
+        );
+    }
+
+    #[test]
+    fn twitter_url_discovery_rejects_embedded_or_suffix_confusion_urls() {
+        assert!(!is_supported_status_url("https://evilx.com/a/status/123"));
+        assert!(discover_supported_status_urls(
+            "https://example.com/?next=https://x.com/a/status/123"
+        )
+        .is_empty());
+        assert_eq!(
+            discover_supported_status_urls("read https://x.com/a/status/123?s=20 now"),
+            vec!["https://x.com/a/status/123?s=20"]
+        );
     }
 }
