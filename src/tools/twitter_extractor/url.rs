@@ -30,6 +30,22 @@ mod tests {
             assert!(parse_status_identity(raw).is_err(), "accepted {raw}");
         }
     }
+
+    #[test]
+    fn status_identity_accepts_case_insensitive_http_schemes_and_schemeless_urls() {
+        for raw in [
+            "HTTPS://x.com/alice/status/123456",
+            "HtTp://x.com/alice/status/123456",
+            "x.com/alice/status/123456",
+        ] {
+            assert_eq!(
+                canonical_status_key(raw).unwrap(),
+                "123456",
+                "rejected {raw}"
+            );
+        }
+        assert!(parse_status_identity("ftp://x.com/alice/status/123456").is_err());
+    }
 }
 use ::url::Url;
 use anyhow::{anyhow, Result};
@@ -68,12 +84,7 @@ pub(crate) fn parse_status_identity(raw_url: &str) -> Result<XStatusIdentity> {
         return Err(anyhow!("Empty URL provided for Twitter extraction"));
     }
     let trimmed = raw_url.trim();
-    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("https://{trimmed}")
-    };
-    let parsed = Url::parse(&candidate)?;
+    let parsed = Url::parse(trimmed).or_else(|_| Url::parse(&format!("https://{trimmed}")))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!("Twitter/X URL must use HTTP or HTTPS"));
     }
