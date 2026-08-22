@@ -7,6 +7,8 @@ use url::Url;
 use crate::config::Config;
 use crate::utils::http::get_http_client_no_redirect as shared_http_client_no_redirect;
 
+pub(crate) mod fxtwitter;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TwitterProvider {
     FxTwitter,

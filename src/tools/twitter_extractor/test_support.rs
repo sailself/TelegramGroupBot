@@ -51,6 +51,18 @@ pub(crate) struct TestServer {
 }
 
 impl TestServer {
+    pub(crate) fn single_json(method: &str, path: &str, body: &[u8]) -> Self {
+        Self::new(vec![ExpectedRequest::new(
+            method,
+            path,
+            response_with_content_length(body.len(), body.to_vec()),
+        )])
+    }
+
+    pub(crate) fn base_url(&self) -> Url {
+        Url::parse(&format!("http://{}", self.address)).expect("test server base URL")
+    }
+
     pub(crate) fn single(response: Vec<u8>) -> Self {
         Self::new(vec![ExpectedRequest::any(response)])
     }
