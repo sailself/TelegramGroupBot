@@ -1,13 +1,19 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use ::url::Url;
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use tracing::{debug, info};
-use url::Url;
 
 use crate::utils::http::get_http_client;
+
+pub(crate) mod url;
+#[allow(unused_imports)]
+pub(crate) use url::{
+    canonical_status_key, is_supported_status_url, parse_status_identity, XStatusIdentity,
+};
 
 #[derive(Debug, Clone)]
 pub struct TwitterContent {
@@ -37,52 +43,8 @@ static EMPTY_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
 static WHITESPACE_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\s+").expect("valid whitespace regex"));
 
-fn is_supported_host(host: &str) -> bool {
-    let mut host = host.to_lowercase();
-    if host.starts_with("www.") {
-        host = host.trim_start_matches("www.").to_string();
-    }
-    if host.ends_with("x.com") {
-        return true;
-    }
-    let tokens = [
-        "twitter.com",
-        "fxtwitter.com",
-        "vxtwitter.com",
-        "fixupx.com",
-        "fixvx.com",
-        "twittpr.com",
-        "pxtwitter.com",
-        "tweetpik.com",
-    ];
-    tokens.iter().any(|token| host.ends_with(token))
-}
-
 fn normalize_status_url(raw_url: &str) -> Result<String> {
-    if raw_url.trim().is_empty() {
-        return Err(anyhow!("Empty URL provided for Twitter extraction"));
-    }
-
-    let mut candidate = raw_url.trim().to_string();
-    if !candidate.starts_with("http://") && !candidate.starts_with("https://") {
-        candidate = format!("https://{}", candidate);
-    }
-
-    let parsed = Url::parse(&candidate)?;
-    let host = parsed.host_str().unwrap_or_default();
-    if !is_supported_host(host) {
-        return Err(anyhow!("Unsupported Twitter/X host: {}", host));
-    }
-
-    if !parsed.path().contains("/status/") {
-        return Err(anyhow!("Twitter/X URL does not reference a status update"));
-    }
-
-    let mut canonical = parsed.clone();
-    canonical.set_scheme("https").ok();
-    canonical.set_host(Some("x.com")).ok();
-
-    Ok(canonical.to_string())
+    Ok(parse_status_identity(raw_url)?.canonical_url.to_string())
 }
 
 fn build_proxy_url(normalized_url: &str) -> String {
