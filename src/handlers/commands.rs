@@ -4174,20 +4174,42 @@ mod tests {
 
     #[test]
     fn twitter_fetch_diagnostics_are_sanitized_and_complete() {
-        let config = Config::load().expect("test config should load");
+        let mut config = (*CONFIG).clone();
+        config.twitter_fetch_providers = vec![
+            "fxtwitter".to_string(),
+            "vxtwitter".to_string(),
+            "jina".to_string(),
+        ];
+        config.twitter_fetch_total_timeout_secs = 20;
+        config.twitter_provider_timeout_secs = 8;
+        config.twitter_response_max_bytes = 2_097_152;
+        config.external_media_max_bytes = 20_971_520;
+        config.external_media_total_max_bytes = 52_428_800;
+        config.jina_ai_api_key = "seeded-jina-secret".to_string();
+        config.fxtwitter_api_base = "https://seeded-fxtwitter.invalid/api".to_string();
+        config.vxtwitter_api_base = "https://seeded-vxtwitter.invalid/api".to_string();
+        config.jina_reader_endpoint = "https://seeded-jina.invalid/reader".to_string();
         let report = format_twitter_fetch_diagnostics(&config);
 
-        assert!(report.contains("twitter_fetch_providers_order: fxtwitter, vxtwitter, jina"));
-        assert!(report.contains("twitter_fetch_total_timeout_secs: 20"));
-        assert!(report.contains("twitter_provider_timeout_secs: 8"));
-        assert!(report.contains("twitter_response_max_bytes: 2097152"));
-        assert!(report.contains("external_media_max_bytes: 20971520"));
-        assert!(report.contains("external_media_total_max_bytes: 52428800"));
-        assert!(!report.contains("JINA_AI_API_KEY"));
-        assert!(!report.contains("test-jina-bearer"));
-        assert!(!report.contains("https://api.fxtwitter.com"));
-        assert!(!report.contains("https://api.vxtwitter.com"));
-        assert!(!report.contains("https://r.jina.ai"));
+        assert_eq!(
+            report,
+            "twitter_fetch_providers_order: fxtwitter, vxtwitter, jina\n\
+twitter_fetch_total_timeout_secs: 20\n\
+twitter_provider_timeout_secs: 8\n\
+twitter_response_max_bytes: 2097152\n\
+external_media_max_bytes: 20971520\n\
+external_media_total_max_bytes: 52428800\n"
+        );
+        for secret in [
+            "JINA_AI_API_KEY",
+            "seeded-jina-secret",
+            "Bearer seeded-jina-secret",
+            "https://seeded-fxtwitter.invalid/api",
+            "https://seeded-vxtwitter.invalid/api",
+            "https://seeded-jina.invalid/reader",
+        ] {
+            assert!(!report.contains(secret), "diagnostic leaked {secret}");
+        }
     }
 
     #[test]
