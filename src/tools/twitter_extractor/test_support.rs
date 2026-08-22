@@ -17,6 +17,8 @@ pub(crate) struct ExpectedRequest {
     headers: Vec<(String, String)>,
     absent_headers: Vec<String>,
     response: Vec<u8>,
+    delay: Option<std::time::Duration>,
+    allow_client_disconnect: bool,
 }
 
 impl ExpectedRequest {
@@ -27,6 +29,8 @@ impl ExpectedRequest {
             headers: Vec::new(),
             absent_headers: Vec::new(),
             response,
+            delay: None,
+            allow_client_disconnect: false,
         }
     }
 
@@ -37,6 +41,8 @@ impl ExpectedRequest {
             headers: Vec::new(),
             absent_headers: Vec::new(),
             response,
+            delay: None,
+            allow_client_disconnect: false,
         }
     }
 
@@ -48,6 +54,12 @@ impl ExpectedRequest {
 
     pub(crate) fn without_header(mut self, name: &str) -> Self {
         self.absent_headers.push(name.to_ascii_lowercase());
+        self
+    }
+
+    pub(crate) fn delayed(mut self, delay: std::time::Duration) -> Self {
+        self.delay = Some(delay);
+        self.allow_client_disconnect = true;
         self
     }
 }
@@ -67,12 +79,39 @@ impl TestServer {
         )])
     }
 
+    pub(crate) fn single_status(method: &str, path: &str, status: u16) -> Self {
+        Self::new(vec![ExpectedRequest::new(
+            method,
+            path,
+            response_with_status(status, Vec::new()),
+        )])
+    }
+
+    pub(crate) fn single_delayed(
+        method: &str,
+        path: &str,
+        delay: std::time::Duration,
+        status: u16,
+        body: &[u8],
+    ) -> Self {
+        Self::new(vec![ExpectedRequest::new(
+            method,
+            path,
+            response_with_status(status, body.to_vec()),
+        )
+        .delayed(delay)])
+    }
+
     pub(crate) fn base_url(&self) -> Url {
         Url::parse(&format!("http://{}", self.address)).expect("test server base URL")
     }
 
     pub(crate) fn single(response: Vec<u8>) -> Self {
         Self::new(vec![ExpectedRequest::any(response)])
+    }
+
+    pub(crate) fn expect_no_requests() -> Self {
+        Self::new(Vec::new())
     }
 
     pub(crate) fn new(expected: Vec<ExpectedRequest>) -> Self {
@@ -101,6 +140,10 @@ impl TestServer {
             Err(_) => Err("test server worker panicked".to_string()),
         }
     }
+
+    pub(crate) fn join_allowing_client_disconnect(self) {
+        let _ = self.join();
+    }
 }
 
 fn serve(
@@ -126,12 +169,17 @@ fn serve(
                         first_error.get_or_insert(error);
                     }
                 }
+                if let Some(delay) = expectation.delay {
+                    thread::sleep(delay);
+                }
                 if let Err(error) = stream
                     .write_all(&expectation.response)
                     .and_then(|_| stream.flush())
                     .map_err(|error| error.to_string())
                 {
-                    first_error.get_or_insert(error);
+                    if !expectation.allow_client_disconnect {
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
             None => {
@@ -256,6 +304,26 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
 pub(crate) fn response_with_content_length(declared_length: usize, body: Vec<u8>) -> Vec<u8> {
     let mut response = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    response
+}
+
+pub(crate) fn response_with_status(status: u16, body: Vec<u8>) -> Vec<u8> {
+    let reason = match status {
+        200 => "OK",
+        302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Test Status",
+    };
+    let mut response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
     )
     .into_bytes();
     response.extend_from_slice(&body);

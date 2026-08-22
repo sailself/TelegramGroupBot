@@ -21,6 +21,16 @@ pub(crate) enum TwitterProvider {
 }
 
 impl TwitterProvider {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::FxTwitter => "fxtwitter",
+            Self::VxTwitter => "vxtwitter",
+            Self::Jina => "jina",
+        }
+    }
+}
+
+impl TwitterProvider {
     pub(crate) fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "fxtwitter" => Ok(Self::FxTwitter),
@@ -63,6 +73,53 @@ pub(crate) struct ProviderError {
     pub(crate) kind: ProviderErrorKind,
     pub(crate) status: Option<reqwest::StatusCode>,
     pub(crate) detail: String,
+}
+
+impl ProviderError {
+    pub(crate) fn deadline(provider: TwitterProvider) -> Self {
+        Self {
+            provider,
+            kind: ProviderErrorKind::DeadlineExhausted,
+            status: None,
+            detail: "total deadline exhausted".to_string(),
+        }
+    }
+}
+
+impl ProviderErrorKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::HttpStatus => "http_status",
+            Self::BodyTooLarge => "body_too_large",
+            Self::Decode => "decode",
+            Self::Incomplete => "incomplete",
+            Self::DeadlineExhausted => "deadline_exhausted",
+        }
+    }
+}
+
+pub(crate) fn aggregate_provider_failures(
+    identity: &crate::tools::twitter_extractor::url::XStatusIdentity,
+    failures: &[ProviderError],
+) -> anyhow::Error {
+    let summaries = failures
+        .iter()
+        .map(|failure| {
+            let status = failure
+                .status
+                .map_or_else(|| "-".to_string(), |status| status.as_u16().to_string());
+            format!(
+                "{}:{}/{}",
+                failure.provider.as_str(),
+                failure.kind.as_str(),
+                status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow!("failed to fetch X status {}: {}", identity.id, summaries)
 }
 
 impl TryFrom<&Config> for TwitterFetchConfig {
