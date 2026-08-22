@@ -3,6 +3,10 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread::{self, JoinHandle};
 
 use url::Url;
@@ -42,6 +46,7 @@ impl ExpectedRequest {
 
 pub(crate) struct TestServer {
     address: std::net::SocketAddr,
+    shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<(), String>>>,
 }
 
@@ -53,9 +58,12 @@ impl TestServer {
     pub(crate) fn new(expected: Vec<ExpectedRequest>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let address = listener.local_addr().expect("test server address");
-        let worker = thread::spawn(move || serve(listener, expected));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || serve(listener, expected, worker_shutdown));
         Self {
             address,
+            shutdown,
             worker: Some(worker),
         }
     }
@@ -64,30 +72,69 @@ impl TestServer {
         Url::parse(&format!("http://{}{}", self.address, path)).expect("test server URL")
     }
 
-    pub(crate) async fn join(mut self) {
+    pub(crate) fn join(mut self) -> Result<(), String> {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.address);
         let worker = self.worker.take().expect("test server already joined");
-        let result = tokio::task::spawn_blocking(move || worker.join()).await;
-        match result {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => panic!("test server expectation failed: {error}"),
-            Ok(Err(_)) => panic!("test server worker panicked"),
-            Err(error) => panic!("test server join failed: {error}"),
+        match worker.join() {
+            Ok(result) => result,
+            Err(_) => Err("test server worker panicked".to_string()),
         }
     }
 }
 
-fn serve(listener: TcpListener, expected: Vec<ExpectedRequest>) -> Result<(), String> {
+fn serve(
+    listener: TcpListener,
+    expected: Vec<ExpectedRequest>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), String> {
     let mut expected = VecDeque::from(expected);
-    while let Some(expectation) = expected.pop_front() {
+    let mut first_error = None;
+    loop {
         let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
-        let request = read_request(&mut stream)?;
-        expectation.verify(&request)?;
-        stream
-            .write_all(&expectation.response)
-            .map_err(|error| error.to_string())?;
-        stream.flush().map_err(|error| error.to_string())?;
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+
+        let expectation = expected.pop_front();
+        match expectation {
+            Some(expectation) => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+                match read_request(&mut stream).and_then(|request| expectation.verify(&request)) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                if let Err(error) = stream
+                    .write_all(&expectation.response)
+                    .and_then(|_| stream.flush())
+                    .map_err(|error| error.to_string())
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+            None => {
+                let error = read_request(&mut stream)
+                    .map(|request| {
+                        format!(
+                            "unexpected extra request: {} {}",
+                            request.method, request.path
+                        )
+                    })
+                    .unwrap_or_else(|error| format!("unexpected extra request: {error}"));
+                first_error.get_or_insert(error);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                );
+            }
+        }
     }
-    Ok(())
+
+    if !expected.is_empty() {
+        return Err(format!("unmet expectations: {}", expected.len()));
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 struct Request {

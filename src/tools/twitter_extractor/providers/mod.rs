@@ -89,6 +89,7 @@ impl TryFrom<&Config> for TwitterFetchConfig {
 
 #[allow(dead_code)]
 pub(crate) async fn read_limited_body(
+    provider: TwitterProvider,
     mut response: Response,
     max_bytes: usize,
 ) -> std::result::Result<Vec<u8>, ProviderError> {
@@ -98,7 +99,7 @@ pub(crate) async fn read_limited_body(
         .is_some_and(|length| length > max_bytes as u64)
     {
         return Err(ProviderError {
-            provider: TwitterProvider::FxTwitter,
+            provider,
             kind: ProviderErrorKind::BodyTooLarge,
             status: Some(status),
             detail: "provider response exceeds configured byte limit".to_string(),
@@ -107,14 +108,14 @@ pub(crate) async fn read_limited_body(
 
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| ProviderError {
-        provider: TwitterProvider::FxTwitter,
+        provider,
         kind: ProviderErrorKind::Transport,
         status: Some(status),
         detail: "provider response body read failed".to_string(),
     })? {
         if body.len().saturating_add(chunk.len()) > max_bytes {
             return Err(ProviderError {
-                provider: TwitterProvider::FxTwitter,
+                provider,
                 kind: ProviderErrorKind::BodyTooLarge,
                 status: Some(status),
                 detail: "provider response exceeds configured byte limit".to_string(),
@@ -135,7 +136,7 @@ mod tests {
     use super::*;
     use crate::config::CONFIG;
     use crate::tools::twitter_extractor::test_support::{
-        chunked_response, response_with_content_length, TestServer,
+        chunked_response, response_with_content_length, ExpectedRequest, TestServer,
     };
 
     #[test]
@@ -157,16 +158,32 @@ mod tests {
 
     #[tokio::test]
     async fn limited_body_rejects_declared_and_streamed_overflow() {
-        let declared = TestServer::single(response_with_content_length(2_048, vec![b'x'; 2_048]));
+        let declared = TestServer::new(vec![
+            ExpectedRequest::any(response_with_content_length(2_048, vec![b'x'; 2_048])),
+            ExpectedRequest::any(response_with_content_length(2_048, vec![b'x'; 2_048])),
+        ]);
         let response = reqwest::Client::new()
             .get(declared.url("/"))
             .send()
             .await
             .unwrap();
         assert_eq!(
-            read_limited_body(response, 1_024).await.unwrap_err().kind,
+            read_limited_body(TwitterProvider::VxTwitter, response, 1_024)
+                .await
+                .unwrap_err()
+                .kind,
             ProviderErrorKind::BodyTooLarge
         );
+        let response = reqwest::Client::new()
+            .get(declared.url("/"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_limited_body(TwitterProvider::Jina, response, 1_024)
+            .await
+            .unwrap_err();
+        assert_eq!(error.provider, TwitterProvider::Jina);
+        declared.join().unwrap();
 
         let chunked = TestServer::single(chunked_response(vec![vec![b'a'; 700], vec![b'b'; 700]]));
         let response = reqwest::Client::new()
@@ -175,9 +192,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_limited_body(response, 1_024).await.unwrap_err().kind,
+            read_limited_body(TwitterProvider::VxTwitter, response, 1_024)
+                .await
+                .unwrap_err()
+                .kind,
             ProviderErrorKind::BodyTooLarge
         );
+        chunked.join().unwrap();
     }
 
     #[test]
@@ -196,5 +217,27 @@ mod tests {
             TwitterFetchConfig::try_from(&enabled).unwrap().providers,
             vec![TwitterProvider::Jina]
         );
+    }
+
+    #[test]
+    fn test_server_join_surfaces_missing_expectations_without_hanging() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/never-requested",
+            response_with_content_length(0, Vec::new()),
+        )]);
+        let error = server.join().unwrap_err();
+        assert!(error.contains("unmet"));
+    }
+
+    #[tokio::test]
+    async fn test_server_join_surfaces_unexpected_extra_requests() {
+        let server = TestServer::single(response_with_content_length(0, Vec::new()));
+        let client = reqwest::Client::new();
+        client.get(server.url("/first")).send().await.unwrap();
+        let extra = client.get(server.url("/extra")).send().await.unwrap();
+        assert_eq!(extra.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        let error = server.join().unwrap_err();
+        assert!(error.contains("unexpected extra request"));
     }
 }
