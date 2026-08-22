@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Result};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Response;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -77,6 +77,32 @@ pub(crate) struct ExternalMediaReservation {
     budget: ExternalMediaBudget,
     reserved: usize,
     committed: bool,
+}
+
+struct AbortOnDropLauncher {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl AbortOnDropLauncher {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn finish(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for AbortOnDropLauncher {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl ExternalMediaReservation {
@@ -393,7 +419,7 @@ where
         receivers.push(receiver);
     }
     let launcher_semaphore = semaphore.clone();
-    let launcher = tokio::spawn(async move {
+    let launcher = AbortOnDropLauncher::new(tokio::spawn(async move {
         let mut workers = JoinSet::new();
         for (request, sender) in requests.into_iter().zip(senders) {
             let permit = match launcher_semaphore.clone().acquire_owned().await {
@@ -407,7 +433,7 @@ where
             });
         }
         while workers.join_next().await.is_some() {}
-    });
+    }));
 
     let mut collected = Vec::new();
     for receiver in receivers {
@@ -424,7 +450,7 @@ where
         }
         drop(permit);
     }
-    let _ = launcher.await;
+    launcher.finish().await;
     collected.sort_by_key(|(index, _)| *index);
     collected
         .into_iter()
@@ -579,6 +605,83 @@ mod tests {
         (url, ready_receiver, release_sender, worker)
     }
 
+    fn controlled_thirty_chunk_server() -> (
+        url::Url,
+        tokio::sync::oneshot::Receiver<()>,
+        Sender<()>,
+        JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = url::Url::parse(&format!("http://{address}/media")).unwrap();
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver): (Sender<()>, Receiver<()>) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1E\r\n",
+                )
+                .unwrap();
+            stream.write_all(&[b'a'; 30]).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            stream.flush().unwrap();
+            let _ = ready_sender.send(());
+            let _ = release_receiver.recv_timeout(std::time::Duration::from_secs(2));
+            stream.write_all(b"1E\r\n").unwrap();
+            stream.write_all(&[b'b'; 30]).unwrap();
+            stream.write_all(b"\r\n0\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+        });
+        (url, ready_receiver, release_sender, worker)
+    }
+
+    fn cancellation_body_server() -> (
+        url::Url,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+        JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = url::Url::parse(&format!("http://{address}/media")).unwrap();
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            let _ = ready_sender.send(());
+            let mut buffer = [0u8; 1];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => {
+                        let _ = closed_sender.send(());
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => {
+                        let _ = closed_sender.send(());
+                        break;
+                    }
+                }
+            }
+        });
+        (url, ready_receiver, closed_receiver, worker)
+    }
+
     #[tokio::test]
     async fn twitter_media_fetch_rejects_redirect_without_following_location() {
         let server = TestServer::new(vec![
@@ -675,23 +778,37 @@ mod tests {
 
     #[tokio::test]
     async fn total_budget_exhaustion_refunds_and_allows_a_later_request() {
-        let first = TestServer::single(
-            crate::tools::twitter_extractor::test_support::chunked_response(vec![
-                vec![b'a'; 30],
-                vec![b'b'; 30],
-            ]),
-        );
+        let (first_url, first_ready, release_first, first_worker) =
+            controlled_thirty_chunk_server();
         let budget = ExternalMediaBudget::new(50);
         let response = get_http_client_no_redirect()
-            .get(first.url("/media"))
+            .get(first_url)
             .send()
             .await
             .unwrap();
-        assert!(read_external_media_response(response, 100, &budget)
-            .await
-            .is_err());
+        let read = read_external_media_response(response, 100, &budget);
+        tokio::pin!(read);
+        first_ready.await.unwrap();
+        let first_reserved = async {
+            loop {
+                if budget.remaining() == 20 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::select! {
+                _ = first_reserved => {}
+                result = &mut read => panic!("stream completed before second chunk gate: {result:?}"),
+            }
+        })
+        .await
+        .expect("first 30-byte chunk should reserve before the gate");
+        release_first.send(()).unwrap();
+        assert!(read.await.is_err());
         assert_eq!(budget.remaining(), 50);
-        first.join().unwrap();
+        first_worker.join().unwrap();
 
         let second = TestServer::single(
             crate::tools::twitter_extractor::test_support::response_with_content_length(
@@ -922,6 +1039,87 @@ mod tests {
         assert_eq!(started.load(Ordering::SeqCst), 2);
         slow_worker.join().unwrap();
         fast.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_parent_stops_unsent_starts_and_refunds_open_body() {
+        let (slow_url, body_ready, closed, slow_worker) = cancellation_body_server();
+        let started = Arc::new(AtomicUsize::new(0));
+        let second_started = Arc::new(tokio::sync::Notify::new());
+        let second_started_for_start = second_started.clone();
+        let started_for_start = started.clone();
+        let requests = (0..4)
+            .map(|index| ExternalMediaRequest {
+                index,
+                url: format!("https://telegra.ph/file/{index}.jpg"),
+                kind: ExternalMediaKind::Image("telegraph"),
+                source: "telegraph",
+                thumbnail_url: None,
+            })
+            .collect::<Vec<_>>();
+        let budget = ExternalMediaBudget::new(10);
+        let observed_budget = budget.clone();
+        let parent_budget = budget.clone();
+        let parent = tokio::spawn(async move {
+            collect_external_media_with_starts_limit(
+                requests,
+                4,
+                &parent_budget,
+                move |request| {
+                    let slow_url = slow_url.clone();
+                    let started_for_start = started_for_start.clone();
+                    let second_started = second_started_for_start.clone();
+                    async move {
+                        started_for_start.fetch_add(1, Ordering::SeqCst);
+                        if request.index > 0 {
+                            second_started.notify_waiters();
+                            return None;
+                        }
+                        get_http_client_no_redirect()
+                            .get(slow_url)
+                            .send()
+                            .await
+                            .ok()
+                    }
+                },
+                1,
+            )
+            .await
+        });
+        body_ready.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if observed_budget.remaining() == 9 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first body chunk should reserve before cancellation");
+        let second_wait = second_started.notified();
+        parent.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if observed_budget.remaining() == 10 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("parent cancellation should refund the partial reservation");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), second_wait)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), closed)
+            .await
+            .expect("controlled response should observe client disconnect")
+            .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        slow_worker.join().unwrap();
     }
 
     #[tokio::test]
