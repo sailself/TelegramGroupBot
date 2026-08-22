@@ -15,6 +15,7 @@ pub(crate) struct ExpectedRequest {
     method: Option<String>,
     path: Option<String>,
     headers: Vec<(String, String)>,
+    absent_headers: Vec<String>,
     response: Vec<u8>,
 }
 
@@ -24,6 +25,7 @@ impl ExpectedRequest {
             method: None,
             path: None,
             headers: Vec::new(),
+            absent_headers: Vec::new(),
             response,
         }
     }
@@ -33,6 +35,7 @@ impl ExpectedRequest {
             method: Some(method.to_ascii_uppercase()),
             path: Some(path.to_string()),
             headers: Vec::new(),
+            absent_headers: Vec::new(),
             response,
         }
     }
@@ -40,6 +43,11 @@ impl ExpectedRequest {
     pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers
             .push((name.to_ascii_lowercase(), value.to_string()));
+        self
+    }
+
+    pub(crate) fn without_header(mut self, name: &str) -> Self {
+        self.absent_headers.push(name.to_ascii_lowercase());
         self
     }
 }
@@ -184,6 +192,15 @@ impl ExpectedRequest {
                 .any(|(actual_name, actual_value)| actual_name == name && actual_value == value)
             {
                 return Err(format!("missing expected header {name}"));
+            }
+        }
+        for name in &self.absent_headers {
+            if request
+                .headers
+                .iter()
+                .any(|(actual_name, _)| actual_name == name)
+            {
+                return Err(format!("unexpected header {name}"));
             }
         }
         Ok(())

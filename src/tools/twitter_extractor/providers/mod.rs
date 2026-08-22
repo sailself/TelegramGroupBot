@@ -10,6 +10,7 @@ use crate::utils::http::{
 };
 
 pub(crate) mod fxtwitter;
+pub(crate) mod jina;
 pub(crate) mod vxtwitter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
