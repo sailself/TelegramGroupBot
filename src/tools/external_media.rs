@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -257,10 +258,14 @@ fn video_mime_from_url(url: &str) -> Option<&'static str> {
     }
 }
 
-async fn fetch_request(
-    request: ExternalMediaRequest,
-    budget: &ExternalMediaBudget,
-) -> Option<MediaFile> {
+fn resolve_video_mime_type(url: &str, _content_type: Option<&str>, bytes: &[u8]) -> String {
+    video_mime_from_url(url)
+        .map(ToString::to_string)
+        .or_else(|| detect_mime_type(bytes))
+        .unwrap_or_else(|| "video/mp4".to_string())
+}
+
+async fn start_request(request: &ExternalMediaRequest) -> Option<Response> {
     let parsed_url = match validate_media_url(&request.url, request.source) {
         Ok(url) => url,
         Err(err) => {
@@ -281,7 +286,14 @@ async fn fetch_request(
             return None;
         }
     };
+    Some(response)
+}
 
+async fn process_response(
+    request: &ExternalMediaRequest,
+    response: Response,
+    budget: &ExternalMediaBudget,
+) -> Option<MediaFile> {
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
@@ -325,11 +337,7 @@ async fn fetch_request(
                 return None;
             }
         };
-    let mime_type = video_mime_from_url(&request.url)
-        .map(ToString::to_string)
-        .or(content_type)
-        .or_else(|| detect_mime_type(&bytes))
-        .unwrap_or_else(|| "video/mp4".to_string());
+    let mime_type = resolve_video_mime_type(&request.url, content_type.as_deref(), &bytes);
     Some(MediaFile::new(
         bytes,
         mime_type,
@@ -338,48 +346,76 @@ async fn fetch_request(
     ))
 }
 
-async fn fetch_request_with_fallback(
+async fn process_response_with_fallback<F, Fut>(
     request: ExternalMediaRequest,
+    response: Option<Response>,
     budget: &ExternalMediaBudget,
-) -> Option<MediaFile> {
-    let fallback = request.thumbnail_fallback();
-    let direct = fetch_request(request, budget).await;
-    if direct.is_some() {
-        direct
-    } else if let Some(fallback) = fallback {
-        fetch_request(fallback, budget).await
-    } else {
-        None
+    fallback_start: F,
+) -> Option<(usize, MediaFile)>
+where
+    F: FnOnce(ExternalMediaRequest) -> Fut,
+    Fut: std::future::Future<Output = Option<Response>>,
+{
+    let mut media = match response {
+        Some(response) => process_response(&request, response, budget).await,
+        None => None,
+    };
+    if media.is_none() {
+        if let Some(fallback) = request.thumbnail_fallback() {
+            if let Some(response) = fallback_start(fallback.clone()).await {
+                media = process_response(&fallback, response, budget).await;
+            }
+        }
     }
+    media.map(|file| (request.index, file))
 }
 
-async fn collect_external_media(
+async fn collect_external_media_with_starts<F, Fut>(
     requests: Vec<ExternalMediaRequest>,
     max_files: usize,
     budget: &ExternalMediaBudget,
-) -> Vec<MediaFile> {
+    start: F,
+) -> Vec<MediaFile>
+where
+    F: Fn(ExternalMediaRequest) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<Response>> + Send + 'static,
+{
     if requests.is_empty() || max_files == 0 {
         return Vec::new();
     }
     let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
     let mut join_set = JoinSet::new();
+    let request_count = requests.len();
     for request in requests {
         let semaphore = semaphore.clone();
-        let budget = budget.clone();
+        let start = start.clone();
         join_set.spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("external enrich semaphore should remain open");
-            (
-                request.index,
-                fetch_request_with_fallback(request, &budget).await,
-            )
+            let response = start(request.clone()).await;
+            (request.index, request, response)
         });
     }
-    let mut collected = Vec::new();
+    let mut pending = HashMap::new();
     while let Some(result) = join_set.join_next().await {
-        if let Ok((index, Some(file))) = result {
+        if let Ok((index, request, response)) = result {
+            pending.insert(index, (request, response));
+        }
+    }
+
+    let mut collected = Vec::new();
+    for index in 0..request_count {
+        let Some((request, response)) = pending.remove(&index) else {
+            continue;
+        };
+        if let Some((index, file)) =
+            process_response_with_fallback(request, response, budget, |fallback| async move {
+                start_request(&fallback).await
+            })
+            .await
+        {
             collected.push((index, file));
         }
     }
@@ -389,6 +425,17 @@ async fn collect_external_media(
         .take(max_files)
         .map(|(_, file)| file)
         .collect()
+}
+
+async fn collect_external_media(
+    requests: Vec<ExternalMediaRequest>,
+    max_files: usize,
+    budget: &ExternalMediaBudget,
+) -> Vec<MediaFile> {
+    collect_external_media_with_starts(requests, max_files, budget, |request| async move {
+        start_request(&request).await
+    })
+    .await
 }
 
 pub async fn download_telegraph_media(
@@ -522,5 +569,274 @@ mod tests {
         budget.test_commit(60).unwrap();
         assert_eq!(budget.remaining(), 40);
         assert!(budget.test_commit(41).is_err());
+    }
+
+    #[tokio::test]
+    async fn declared_per_file_overflow_is_rejected_before_read_and_keeps_budget() {
+        let server = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                101,
+                vec![b'x'; 101],
+            ),
+        );
+        let budget = ExternalMediaBudget::new(200);
+        let response = get_http_client_no_redirect()
+            .get(server.url("/media"))
+            .send()
+            .await
+            .unwrap();
+        assert!(read_external_media_response(response, 100, &budget)
+            .await
+            .is_err());
+        assert_eq!(budget.remaining(), 200);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_per_file_overflow_refunds_partial_reservation() {
+        let server = TestServer::single(
+            crate::tools::twitter_extractor::test_support::chunked_response(vec![
+                vec![b'a'; 60],
+                vec![b'b'; 60],
+            ]),
+        );
+        let budget = ExternalMediaBudget::new(200);
+        let response = get_http_client_no_redirect()
+            .get(server.url("/media"))
+            .send()
+            .await
+            .unwrap();
+        assert!(read_external_media_response(response, 100, &budget)
+            .await
+            .is_err());
+        assert_eq!(budget.remaining(), 200);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn total_budget_exhaustion_refunds_and_allows_a_later_request() {
+        let first = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                60,
+                vec![b'a'; 60],
+            ),
+        );
+        let budget = ExternalMediaBudget::new(50);
+        let response = get_http_client_no_redirect()
+            .get(first.url("/media"))
+            .send()
+            .await
+            .unwrap();
+        assert!(read_external_media_response(response, 100, &budget)
+            .await
+            .is_err());
+        assert_eq!(budget.remaining(), 50);
+        first.join().unwrap();
+
+        let second = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                50,
+                vec![b'b'; 50],
+            ),
+        );
+        let response = get_http_client_no_redirect()
+            .get(second.url("/media"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            read_external_media_response(response, 100, &budget)
+                .await
+                .unwrap()
+                .len(),
+            50
+        );
+        assert_eq!(budget.remaining(), 0);
+        second.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_video_control_path_fetches_thumbnail_at_same_index_without_extra_slot() {
+        let server = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_status(
+                    500,
+                    Vec::new(),
+                ),
+            ),
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_content_length(
+                    3,
+                    b"abc".to_vec(),
+                ),
+            ),
+        ]);
+        let direct_url = server.url("/direct");
+        let fallback_url = server.url("/fallback");
+        let request = twitter_video_request(
+            3,
+            "https://video.twimg.com/video/a.mp4",
+            Some("https://pbs.twimg.com/media/a-thumb.jpg"),
+        );
+        let direct = get_http_client_no_redirect()
+            .get(direct_url)
+            .send()
+            .await
+            .unwrap();
+        let budget = ExternalMediaBudget::new(100);
+        let (index, file) =
+            process_response_with_fallback(request, Some(direct), &budget, move |_| async move {
+                get_http_client_no_redirect()
+                    .get(fallback_url)
+                    .send()
+                    .await
+                    .ok()
+            })
+            .await
+            .expect("thumbnail fallback should produce a file");
+        assert_eq!(index, 3);
+        assert_eq!(file.kind, MediaKind::Image);
+        assert_eq!(budget.remaining(), 97);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn inverted_response_delays_keep_source_index_priority_for_budget_survivors() {
+        let slow = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_content_length(
+                    2,
+                    b"0a".to_vec(),
+                ),
+            )
+            .delayed(std::time::Duration::from_millis(50)),
+        ]);
+        let fast = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_content_length(
+                    2,
+                    b"1b".to_vec(),
+                ),
+            )
+            .delayed(std::time::Duration::from_millis(1)),
+        ]);
+        let requests = vec![
+            ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file/0.jpg".to_string(),
+                kind: ExternalMediaKind::Image("telegraph"),
+                source: "telegraph",
+                thumbnail_url: None,
+            },
+            ExternalMediaRequest {
+                index: 1,
+                url: "https://telegra.ph/file/1.jpg".to_string(),
+                kind: ExternalMediaKind::Image("telegraph"),
+                source: "telegraph",
+                thumbnail_url: None,
+            },
+        ];
+        let slow_url = slow.url("/media");
+        let fast_url = fast.url("/media");
+        let budget = ExternalMediaBudget::new(2);
+        let files = collect_external_media_with_starts(requests, 2, &budget, move |request| {
+            let slow_url = slow_url.clone();
+            let fast_url = fast_url.clone();
+            async move {
+                let url = if request.index == 0 {
+                    slow_url
+                } else {
+                    fast_url
+                };
+                get_http_client_no_redirect().get(url).send().await.ok()
+            }
+        })
+        .await;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].bytes(), b"0a");
+        slow.join().unwrap();
+        fast.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_budget_carries_committed_telegraph_bytes_into_twitter_stage() {
+        let telegraph = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                60,
+                vec![b't'; 60],
+            ),
+        );
+        let twitter = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                41,
+                vec![b'x'; 41],
+            ),
+        );
+        let telegraph_url = telegraph.url("/media");
+        let twitter_url = twitter.url("/media");
+        let budget = ExternalMediaBudget::new(100);
+        let telegraph_files = collect_external_media_with_starts(
+            vec![ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file/stage.jpg".to_string(),
+                kind: ExternalMediaKind::Image("telegraph"),
+                source: "telegraph",
+                thumbnail_url: None,
+            }],
+            1,
+            &budget,
+            move |_| {
+                let url = telegraph_url.clone();
+                async move { get_http_client_no_redirect().get(url).send().await.ok() }
+            },
+        )
+        .await;
+        assert_eq!(telegraph_files.len(), 1);
+        assert_eq!(budget.remaining(), 40);
+        telegraph.join().unwrap();
+
+        let twitter_files = collect_external_media_with_starts(
+            vec![ExternalMediaRequest {
+                index: 0,
+                url: "https://pbs.twimg.com/media/stage.jpg".to_string(),
+                kind: ExternalMediaKind::Image("twitter"),
+                source: "twitter",
+                thumbnail_url: None,
+            }],
+            1,
+            &budget,
+            move |_| {
+                let url = twitter_url.clone();
+                async move { get_http_client_no_redirect().get(url).send().await.ok() }
+            },
+        )
+        .await;
+        assert!(twitter_files.is_empty());
+        assert_eq!(budget.remaining(), 40);
+        twitter.join().unwrap();
+    }
+
+    #[test]
+    fn video_mime_preserves_url_then_bytes_then_default_precedence() {
+        assert_eq!(
+            resolve_video_mime_type(
+                "https://video.twimg.com/v.mp4",
+                Some("application/octet-stream"),
+                b"bad"
+            ),
+            "video/mp4"
+        );
+        assert_eq!(
+            resolve_video_mime_type(
+                "https://video.twimg.com/v",
+                Some("application/octet-stream"),
+                &[0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x86, 0x81],
+            ),
+            "video/webm"
+        );
+        assert_eq!(
+            resolve_video_mime_type("https://video.twimg.com/v", None, b"bad"),
+            "video/mp4"
+        );
     }
 }

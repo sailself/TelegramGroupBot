@@ -38,7 +38,7 @@ static TELEGRAPH_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"https?://(?:telegra\.ph|t\.me)/[^\s\)>"]+"#).expect("valid telegraph url regex")
 });
 static HTTP_URL_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"https?://[^\s<>\"']+"#).expect("valid HTTP URL regex"));
+    Lazy::new(|| Regex::new(r#"(?i)https?://[^\s<>\"']+"#).expect("valid HTTP URL regex"));
 static MARKDOWN_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"\[[^\]]*\]\((https?://[^)]+)\)"#).expect("valid markdown link regex")
 });
@@ -662,6 +662,21 @@ fn prune_twitter_cache(cache: &mut HashMap<String, TwitterCacheEntry>) {
     }
 }
 
+fn insert_twitter_cache_entry(
+    cache: &mut HashMap<String, TwitterCacheEntry>,
+    key: &str,
+    content: TwitterContent,
+) {
+    cache.insert(
+        key.to_string(),
+        TwitterCacheEntry {
+            stored_at: Instant::now(),
+            content,
+        },
+    );
+    prune_twitter_cache(cache);
+}
+
 async fn extract_cached_telegraph_content(url: &str) -> anyhow::Result<TelegraphContent> {
     {
         let mut cache = TELEGRAPH_CACHE.lock();
@@ -700,13 +715,7 @@ async fn extract_cached_twitter_content(url: &str) -> anyhow::Result<TwitterCont
     if let Some(cache_key) = cache_key {
         let mut cache = TWITTER_CACHE.lock();
         prune_twitter_cache(&mut cache);
-        cache.insert(
-            cache_key,
-            TwitterCacheEntry {
-                stored_at: Instant::now(),
-                content: content.clone(),
-            },
-        );
+        insert_twitter_cache_entry(&mut cache, &cache_key, content.clone());
     }
     Ok(content)
 }
@@ -973,5 +982,42 @@ mod tests {
             discover_supported_status_urls("read https://x.com/a/status/123?s=20 now"),
             vec!["https://x.com/a/status/123?s=20"]
         );
+    }
+
+    #[test]
+    fn twitter_url_discovery_accepts_uppercase_http_tokens() {
+        assert_eq!(
+            discover_supported_status_urls("HTTPS://X.COM/a/status/123"),
+            vec!["HTTPS://X.COM/a/status/123"]
+        );
+        assert_eq!(
+            discover_supported_status_urls("hTtPs://mobile.twitter.com/a/status/456/photo/1"),
+            vec!["hTtPs://mobile.twitter.com/a/status/456/photo/1"]
+        );
+        assert!(is_supported_status_url("HTTPS://X.COM/a/status/123"));
+    }
+
+    #[test]
+    fn twitter_cache_insert_never_leaves_more_than_64_entries() {
+        let mut cache = HashMap::new();
+        for id in 0..64 {
+            cache.insert(
+                id.to_string(),
+                TwitterCacheEntry {
+                    stored_at: Instant::now(),
+                    content: TwitterContent {
+                        url: format!("https://x.com/a/status/{id}"),
+                        text_content: String::new(),
+                        image_urls: Vec::new(),
+                        video_urls: Vec::new(),
+                        formatted_content: String::new(),
+                        video_thumbnail_fallbacks: Vec::new(),
+                    },
+                },
+            );
+        }
+        let sample = cache.values().next().unwrap().content.clone();
+        insert_twitter_cache_entry(&mut cache, "64", sample);
+        assert_eq!(cache.len(), 64);
     }
 }
