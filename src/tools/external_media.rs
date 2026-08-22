@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -7,7 +6,7 @@ use std::sync::{
 use anyhow::{anyhow, bail, Result};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Response;
-use tokio::sync::Semaphore;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 use url::Url;
@@ -370,11 +369,12 @@ where
     media.map(|file| (request.index, file))
 }
 
-async fn collect_external_media_with_starts<F, Fut>(
+async fn collect_external_media_with_starts_limit<F, Fut>(
     requests: Vec<ExternalMediaRequest>,
     max_files: usize,
     budget: &ExternalMediaBudget,
     start: F,
+    fanout: usize,
 ) -> Vec<MediaFile>
 where
     F: Fn(ExternalMediaRequest) -> Fut + Clone + Send + Sync + 'static,
@@ -383,31 +383,35 @@ where
     if requests.is_empty() || max_files == 0 {
         return Vec::new();
     }
-    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
-    let mut join_set = JoinSet::new();
-    let request_count = requests.len();
-    for request in requests {
-        let semaphore = semaphore.clone();
-        let start = start.clone();
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("external enrich semaphore should remain open");
-            let response = start(request.clone()).await;
-            (request.index, request, response)
-        });
+    let semaphore = Arc::new(Semaphore::new(fanout.max(1)));
+    let mut receivers = Vec::with_capacity(requests.len());
+    let mut senders = Vec::with_capacity(requests.len());
+    for _ in 0..requests.len() {
+        let (sender, receiver) =
+            oneshot::channel::<(ExternalMediaRequest, Option<Response>, OwnedSemaphorePermit)>();
+        senders.push(sender);
+        receivers.push(receiver);
     }
-    let mut pending = HashMap::new();
-    while let Some(result) = join_set.join_next().await {
-        if let Ok((index, request, response)) = result {
-            pending.insert(index, (request, response));
+    let launcher_semaphore = semaphore.clone();
+    let launcher = tokio::spawn(async move {
+        let mut workers = JoinSet::new();
+        for (request, sender) in requests.into_iter().zip(senders) {
+            let permit = match launcher_semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let start = start.clone();
+            workers.spawn(async move {
+                let response = start(request.clone()).await;
+                let _ = sender.send((request, response, permit));
+            });
         }
-    }
+        while workers.join_next().await.is_some() {}
+    });
 
     let mut collected = Vec::new();
-    for index in 0..request_count {
-        let Some((request, response)) = pending.remove(&index) else {
+    for receiver in receivers {
+        let Ok((request, response, permit)) = receiver.await else {
             continue;
         };
         if let Some((index, file)) =
@@ -418,13 +422,35 @@ where
         {
             collected.push((index, file));
         }
+        drop(permit);
     }
+    let _ = launcher.await;
     collected.sort_by_key(|(index, _)| *index);
     collected
         .into_iter()
         .take(max_files)
         .map(|(_, file)| file)
         .collect()
+}
+
+async fn collect_external_media_with_starts<F, Fut>(
+    requests: Vec<ExternalMediaRequest>,
+    max_files: usize,
+    budget: &ExternalMediaBudget,
+    start: F,
+) -> Vec<MediaFile>
+where
+    F: Fn(ExternalMediaRequest) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<Response>> + Send + 'static,
+{
+    collect_external_media_with_starts_limit(
+        requests,
+        max_files,
+        budget,
+        start,
+        CONFIG.external_enrich_fanout,
+    )
+    .await
 }
 
 async fn collect_external_media(
@@ -515,9 +541,43 @@ pub async fn download_twitter_media(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread::JoinHandle;
+
     use super::*;
     use crate::tools::twitter_extractor::test_support::{redirect_response, TestServer};
     use crate::utils::http::get_http_client_no_redirect;
+
+    fn controlled_body_server() -> (
+        url::Url,
+        tokio::sync::oneshot::Receiver<()>,
+        Sender<()>,
+        JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = url::Url::parse(&format!("http://{address}/media")).unwrap();
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver): (Sender<()>, Receiver<()>) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            let _ = ready_sender.send(());
+            let _ = release_receiver.recv_timeout(std::time::Duration::from_secs(2));
+            stream.write_all(b"1\r\ny\r\n0\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+        });
+        (url, ready_receiver, release_sender, worker)
+    }
 
     #[tokio::test]
     async fn twitter_media_fetch_rejects_redirect_without_following_location() {
@@ -616,10 +676,10 @@ mod tests {
     #[tokio::test]
     async fn total_budget_exhaustion_refunds_and_allows_a_later_request() {
         let first = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                60,
-                vec![b'a'; 60],
-            ),
+            crate::tools::twitter_extractor::test_support::chunked_response(vec![
+                vec![b'a'; 30],
+                vec![b'b'; 30],
+            ]),
         );
         let budget = ExternalMediaBudget::new(50);
         let response = get_http_client_no_redirect()
@@ -755,6 +815,112 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].bytes(), b"0a");
         slow.join().unwrap();
+        fast.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_lower_index_start_advances_without_deadlock_or_budget_leak() {
+        let server = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                2,
+                b"1b".to_vec(),
+            ),
+        );
+        let url = server.url("/media");
+        let requests = vec![
+            ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file/0.jpg".to_string(),
+                kind: ExternalMediaKind::Image("telegraph"),
+                source: "telegraph",
+                thumbnail_url: None,
+            },
+            ExternalMediaRequest {
+                index: 1,
+                url: "https://telegra.ph/file/1.jpg".to_string(),
+                kind: ExternalMediaKind::Image("telegraph"),
+                source: "telegraph",
+                thumbnail_url: None,
+            },
+        ];
+        let budget = ExternalMediaBudget::new(2);
+        let files = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            collect_external_media_with_starts(requests, 2, &budget, move |request| {
+                let url = url.clone();
+                async move {
+                    if request.index == 0 {
+                        panic!("simulated lower-index start panic");
+                    }
+                    get_http_client_no_redirect().get(url).send().await.ok()
+                }
+            }),
+        )
+        .await
+        .expect("a failed lower-index start must not hang");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].bytes(), b"1b");
+        assert_eq!(budget.remaining(), 0);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fanout_permit_stays_held_through_body_consumption() {
+        let (slow_url, mut body_ready, release_body, slow_worker) = controlled_body_server();
+        let fast = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                1,
+                b"1".to_vec(),
+            ),
+        );
+        let fast_url = fast.url("/media");
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_for_start = started.clone();
+        let requests = vec![
+            ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file/0.jpg".to_string(),
+                kind: ExternalMediaKind::Image("telegraph"),
+                source: "telegraph",
+                thumbnail_url: None,
+            },
+            ExternalMediaRequest {
+                index: 1,
+                url: "https://telegra.ph/file/1.jpg".to_string(),
+                kind: ExternalMediaKind::Image("telegraph"),
+                source: "telegraph",
+                thumbnail_url: None,
+            },
+        ];
+        let budget = ExternalMediaBudget::new(10);
+        let collection = collect_external_media_with_starts_limit(
+            requests,
+            2,
+            &budget,
+            move |request| {
+                started_for_start.fetch_add(1, Ordering::SeqCst);
+                let url = if request.index == 0 {
+                    slow_url.clone()
+                } else {
+                    fast_url.clone()
+                };
+                async move { get_http_client_no_redirect().get(url).send().await.ok() }
+            },
+            1,
+        );
+        tokio::pin!(collection);
+        tokio::select! {
+            _ = &mut body_ready => {}
+            _ = &mut collection => panic!("collection completed before the controlled body was released"),
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        release_body.send(()).unwrap();
+        let files = tokio::time::timeout(std::time::Duration::from_secs(2), collection)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        slow_worker.join().unwrap();
         fast.join().unwrap();
     }
 
