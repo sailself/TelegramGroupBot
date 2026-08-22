@@ -83,6 +83,14 @@ struct AbortOnDropLauncher {
     handle: Option<JoinHandle<()>>,
 }
 
+type StartedExternalMedia = (ExternalMediaRequest, Option<Response>, OwnedSemaphorePermit);
+
+struct PendingRequestGuard {
+    receiver: Option<oneshot::Receiver<StartedExternalMedia>>,
+    launcher_abort: AbortHandle,
+    armed: bool,
+}
+
 struct ActiveRequestGuard {
     permit: Option<OwnedSemaphorePermit>,
     launcher_abort: AbortHandle,
@@ -115,6 +123,35 @@ impl Drop for AbortOnDropLauncher {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
+        }
+    }
+}
+
+impl PendingRequestGuard {
+    fn new(receiver: oneshot::Receiver<StartedExternalMedia>, launcher_abort: AbortHandle) -> Self {
+        Self {
+            receiver: Some(receiver),
+            launcher_abort,
+            armed: true,
+        }
+    }
+
+    async fn receive(mut self) -> Result<StartedExternalMedia, oneshot::error::RecvError> {
+        let result = self
+            .receiver
+            .as_mut()
+            .expect("pending request receiver should remain owned while armed")
+            .await;
+        self.armed = false;
+        self.receiver.take();
+        result
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.launcher_abort.abort();
         }
     }
 }
@@ -450,8 +487,7 @@ where
     let mut receivers = Vec::with_capacity(requests.len());
     let mut senders = Vec::with_capacity(requests.len());
     for _ in 0..requests.len() {
-        let (sender, receiver) =
-            oneshot::channel::<(ExternalMediaRequest, Option<Response>, OwnedSemaphorePermit)>();
+        let (sender, receiver) = oneshot::channel::<StartedExternalMedia>();
         senders.push(sender);
         receivers.push(receiver);
     }
@@ -474,7 +510,8 @@ where
 
     let mut collected = Vec::new();
     for receiver in receivers {
-        let Ok((request, response, permit)) = receiver.await else {
+        let pending_request = PendingRequestGuard::new(receiver, launcher.abort_handle());
+        let Ok((request, response, permit)) = pending_request.receive().await else {
             continue;
         };
         let active_request = ActiveRequestGuard::new(permit, launcher.abort_handle());
@@ -1093,6 +1130,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_request_guard_aborts_launcher_before_releasing_buffered_permit() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let (sender, receiver) = oneshot::channel();
+        sender
+            .send((
+                ExternalMediaRequest {
+                    index: 0,
+                    url: "https://telegra.ph/file/0.jpg".to_string(),
+                    kind: ExternalMediaKind::Image("telegraph"),
+                    source: "telegraph",
+                    thumbnail_url: None,
+                },
+                None,
+                permit,
+            ))
+            .expect("buffered request tuple should have a receiver");
+        let waiter_semaphore = semaphore.clone();
+        let (queued_sender, queued_receiver) = oneshot::channel();
+        let (started_sender, started_receiver) = oneshot::channel();
+        let launcher = AbortOnDropLauncher::new(tokio::spawn(async move {
+            let acquire = waiter_semaphore.acquire_owned();
+            tokio::pin!(acquire);
+            let mut queued_sender = Some(queued_sender);
+            std::future::poll_fn(|context| match acquire.as_mut().poll(context) {
+                std::task::Poll::Pending => {
+                    let _ = queued_sender.take().unwrap().send(());
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Ready(_) => {
+                    panic!("queued launcher unexpectedly acquired the buffered permit")
+                }
+            })
+            .await;
+            let _permit = acquire.await.unwrap();
+            let _ = started_sender.send(());
+        }));
+        let pending_request = PendingRequestGuard::new(receiver, launcher.abort_handle());
+
+        tokio::time::timeout(SIGNAL_TIMEOUT, queued_receiver)
+            .await
+            .expect("launcher should queue behind the buffered permit")
+            .unwrap();
+        drop(pending_request);
+        tokio::time::timeout(SIGNAL_TIMEOUT, launcher.finish())
+            .await
+            .expect("aborted launcher should stop");
+
+        assert!(!matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), started_receiver).await,
+            Ok(Ok(()))
+        ));
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn active_request_guard_aborts_launcher_before_releasing_permit() {
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -1169,6 +1262,127 @@ mod tests {
             .await
             .expect("cancelling finish should abort the launcher")
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_pending_receiver_aborts_before_buffered_tuple_releases_permit() {
+        struct WorkerStopSignal {
+            index: usize,
+            sender: tokio::sync::mpsc::UnboundedSender<usize>,
+        }
+
+        impl Drop for WorkerStopSignal {
+            fn drop(&mut self) {
+                let _ = self.sender.send(self.index);
+            }
+        }
+
+        let (buffered_url, body_ready, response_closed, response_worker) =
+            cancellation_body_server();
+        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (stopped_sender, mut stopped_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let requests = (0..3)
+            .map(|index| ExternalMediaRequest {
+                index,
+                url: format!("https://telegra.ph/file/{index}.jpg"),
+                kind: ExternalMediaKind::Image("telegraph"),
+                source: "telegraph",
+                thumbnail_url: None,
+            })
+            .collect::<Vec<_>>();
+        let budget = ExternalMediaBudget::new(10);
+        let parent_budget = budget.clone();
+        let parent = tokio::spawn(async move {
+            collect_external_media_with_starts_limit(
+                requests,
+                3,
+                &parent_budget,
+                move |request| {
+                    let buffered_url = buffered_url.clone();
+                    let started_sender = started_sender.clone();
+                    let stopped_sender = stopped_sender.clone();
+                    async move {
+                        let _stop_signal = WorkerStopSignal {
+                            index: request.index,
+                            sender: stopped_sender,
+                        };
+                        let _ = started_sender.send(request.index);
+                        match request.index {
+                            0 => std::future::pending::<Option<Response>>().await,
+                            1 => get_http_client_no_redirect()
+                                .get(buffered_url)
+                                .send()
+                                .await
+                                .ok(),
+                            _ => None,
+                        }
+                    }
+                },
+                2,
+            )
+            .await
+        });
+
+        let mut starts = Vec::new();
+        tokio::time::timeout(SIGNAL_TIMEOUT, async {
+            while starts.len() < 2 {
+                starts.push(
+                    started_receiver
+                        .recv()
+                        .await
+                        .expect("initial worker start channel should remain open"),
+                );
+            }
+        })
+        .await
+        .expect("the first two workers should start");
+        starts.sort_unstable();
+        assert_eq!(starts, vec![0, 1]);
+        tokio::time::timeout(SIGNAL_TIMEOUT, body_ready)
+            .await
+            .expect("the index-1 response should reach the buffered body")
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(SIGNAL_TIMEOUT, stopped_receiver.recv())
+                .await
+                .expect("the index-1 start future should return its response"),
+            Some(1)
+        );
+        assert_eq!(budget.remaining(), 10);
+
+        parent.abort();
+        tokio::time::timeout(SIGNAL_TIMEOUT, parent)
+            .await
+            .expect("the cancelled collector should stop")
+            .expect_err("the cancelled collector unexpectedly completed normally");
+
+        assert!(!matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                started_receiver.recv(),
+            )
+            .await,
+            Ok(Some(2))
+        ));
+        assert_eq!(budget.remaining(), 10);
+        tokio::time::timeout(SIGNAL_TIMEOUT, response_closed)
+            .await
+            .expect("dropping the buffered response should disconnect its body")
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(SIGNAL_TIMEOUT, stopped_receiver.recv())
+                .await
+                .expect("aborting the launcher should stop the index-0 worker"),
+            Some(0)
+        );
+        tokio::time::timeout(
+            SIGNAL_TIMEOUT,
+            tokio::task::spawn_blocking(move || response_worker.join()),
+        )
+        .await
+        .expect("the buffered response worker should stop")
+        .expect("the buffered response join task should run")
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
