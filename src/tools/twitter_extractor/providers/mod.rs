@@ -265,7 +265,8 @@ mod tests {
     use super::*;
     use crate::config::CONFIG;
     use crate::tools::twitter_extractor::test_support::{
-        chunked_response, response_with_content_length, ExpectedRequest, TestServer,
+        chunked_response, is_client_disconnect_kind, response_with_content_length, ExpectedRequest,
+        TestServer,
     };
 
     fn join_with_timeout(server: TestServer) -> Result<Result<(), String>, &'static str> {
@@ -431,5 +432,45 @@ mod tests {
         drop(stream);
         let error = strict.join().unwrap_err();
         assert!(error.contains("client disconnected"));
+    }
+
+    #[test]
+    fn test_server_non_delayed_client_disconnect_requires_explicit_allowance() {
+        let allowing = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/immediate",
+            response_with_content_length(0, Vec::new()),
+        )]);
+        let allowing_address = format!(
+            "127.0.0.1:{}",
+            allowing.base_url().port().expect("test server port")
+        );
+        drop(std::net::TcpStream::connect(allowing_address).unwrap());
+        allowing.join_allowing_client_disconnect().unwrap();
+
+        let strict = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/immediate",
+            response_with_content_length(0, Vec::new()),
+        )]);
+        let strict_address = format!(
+            "127.0.0.1:{}",
+            strict.base_url().port().expect("test server port")
+        );
+        drop(std::net::TcpStream::connect(strict_address).unwrap());
+        let error = strict.join().unwrap_err();
+        assert!(error.contains("client disconnected"));
+    }
+
+    #[test]
+    fn client_disconnect_error_kinds_are_typed_and_narrow() {
+        assert!(is_client_disconnect_kind(
+            std::io::ErrorKind::ConnectionReset
+        ));
+        assert!(is_client_disconnect_kind(
+            std::io::ErrorKind::ConnectionAborted
+        ));
+        assert!(is_client_disconnect_kind(std::io::ErrorKind::BrokenPipe));
+        assert!(!is_client_disconnect_kind(std::io::ErrorKind::Other));
     }
 }

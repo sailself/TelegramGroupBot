@@ -198,14 +198,11 @@ fn serve(
                         }
                     }
                     Err(error) => {
-                        let error = match (error, expectation.delay.is_some()) {
-                            (RequestError::ClientDisconnect(error), true) => {
+                        let error = match error {
+                            RequestError::ClientDisconnect(error) => {
                                 ServerError::ClientDisconnect(error)
                             }
-                            (RequestError::ClientDisconnect(error), false) => {
-                                ServerError::Assertion(error)
-                            }
-                            (RequestError::Assertion(error), _) => ServerError::Assertion(error),
+                            RequestError::Assertion(error) => ServerError::Assertion(error),
                         };
                         record_error(&mut first_error, error);
                     }
@@ -216,12 +213,14 @@ fn serve(
                 if let Err(error) = stream
                     .write_all(&expectation.response)
                     .and_then(|_| stream.flush())
-                    .map_err(|error| error.to_string())
                 {
-                    if expectation.delay.is_some() {
-                        record_error(&mut first_error, ServerError::ClientDisconnect(error));
+                    if expectation.delay.is_some() && is_client_disconnect_kind(error.kind()) {
+                        record_error(
+                            &mut first_error,
+                            ServerError::ClientDisconnect(error.to_string()),
+                        );
                     } else {
-                        record_error(&mut first_error, ServerError::Assertion(error));
+                        record_error(&mut first_error, ServerError::Assertion(error.to_string()));
                     }
                 }
             }
@@ -338,6 +337,15 @@ enum RequestError {
     ClientDisconnect(String),
 }
 
+pub(crate) fn is_client_disconnect_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
 impl std::fmt::Display for RequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -356,12 +364,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestError> {
             ));
         }
         let read = stream.read(&mut chunk).map_err(|error| {
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
-            ) {
+            if is_client_disconnect_kind(error.kind()) {
                 RequestError::ClientDisconnect(error.to_string())
             } else {
                 RequestError::Assertion(error.to_string())
