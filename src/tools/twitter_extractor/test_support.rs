@@ -175,7 +175,7 @@ fn serve(
     allow_client_disconnect: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut expected = VecDeque::from(expected);
-    let mut first_error = None;
+    let mut first_error: Option<ServerError> = None;
     loop {
         let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
@@ -191,10 +191,23 @@ fn serve(
         let expectation = expected.pop_front();
         match expectation {
             Some(expectation) => {
-                match request.and_then(|request| expectation.verify(&request)) {
-                    Ok(()) => {}
+                match request {
+                    Ok(request) => {
+                        if let Err(error) = expectation.verify(&request) {
+                            record_error(&mut first_error, ServerError::Assertion(error));
+                        }
+                    }
                     Err(error) => {
-                        first_error.get_or_insert(error);
+                        let error = match (error, expectation.delay.is_some()) {
+                            (RequestError::ClientDisconnect(error), true) => {
+                                ServerError::ClientDisconnect(error)
+                            }
+                            (RequestError::ClientDisconnect(error), false) => {
+                                ServerError::Assertion(error)
+                            }
+                            (RequestError::Assertion(error), _) => ServerError::Assertion(error),
+                        };
+                        record_error(&mut first_error, error);
                     }
                 }
                 if let Some(delay) = expectation.delay {
@@ -205,10 +218,10 @@ fn serve(
                     .and_then(|_| stream.flush())
                     .map_err(|error| error.to_string())
                 {
-                    if !allow_client_disconnect.load(Ordering::Acquire)
-                        || expectation.delay.is_none()
-                    {
-                        first_error.get_or_insert(error);
+                    if expectation.delay.is_some() {
+                        record_error(&mut first_error, ServerError::ClientDisconnect(error));
+                    } else {
+                        record_error(&mut first_error, ServerError::Assertion(error));
                     }
                 }
             }
@@ -221,7 +234,7 @@ fn serve(
                         )
                     })
                     .unwrap_or_else(|error| format!("unexpected extra request: {error}"));
-                first_error.get_or_insert(error);
+                record_error(&mut first_error, ServerError::Assertion(error));
                 let _ = stream.write_all(
                     b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
                 );
@@ -232,7 +245,42 @@ fn serve(
     if !expected.is_empty() {
         return Err(format!("unmet expectations: {}", expected.len()));
     }
-    first_error.map_or(Ok(()), Err)
+    first_error.map_or(Ok(()), |error| {
+        if allow_client_disconnect.load(Ordering::Acquire) && error.is_client_disconnect() {
+            Ok(())
+        } else {
+            Err(error.to_string())
+        }
+    })
+}
+
+enum ServerError {
+    Assertion(String),
+    ClientDisconnect(String),
+}
+
+fn record_error(first_error: &mut Option<ServerError>, error: ServerError) {
+    if first_error
+        .as_ref()
+        .is_none_or(|existing| existing.is_client_disconnect() && !error.is_client_disconnect())
+    {
+        *first_error = Some(error);
+    }
+}
+
+impl ServerError {
+    fn is_client_disconnect(&self) -> bool {
+        matches!(self, Self::ClientDisconnect(_))
+    }
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Assertion(error) => formatter.write_str(error),
+            Self::ClientDisconnect(error) => write!(formatter, "client disconnected: {error}"),
+        }
+    }
 }
 
 struct Request {
@@ -285,34 +333,62 @@ impl ExpectedRequest {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
+enum RequestError {
+    Assertion(String),
+    ClientDisconnect(String),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Assertion(error) | Self::ClientDisconnect(error) => formatter.write_str(error),
+        }
+    }
+}
+
+fn read_request(stream: &mut TcpStream) -> Result<Request, RequestError> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
     while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
         if bytes.len() >= 64 * 1024 {
-            return Err("request headers exceed test limit".to_string());
+            return Err(RequestError::Assertion(
+                "request headers exceed test limit".to_string(),
+            ));
         }
-        let read = stream.read(&mut chunk).map_err(|error| error.to_string())?;
+        let read = stream.read(&mut chunk).map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            ) {
+                RequestError::ClientDisconnect(error.to_string())
+            } else {
+                RequestError::Assertion(error.to_string())
+            }
+        })?;
         if read == 0 {
-            return Err("request ended before headers".to_string());
+            return Err(RequestError::ClientDisconnect(
+                "request ended before headers".to_string(),
+            ));
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
 
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| "request headers are not UTF-8".to_string())?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| RequestError::Assertion("request headers are not UTF-8".to_string()))?;
     let mut lines = text.split("\r\n");
     let request_line = lines
         .next()
-        .ok_or_else(|| "missing request line".to_string())?;
+        .ok_or_else(|| RequestError::Assertion("missing request line".to_string()))?;
     let mut request_parts = request_line.split_whitespace();
     let method = request_parts
         .next()
-        .ok_or_else(|| "missing request method".to_string())?
+        .ok_or_else(|| RequestError::Assertion("missing request method".to_string()))?
         .to_ascii_uppercase();
     let path = request_parts
         .next()
-        .ok_or_else(|| "missing request path".to_string())?
+        .ok_or_else(|| RequestError::Assertion("missing request path".to_string()))?
         .to_string();
     let mut headers = Vec::new();
     for line in lines {
@@ -321,7 +397,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
         }
         let (name, value) = line
             .split_once(':')
-            .ok_or_else(|| "malformed request header".to_string())?;
+            .ok_or_else(|| RequestError::Assertion("malformed request header".to_string()))?;
         headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
     Ok(Request {

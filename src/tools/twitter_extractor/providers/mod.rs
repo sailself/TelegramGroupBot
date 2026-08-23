@@ -400,4 +400,36 @@ mod tests {
         let error = server.join_allowing_client_disconnect().unwrap_err();
         assert!(error.contains("expected path"));
     }
+
+    #[test]
+    fn test_server_client_disconnect_requires_explicit_allowance() {
+        let allowing = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/delayed",
+            response_with_content_length(0, Vec::new()),
+        )
+        .delayed(Duration::from_millis(1))]);
+        let allowing_address = format!(
+            "127.0.0.1:{}",
+            allowing.base_url().port().expect("test server port")
+        );
+        let stream = std::net::TcpStream::connect(allowing_address).unwrap();
+        drop(stream);
+        allowing.join_allowing_client_disconnect().unwrap();
+
+        let strict = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/delayed",
+            response_with_content_length(0, Vec::new()),
+        )
+        .delayed(Duration::from_millis(1))]);
+        let strict_address = format!(
+            "127.0.0.1:{}",
+            strict.base_url().port().expect("test server port")
+        );
+        let stream = std::net::TcpStream::connect(strict_address).unwrap();
+        drop(stream);
+        let error = strict.join().unwrap_err();
+        assert!(error.contains("client disconnected"));
+    }
 }
