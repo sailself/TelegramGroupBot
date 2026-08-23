@@ -8,7 +8,7 @@ use url::Url;
 
 use super::{
     read_limited_body, run_blocking_parser, ProviderError, ProviderErrorKind, TwitterFetchConfig,
-    TwitterProvider,
+    TwitterProvider, TWITTER_USER_AGENT,
 };
 use crate::tools::twitter_extractor::model::{
     is_usable_direct_video_url, is_usable_pbs_image_url, parse_allowed_media_url,
@@ -328,13 +328,18 @@ where
         endpoint.set_path(&path);
         endpoint.set_query(None);
         endpoint.set_fragment(None);
-        let response = client.get(endpoint).send().await.map_err(|_| {
-            error(
-                ProviderErrorKind::Transport,
-                "provider request failed",
-                None,
-            )
-        })?;
+        let response = client
+            .get(endpoint)
+            .header(reqwest::header::USER_AGENT, TWITTER_USER_AGENT)
+            .send()
+            .await
+            .map_err(|_| {
+                error(
+                    ProviderErrorKind::Transport,
+                    "provider request failed",
+                    None,
+                )
+            })?;
         let status = response.status();
         if !status.is_success() {
             return Err(error(
@@ -381,7 +386,7 @@ mod tests {
     use super::*;
     use crate::tools::twitter_extractor::model::XMedia;
     use crate::tools::twitter_extractor::test_support::{
-        redirect_response, ExpectedRequest, TestServer,
+        redirect_response, response_with_content_length, ExpectedRequest, TestServer,
     };
     use crate::tools::twitter_extractor::url::XStatusIdentity;
 
@@ -523,6 +528,30 @@ mod tests {
         .unwrap();
         assert_eq!(post.text, "root text");
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fxtwitter_fetch_identifies_client_with_user_agent() {
+        let body = include_bytes!("../fixtures/fxtwitter_photo_quote.json");
+        let expected_user_agent =
+            format!("telegram_group_helper_bot/{}", env!("CARGO_PKG_VERSION"));
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/i/status/123",
+            response_with_content_length(body.len(), body.to_vec()),
+        )
+        .with_header("user-agent", &expected_user_agent)]);
+        let config = test_config_with_fx_base(server.base_url());
+
+        let result = fetch(
+            super::super::get_http_client_no_redirect(),
+            &config,
+            &identity("123"),
+            Duration::from_secs(1),
+        )
+        .await;
+        server.join().unwrap();
+        assert_eq!(result.unwrap().text, "root text");
     }
 
     #[tokio::test]

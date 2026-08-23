@@ -18,6 +18,8 @@ pub(crate) mod vxtwitter;
 
 static BLOCKING_PARSER_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
 
+const TWITTER_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
 struct AbortOnDropParser<T> {
     handle: Option<JoinHandle<T>>,
 }
