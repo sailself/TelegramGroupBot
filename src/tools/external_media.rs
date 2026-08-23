@@ -608,14 +608,25 @@ pub async fn download_twitter_media(
     max_files: usize,
     budget: &ExternalMediaBudget,
 ) -> Vec<MediaFile> {
-    collect_external_media(twitter_media_requests(contents), max_files, budget).await
+    collect_external_media(
+        twitter_media_requests(contents, max_files),
+        max_files,
+        budget,
+    )
+    .await
 }
 
-fn twitter_media_requests(contents: &[TwitterContent]) -> Vec<ExternalMediaRequest> {
+fn twitter_media_requests(
+    contents: &[TwitterContent],
+    max_files: usize,
+) -> Vec<ExternalMediaRequest> {
     let mut requests = Vec::new();
     let mut index = 0;
     for content in contents {
         for attachment in &content.attachment_plan {
+            if requests.len() >= max_files {
+                return requests;
+            }
             match attachment {
                 TwitterAttachment::Image { url } => requests.push(ExternalMediaRequest {
                     index,
@@ -1118,17 +1129,10 @@ mod tests {
             )
             .delayed(std::time::Duration::from_millis(50)),
         ]);
-        let fast = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_content_length(
-                    5,
-                    b"quote".to_vec(),
-                ),
-            )
-            .delayed(std::time::Duration::from_millis(1)),
-        ]);
+        let fast = TestServer::expect_no_requests();
         let content = twitter_content_with_root_video_and_quoted_image();
-        let requests = twitter_media_requests(&[content]);
+        let requests = twitter_media_requests(&[content], 1);
+        assert_eq!(requests.len(), 1);
         let slow_url = slow.url("/root");
         let fast_url = fast.url("/quote");
         let budget = ExternalMediaBudget::new(100);
