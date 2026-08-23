@@ -421,6 +421,15 @@ fn provider_runtime_config(provider: ThirdPartyProvider) -> Result<ProviderRunti
     Ok(config)
 }
 
+/// Convert an f32 sampling parameter to JSON without f32->f64 widening noise
+/// (0.4f32 would otherwise serialize as 0.4000000059604645, which at least one
+/// OpenRouter upstream rejects with an opaque 400). Round-tripping through the
+/// shortest decimal representation keeps the wire value equal to the
+/// configured literal.
+fn sampling_param(value: f32) -> Value {
+    json!(value.to_string().parse::<f64>().unwrap_or(f64::from(value)))
+}
+
 fn build_request_details_for_runtime(
     model_config: &ThirdPartyModelConfig,
     runtime: &ProviderRuntimeConfig,
@@ -440,8 +449,8 @@ fn build_request_details_for_runtime(
     let mut payload = json!({
         "model": model_config.model,
         "messages": messages,
-        "temperature": runtime.temperature,
-        "top_p": runtime.top_p,
+        "temperature": sampling_param(runtime.temperature),
+        "top_p": sampling_param(runtime.top_p),
     });
 
     if let Some(top_k) = runtime.top_k {
@@ -1076,6 +1085,33 @@ mod tests {
             Some(40)
         );
         assert_eq!(details.request_timeout_secs, 75);
+    }
+
+    #[test]
+    fn request_details_serialize_f32_sampling_params_without_float_noise() {
+        // 0.4f32 widened to f64 becomes 0.4000000059604645; at least one
+        // OpenRouter upstream (stealth/ox-alpha) rejects such values with an
+        // opaque 400, so the wire value must match the configured literal.
+        let runtime = ProviderRuntimeConfig {
+            provider: ThirdPartyProvider::OpenRouter,
+            display_name: "OpenRouter",
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: "test-openrouter".to_string(),
+            temperature: 0.4,
+            top_p: 0.95,
+            top_k: Some(40),
+            request_timeout_secs: 60,
+        };
+        let details = build_request_details_for_runtime(
+            &model(ThirdPartyProvider::OpenRouter, "Ox Alpha", "stealth/ox-alpha"),
+            &runtime,
+            vec![json!({ "role": "user", "content": "hello" })],
+            None,
+            None,
+        );
+
+        assert_eq!(details.payload["temperature"].to_string(), "0.4");
+        assert_eq!(details.payload["top_p"].to_string(), "0.95");
     }
 
     #[test]
