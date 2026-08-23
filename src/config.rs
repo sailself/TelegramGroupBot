@@ -7,6 +7,7 @@ use anyhow::Result;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use tracing::{info, warn};
+use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub enum ThirdPartyProvider {
@@ -175,6 +176,14 @@ pub struct Config {
     pub jina_ai_api_key: String,
     pub jina_search_endpoint: String,
     pub jina_reader_endpoint: String,
+    pub twitter_fetch_providers: Vec<String>,
+    pub fxtwitter_api_base: String,
+    pub vxtwitter_api_base: String,
+    pub twitter_fetch_total_timeout_secs: u64,
+    pub twitter_provider_timeout_secs: u64,
+    pub twitter_response_max_bytes: usize,
+    pub external_media_max_bytes: usize,
+    pub external_media_total_max_bytes: usize,
     pub enable_brave_search: bool,
     pub brave_search_api_key: String,
     pub brave_search_endpoint: String,
@@ -305,6 +314,82 @@ fn env_csv_lowercase(name: &str, default: &str) -> Vec<String> {
         .map(|value| value.trim().to_lowercase())
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+fn normalize_twitter_fetch_providers(providers: Vec<String>) -> Result<Vec<String>> {
+    let mut normalized = Vec::with_capacity(providers.len());
+    for provider in providers {
+        let provider = provider.trim().to_lowercase();
+        if !matches!(provider.as_str(), "fxtwitter" | "vxtwitter" | "jina") {
+            return Err(anyhow::anyhow!(
+                "Unsupported Twitter fetch provider: {provider}"
+            ));
+        }
+        if normalized.iter().any(|known| known == &provider) {
+            return Err(anyhow::anyhow!(
+                "Duplicate Twitter fetch provider: {provider}"
+            ));
+        }
+        normalized.push(provider);
+    }
+    if normalized.is_empty() {
+        return Err(anyhow::anyhow!(
+            "At least one Twitter fetch provider is required"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn validate_twitter_fetch_limits(
+    total_timeout_secs: u64,
+    provider_timeout_secs: u64,
+    response_max_bytes: usize,
+    external_media_max_bytes: usize,
+    external_media_total_max_bytes: usize,
+) -> Result<()> {
+    if total_timeout_secs == 0 || provider_timeout_secs == 0 {
+        return Err(anyhow::anyhow!("Twitter fetch timeouts must be positive"));
+    }
+    if provider_timeout_secs > total_timeout_secs {
+        return Err(anyhow::anyhow!(
+            "Twitter provider timeout cannot exceed total timeout"
+        ));
+    }
+    if response_max_bytes == 0
+        || external_media_max_bytes == 0
+        || external_media_total_max_bytes == 0
+    {
+        return Err(anyhow::anyhow!("Twitter byte limits must be positive"));
+    }
+    if external_media_max_bytes > external_media_total_max_bytes {
+        return Err(anyhow::anyhow!(
+            "Per-file external media limit cannot exceed total limit"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_https_base(name: &str, value: String) -> Result<String> {
+    let parsed = Url::parse(value.trim())
+        .map_err(|err| anyhow::anyhow!("{name} must be a valid HTTPS URL: {err}"))?;
+    if parsed.scheme() != "https" {
+        return Err(anyhow::anyhow!("{name} must use HTTPS"));
+    }
+    if parsed.host_str().is_none() {
+        return Err(anyhow::anyhow!("{name} must contain a host"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(anyhow::anyhow!("{name} must not contain credentials"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(anyhow::anyhow!(
+            "{name} must not contain a query or fragment"
+        ));
+    }
+    if parsed.port().is_some() && parsed.port_or_known_default() != Some(443) {
+        return Err(anyhow::anyhow!("{name} must not use a non-default port"));
+    }
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
 fn normalize_database_url(value: String) -> String {
@@ -564,6 +649,36 @@ impl Config {
         let quick_reasoning_effort = resolve_quick_reasoning_effort_value(
             env::var("QUICK_REASONING_EFFORT").ok().as_deref(),
         );
+        let twitter_fetch_providers = normalize_twitter_fetch_providers(env_csv_lowercase(
+            "TWITTER_FETCH_PROVIDERS",
+            "fxtwitter,vxtwitter,jina",
+        ))?;
+        let fxtwitter_api_base = validate_https_base(
+            "FXTWITTER_API_BASE",
+            env_string("FXTWITTER_API_BASE", "https://api.fxtwitter.com"),
+        )?;
+        let vxtwitter_api_base = validate_https_base(
+            "VXTWITTER_API_BASE",
+            env_string("VXTWITTER_API_BASE", "https://api.vxtwitter.com"),
+        )?;
+        let jina_reader_endpoint = validate_https_base(
+            "JINA_READER_ENDPOINT",
+            env_string("JINA_READER_ENDPOINT", "https://r.jina.ai/"),
+        )?;
+        let twitter_fetch_total_timeout_secs =
+            env_timeout_secs("TWITTER_FETCH_TOTAL_TIMEOUT_SECS", 20);
+        let twitter_provider_timeout_secs = env_timeout_secs("TWITTER_PROVIDER_TIMEOUT_SECS", 8);
+        let twitter_response_max_bytes = env_usize("TWITTER_RESPONSE_MAX_BYTES", 2_097_152);
+        let external_media_max_bytes = env_usize("EXTERNAL_MEDIA_MAX_BYTES", 20_971_520);
+        let external_media_total_max_bytes =
+            env_usize("EXTERNAL_MEDIA_TOTAL_MAX_BYTES", 52_428_800);
+        validate_twitter_fetch_limits(
+            twitter_fetch_total_timeout_secs,
+            twitter_provider_timeout_secs,
+            twitter_response_max_bytes,
+            external_media_max_bytes,
+            external_media_total_max_bytes,
+        )?;
 
         Ok(Config {
             bot_token,
@@ -677,7 +792,15 @@ impl Config {
             enable_jina_mcp: env_bool("ENABLE_JINA_MCP", false),
             jina_ai_api_key: env_string("JINA_AI_API_KEY", ""),
             jina_search_endpoint: env_string("JINA_SEARCH_ENDPOINT", "https://s.jina.ai/search"),
-            jina_reader_endpoint: env_string("JINA_READER_ENDPOINT", "https://r.jina.ai/"),
+            jina_reader_endpoint,
+            twitter_fetch_providers,
+            fxtwitter_api_base,
+            vxtwitter_api_base,
+            twitter_fetch_total_timeout_secs,
+            twitter_provider_timeout_secs,
+            twitter_response_max_bytes,
+            external_media_max_bytes,
+            external_media_total_max_bytes,
             enable_brave_search: env_bool("ENABLE_BRAVE_SEARCH", true),
             brave_search_api_key: env_string("BRAVE_SEARCH_API_KEY", ""),
             brave_search_endpoint: env_string(
@@ -1132,6 +1255,53 @@ mod tests {
         assert_eq!(parse_optional_positive_u32(""), None);
         assert_eq!(parse_optional_positive_u32("0"), None);
         assert_eq!(parse_optional_positive_u32("wide"), None);
+    }
+
+    #[test]
+    fn twitter_provider_order_requires_known_unique_entries() {
+        assert_eq!(
+            normalize_twitter_fetch_providers(vec![
+                "fxtwitter".into(),
+                "vxtwitter".into(),
+                "jina".into(),
+            ])
+            .unwrap(),
+            vec!["fxtwitter", "vxtwitter", "jina"]
+        );
+        assert!(
+            normalize_twitter_fetch_providers(vec!["fxtwitter".into(), "fxtwitter".into()])
+                .is_err()
+        );
+        assert!(normalize_twitter_fetch_providers(vec!["unknown".into()]).is_err());
+        assert!(normalize_twitter_fetch_providers(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn twitter_limits_reject_unsafe_combinations() {
+        assert!(validate_twitter_fetch_limits(20, 8, 2_097_152, 20_971_520, 52_428_800).is_ok());
+        assert!(validate_twitter_fetch_limits(8, 20, 2_097_152, 20_971_520, 52_428_800).is_err());
+        assert!(validate_twitter_fetch_limits(20, 8, 0, 20_971_520, 52_428_800).is_err());
+        assert!(validate_twitter_fetch_limits(20, 8, 2_097_152, 60_000_000, 52_428_800).is_err());
+    }
+
+    #[test]
+    fn twitter_provider_bases_require_safe_https() {
+        for value in [
+            "https://api.fxtwitter.com",
+            "https://api.vxtwitter.com",
+            "https://r.jina.ai/",
+        ] {
+            assert!(validate_https_base("TEST_ENDPOINT", value.into()).is_ok());
+        }
+        for value in [
+            "http://api.fxtwitter.com",
+            "https://user@api.fxtwitter.com",
+            "https://api.fxtwitter.com?debug=1",
+            "https://api.fxtwitter.com/#fragment",
+            "https://api.fxtwitter.com:8443",
+        ] {
+            assert!(validate_https_base("TEST_ENDPOINT", value.into()).is_err());
+        }
     }
 }
 

@@ -357,6 +357,16 @@ Example `third_party_models.json`:
 - `JINA_AI_API_KEY` - Jina AI key.
 - `JINA_SEARCH_ENDPOINT` - Default: `https://s.jina.ai/search`.
 - `JINA_READER_ENDPOINT` - Default: `https://r.jina.ai/`.
+- `TWITTER_FETCH_PROVIDERS` - Comma-separated X/Twitter extraction provider order. Default: `fxtwitter,vxtwitter,jina`.
+- `FXTWITTER_API_BASE` - HTTPS base URL for the FxTwitter adapter. Default: `https://api.fxtwitter.com`.
+- `VXTWITTER_API_BASE` - HTTPS base URL for the VxTwitter adapter. Default: `https://api.vxtwitter.com`.
+- `TWITTER_FETCH_TOTAL_TIMEOUT_SECS` - Total deadline for one X/Twitter extraction. Default: `20`.
+- `TWITTER_PROVIDER_TIMEOUT_SECS` - Per-provider X/Twitter timeout. Default: `8`.
+- `TWITTER_RESPONSE_MAX_BYTES` - Maximum provider response body size. Default: `2097152` (2 MiB).
+- `EXTERNAL_MEDIA_MAX_BYTES` - Maximum bytes for one downloaded external media file. Default: `20971520` (20 MiB).
+- `EXTERNAL_MEDIA_TOTAL_MAX_BYTES` - Maximum aggregate bytes for external media in one request. Default: `52428800` (50 MiB).
+- `TWITTER_FETCH_PROVIDERS` controls X/Twitter extraction independently of `ENABLE_JINA_MCP`. Set `TWITTER_FETCH_PROVIDERS=jina` and restart the bot to restore the legacy Jina-only provider order.
+- Direct X media is accepted only from `pbs.twimg.com` (images/thumbnails) and `video.twimg.com` (videos), over HTTPS without credentials or non-default ports. Oversized or unavailable videos use an allowed thumbnail and text fallback when available.
 - `WEB_SEARCH_PROVIDERS` - Comma-separated provider order. Default: `brave,exa,jina`.
 - `WEB_SEARCH_CACHE_TTL_SECONDS` - Cache TTL for web search results. Default: `900` (15 minutes).
 - `WEB_SEARCH_CACHE_MAX_ENTRIES` - Max cached web-search queries kept in memory. Default: `256`.

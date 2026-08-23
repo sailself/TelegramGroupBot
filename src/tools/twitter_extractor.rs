@@ -1,524 +1,457 @@
-use std::collections::HashSet;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use once_cell::sync::Lazy;
-use regex::Regex;
-use tracing::{debug, info};
-use url::Url;
+use anyhow::Result;
 
-use crate::utils::http::get_http_client;
+use crate::utils::http::get_http_client_no_redirect;
+use crate::utils::http::NoRedirectClient;
 
-#[derive(Debug, Clone)]
-pub struct TwitterContent {
-    #[allow(dead_code)]
-    pub url: String,
-    pub text_content: String,
-    pub image_urls: Vec<String>,
-    pub video_urls: Vec<String>,
-    pub formatted_content: String,
+pub(crate) mod model;
+pub(crate) mod providers;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub(crate) mod url;
+pub(crate) use model::parse_allowed_media_url;
+#[allow(unused_imports)]
+pub(crate) use model::TwitterAttachment;
+pub use model::TwitterContent;
+#[allow(unused_imports)]
+pub(crate) use url::{
+    canonical_status_key, is_supported_status_url, parse_status_identity, XStatusIdentity,
+};
+
+use providers::{aggregate_provider_failures, ProviderError, TwitterFetchConfig, TwitterProvider};
+
+pub(crate) struct TwitterExtractor<'a> {
+    client: &'a NoRedirectClient,
+    config: TwitterFetchConfig,
 }
 
-const REQUEST_TIMEOUT: u64 = 20;
-const USER_AGENT: &str =
-    "TelegramGroupHelperBot/0.1 (+https://github.com/sailself/TelegramGroupHelperBot)";
-
-static TIMESTAMP_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\d{1,2}:\d{2}\s?[AP]M").expect("valid timestamp regex"));
-static MEDIA_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"!\[[^\]]*?\]\((https?://[^\)]+)\)").expect("valid twitter media regex")
-});
-static LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\[([^\]]*?)\]\((https?://[^\)]+)\)").expect("valid twitter link regex")
-});
-static EMPTY_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\[\s*\]\((https?://[^\)]+)\)").expect("valid twitter empty link regex")
-});
-static WHITESPACE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\s+").expect("valid whitespace regex"));
-
-fn is_supported_host(host: &str) -> bool {
-    let mut host = host.to_lowercase();
-    if host.starts_with("www.") {
-        host = host.trim_start_matches("www.").to_string();
-    }
-    if host.ends_with("x.com") {
-        return true;
-    }
-    let tokens = [
-        "twitter.com",
-        "fxtwitter.com",
-        "vxtwitter.com",
-        "fixupx.com",
-        "fixvx.com",
-        "twittpr.com",
-        "pxtwitter.com",
-        "tweetpik.com",
-    ];
-    tokens.iter().any(|token| host.ends_with(token))
-}
-
-fn normalize_status_url(raw_url: &str) -> Result<String> {
-    if raw_url.trim().is_empty() {
-        return Err(anyhow!("Empty URL provided for Twitter extraction"));
+impl<'a> TwitterExtractor<'a> {
+    pub(crate) fn new(client: &'a NoRedirectClient, config: TwitterFetchConfig) -> Self {
+        Self { client, config }
     }
 
-    let mut candidate = raw_url.trim().to_string();
-    if !candidate.starts_with("http://") && !candidate.starts_with("https://") {
-        candidate = format!("https://{}", candidate);
-    }
+    pub(crate) async fn fetch(&self, raw_url: &str) -> Result<TwitterContent> {
+        let identity = parse_status_identity(raw_url)?;
+        let started = tokio::time::Instant::now();
+        let deadline = started + self.config.total_timeout;
+        let mut failures = Vec::new();
 
-    let parsed = Url::parse(&candidate)?;
-    let host = parsed.host_str().unwrap_or_default();
-    if !is_supported_host(host) {
-        return Err(anyhow!("Unsupported Twitter/X host: {}", host));
-    }
-
-    if !parsed.path().contains("/status/") {
-        return Err(anyhow!("Twitter/X URL does not reference a status update"));
-    }
-
-    let mut canonical = parsed.clone();
-    canonical.set_scheme("https").ok();
-    canonical.set_host(Some("x.com")).ok();
-
-    Ok(canonical.to_string())
-}
-
-fn build_proxy_url(normalized_url: &str) -> String {
-    let stripped = normalized_url.trim_start_matches("https://");
-    format!("https://r.jina.ai/https://{}", stripped)
-}
-
-fn normalize_media_url(url: &str) -> String {
-    let parsed = Url::parse(url)
-        .or_else(|_| Url::parse(&format!("https:{}", url)))
-        .unwrap_or_else(|_| Url::parse("https://x.com").unwrap());
-    let mut query_pairs = parsed.query_pairs().collect::<Vec<_>>();
-    if parsed
-        .domain()
-        .map(|d| d.ends_with("twimg.com"))
-        .unwrap_or(false)
-    {
-        for pair in &mut query_pairs {
-            if pair.0 == "name" {
-                pair.1 = "orig".into();
-            }
-        }
-    }
-    let mut normalized = parsed.clone();
-    if !query_pairs.is_empty() {
-        normalized.set_query(Some(
-            &serde_urlencoded::to_string(&query_pairs).unwrap_or_default(),
-        ));
-    }
-    normalized.to_string()
-}
-
-fn looks_like_timestamp(text: &str) -> bool {
-    if TIMESTAMP_REGEX.is_match(text) {
-        return true;
-    }
-    let lowered = text.to_lowercase();
-    if lowered.contains("am") || lowered.contains("pm") {
-        let months = [
-            "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov",
-            "dec",
-        ];
-        return months.iter().any(|month| lowered.contains(month));
-    }
-    false
-}
-
-fn collect_relevant_lines(markdown_block: &str) -> Vec<String> {
-    let mut relevant: Vec<String> = Vec::new();
-    let mut collecting = false;
-    let mut seen_content = false;
-
-    for line in markdown_block.lines() {
-        let stripped = line.trim();
-        let lowered = stripped.to_lowercase();
-
-        if !collecting {
-            if lowered == "conversation" {
-                collecting = true;
-            }
-            continue;
-        }
-
-        if !seen_content {
-            if stripped.is_empty() || stripped.chars().all(|c| c == '-') {
-                continue;
-            }
-            seen_content = true;
-        }
-
-        if stripped.is_empty() {
-            if relevant
-                .last()
-                .map(|line| !line.is_empty())
-                .unwrap_or(false)
-            {
-                relevant.push(String::new());
-            }
-            continue;
-        }
-
-        let stop_markers = [
-            "new to x?",
-            "join x today",
-            "sign up now to get your own personalized timeline!",
-            "sign up",
-            "log in",
-            "tweet your reply",
-            "trending now",
-            "what's happening",
-            "terms of service",
-            "privacy policy",
-            "cookie policy",
-            "accessibility",
-            "ads info",
-        ];
-        let stop_prefixes = [
-            "watch on",
-            "show more",
-            "related",
-            "more replies",
-            "explore",
-            "tweet your reply",
-        ];
-
-        if stop_markers.iter().any(|marker| marker == &lowered)
-            || stop_prefixes
-                .iter()
-                .any(|prefix| lowered.starts_with(prefix))
-        {
-            break;
-        }
-
-        relevant.push(line.to_string());
-    }
-
-    if relevant.is_empty() {
-        for line in markdown_block.lines() {
-            let stripped = line.trim();
-            if stripped.is_empty() {
-                continue;
-            }
-            let lowered = stripped.to_lowercase();
-            let stop_markers = [
-                "new to x?",
-                "join x today",
-                "sign up now to get your own personalized timeline!",
-                "sign up",
-                "log in",
-                "tweet your reply",
-                "trending now",
-                "what's happening",
-                "terms of service",
-                "privacy policy",
-                "cookie policy",
-                "accessibility",
-                "ads info",
-            ];
-            let stop_prefixes = [
-                "watch on",
-                "show more",
-                "related",
-                "more replies",
-                "explore",
-                "tweet your reply",
-            ];
-            if stop_markers.iter().any(|marker| marker == &lowered)
-                || stop_prefixes
-                    .iter()
-                    .any(|prefix| lowered.starts_with(prefix))
-            {
+        for provider in &self.config.providers {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                failures.push(ProviderError::deadline(*provider));
                 break;
             }
-            relevant.push(line.to_string());
-        }
-    }
-
-    relevant
-}
-
-fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut cleaned: Vec<String> = Vec::new();
-    let mut image_urls = Vec::new();
-    let mut video_urls = Vec::new();
-
-    let profile_media_tokens = [
-        "profile_images",
-        "profile_banners",
-        "semantic_core_img",
-        "/emoji/",
-        "responsive-web/client-web",
-    ];
-    let video_extensions = [".mp4", ".m3u8", ".mpd"];
-    let punct_prefixes = [".", ",", ";", ":", ")", "]", "}", "!", "?"];
-    for line in lines {
-        let mut working = line.clone();
-        for caps in MEDIA_REGEX.captures_iter(&working) {
-            let media_url = normalize_media_url(&caps[1]);
-            debug!(
-                target: "content.extract",
-                source = "twitter",
-                media_url = %media_url,
-                line = %line,
-                "Found Twitter media candidate"
-            );
-            if media_url.to_ascii_lowercase().contains(".svg") {
-                debug!(
-                    target: "content.extract",
-                    source = "twitter",
-                    media_url = %media_url,
-                    line = %line,
-                    reason = "svg",
-                    "Skipping Twitter media candidate"
-                );
-                continue;
-            }
-            if profile_media_tokens
-                .iter()
-                .any(|token| media_url.contains(token))
-            {
-                debug!(
-                    target: "content.extract",
-                    source = "twitter",
-                    media_url = %media_url,
-                    line = %line,
-                    reason = "profile_media",
-                    "Skipping Twitter media candidate"
-                );
-                continue;
-            }
-            if video_extensions.iter().any(|ext| media_url.ends_with(ext))
-                || media_url.contains("video.twimg.com")
-            {
-                if !video_urls.contains(&media_url) {
-                    debug!(
-                        target: "content.extract",
-                        source = "twitter",
-                        media_url = %media_url,
-                        line = %line,
-                        media_kind = "video",
-                        "Added Twitter video"
+            let timeout = remaining.min(self.config.provider_timeout);
+            let attempt_started = tokio::time::Instant::now();
+            match self.fetch_provider(*provider, &identity, timeout).await {
+                Ok(post) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::debug!(
+                            target: "tools.twitter",
+                            provider = provider.as_str(),
+                            status_id = %identity.id,
+                            elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                            result = "deadline_exhausted",
+                            "Twitter provider attempt"
+                        );
+                        failures.push(ProviderError::deadline(*provider));
+                        break;
+                    }
+                    let (media_images, media_videos) = post.media.iter().fold(
+                        (0_u64, 0_u64),
+                        |(images, videos), media| match media {
+                            model::XMedia::Image { .. } => (images + 1, videos),
+                            model::XMedia::Video { .. } => (images, videos + 1),
+                        },
                     );
-                    video_urls.push(media_url);
-                } else {
-                    debug!(
-                        target: "content.extract",
-                        source = "twitter",
-                        media_url = %media_url,
-                        line = %line,
-                        media_kind = "video",
-                        reason = "duplicate",
-                        "Skipping duplicate Twitter video"
+                    tracing::debug!(
+                        target: "tools.twitter",
+                        provider = provider.as_str(),
+                        status_id = %identity.id,
+                        elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                        result = "success",
+                        http_status = 200_u16,
+                        media_images,
+                        media_videos,
+                        "Twitter provider attempt"
                     );
+                    return model::build_twitter_content(&identity, post);
                 }
-            } else if !image_urls.contains(&media_url) {
-                debug!(
-                    target: "content.extract",
-                    source = "twitter",
-                    media_url = %media_url,
-                    line = %line,
-                    media_kind = "image",
-                    "Added Twitter image"
-                );
-                image_urls.push(media_url);
-            } else {
-                debug!(
-                    target: "content.extract",
-                    source = "twitter",
-                    media_url = %media_url,
-                    line = %line,
-                    media_kind = "image",
-                    reason = "duplicate",
-                    "Skipping duplicate Twitter image"
-                );
-            }
-        }
-        working = MEDIA_REGEX.replace_all(&working, "").to_string();
-        working = EMPTY_LINK_REGEX.replace_all(&working, "").to_string();
-
-        working = LINK_REGEX
-            .replace_all(&working, |caps: &regex::Captures| {
-                caps[1].trim().to_string()
-            })
-            .to_string();
-        working = WHITESPACE_REGEX
-            .replace_all(&working, " ")
-            .trim()
-            .to_string();
-
-        if working.is_empty() {
-            continue;
-        }
-
-        if let Some(last) = cleaned.last_mut() {
-            if !last.ends_with(['.', '!', '?', ':'])
-                && (working.starts_with('@') || working.starts_with('#'))
-            {
-                *last = format!("{} {}", last, working);
-                continue;
-            }
-            if punct_prefixes
-                .iter()
-                .any(|prefix| working.starts_with(prefix))
-            {
-                *last = format!("{}{}", last, working);
-                continue;
+                Err(error) => {
+                    tracing::debug!(
+                        target: "tools.twitter",
+                        provider = provider.as_str(),
+                        status_id = %identity.id,
+                        elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                        result = error.kind.as_str(),
+                        status = error.status.map(|status| status.as_u16()),
+                        "Twitter provider attempt"
+                    );
+                    let exhausted = tokio::time::Instant::now() >= deadline;
+                    failures.push(error);
+                    if exhausted {
+                        failures.push(ProviderError::deadline(*provider));
+                        break;
+                    }
+                }
             }
         }
 
-        cleaned.push(working);
+        Err(aggregate_provider_failures(&identity, &failures))
     }
 
-    (cleaned, image_urls, video_urls)
-}
-
-fn extract_metadata(cleaned_lines: &[String]) -> (Option<String>, Option<String>, Option<usize>) {
-    let mut display_name = None;
-    let mut handle = None;
-    let mut handle_index = None;
-
-    for (idx, line) in cleaned_lines.iter().take(6).enumerate() {
-        if line.starts_with('@') && !line.contains(' ') {
-            handle = Some(line.to_string());
-            handle_index = Some(idx);
-            if let Some(prev) = cleaned_lines[..idx]
-                .iter()
-                .rev()
-                .find(|line| !line.is_empty())
-            {
-                display_name = Some(prev.to_string());
+    async fn fetch_provider(
+        &self,
+        provider: TwitterProvider,
+        identity: &XStatusIdentity,
+        timeout: Duration,
+    ) -> std::result::Result<model::XPost, ProviderError> {
+        match provider {
+            TwitterProvider::FxTwitter => {
+                providers::fxtwitter::fetch(self.client, &self.config, identity, timeout).await
             }
-            break;
+            TwitterProvider::VxTwitter => {
+                providers::vxtwitter::fetch(self.client, &self.config, identity, timeout).await
+            }
+            TwitterProvider::Jina => {
+                providers::jina::fetch(self.client, &self.config, identity, timeout).await
+            }
         }
     }
-
-    (display_name, handle, handle_index)
-}
-
-fn strip_indices(lines: &[String], indexes: &[Option<usize>]) -> Vec<String> {
-    let mut skip = HashSet::new();
-    for value in indexes.iter().flatten() {
-        skip.insert(*value);
-    }
-    lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| {
-            if skip.contains(&idx) {
-                None
-            } else {
-                Some(line.clone())
-            }
-        })
-        .collect()
 }
 
 pub async fn extract_twitter_content(url: &str) -> Result<TwitterContent> {
-    let normalized_url = normalize_status_url(url)?;
-    let proxy_url = build_proxy_url(&normalized_url);
-    info!("Fetching Twitter/X content via proxy: {}", proxy_url);
+    let config = TwitterFetchConfig::try_from(&*crate::config::CONFIG)?;
+    TwitterExtractor::new(get_http_client_no_redirect(), config)
+        .fetch(url)
+        .await
+}
 
-    let client = get_http_client();
-    let response = client
-        .get(proxy_url)
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT))
-        .header("User-Agent", USER_AGENT)
-        .send()
-        .await?;
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Twitter proxy request failed with status {}",
-            response.status()
-        ));
-    }
+    use super::*;
+    use crate::tools::twitter_extractor::providers::{TwitterFetchConfig, TwitterProvider};
+    use crate::tools::twitter_extractor::test_support::{response_with_status, TestServer};
 
-    let raw_text = response.text().await?;
-    let marker = "Markdown Content:\n";
-    let marker_idx = raw_text
-        .find(marker)
-        .ok_or_else(|| anyhow!("Unable to locate Twitter/X markdown content in response"))?;
-    let markdown_block = &raw_text[marker_idx + marker.len()..];
-
-    let relevant_lines = collect_relevant_lines(markdown_block);
-    let (cleaned_lines, image_urls, video_urls) = clean_lines_and_media(&relevant_lines);
-
-    if cleaned_lines.is_empty() && image_urls.is_empty() && video_urls.is_empty() {
-        return Err(anyhow!("No content extracted from Twitter/X response"));
-    }
-
-    let (display_name, handle, handle_idx) = extract_metadata(&cleaned_lines);
-    let mut timestamp_idx = None;
-    let mut timestamp_text = None;
-    for (idx, line) in cleaned_lines.iter().enumerate() {
-        if looks_like_timestamp(line) {
-            timestamp_idx = Some(idx);
-            timestamp_text = Some(line.clone());
-            break;
+    fn test_chain_config(fx: ::url::Url, vx: ::url::Url, jina: ::url::Url) -> TwitterFetchConfig {
+        TwitterFetchConfig {
+            providers: vec![
+                TwitterProvider::FxTwitter,
+                TwitterProvider::VxTwitter,
+                TwitterProvider::Jina,
+            ],
+            fxtwitter_api_base: fx,
+            vxtwitter_api_base: vx,
+            jina_reader_endpoint: jina,
+            jina_api_key: None,
+            total_timeout: Duration::from_secs(20),
+            provider_timeout: Duration::from_secs(5),
+            response_max_bytes: 1024 * 1024,
         }
     }
 
-    let display_index = display_name
-        .as_ref()
-        .and_then(|name| cleaned_lines.iter().position(|line| line == name));
-    let body_lines = strip_indices(&cleaned_lines, &[handle_idx, display_index, timestamp_idx]);
-    let body_text = body_lines.join("\n").trim().to_string();
+    #[tokio::test]
+    async fn extractor_falls_back_fx_to_vx_and_stops_before_jina() {
+        let fx = TestServer::single_status("GET", "/i/status/123", 503);
+        let vx = TestServer::single_json(
+            "GET",
+            "/Twitter/status/123",
+            include_bytes!("twitter_extractor/fixtures/vxtwitter_photo_quote.json"),
+        );
+        let jina = TestServer::expect_no_requests();
+        let extractor = TwitterExtractor::new(
+            providers::get_http_client_no_redirect(),
+            test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
+        );
 
-    let mut header_parts = Vec::new();
-    if let Some(name) = display_name.clone() {
-        header_parts.push(name);
-    }
-    if let Some(handle_value) = handle.clone() {
-        if !header_parts.contains(&handle_value) {
-            header_parts.push(handle_value);
-        }
-    }
-
-    let mut header_text = String::new();
-    if !header_parts.is_empty() {
-        header_text = format!("Tweet by {}", header_parts.join(" "));
-    }
-    if let Some(timestamp) = timestamp_text.clone() {
-        if header_text.is_empty() {
-            header_text = format!("Tweet at {}", timestamp);
-        } else {
-            header_text = format!("{} at {}", header_text, timestamp);
-        }
+        let content = extractor
+            .fetch("https://x.com/alice/status/123")
+            .await
+            .unwrap();
+        assert!(content.text_content.contains("root text"));
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
     }
 
-    let mut sections = Vec::new();
-    if !header_text.trim().is_empty() {
-        sections.push(header_text.trim().to_string());
-    }
-    if !body_text.trim().is_empty() {
-        sections.push(body_text.clone());
-    }
-    sections.push(format!("Original link: {}", normalized_url));
+    #[tokio::test]
+    async fn extractor_stops_after_fxtwitter_success() {
+        let fx = TestServer::single_json(
+            "GET",
+            "/i/status/123",
+            include_bytes!("twitter_extractor/fixtures/fxtwitter_photo_quote.json"),
+        );
+        let vx = TestServer::expect_no_requests();
+        let jina = TestServer::expect_no_requests();
+        let extractor = TwitterExtractor::new(
+            providers::get_http_client_no_redirect(),
+            test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
+        );
 
-    let text_content = sections.join("\n\n");
-    let mut formatted_content = format!("\n\n--- Twitter Content ---\n{}", text_content);
-    if !image_urls.is_empty() {
-        formatted_content.push_str(&format!(
-            "\n\nImages attached: {} image(s)",
-            image_urls.len()
-        ));
+        extractor
+            .fetch("https://x.com/alice/status/123")
+            .await
+            .unwrap();
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
     }
-    if !video_urls.is_empty() {
-        formatted_content.push_str(&format!("\nVideos attached: {} video(s)", video_urls.len()));
-    }
-    formatted_content.push_str("\n--- End Twitter Content ---\n\n");
 
-    Ok(TwitterContent {
-        url: normalized_url,
-        text_content,
-        image_urls,
-        video_urls,
-        formatted_content,
-    })
+    #[tokio::test]
+    async fn extractor_falls_back_on_invalid_fxtwitter_json() {
+        let fx = TestServer::single(response_with_status(200, b"not json".to_vec()));
+        let vx = TestServer::single_json(
+            "GET",
+            "/Twitter/status/123",
+            include_bytes!("twitter_extractor/fixtures/vxtwitter_photo_quote.json"),
+        );
+        let jina = TestServer::expect_no_requests();
+        let extractor = TwitterExtractor::new(
+            providers::get_http_client_no_redirect(),
+            test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
+        );
+
+        assert!(extractor
+            .fetch("https://x.com/alice/status/123")
+            .await
+            .unwrap()
+            .text_content
+            .contains("root text"));
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_falls_back_on_incomplete_fxtwitter_post() {
+        let fx = TestServer::single_json("GET", "/i/status/123", br#"{"status":{}}"#);
+        let vx = TestServer::single_json(
+            "GET",
+            "/Twitter/status/123",
+            include_bytes!("twitter_extractor/fixtures/vxtwitter_photo_quote.json"),
+        );
+        let jina = TestServer::expect_no_requests();
+        let extractor = TwitterExtractor::new(
+            providers::get_http_client_no_redirect(),
+            test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
+        );
+
+        assert!(extractor
+            .fetch("https://x.com/alice/status/123")
+            .await
+            .unwrap()
+            .text_content
+            .contains("root text"));
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_falls_back_fx_and_vx_to_jina() {
+        let fx = TestServer::single_status("GET", "/i/status/123", 503);
+        let vx = TestServer::single_status("GET", "/Twitter/status/123", 503);
+        let body = include_bytes!("twitter_extractor/fixtures/jina_photo.txt");
+        let jina = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
+                "GET",
+                "/https://x.com/i/status/123",
+                response_with_status(200, body.to_vec()),
+            ),
+        ]);
+        let extractor = TwitterExtractor::new(
+            providers::get_http_client_no_redirect(),
+            test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
+        );
+
+        assert!(extractor
+            .fetch("https://x.com/alice/status/123")
+            .await
+            .unwrap()
+            .text_content
+            .contains("fixture body"));
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_with_jina_only_makes_one_request() {
+        let fx = TestServer::expect_no_requests();
+        let vx = TestServer::expect_no_requests();
+        let body = include_bytes!("twitter_extractor/fixtures/jina_photo.txt");
+        let jina = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
+                "GET",
+                "/https://x.com/i/status/123",
+                response_with_status(200, body.to_vec()),
+            ),
+        ]);
+        let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
+        config.providers = vec![TwitterProvider::Jina];
+        let extractor = TwitterExtractor::new(providers::get_http_client_no_redirect(), config);
+
+        extractor
+            .fetch("https://x.com/alice/status/123")
+            .await
+            .unwrap();
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_stops_at_total_deadline() {
+        let fx = TestServer::single_delayed(
+            "GET",
+            "/i/status/123",
+            Duration::from_millis(100),
+            200,
+            br#"{}"#,
+        );
+        let vx = TestServer::single_delayed(
+            "GET",
+            "/Twitter/status/123",
+            Duration::from_millis(100),
+            200,
+            br#"{}"#,
+        );
+        let jina = TestServer::expect_no_requests();
+        let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
+        config.total_timeout = Duration::from_millis(30);
+        config.provider_timeout = Duration::from_millis(15);
+        let started = tokio::time::Instant::now();
+        let error = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+            .fetch("https://x.com/a/status/123")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deadline"));
+        assert!(started.elapsed() < Duration::from_millis(80));
+        fx.join_allowing_client_disconnect().unwrap();
+        vx.join_allowing_client_disconnect().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_error_does_not_expose_response_body_or_endpoint() {
+        let secret_body = b"response body secret".to_vec();
+        let fx = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
+                "GET",
+                "/i/status/123",
+                response_with_status(503, secret_body.clone()),
+            ),
+        ]);
+        let vx = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
+                "GET",
+                "/Twitter/status/123",
+                response_with_status(503, secret_body),
+            ),
+        ]);
+        let jina = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
+                "GET",
+                "/custom-endpoint-secret/https://x.com/i/status/123",
+                response_with_status(503, b"jina body secret".to_vec()),
+            ),
+        ]);
+        let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
+        config.jina_reader_endpoint = jina.base_url().join("custom-endpoint-secret").unwrap();
+        config.jina_api_key = Some("secret-bearer-value".to_string());
+        let error = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+            .fetch("https://x.com/a/status/123")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("123"));
+        assert!(!error.contains("response body secret"));
+        assert!(!error.contains("jina body secret"));
+        assert!(!error.contains("custom-endpoint-secret"));
+        assert!(!error.contains("secret-bearer-value"));
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_falls_back_after_fxtwitter_timeout() {
+        let fx = TestServer::single_delayed(
+            "GET",
+            "/i/status/123",
+            Duration::from_millis(100),
+            200,
+            br#"{}"#,
+        );
+        let vx = TestServer::single_json(
+            "GET",
+            "/Twitter/status/123",
+            include_bytes!("twitter_extractor/fixtures/vxtwitter_photo_quote.json"),
+        );
+        let jina = TestServer::expect_no_requests();
+        let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
+        config.provider_timeout = Duration::from_millis(15);
+        let content = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+            .fetch("https://x.com/a/status/123")
+            .await
+            .unwrap();
+        assert!(content.text_content.contains("root text"));
+        fx.join_allowing_client_disconnect().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_falls_back_after_fxtwitter_body_too_large() {
+        let fx = TestServer::single_json("GET", "/i/status/123", &vec![b'x'; 2_048]);
+        let vx = TestServer::single_json(
+            "GET",
+            "/Twitter/status/123",
+            include_bytes!("twitter_extractor/fixtures/vxtwitter_photo_quote.json"),
+        );
+        let jina = TestServer::expect_no_requests();
+        let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
+        config.response_max_bytes = 1_024;
+        let content = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+            .fetch("https://x.com/a/status/123")
+            .await
+            .unwrap();
+        assert!(content.text_content.contains("root text"));
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extractor_falls_back_after_fxtwitter_transport_failure() {
+        let fx = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
+                "GET",
+                "/i/status/123",
+                Vec::new(),
+            ),
+        ]);
+        let vx = TestServer::single_json(
+            "GET",
+            "/Twitter/status/123",
+            include_bytes!("twitter_extractor/fixtures/vxtwitter_photo_quote.json"),
+        );
+        let jina = TestServer::expect_no_requests();
+        let content = TwitterExtractor::new(
+            providers::get_http_client_no_redirect(),
+            test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
+        )
+        .fetch("https://x.com/a/status/123")
+        .await
+        .unwrap();
+        assert!(content.text_content.contains("root text"));
+        fx.join().unwrap();
+        vx.join().unwrap();
+        jina.join().unwrap();
+    }
 }

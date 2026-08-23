@@ -15,8 +15,8 @@ use teloxide::RequestError;
 
 use crate::agents::factcheck::{run_factcheck_pipeline, FactcheckOutcome};
 use crate::config::{
-    ThirdPartyProvider, CONFIG, FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY, PAINTME_SYSTEM_PROMPT,
-    PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
+    Config, ThirdPartyProvider, CONFIG, FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY,
+    PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
 };
 use crate::db::models::{ModelTokenStat, TokenUserStat};
 use crate::handlers::access::{check_access_control, check_admin_access, is_rate_limited};
@@ -48,6 +48,7 @@ use crate::state::{
     AppState, ImageGenerationModel, MediaGroupItem, PendingImageCommand, PendingImageRequest,
 };
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
+use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::logging::read_recent_log_lines;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::start_chat_action_heartbeat;
@@ -871,6 +872,23 @@ fn append_log_tail(report: &mut String, base_name: &str, title: &str, max_lines:
     }
 }
 
+fn format_twitter_fetch_diagnostics(config: &Config) -> String {
+    format!(
+        "twitter_fetch_providers_order: {}\n\
+twitter_fetch_total_timeout_secs: {}\n\
+twitter_provider_timeout_secs: {}\n\
+twitter_response_max_bytes: {}\n\
+external_media_max_bytes: {}\n\
+external_media_total_max_bytes: {}\n",
+        config.twitter_fetch_providers.join(", "),
+        config.twitter_fetch_total_timeout_secs,
+        config.twitter_provider_timeout_secs,
+        config.twitter_response_max_bytes,
+        config.external_media_max_bytes,
+        config.external_media_total_max_bytes,
+    )
+}
+
 async fn build_status_report(state: &AppState) -> String {
     let db_result = state.db.health_check().await;
     let db_status = if db_result.is_ok() { "ok" } else { "error" };
@@ -1137,6 +1155,8 @@ async fn build_diagnose_report(state: &AppState) -> String {
         "OPENAI_CODEX_MODEL_FILE_present: {}\n",
         bool_label(Path::new(&CONFIG.openai_codex_model_path).exists())
     ));
+    report.push_str("\nTwitter fetch diagnostics (sanitized)\n");
+    report.push_str(&format_twitter_fetch_diagnostics(&CONFIG));
 
     append_log_tail(
         &mut report,
@@ -3082,17 +3102,25 @@ pub async fn factcheck_handler(
     let mut media_files = collected_media.files;
 
     let mut remaining = max_files.saturating_sub(media_files.len());
+    let external_media_budget = ExternalMediaBudget::new(CONFIG.external_media_total_max_bytes);
     if remaining > 0 {
-        let telegraph_files =
-            crate::handlers::content::download_telegraph_media(&telegraph_contents, remaining)
-                .await;
+        let telegraph_files = crate::handlers::content::download_telegraph_media(
+            &telegraph_contents,
+            remaining,
+            &external_media_budget,
+        )
+        .await;
         remaining = remaining.saturating_sub(telegraph_files.len());
         media_files.extend(telegraph_files);
     }
 
     if remaining > 0 {
-        let twitter_files =
-            crate::handlers::content::download_twitter_media(&twitter_contents, remaining).await;
+        let twitter_files = crate::handlers::content::download_twitter_media(
+            &twitter_contents,
+            remaining,
+            &external_media_budget,
+        )
+        .await;
         media_files.extend(twitter_files);
     }
 
@@ -4143,6 +4171,46 @@ pub async fn handle_media_group(state: AppState, message: Message) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn twitter_fetch_diagnostics_are_sanitized_and_complete() {
+        let mut config = (*CONFIG).clone();
+        config.twitter_fetch_providers = vec![
+            "fxtwitter".to_string(),
+            "vxtwitter".to_string(),
+            "jina".to_string(),
+        ];
+        config.twitter_fetch_total_timeout_secs = 20;
+        config.twitter_provider_timeout_secs = 8;
+        config.twitter_response_max_bytes = 2_097_152;
+        config.external_media_max_bytes = 20_971_520;
+        config.external_media_total_max_bytes = 52_428_800;
+        config.jina_ai_api_key = "seeded-jina-secret".to_string();
+        config.fxtwitter_api_base = "https://seeded-fxtwitter.invalid/api".to_string();
+        config.vxtwitter_api_base = "https://seeded-vxtwitter.invalid/api".to_string();
+        config.jina_reader_endpoint = "https://seeded-jina.invalid/reader".to_string();
+        let report = format_twitter_fetch_diagnostics(&config);
+
+        assert_eq!(
+            report,
+            "twitter_fetch_providers_order: fxtwitter, vxtwitter, jina\n\
+twitter_fetch_total_timeout_secs: 20\n\
+twitter_provider_timeout_secs: 8\n\
+twitter_response_max_bytes: 2097152\n\
+external_media_max_bytes: 20971520\n\
+external_media_total_max_bytes: 52428800\n"
+        );
+        for secret in [
+            "JINA_AI_API_KEY",
+            "seeded-jina-secret",
+            "Bearer seeded-jina-secret",
+            "https://seeded-fxtwitter.invalid/api",
+            "https://seeded-vxtwitter.invalid/api",
+            "https://seeded-jina.invalid/reader",
+        ] {
+            assert!(!report.contains(secret), "diagnostic leaked {secret}");
+        }
+    }
 
     #[test]
     fn factcheck_prompt_renders_without_placeholders() {

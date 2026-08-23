@@ -1,0 +1,24 @@
+{
+  "tweetID": "123",
+  "text": "root text",
+  "user_name": "Alice",
+  "user_screen_name": "alice",
+  "date": "2026-08-19T12:00:00Z",
+  "mediaURLs": ["https://pbs.twimg.com/media/root.jpg", "https://pbs.twimg.com/media/root.jpg"],
+  "media_extended": [
+    {
+      "type": "image",
+      "url": "https://pbs.twimg.com/media/root.jpg",
+      "altText": "root alt",
+      "size": { "width": 1200, "height": 800 }
+    }
+  ],
+  "qrt": {
+    "tweetID": "122",
+    "text": "quoted text",
+    "user_name": "Bob",
+    "user_screen_name": "bob",
+    "mediaURLs": [],
+    "media_extended": []
+  }
+}

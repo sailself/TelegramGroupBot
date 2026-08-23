@@ -1,0 +1,18 @@
+{
+  "code": 200,
+  "status": {
+    "id": "123",
+    "text": "video post",
+    "author": { "name": "Alice", "screen_name": "alice" },
+    "media": {
+      "photos": [],
+      "videos": [{
+        "thumbnail_url": "https://pbs.twimg.com/media/thumb.jpg",
+        "variants": [
+          { "url": "https://video.twimg.com/video/low.mp4", "type": "video/mp4", "bitrate": 256000 },
+          { "url": "https://video.twimg.com/video/high.mp4", "type": "video/mp4", "bitrate": 2176000 }
+        ]
+      }]
+    }
+  }
+}

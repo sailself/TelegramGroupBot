@@ -1,0 +1,13 @@
+{
+  "tweet_id": "123",
+  "text": "video text",
+  "mediaURLs": ["https://pbs.twimg.com/media/vx-thumb.jpg"],
+  "media_extended": [
+    {
+      "type": "gif",
+      "url": "https://video.twimg.com/video/vx.mp4",
+      "thumbnail_url": "https://pbs.twimg.com/media/vx-thumb.jpg",
+      "alt_text": "video alt"
+    }
+  ]
+}
