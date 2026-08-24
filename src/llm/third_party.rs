@@ -1103,7 +1103,11 @@ mod tests {
             request_timeout_secs: 60,
         };
         let details = build_request_details_for_runtime(
-            &model(ThirdPartyProvider::OpenRouter, "Ox Alpha", "stealth/ox-alpha"),
+            &model(
+                ThirdPartyProvider::OpenRouter,
+                "Ox Alpha",
+                "stealth/ox-alpha",
+            ),
             &runtime,
             vec![json!({ "role": "user", "content": "hello" })],
             None,
