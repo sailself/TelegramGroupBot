@@ -516,11 +516,18 @@ struct MysongLanguageSelection {
 }
 
 fn strip_command_prefix(text: &str, command_prefix: &str) -> String {
-    if let Some(stripped) = text.strip_prefix(command_prefix) {
-        stripped.trim().to_string()
-    } else {
-        text.to_string()
-    }
+    let Some(stripped) = text.strip_prefix(command_prefix) else {
+        return text.to_string();
+    };
+    // Telegram appends `@botname` to the command when it is addressed to a
+    // specific bot (`/img@MyBot ...`); that mention is not part of the prompt.
+    let stripped = match stripped.strip_prefix('@') {
+        Some(after_at) => {
+            after_at.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => stripped,
+    };
+    stripped.trim().to_string()
 }
 
 fn format_user_history_for_persona(history: &[crate::db::models::MessageRow]) -> String {
@@ -4603,6 +4610,22 @@ external_media_total_max_bytes: 52428800\n"
             build_token_stats_user_response(&rows),
             "Token usage by user:\n\n1. Alice: 9.9k tokens"
         );
+    }
+
+    #[test]
+    fn strip_command_prefix_removes_command_and_attached_bot_mention() {
+        assert_eq!(strip_command_prefix("/img a cat", "/img"), "a cat");
+        assert_eq!(strip_command_prefix("/img@MyBot a cat", "/img"), "a cat");
+        assert_eq!(strip_command_prefix("/image@My_Bot2", "/image"), "");
+    }
+
+    #[test]
+    fn strip_command_prefix_keeps_mentions_inside_the_prompt() {
+        assert_eq!(
+            strip_command_prefix("/img @alice as a knight", "/img"),
+            "@alice as a knight"
+        );
+        assert_eq!(strip_command_prefix("draw a cat", "/img"), "draw a cat");
     }
 
     #[test]
