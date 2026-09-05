@@ -232,7 +232,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `GEMINI_TOP_K` - Default: `40`.
 - `GEMINI_TOP_P` - Default: `0.95`.
 - `GEMINI_MAX_OUTPUT_TOKENS` - Default: `2048`.
-- `GEMINI_THINKING_LEVEL` - Default: `high`.
+- `GEMINI_THINKING_LEVEL` - Sent as `thinkingConfig.thinkingLevel` to Gemini 3 models only (2.5-series models reject it). Default: `high`.
 - `GEMINI_SAFETY_SETTINGS` - Safety profile: `standard` or `permissive` (`off`/`none` are treated as `permissive`). Default: `permissive`.
   - `standard` maps to `BLOCK_MEDIUM_AND_ABOVE`; `permissive` maps to `OFF` for all Gemini safety categories.
 - `GEMINI_REQUEST_TIMEOUT_SECS` - Per-attempt timeout for Gemini `generateContent` requests. Default: `90`.

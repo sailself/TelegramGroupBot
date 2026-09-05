@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::CONFIG;
 use crate::llm::audit::{LlmAuditContext, LlmUsageRecord};
-use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
+use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::transport::retry::is_retryable_status;
 use crate::llm::transport::{
@@ -82,6 +82,9 @@ enum GeminiPart {
         #[serde(rename = "codeExecutionResult")]
         code_execution_result: GeminiCodeExecutionResult,
     },
+    /// Anything else the API may add (function calls, thought signatures,
+    /// file data). Kept so one unfamiliar part never fails the whole response.
+    Other(Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,6 +341,7 @@ fn summarize_gemini_payload(payload: &Value, system_prompt_label: Option<&str>) 
 fn summarize_gemini_response(response: &GeminiResponse) -> Value {
     let mut text_parts = 0usize;
     let mut image_parts = 0usize;
+    let mut other_parts: Vec<String> = Vec::new();
     let mut text_preview = None;
 
     let candidates = response.candidates.as_deref().unwrap_or(&[]);
@@ -377,6 +381,15 @@ fn summarize_gemini_response(response: &GeminiResponse) -> Value {
                                 }
                             }
                         }
+                        GeminiPart::Other(part) => {
+                            // Record which unfamiliar keys the API sent (e.g.
+                            // "functionCall", "thoughtSignature") without the payload.
+                            let keys = part
+                                .as_object()
+                                .map(|object| object.keys().cloned().collect::<Vec<_>>())
+                                .unwrap_or_default();
+                            other_parts.push(keys.join("+"));
+                        }
                     }
                 }
             }
@@ -387,6 +400,7 @@ fn summarize_gemini_response(response: &GeminiResponse) -> Value {
         "candidates": response.candidates.as_ref().map(|candidates| candidates.len()).unwrap_or(0),
         "textParts": text_parts,
         "imageParts": image_parts,
+        "otherParts": other_parts,
         "textPreview": text_preview,
         "hasUsageMetadata": response.usage_metadata.is_some()
     })
@@ -1148,6 +1162,29 @@ fn base_generation_config() -> Value {
     })
 }
 
+/// `thinkingConfig` for `GEMINI_THINKING_LEVEL`. Only Gemini 3 models accept
+/// `thinkingLevel`; the 2.5 generation uses token budgets and rejects it, so
+/// the setting is ignored there.
+fn thinking_config_for(model: &str, level: &str) -> Option<Value> {
+    let level = level.trim();
+    if level.is_empty() || !model.trim().to_ascii_lowercase().starts_with("gemini-3") {
+        return None;
+    }
+    Some(json!({ "thinkingLevel": level }))
+}
+
+/// Sampling config for text calls, with the thinking level when `model`
+/// supports it.
+fn generation_config_for(model: &str, thinking_level: &str) -> Value {
+    let mut config = base_generation_config();
+    if let Some(thinking) = thinking_config_for(model, thinking_level) {
+        if let Some(object) = config.as_object_mut() {
+            object.insert("thinkingConfig".to_string(), thinking);
+        }
+    }
+    config
+}
+
 fn with_response_json_schema(config: Value, response_json_schema: Option<&Value>) -> Value {
     let Some(schema) = response_json_schema else {
         return config;
@@ -1222,7 +1259,7 @@ pub async fn call_gemini_with_tool_runtime(
         let mut payload = json!({
             "systemInstruction": { "parts": [{ "text": system_prompt }] },
             "contents": contents.clone(),
-            "generationConfig": base_generation_config(),
+            "generationConfig": generation_config_for(model, &CONFIG.gemini_thinking_level),
             "safetySettings": build_safety_settings(),
         });
         if tools_enabled {
@@ -1288,7 +1325,7 @@ pub async fn call_gemini_with_tool_runtime(
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": contents.clone(),
         "generationConfig": with_response_json_schema(
-            base_generation_config(),
+            generation_config_for(model, &CONFIG.gemini_thinking_level),
             final_response_json_schema.as_ref()
         ),
         "safetySettings": build_safety_settings(),
@@ -1336,7 +1373,7 @@ pub async fn call_gemini_model_simple(
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": [json!({ "role": "user", "parts": parts })],
         "generationConfig": with_response_json_schema(
-            base_generation_config(),
+            generation_config_for(model, &CONFIG.gemini_thinking_level),
             response_json_schema
         ),
         "safetySettings": build_safety_settings(),
@@ -1435,39 +1472,34 @@ async fn call_gemini_lite_fallback(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn call_gemini(
-    system_prompt: &str,
-    user_content: &str,
-    use_search_grounding: bool,
-    _use_url_context: bool,
-    _thinking_level: Option<&str>,
-    image_url: Option<&str>,
-    use_pro_model: bool,
-    media_files: Option<Vec<MediaFile>>,
-    youtube_urls: Option<Vec<String>>,
-    system_prompt_label: Option<&str>,
-    audit_context: Option<&LlmAuditContext>,
-) -> Result<GeminiCallResult> {
+/// One Gemini text call (default or pro model, with the lite fallback chain).
+#[derive(Default)]
+pub struct GeminiCallRequest<'a> {
+    pub system_prompt: &'a str,
+    pub user_content: &'a str,
+    /// Attach the `google_search` grounding tool.
+    pub use_search_grounding: bool,
+    pub use_pro_model: bool,
+    pub media_files: Vec<MediaFile>,
+    pub youtube_urls: Vec<String>,
+    /// Name used in place of the system prompt text in logs.
+    pub system_prompt_label: Option<&'a str>,
+    pub audit_context: Option<&'a LlmAuditContext>,
+}
+
+pub async fn call_gemini(request: GeminiCallRequest<'_>) -> Result<GeminiCallResult> {
     ensure_gemini_api_available()?;
+    let GeminiCallRequest {
+        system_prompt,
+        user_content,
+        use_search_grounding,
+        use_pro_model,
+        media_files: files,
+        youtube_urls,
+        system_prompt_label,
+        audit_context,
+    } = request;
     let content = user_content.to_string();
-
-    let youtube_urls = youtube_urls.unwrap_or_default();
-
-    let mut files = media_files.unwrap_or_default();
-    if files.is_empty() {
-        if let Some(url) = image_url {
-            if let Some(data) = download_media(url).await {
-                let mime_type = detect_mime_type(&data).unwrap_or_else(|| "image/png".to_string());
-                files.push(MediaFile::new(
-                    data,
-                    mime_type.clone(),
-                    kind_for_mime(&mime_type),
-                    None,
-                ));
-            }
-        }
-    }
 
     let has_video_or_audio = files
         .iter()
@@ -1492,24 +1524,21 @@ pub async fn call_gemini(
         tools
     };
 
-    let payload = json!({
-        "systemInstruction": { "parts": [{ "text": system_prompt }] },
-        "contents": [{ "role": "user", "parts": parts }],
-        "generationConfig": {
-            "temperature": CONFIG.gemini_temperature,
-            "topK": CONFIG.gemini_top_k,
-            "topP": CONFIG.gemini_top_p,
-            "maxOutputTokens": CONFIG.gemini_max_output_tokens,
-        },
-        "safetySettings": build_safety_settings(),
-        "tools": tools,
-    });
-
     let primary_model = if use_pro_model {
         &CONFIG.gemini_pro_model
     } else {
         &CONFIG.gemini_model
     };
+    // The fallback models reuse this payload; thinkingConfig is keyed on the
+    // primary model, which is what every model in one chain shares in
+    // generation (pro/default/lite are all the same major version).
+    let payload = json!({
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "contents": [{ "role": "user", "parts": parts }],
+        "generationConfig": generation_config_for(primary_model, &CONFIG.gemini_thinking_level),
+        "safetySettings": build_safety_settings(),
+        "tools": tools,
+    });
     let primary_operation = if use_pro_model {
         "call_gemini_pro"
     } else {
@@ -2032,6 +2061,43 @@ mod tests {
         server
             .join_allowing_client_disconnect()
             .expect("both requests were served; the first client gave up");
+    }
+
+    #[test]
+    fn unknown_response_parts_do_not_break_text_extraction() {
+        let response: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [
+                { "functionCall": { "name": "web_search", "args": {} } },
+                { "text": "visible answer" }
+            ] } }]
+        }))
+        .expect("unknown part kinds must deserialize");
+
+        assert_eq!(extract_text_from_response(response), "visible answer");
+    }
+
+    #[test]
+    fn thinking_level_is_only_sent_to_gemini_3_models() {
+        assert_eq!(
+            thinking_config_for("gemini-3-pro-preview", "high"),
+            Some(json!({ "thinkingLevel": "high" }))
+        );
+        assert_eq!(
+            thinking_config_for("gemini-3-flash", "low"),
+            Some(json!({ "thinkingLevel": "low" }))
+        );
+        assert_eq!(thinking_config_for("gemini-2.5-flash", "high"), None);
+        assert_eq!(thinking_config_for("gemini-3-pro", "  "), None);
+    }
+
+    #[test]
+    fn generation_config_carries_the_thinking_level_for_gemini_3() {
+        let config = generation_config_for("gemini-3-pro", "high");
+        assert_eq!(config["thinkingConfig"]["thinkingLevel"], "high");
+        assert_eq!(config["temperature"], json!(CONFIG.gemini_temperature));
+        assert!(generation_config_for("gemini-2.5-flash", "high")
+            .get("thinkingConfig")
+            .is_none());
     }
 
     #[test]

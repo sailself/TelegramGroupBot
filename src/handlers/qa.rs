@@ -44,7 +44,7 @@ use crate::llm::runtime_models::{
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::{
     call_gemini, call_gemini_with_tool_runtime, call_third_party,
-    call_third_party_with_tool_runtime,
+    call_third_party_with_tool_runtime, GeminiCallRequest,
 };
 use crate::state::{AppState, PendingEntryGuard, PendingQRequest, QaCommandMode};
 use crate::tools::external_media::ExternalMediaBudget;
@@ -1824,19 +1824,16 @@ async fn process_request(
         QaCommandMode::Standard => {
             if model_name == MODEL_GEMINI {
                 let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
-                call_gemini(
-                    &system_prompt,
-                    &query,
-                    true,
-                    false,
-                    Some(&CONFIG.gemini_thinking_level),
-                    None,
-                    use_pro,
-                    Some(request.media_files.clone()),
-                    Some(request.youtube_urls.clone()),
-                    Some("Q_SYSTEM_PROMPT"),
-                    audit_context.as_ref(),
-                )
+                call_gemini(GeminiCallRequest {
+                    system_prompt: &system_prompt,
+                    user_content: &query,
+                    use_search_grounding: true,
+                    use_pro_model: use_pro,
+                    media_files: request.media_files.clone(),
+                    youtube_urls: request.youtube_urls.clone(),
+                    system_prompt_label: Some("Q_SYSTEM_PROMPT"),
+                    audit_context: audit_context.as_ref(),
+                })
                 .await
                 .map(|result| (result.text, Some(result.model_used)))
             } else {

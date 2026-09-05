@@ -42,8 +42,8 @@ use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
     audit_context_from_id, call_gemini, call_third_party, create_audit_context_from_message,
     generate_image_with_codex, generate_image_with_gemini, generate_image_with_img2,
-    generate_music_with_lyria, generate_video_with_veo, CodexImageConfig, GeminiImageConfig,
-    LlmAuditContext,
+    generate_music_with_lyria, generate_video_with_veo, CodexImageConfig, GeminiCallRequest,
+    GeminiImageConfig, LlmAuditContext,
 };
 use crate::state::{
     AppState, ImageGenerationModel, MediaGroupItem, PendingImageCommand, PendingImageRequest,
@@ -206,19 +206,16 @@ pub(crate) async fn call_configured_text_model(
     )?;
 
     if model_name == MODEL_GEMINI {
-        let response = call_gemini(
+        let response = call_gemini(GeminiCallRequest {
             system_prompt,
             user_content,
-            tools_enabled,
-            false,
-            Some(&CONFIG.gemini_thinking_level),
-            None,
-            use_pro,
-            media_files,
-            None,
-            prompt_name,
+            use_search_grounding: tools_enabled,
+            use_pro_model: use_pro,
+            media_files: media_files.unwrap_or_default(),
+            youtube_urls: Vec::new(),
+            system_prompt_label: prompt_name,
             audit_context,
-        )
+        })
         .await?;
         let model_used = response.model_used;
         return Ok((response.text, model_used));
@@ -3439,19 +3436,13 @@ pub async fn mysong_handler(
             "persona summary generation",
             "Summarizing your chat style failed, retrying ({attempt}/{max})...",
             || async {
-                call_gemini(
-                    MYSONG_SUMMARY_SYSTEM_PROMPT,
-                    &formatted_history,
-                    false,
-                    false,
-                    Some(&CONFIG.gemini_thinking_level),
-                    None,
-                    false,
-                    None,
-                    None,
-                    Some("MYSONG_SUMMARY_SYSTEM_PROMPT"),
-                    audit_context.as_ref(),
-                )
+                call_gemini(GeminiCallRequest {
+                    system_prompt: MYSONG_SUMMARY_SYSTEM_PROMPT,
+                    user_content: &formatted_history,
+                    system_prompt_label: Some("MYSONG_SUMMARY_SYSTEM_PROMPT"),
+                    audit_context: audit_context.as_ref(),
+                    ..GeminiCallRequest::default()
+                })
                 .await
             },
         )
@@ -3477,19 +3468,14 @@ pub async fn mysong_handler(
             "final prompt generation",
             "Writing the final song prompt failed, retrying ({attempt}/{max})...",
             || async {
-                call_gemini(
-                    MYSONG_PROMPT_SYSTEM_PROMPT,
-                    &prompt_request,
-                    false,
-                    false,
-                    Some(&CONFIG.gemini_thinking_level),
-                    None,
-                    true,
-                    None,
-                    None,
-                    Some("MYSONG_PROMPT_SYSTEM_PROMPT"),
-                    audit_context.as_ref(),
-                )
+                call_gemini(GeminiCallRequest {
+                    system_prompt: MYSONG_PROMPT_SYSTEM_PROMPT,
+                    user_content: &prompt_request,
+                    use_pro_model: true,
+                    system_prompt_label: Some("MYSONG_PROMPT_SYSTEM_PROMPT"),
+                    audit_context: audit_context.as_ref(),
+                    ..GeminiCallRequest::default()
+                })
                 .await
             },
         )

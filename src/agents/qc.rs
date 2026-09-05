@@ -18,7 +18,7 @@ use crate::config::CONFIG;
 use crate::db::database::Database;
 use crate::handlers::{neutralize_closing_tag, neutralize_tag};
 use crate::llm::call_third_party;
-use crate::llm::gemini::{call_gemini, call_gemini_with_tool_runtime};
+use crate::llm::gemini::{call_gemini, call_gemini_with_tool_runtime, GeminiCallRequest};
 use crate::llm::media::MediaFile;
 use crate::llm::third_party::call_third_party_with_tool_runtime;
 use crate::llm::tool_runtime::ToolRuntime;
@@ -192,19 +192,16 @@ pub(super) async fn compose_final_answer(
 ) -> Result<(String, Option<String>)> {
     if model_name == crate::handlers::qa::MODEL_GEMINI {
         let use_pro = !media_files.is_empty() || !youtube_urls.is_empty();
-        let result = call_gemini(
+        let result = call_gemini(GeminiCallRequest {
             system_prompt,
             user_content,
-            false,
-            false,
-            Some(&CONFIG.gemini_thinking_level),
-            None,
-            use_pro,
-            (!media_files.is_empty()).then(|| media_files.to_vec()),
-            Some(youtube_urls.to_vec()),
-            Some("QC_SYSTEM_PROMPT"),
+            use_search_grounding: false,
+            use_pro_model: use_pro,
+            media_files: media_files.to_vec(),
+            youtube_urls: youtube_urls.to_vec(),
+            system_prompt_label: Some("QC_SYSTEM_PROMPT"),
             audit_context,
-        )
+        })
         .await?;
         Ok((result.text, Some(result.model_used)))
     } else {
