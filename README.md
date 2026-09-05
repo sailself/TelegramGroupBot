@@ -246,7 +246,6 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `ENABLE_OPENROUTER` - Enable OpenRouter. Default: `true`.
 - `OPENROUTER_API_KEY` - OpenRouter API key.
 - `OPENROUTER_BASE_URL` - Default: `https://openrouter.ai/api/v1`.
-- `OPENROUTER_ALPHA_BASE_URL` - Default: `https://openrouter.ai/api/alpha`.
 - `OPENROUTER_TEMPERATURE` - Default: `0.7`.
 - `OPENROUTER_TOP_K` - Default: `40`.
 - `OPENROUTER_TOP_P` - Default: `0.95`.
@@ -257,7 +256,6 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `NVIDIA_API_KEY` - NVIDIA API key for `integrate.api.nvidia.com`.
 - `NVIDIA_BASE_URL` - Default: `https://integrate.api.nvidia.com/v1`.
 - `NVIDIA_TEMPERATURE` - Default: `0.7`.
-- `NVIDIA_TOP_K` - Stored for config symmetry; not sent to hosted NVIDIA chat requests unless NVIDIA documents support.
 - `NVIDIA_TOP_P` - Default: `0.95`.
 - `NVIDIA_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `60`.
 - NVIDIA hosted chat completions are integrated through their OpenAI-compatible endpoint.
