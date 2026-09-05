@@ -645,21 +645,25 @@ mod tests {
             include_bytes!("../fixtures/fxtwitter_photo_quote.json"),
         );
         let config = test_config_with_fx_base(server.base_url());
+        // The parser blocks until the test releases it, so only the timeout
+        // path can make fetch_with_parser return early.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let started = std::time::Instant::now();
         let error = fetch_with_parser(
             super::super::get_http_client_no_redirect(),
             &config,
             &identity("123"),
             Duration::from_millis(20),
-            |_body, _identity| {
-                std::thread::sleep(Duration::from_millis(250));
+            move |_body, _identity| {
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
                 Err(error(ProviderErrorKind::Incomplete, "slow parser", None))
             },
         )
         .await
         .unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::Timeout);
-        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = release_tx.send(());
         server.join().unwrap();
     }
 

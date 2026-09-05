@@ -179,6 +179,20 @@ impl AppState {
         permit
     }
 
+    /// Reuse a permit the caller already holds, or acquire a fresh one. Lets a
+    /// handler that throttled its own preparation hand the same permit to the
+    /// request processor instead of taking a second slot (which could exhaust
+    /// the semaphore and deadlock the heavy-command lane).
+    pub async fn reuse_or_acquire_heavy_permit(
+        &self,
+        existing: Option<OwnedSemaphorePermit>,
+    ) -> OwnedSemaphorePermit {
+        match existing {
+            Some(permit) => permit,
+            None => self.acquire_heavy_command_permit().await,
+        }
+    }
+
     pub fn heavy_command_active(&self) -> usize {
         CONFIG
             .heavy_command_max_concurrency
@@ -236,5 +250,45 @@ fn prune_media_groups(groups: &mut HashMap<MediaGroupId, MediaGroupState>) {
     let remove_count = groups.len().saturating_sub(max_items);
     for (group_id, _) in ordered.into_iter().take(remove_count) {
         groups.remove(&group_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_state(name: &str) -> AppState {
+        let mut path = std::path::PathBuf::from("target");
+        path.push("test-dbs");
+        std::fs::create_dir_all(&path).expect("test db directory should exist");
+        path.push(format!(
+            "telegram-chat-bot-state-{}-{}-{}.db",
+            name,
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::File::create(&path).expect("test db file should be creatable");
+        let url = format!("sqlite://{}", path.to_string_lossy().replace('\\', "/"));
+        let db = Database::init(&url)
+            .await
+            .expect("test database should initialize");
+        AppState::new(db, 1, "test_bot".to_string())
+    }
+
+    #[tokio::test]
+    async fn reusing_a_held_permit_does_not_take_a_second_slot() {
+        let state = test_state("reuse-permit").await;
+        let held = state.acquire_heavy_command_permit().await;
+        assert_eq!(state.heavy_command_active(), 1);
+
+        let reused = state.reuse_or_acquire_heavy_permit(Some(held)).await;
+        assert_eq!(state.heavy_command_active(), 1, "no second permit taken");
+
+        let fresh = state.reuse_or_acquire_heavy_permit(None).await;
+        assert_eq!(state.heavy_command_active(), 2);
+
+        drop(reused);
+        drop(fresh);
+        assert_eq!(state.heavy_command_active(), 0);
     }
 }

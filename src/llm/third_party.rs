@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -196,24 +197,34 @@ fn build_third_party_system_prompt(
     format!("{system_prompt}\n\n{guidance}")
 }
 
+static HARMONY_TAG_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<\|.*?\|>").expect("valid harmony tag regex"));
+// `(?s)` lets `.` span newlines: reasoning blocks are normally multi-line.
+static THINK_BLOCK_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?s)<think>(.*?)</think>(.*)").expect("valid think block regex"));
+
 fn parse_gpt_content(content: &str) -> String {
     if let Some(last_pos) = content.rfind("<|message|>") {
         let analysis = &content[..last_pos];
         let final_text = &content[last_pos + "<|message|>".len()..];
-        let cleanup = Regex::new(r"<\|.*?\|>").unwrap();
-        let final_clean = cleanup.replace_all(final_text, "").trim().to_string();
+        let final_clean = HARMONY_TAG_REGEX
+            .replace_all(final_text, "")
+            .trim()
+            .to_string();
         if !final_clean.is_empty() {
             return final_clean;
         }
-        let analysis_clean = cleanup.replace_all(analysis, "").trim().to_string();
+        let analysis_clean = HARMONY_TAG_REGEX
+            .replace_all(analysis, "")
+            .trim()
+            .to_string();
         return analysis_clean;
     }
     content.to_string()
 }
 
 fn parse_qwen_content(content: &str) -> String {
-    let re = Regex::new(r"<think>(.*?)</think>(.*)").unwrap();
-    if let Some(caps) = re.captures(content) {
+    if let Some(caps) = THINK_BLOCK_REGEX.captures(content) {
         let final_text = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         let final_text = final_text.trim();
         if !final_text.is_empty() {
@@ -225,26 +236,46 @@ fn parse_qwen_content(content: &str) -> String {
     content.trim().to_string()
 }
 
-fn parse_third_party_response(model_config: &ThirdPartyModelConfig, content: &str) -> String {
-    if model_config.provider != ThirdPartyProvider::OpenRouter {
-        return content.to_string();
-    }
-
-    let haystack = format!("{} {}", model_config.name, model_config.model).to_lowercase();
-    if haystack.contains("gpt") {
+/// Remove inline reasoning markup that some models put in `content`: a
+/// leading Qwen/DeepSeek/GLM-style `<think>...</think>` block, or GPT-OSS
+/// harmony channel tokens. Detection is content-based rather than keyed on
+/// provider or model name, because the same model families are served by
+/// OpenRouter, NVIDIA and Ollama alike and the markers never appear unless a
+/// model actually produced them.
+fn strip_reasoning_markup(content: &str) -> String {
+    if content.contains("<|message|>") {
         return parse_gpt_content(content);
     }
-    if haystack.contains("qwen") {
+    // Only a block at the very start is reasoning; an answer that merely
+    // mentions the tags must be left intact.
+    if content.trim_start().starts_with("<think>") {
         return parse_qwen_content(content);
     }
     content.to_string()
 }
 
+fn parse_third_party_response(model_config: &ThirdPartyModelConfig, content: &str) -> String {
+    let cleaned = strip_reasoning_markup(content);
+    if cleaned != content {
+        debug!(
+            model = %model_config.id,
+            provider = model_config.provider.as_str(),
+            "stripped inline reasoning markup from response"
+        );
+    }
+    cleaned
+}
+
 fn extract_reasoning_text(message: &Value) -> Option<String> {
-    if let Some(reasoning) = message.get("reasoning").and_then(|v| v.as_str()) {
-        let trimmed = reasoning.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+    // `reasoning` (OpenRouter), `reasoning_content` (NVIDIA NIM / DeepSeek),
+    // `thinking` (Ollama): whichever the provider used for the separate
+    // reasoning stream.
+    for key in ["reasoning", "reasoning_content", "thinking"] {
+        if let Some(reasoning) = message.get(key).and_then(|v| v.as_str()) {
+            let trimmed = reasoning.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
         }
     }
 
@@ -1328,5 +1359,72 @@ mod tests {
             build_third_party_system_prompt("Base prompt", false),
             "Base prompt"
         );
+    }
+
+    #[test]
+    fn parse_qwen_content_strips_multiline_think_block() {
+        let content = "<think>\nLet me reason.\nStep two.\n</think>\n\nThe answer is 42.";
+        assert_eq!(parse_qwen_content(content), "The answer is 42.");
+    }
+
+    #[test]
+    fn parse_qwen_content_strips_single_line_think_block() {
+        assert_eq!(
+            parse_qwen_content("<think>hmm</think> Final answer"),
+            "Final answer"
+        );
+    }
+
+    #[test]
+    fn parse_qwen_content_falls_back_to_reasoning_when_answer_is_empty() {
+        assert_eq!(
+            parse_qwen_content("<think>\nonly reasoning\n</think>"),
+            "only reasoning"
+        );
+    }
+
+    #[test]
+    fn parse_qwen_content_returns_plain_text_unchanged() {
+        assert_eq!(parse_qwen_content("  plain answer  "), "plain answer");
+    }
+
+    #[test]
+    fn inline_reasoning_markup_is_stripped_for_every_provider() {
+        let think = "<think>\nplanning\n</think>\nThe answer.";
+        for provider in [
+            ThirdPartyProvider::Nvidia,
+            ThirdPartyProvider::Ollama,
+            ThirdPartyProvider::OpenRouter,
+        ] {
+            let config = model(provider, "DeepSeek", "deepseek-ai/deepseek-v4-flash");
+            assert_eq!(
+                parse_third_party_response(&config, think),
+                "The answer.",
+                "provider {provider:?}"
+            );
+        }
+
+        let harmony = "<|channel|>analysis<|message|>thinking<|end|><|start|>assistant<|channel|>final<|message|>Answer";
+        let config = model(ThirdPartyProvider::Nvidia, "GPT OSS", "openai/gpt-oss-120b");
+        assert_eq!(parse_third_party_response(&config, harmony), "Answer");
+    }
+
+    #[test]
+    fn think_tags_mentioned_inside_an_answer_are_left_alone() {
+        let text = "Qwen wraps its reasoning in <think>...</think> tags.";
+        let config = model(ThirdPartyProvider::OpenRouter, "Qwen", "qwen/qwen3-next");
+        assert_eq!(parse_third_party_response(&config, text), text);
+    }
+
+    #[test]
+    fn empty_content_falls_back_to_provider_specific_reasoning_fields() {
+        let nvidia = json!({ "content": "", "reasoning_content": "  deep thought  " });
+        assert_eq!(extract_message_content(&nvidia), "deep thought");
+
+        let ollama = json!({ "content": "", "thinking": "hmm" });
+        assert_eq!(extract_message_content(&ollama), "hmm");
+
+        let openrouter = json!({ "content": "", "reasoning": "existing path" });
+        assert_eq!(extract_message_content(&openrouter), "existing path");
     }
 }

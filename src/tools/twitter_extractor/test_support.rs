@@ -242,6 +242,11 @@ fn serve(
     }
 
     if !expected.is_empty() {
+        // When the client is allowed to give up (deadline tests), it may do so
+        // before the request ever reaches this server; that is not a failure.
+        if allow_client_disconnect.load(Ordering::Acquire) {
+            return Ok(());
+        }
         return Err(format!("unmet expectations: {}", expected.len()));
     }
     first_error.map_or(Ok(()), |error| {
@@ -338,11 +343,15 @@ enum RequestError {
 }
 
 pub(crate) fn is_client_disconnect_kind(kind: std::io::ErrorKind) -> bool {
+    // `TimedOut` / `WouldBlock` cover the socket read timeout that fires when
+    // the client hit its own deadline and never sent (or finished) the request.
     matches!(
         kind,
         std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
     )
 }
 

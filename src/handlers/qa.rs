@@ -9,12 +9,14 @@ use teloxide::types::{
     MessageId, ParseMode, ReplyParameters,
 };
 use teloxide::RequestError;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::config::{
     parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
     QUICK_Q_SYSTEM_PROMPT, Q_SYSTEM_PROMPT,
 };
 use crate::db::database::build_message_insert;
+use crate::db::models::MessageInsert;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::commands::message_has_image;
 use crate::handlers::content::{
@@ -1800,12 +1802,17 @@ fn build_chat_search_pending_request(
 }
 
 #[allow(deprecated)]
+/// Run a prepared request against `model_name`. `heavy_permit` is the permit a
+/// caller already holds (the direct `/q` path throttles its own preparation);
+/// passing it through avoids taking a second slot from the same semaphore,
+/// which could exhaust the heavy-command lane and deadlock it.
 async fn process_request(
     bot: &Bot,
     state: &AppState,
     request: PendingQRequest,
     model_name: &str,
     pinned_codex: Option<&PinnedCodexRequestContract>,
+    heavy_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<()> {
     if model_name == MODEL_GEMINI && !CONFIG.gemini_api_available() {
         bot.edit_message_text(
@@ -1830,7 +1837,7 @@ async fn process_request(
         None => runtime_config.as_ref(),
     };
 
-    let _heavy_permit = state.acquire_heavy_command_permit().await;
+    let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
     if request.mode.requires_chat_search_index() && !state.db.is_search_ready() {
         bot.edit_message_text(
@@ -2376,6 +2383,35 @@ mod tests {
             "entities": entities
         }))
         .expect("test message should deserialize")
+    }
+
+    #[test]
+    fn q_command_insert_records_the_question_as_an_ai_command() {
+        let message = text_message_from(10, false, "/q what is rust", vec![]);
+
+        let insert = build_q_command_insert(
+            &message,
+            10,
+            "Human",
+            "what is rust",
+            "Context from replied message: \"x\"\n\nQuestion: what is rust",
+            "q",
+        );
+
+        assert_eq!(insert.message_id, 42);
+        assert_eq!(insert.chat_id, -100123);
+        assert_eq!(insert.user_id, Some(10));
+        assert_eq!(insert.username.as_deref(), Some("Human"));
+        assert_eq!(insert.text.as_deref(), Some("/q what is rust"));
+        assert!(insert
+            .search_source_text
+            .as_deref()
+            .unwrap()
+            .ends_with("what is rust"));
+        assert!(insert.asks_ai);
+        assert!(insert.is_command);
+        assert!(insert.is_synthetic_record);
+        assert_eq!(insert.ai_command.as_deref(), Some("q"));
     }
 
     #[test]
@@ -3527,6 +3563,38 @@ mod tests {
     }
 }
 
+/// Row recording a `/q`-family command in the chat history and search index.
+/// Built once per request so every path (direct model, picker, auto-`/q`,
+/// `/s`) records the question the same way.
+fn build_q_command_insert(
+    message: &Message,
+    user_id: i64,
+    username: &str,
+    original_query: &str,
+    db_query_text: &str,
+    command_name: &str,
+) -> MessageInsert {
+    build_message_insert(
+        Some(user_id),
+        Some(username.to_string()),
+        message
+            .text()
+            .map(|value| value.to_string())
+            .or_else(|| message.caption().map(|value| value.to_string()))
+            .or_else(|| Some(original_query.to_string())),
+        None,
+        message.date,
+        message.reply_to_message().map(|msg| msg.id.0 as i64),
+        Some(message.chat.id.0),
+        Some(message.id.0 as i64),
+        Some(db_query_text.to_string()),
+        true,
+        Some(command_name.to_string()),
+        true,
+        true,
+    )
+}
+
 #[allow(deprecated)]
 async fn q_handler_internal(
     bot: Bot,
@@ -3557,7 +3625,7 @@ async fn q_handler_internal(
         .await?;
         return Ok(());
     }
-    let _heavy_permit = state.acquire_heavy_command_permit().await;
+    let heavy_permit = state.acquire_heavy_command_permit().await;
 
     let query_text_raw = query.unwrap_or_default();
     let query_entities = message_entities_for_text(&message);
@@ -3693,6 +3761,20 @@ async fn q_handler_internal(
     } else {
         query_text.clone()
     };
+
+    // Record the question now so it lands in the chat history and search
+    // index no matter which path (direct model, picker, timeout) answers it.
+    let db_insert = build_q_command_insert(
+        &message,
+        user_id,
+        &username,
+        &original_query,
+        &db_query_text,
+        command_name,
+    );
+    if let Err(err) = state.db.queue_message_insert(db_insert).await {
+        warn!("Failed to queue /{command_name} message insert: {err}");
+    }
 
     let mut remaining = max_files.saturating_sub(media_files.len());
     let external_media_budget = ExternalMediaBudget::new(CONFIG.external_media_total_max_bytes);
@@ -3909,6 +3991,7 @@ async fn q_handler_internal(
             pending_request,
             &selected_model,
             pinned_codex.as_ref(),
+            Some(heavy_permit),
         )
         .await;
         let status = if result.is_ok() { "success" } else { "error" };
@@ -3981,27 +4064,6 @@ async fn q_handler_internal(
     tokio::spawn(async move {
         handle_model_timeout(bot_clone, state_clone, request_key).await;
     });
-
-    let db_insert = build_message_insert(
-        Some(user_id),
-        Some(username),
-        message
-            .text()
-            .map(|value| value.to_string())
-            .or_else(|| message.caption().map(|value| value.to_string()))
-            .or_else(|| Some(original_query.clone())),
-        None,
-        message.date,
-        message.reply_to_message().map(|msg| msg.id.0 as i64),
-        Some(message.chat.id.0),
-        Some(message.id.0 as i64),
-        Some(db_query_text.clone()),
-        true,
-        Some(command_name.to_string()),
-        true,
-        true,
-    );
-    let _ = state.db.queue_message_insert(db_insert).await;
 
     Ok(())
 }
@@ -4083,6 +4145,17 @@ pub async fn s_handler(
         )
         .await?;
         return Ok(());
+    }
+
+    let username = message
+        .from
+        .as_ref()
+        .map(|user| user.full_name())
+        .unwrap_or_else(|| "Anonymous".to_string());
+    let db_insert =
+        build_q_command_insert(&message, user_id, &username, &query_text, &query_text, "s");
+    if let Err(err) = state.db.queue_message_insert(db_insert).await {
+        warn!("Failed to queue /s message insert: {err}");
     }
 
     if !state.db.is_search_ready() {
@@ -4176,7 +4249,8 @@ pub async fn s_handler(
             None,
         );
 
-        let result = process_request(&bot, &state, pending_request, &selected_model, None).await;
+        let result =
+            process_request(&bot, &state, pending_request, &selected_model, None, None).await;
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(&mut timer, status, Some(timer_detail.to_string()));
         result?;
@@ -4289,7 +4363,7 @@ async fn process_timed_out_q_request_with_default_model(
         .await;
 
     let command_timer = request.command_timer.take();
-    let result = process_request(bot, state, request, &default_model, None).await;
+    let result = process_request(bot, state, request, &default_model, None, None).await;
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(
@@ -4407,7 +4481,7 @@ pub async fn model_selection_callback(
         .await?;
 
     let command_timer = request.command_timer.take();
-    let result = process_request(&bot, &state, request, &selected_model, None).await;
+    let result = process_request(&bot, &state, request, &selected_model, None, None).await;
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(&mut timer, status, None);

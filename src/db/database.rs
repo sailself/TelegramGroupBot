@@ -572,12 +572,15 @@ impl Database {
         Ok(rows.into_iter().rev().collect())
     }
 
+    /// Messages from `message_id` onward, newest `limit` only, in ascending order.
     pub async fn select_messages_from_id(
         &self,
         chat_id: i64,
         message_id: i64,
+        limit: i64,
     ) -> Result<Vec<MessageRow>> {
-        self.get_messages_from_id(chat_id, message_id, true).await
+        self.get_messages_from_id(chat_id, message_id, limit, true)
+            .await
     }
 
     pub async fn get_last_n_text_messages(
@@ -608,6 +611,7 @@ impl Database {
         &self,
         chat_id: i64,
         from_message_id: i64,
+        limit: i64,
         exclude_commands: bool,
     ) -> Result<Vec<MessageRow>> {
         let mut query = String::from(
@@ -617,11 +621,12 @@ impl Database {
         if exclude_commands {
             query.push_str(" AND text NOT LIKE '/%'");
         }
-        query.push_str(" ORDER BY date DESC");
+        query.push_str(" ORDER BY date DESC LIMIT ?");
 
         let rows = sqlx::query_as::<_, MessageRow>(&query)
             .bind(chat_id)
             .bind(from_message_id)
+            .bind(limit.max(1))
             .fetch_all(&self.pool)
             .await?;
 
@@ -3056,5 +3061,33 @@ mod tests {
         assert!(chat_content.contains("[message_id=1] John (1): Hello from first John"));
         assert!(chat_content.contains("[message_id=2] John (2): Hello from second John"));
         assert!(chat_content.contains("[message_id=3] Alice: Hello from Alice"));
+    }
+
+    #[tokio::test]
+    async fn select_messages_from_id_keeps_only_the_newest_limit_rows() {
+        let db = init_test_db("select-from-id-limit").await;
+        let chat = -1001374348670_i64;
+        for message_id in 1..=5_i64 {
+            insert_count_message(
+                &db,
+                message_id,
+                chat,
+                Some(1001),
+                Some("Alice"),
+                &format!("message {message_id}"),
+                at(&format!("2026-09-01T10:0{message_id}:00Z")),
+                false,
+                false,
+            )
+            .await;
+        }
+
+        let rows = db
+            .select_messages_from_id(chat, 1, 3)
+            .await
+            .expect("select should work");
+
+        let ids: Vec<i64> = rows.iter().map(|row| row.message_id).collect();
+        assert_eq!(ids, vec![3, 4, 5], "newest three, ascending");
     }
 }

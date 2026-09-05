@@ -145,6 +145,45 @@ mod tests {
     use super::{codex_admin_access_decision, normalize_command_name, CodexAdminAccessDecision};
 
     #[test]
+    fn diagnose_requires_a_whitelisted_user_not_just_a_whitelisted_chat() {
+        let chat_only: HashSet<i64> = [-100_i64].into_iter().collect();
+        assert!(!super::admin_access_decision(
+            &chat_only, 5, -100, "diagnose"
+        ));
+        assert!(!super::admin_access_decision(
+            &chat_only, 0, -100, "diagnose"
+        ));
+        // Other admin commands keep accepting a whitelisted chat.
+        assert!(super::admin_access_decision(&chat_only, 5, -100, "status"));
+        assert!(super::admin_access_decision(
+            &chat_only,
+            5,
+            -100,
+            "token_stats"
+        ));
+
+        let user_listed: HashSet<i64> = [5_i64].into_iter().collect();
+        assert!(super::admin_access_decision(
+            &user_listed,
+            5,
+            -100,
+            "diagnose"
+        ));
+        assert!(super::admin_access_decision(
+            &user_listed,
+            5,
+            -100,
+            "status"
+        ));
+        assert!(!super::admin_access_decision(
+            &user_listed,
+            6,
+            -100,
+            "status"
+        ));
+    }
+
+    #[test]
     fn normalize_command_name_trims_slash_and_case() {
         assert_eq!(normalize_command_name("/ProfileMe "), "profileme");
         assert_eq!(normalize_command_name("mysong"), "mysong");
@@ -253,6 +292,23 @@ pub async fn check_codex_admin_access(bot: &Bot, message: &Message, command: &st
     false
 }
 
+/// Whether `user_id` may run the admin `command` from `chat_id`. Most admin
+/// commands accept a whitelisted chat, but `/diagnose` exposes log tails,
+/// account details and file paths, so it requires the *user* to be
+/// whitelisted; membership in a whitelisted group is not enough.
+fn admin_access_decision(
+    whitelist: &HashSet<i64>,
+    user_id: i64,
+    chat_id: i64,
+    command: &str,
+) -> bool {
+    let user_listed = user_id != 0 && whitelist.contains(&user_id);
+    if normalize_command_name(command) == "diagnose" {
+        return user_listed;
+    }
+    user_listed || whitelist.contains(&chat_id)
+}
+
 pub async fn check_admin_access(bot: &Bot, message: &Message, command: &str) -> bool {
     if !WHITELIST_LOADED.load(Ordering::SeqCst) {
         load_whitelist();
@@ -285,7 +341,7 @@ pub async fn check_admin_access(bot: &Bot, message: &Message, command: &str) -> 
         .unwrap_or_default();
     let chat_id = message.chat.id.0;
 
-    let allowed = whitelist.contains(&user_id) || whitelist.contains(&chat_id);
+    let allowed = admin_access_decision(&whitelist, user_id, chat_id, command);
 
     if !allowed {
         let _ = bot

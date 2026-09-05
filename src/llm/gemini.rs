@@ -150,6 +150,34 @@ fn redact_gemini_api_key(text: &str) -> String {
     text.replace(key, "[redacted]")
 }
 
+/// Typed failure from the Gemini generateContent transport, so callers can
+/// decide whether another model is worth trying.
+#[derive(Debug, thiserror::Error)]
+pub enum GeminiApiError {
+    #[error("Gemini request failed: {message}")]
+    Transport { message: String, retryable: bool },
+    #[error("Gemini request failed with status {status}: {detail}")]
+    Http { status: StatusCode, detail: String },
+}
+
+/// Whether an error from one Gemini model justifies retrying the same
+/// payload on a fallback model. Only capacity/availability failures do;
+/// a 400/401/403 or a decode failure will fail identically elsewhere.
+fn gemini_error_allows_model_fallback(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<GeminiApiError>() {
+        Some(GeminiApiError::Transport { retryable, .. }) => *retryable,
+        Some(GeminiApiError::Http { status, .. }) => {
+            gemini_should_retry_status(*status) || *status == StatusCode::NOT_FOUND
+        }
+        None => false,
+    }
+}
+
+/// Total time the fallback chain may spend after the primary model failed.
+fn gemini_fallback_budget() -> Duration {
+    gemini_generate_content_timeout()
+}
+
 fn gemini_should_retry_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect()
 }
@@ -1021,7 +1049,11 @@ async fn call_gemini_api_value_with_timeout(
                     tokio::time::sleep(gemini_retry_delay(attempt)).await;
                     continue;
                 }
-                return Err(anyhow!("Gemini request failed: {}", err_text));
+                return Err(GeminiApiError::Transport {
+                    message: err_text,
+                    retryable: gemini_should_retry_error(&err),
+                }
+                .into());
             }
         };
 
@@ -1047,11 +1079,7 @@ async fn call_gemini_api_value_with_timeout(
                 continue;
             }
             let detail = message.unwrap_or(body_summary);
-            return Err(anyhow!(
-                "Gemini request failed with status {}: {}",
-                status,
-                detail
-            ));
+            return Err(GeminiApiError::Http { status, detail }.into());
         }
 
         let value = decode_json_response::<Value>(response, "Gemini generateContent").await?;
@@ -1518,7 +1546,11 @@ async fn call_gemini_lite_fallback(
                     "Gemini lite fallback attempt {}/{} failed on model '{}': {}",
                     attempt, GEMINI_LITE_FALLBACK_MAX_ATTEMPTS, lite_model, err
                 );
+                let worth_retrying = gemini_error_allows_model_fallback(&err);
                 last_lite_err = Some(err);
+                if !worth_retrying {
+                    break;
+                }
             }
         }
     }
@@ -1634,64 +1666,110 @@ pub async fn call_gemini(
             model_used: primary_model.to_string(),
         }),
         Err(primary_err) => {
-            if !use_pro_model {
-                return call_gemini_lite_fallback(
-                    &payload,
-                    system_prompt_label,
-                    primary_model,
-                    &primary_err,
-                    audit_context,
-                )
-                .await;
+            // A 400/401/403 or a decode failure fails identically on every
+            // model; only capacity/availability errors justify the extra
+            // round-trips.
+            if !gemini_error_allows_model_fallback(&primary_err) {
+                return Err(primary_err);
             }
 
-            let fallback_model = CONFIG.gemini_model.as_str();
-            warn!(
-                "Gemini Pro model '{}' failed after retries; falling back to default model '{}': {}",
-                primary_model, fallback_model, primary_err
+            let budget = gemini_fallback_budget();
+            let primary_err_text = primary_err.to_string();
+            let fallbacks = run_gemini_model_fallbacks(
+                &payload,
+                system_prompt_label,
+                primary_model,
+                use_pro_model,
+                primary_err,
+                audit_context,
             );
-
-            let fallback_text = async {
-                let response = call_gemini_api(
-                    fallback_model,
-                    payload.clone(),
-                    system_prompt_label,
-                    audit_context,
-                    "call_gemini_fallback",
-                )
-                .await?;
-                Ok::<_, anyhow::Error>(extract_text_from_response(response))
+            match tokio::time::timeout(budget, fallbacks).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!(
+                    "Gemini fallback chain exceeded its {}s budget after primary model '{}' failed: {}",
+                    budget.as_secs(),
+                    primary_model,
+                    primary_err_text
+                )),
             }
-            .await;
+        }
+    }
+}
 
-            let fallback_text = match fallback_text {
-                Ok(text) => text,
-                Err(fallback_err) => {
-                    return call_gemini_lite_fallback(
-                        &payload,
-                        system_prompt_label,
-                        fallback_model,
-                        &fallback_err,
-                        audit_context,
-                    )
-                    .await
-                    .map_err(|lite_err| {
-                        anyhow!(
-                            "Gemini request failed on primary model '{}' and fallback model '{}'. \
+/// Try the remaining models after the primary one failed with a fallback-worthy
+/// error: pro -> default -> lite, or default -> lite.
+async fn run_gemini_model_fallbacks(
+    payload: &serde_json::Value,
+    system_prompt_label: Option<&str>,
+    primary_model: &str,
+    use_pro_model: bool,
+    primary_err: anyhow::Error,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<GeminiCallResult> {
+    if !use_pro_model {
+        return call_gemini_lite_fallback(
+            payload,
+            system_prompt_label,
+            primary_model,
+            &primary_err,
+            audit_context,
+        )
+        .await;
+    }
+
+    let fallback_model = CONFIG.gemini_model.as_str();
+    warn!(
+        "Gemini Pro model '{}' failed after retries; falling back to default model '{}': {}",
+        primary_model, fallback_model, primary_err
+    );
+
+    let fallback_text = async {
+        let response = call_gemini_api(
+            fallback_model,
+            payload.clone(),
+            system_prompt_label,
+            audit_context,
+            "call_gemini_fallback",
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(extract_text_from_response(response))
+    }
+    .await;
+
+    match fallback_text {
+        Ok(text) => Ok(GeminiCallResult {
+            text,
+            model_used: fallback_model.to_string(),
+        }),
+        Err(fallback_err) => {
+            if !gemini_error_allows_model_fallback(&fallback_err) {
+                return Err(anyhow!(
+                    "Gemini request failed on primary model '{}' and fallback model '{}'. \
+Primary error: {}. Fallback error: {}",
+                    primary_model,
+                    fallback_model,
+                    primary_err,
+                    fallback_err
+                ));
+            }
+            call_gemini_lite_fallback(
+                payload,
+                system_prompt_label,
+                fallback_model,
+                &fallback_err,
+                audit_context,
+            )
+            .await
+            .map_err(|lite_err| {
+                anyhow!(
+                    "Gemini request failed on primary model '{}' and fallback model '{}'. \
 Primary error: {}. Fallback error: {}. Lite fallback error: {}",
-                            primary_model,
-                            fallback_model,
-                            primary_err,
-                            fallback_err,
-                            lite_err
-                        )
-                    });
-                }
-            };
-
-            Ok(GeminiCallResult {
-                text: fallback_text,
-                model_used: fallback_model.to_string(),
+                    primary_model,
+                    fallback_model,
+                    primary_err,
+                    fallback_err,
+                    lite_err
+                )
             })
         }
     }
@@ -2012,6 +2090,49 @@ pub async fn generate_video_with_veo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn http_error(status: u16) -> anyhow::Error {
+        GeminiApiError::Http {
+            status: StatusCode::from_u16(status).unwrap(),
+            detail: "detail".to_string(),
+        }
+        .into()
+    }
+
+    fn transport_error(retryable: bool) -> anyhow::Error {
+        GeminiApiError::Transport {
+            message: "boom".to_string(),
+            retryable,
+        }
+        .into()
+    }
+
+    #[test]
+    fn model_fallback_allowed_for_capacity_and_availability_failures() {
+        assert!(gemini_error_allows_model_fallback(&http_error(429)));
+        assert!(gemini_error_allows_model_fallback(&http_error(503)));
+        assert!(gemini_error_allows_model_fallback(&http_error(404)));
+        assert!(gemini_error_allows_model_fallback(&transport_error(true)));
+    }
+
+    #[test]
+    fn model_fallback_denied_for_request_errors_that_would_repeat() {
+        assert!(!gemini_error_allows_model_fallback(&http_error(400)));
+        assert!(!gemini_error_allows_model_fallback(&http_error(401)));
+        assert!(!gemini_error_allows_model_fallback(&http_error(403)));
+        assert!(!gemini_error_allows_model_fallback(&transport_error(false)));
+        assert!(!gemini_error_allows_model_fallback(&anyhow!(
+            "Gemini generateContent response decode failed"
+        )));
+    }
+
+    #[test]
+    fn fallback_budget_matches_one_request_timeout() {
+        assert_eq!(
+            gemini_fallback_budget().as_secs(),
+            CONFIG.gemini_request_timeout_secs
+        );
+    }
 
     #[test]
     fn gemini_generate_content_url_does_not_embed_api_key() {

@@ -65,9 +65,7 @@ enum Command {
     TokenDevourers(String),
     #[command(description = "搜索本群聊相关消息，返回命中的消息摘要和直达链接")]
     S(String),
-    #[command(
-        description = "用 Gemini（或已配置的 Vertex）生成/编辑图片，可直接描述或回复图片/贴纸"
-    )]
+    #[command(description = "用 Gemini 生成/编辑图片，可直接描述或回复图片/贴纸")]
     Img(String),
     #[command(description = "hidden image generation command")]
     Img2(String),
@@ -92,17 +90,17 @@ enum Command {
         description = "show bot-wide token statistics (admin)"
     )]
     TokenStats(String),
-    #[command(description = "投喂AI小喵")]
-    #[command(description = "ç™»å½• ChatGPT Codexï¼ˆç®¡ç†å‘˜ï¼‰")]
+    #[command(description = "登录 ChatGPT Codex（管理员）")]
     Codexlogin,
-    #[command(description = "é€€å‡º ChatGPT Codexï¼ˆç®¡ç†å‘˜ï¼‰")]
+    #[command(description = "退出 ChatGPT Codex（管理员）")]
     Codexlogout,
-    #[command(description = "é€‰æ‹©å½“å‰ Codex æ¨¡åž‹ï¼ˆç®¡ç†å‘˜ï¼‰")]
+    #[command(description = "选择当前 Codex 模型（管理员）")]
     Codexmodel,
     #[command(description = "set Codex reasoning level (admin)")]
     Codexreasoning,
     #[command(description = "show Codex usage and rate limits (admin)")]
     Codexusage,
+    #[command(description = "投喂AI小喵")]
     Support,
 }
 
@@ -217,10 +215,7 @@ fn public_bot_commands_with_gemini(gemini_available: bool) -> Vec<BotCommand> {
             "询问本群聊里的历史内容，可检索当前聊天记录并在需要时联网搜索",
         ),
         BotCommand::new("s", "搜索本群聊相关消息，返回命中的消息摘要和直达链接"),
-        BotCommand::new(
-            "img",
-            "用 Gemini（或已配置的 Vertex）生成/编辑图片，可直接描述或回复图片/贴纸",
-        ),
+        BotCommand::new("img", "用 Gemini 生成/编辑图片，可直接描述或回复图片/贴纸"),
         BotCommand::new("image", "与 /img 相同，但附带分辨率与长宽比按钮"),
         BotCommand::new("vid", "用 Veo 生成视频"),
         BotCommand::new("profileme", "基于你在本群的聊天记录生成个人简介"),
@@ -694,6 +689,40 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!commands.iter().any(|command| command == "img2"));
+    }
+
+    #[test]
+    fn command_descriptions_are_readable_and_attached_to_the_right_commands() {
+        let text = <Command as BotCommands>::descriptions().to_string();
+        let line_for = |command: &str| {
+            text.lines()
+                .find(|line| line.starts_with(command))
+                .unwrap_or_else(|| panic!("no description line for {command}: {text}"))
+                .to_string()
+        };
+
+        assert!(
+            !text.contains('ç') && !text.contains('Ã'),
+            "double-encoded UTF-8 in command descriptions: {text}"
+        );
+        assert!(line_for("/codexlogin").contains("登录 ChatGPT Codex"));
+        assert!(line_for("/codexlogout").contains("退出 ChatGPT Codex"));
+        assert!(line_for("/codexmodel").contains("选择当前 Codex 模型"));
+        assert!(line_for("/support").contains("投喂AI小喵"));
+    }
+
+    #[test]
+    fn image_command_descriptions_do_not_advertise_the_removed_vertex_backend() {
+        let enum_text = <Command as BotCommands>::descriptions().to_string();
+        assert!(!enum_text.contains("Vertex"), "{enum_text}");
+
+        let published = public_bot_commands_with_gemini(true);
+        let img = published
+            .iter()
+            .find(|command| command.command == "img")
+            .expect("/img is published");
+        assert!(!img.description.contains("Vertex"), "{}", img.description);
+        assert!(img.description.contains("Gemini"));
     }
 
     #[test]

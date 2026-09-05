@@ -306,20 +306,13 @@ mod tests {
 
     #[tokio::test]
     async fn extractor_stops_at_total_deadline() {
-        let fx = TestServer::single_delayed(
-            "GET",
-            "/i/status/123",
-            Duration::from_millis(100),
-            200,
-            br#"{}"#,
-        );
-        let vx = TestServer::single_delayed(
-            "GET",
-            "/Twitter/status/123",
-            Duration::from_millis(100),
-            200,
-            br#"{}"#,
-        );
+        // Servers answer far later than the deadline; the elapsed bound below
+        // is generous so scheduling jitter under a loaded test run cannot
+        // trip it, yet still well under the server delay.
+        let server_delay = Duration::from_millis(500);
+        let fx = TestServer::single_delayed("GET", "/i/status/123", server_delay, 200, br#"{}"#);
+        let vx =
+            TestServer::single_delayed("GET", "/Twitter/status/123", server_delay, 200, br#"{}"#);
         let jina = TestServer::expect_no_requests();
         let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
         config.total_timeout = Duration::from_millis(30);
@@ -331,7 +324,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("deadline"));
-        assert!(started.elapsed() < Duration::from_millis(80));
+        assert!(started.elapsed() < Duration::from_millis(400));
         fx.join_allowing_client_disconnect().unwrap();
         vx.join_allowing_client_disconnect().unwrap();
         jina.join().unwrap();

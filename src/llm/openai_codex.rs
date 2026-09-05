@@ -654,6 +654,30 @@ fn delete_auth_file(path: &Path) -> Result<bool> {
     }
 }
 
+/// Every credential stored in the Codex auth file (API key and OAuth tokens),
+/// so operator-facing output can be scrubbed of them.
+fn auth_secrets_from_file(auth: &OpenAICodexAuthFile) -> Vec<String> {
+    let mut secrets = Vec::new();
+    if let Some(api_key) = &auth.openai_api_key {
+        secrets.push(api_key.clone());
+    }
+    if let Some(tokens) = &auth.tokens {
+        secrets.push(tokens.id_token.clone());
+        secrets.push(tokens.access_token.clone());
+        secrets.push(tokens.refresh_token.clone());
+    }
+    secrets.retain(|secret| !secret.trim().is_empty());
+    secrets
+}
+
+/// Secrets currently held in the Codex auth file, or empty when there is none.
+pub fn current_auth_secrets() -> Vec<String> {
+    match load_auth_file_internal() {
+        Ok(Some(auth)) => auth_secrets_from_file(&auth),
+        _ => Vec::new(),
+    }
+}
+
 pub fn is_auth_ready() -> bool {
     load_auth_file_internal()
         .ok()
@@ -1406,6 +1430,20 @@ pub async fn logout() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_secrets_cover_api_key_and_every_oauth_token() {
+        let mut auth = test_auth();
+        auth.openai_api_key = Some("sk-secret".to_string());
+        let secrets = auth_secrets_from_file(&auth);
+        for expected in ["sk-secret", "id", "access", "refresh"] {
+            assert!(
+                secrets.iter().any(|s| s == expected),
+                "missing secret {expected}"
+            );
+        }
+        assert!(secrets.iter().all(|s| !s.is_empty()));
+    }
 
     fn test_auth() -> OpenAICodexAuthFile {
         OpenAICodexAuthFile {

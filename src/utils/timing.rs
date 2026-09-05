@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use teloxide::types::Message;
 use tracing::info;
 
+use crate::utils::text::truncate_to_chars;
+
 #[derive(Debug)]
 pub struct CommandTimer {
     command: String,
@@ -19,19 +21,20 @@ pub struct CommandTimer {
     completed: bool,
 }
 
+const COMMAND_TEXT_EXCERPT_MAX_CHARS: usize = 300;
+
+/// Single-line excerpt of the command text for the timing log.
+fn command_text_excerpt(text: &str) -> String {
+    let flattened = text.replace('\n', " ");
+    truncate_to_chars(&flattened, COMMAND_TEXT_EXCERPT_MAX_CHARS).to_string()
+}
+
 impl CommandTimer {
     pub fn from_message(command: &str, message: &Message) -> Self {
         let text = message
             .text()
-            .map(|value| value.replace('\n', " "))
-            .or_else(|| message.caption().map(|value| value.replace('\n', " ")))
-            .map(|value| {
-                if value.len() > 300 {
-                    value[..300].to_string()
-                } else {
-                    value
-                }
-            });
+            .or_else(|| message.caption())
+            .map(command_text_excerpt);
 
         let user = message.from.as_ref();
         CommandTimer {
@@ -100,4 +103,24 @@ pub fn start_command_timer(command: &str, message: &Message) -> CommandTimer {
 pub fn complete_command_timer(timer: &mut CommandTimer, status: &str, detail: Option<String>) {
     timer.mark_status(status, detail);
     timer.log_completed();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_text_excerpt_flattens_newlines_and_keeps_short_text() {
+        assert_eq!(command_text_excerpt("/q hello\nworld"), "/q hello world");
+    }
+
+    #[test]
+    fn command_text_excerpt_does_not_split_multibyte_chars() {
+        // 4 ASCII bytes followed by 3-byte CJK chars: byte offset 300 falls
+        // inside a character, which used to panic.
+        let text = format!("/qq {}", "好".repeat(400));
+        let excerpt = command_text_excerpt(&text);
+        assert!(excerpt.starts_with("/qq "));
+        assert_eq!(excerpt.chars().count(), COMMAND_TEXT_EXCERPT_MAX_CHARS);
+    }
 }

@@ -1,4 +1,4 @@
-﻿FROM rust:1.78-slim AS builder
+FROM rust:1.92-slim AS builder
 
 WORKDIR /app
 
@@ -20,6 +20,6 @@ COPY --from=builder /app/target/release/telegram_group_helper_bot /app/telegram_
 
 VOLUME /app/data
 
-ENV DATABASE_URL=sqlite:///data/bot.db
+ENV DATABASE_URL=sqlite:///app/data/bot.db?mode=rwc
 
 CMD ["/app/telegram_group_helper_bot"]

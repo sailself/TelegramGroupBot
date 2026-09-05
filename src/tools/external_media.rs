@@ -1324,7 +1324,13 @@ mod tests {
         fast.join().unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The guard tests below run on the current-thread runtime on purpose: with
+    // parallel workers the launcher task can still be mid-poll when the guard
+    // aborts it and releases the permit, so it may legitimately grab the permit
+    // before observing cancellation. The ordering the guards guarantee is
+    // "abort is requested before the permit is released", which the
+    // single-threaded scheduler makes observable deterministically.
+    #[tokio::test]
     async fn pending_request_guard_aborts_launcher_before_releasing_buffered_permit() {
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -1380,7 +1386,7 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn active_request_guard_aborts_launcher_before_releasing_permit() {
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -1421,7 +1427,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn cancelling_launcher_finish_still_aborts_the_launcher() {
         struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
 
@@ -1459,7 +1465,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn cancelling_pending_receiver_aborts_before_buffered_tuple_releases_permit() {
         struct WorkerStopSignal {
             index: usize,
@@ -1580,7 +1586,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn cancelling_parent_stops_unsent_starts_and_refunds_open_body() {
         let (slow_url, body_ready, closed, slow_worker) = cancellation_body_server();
         let started = Arc::new(AtomicUsize::new(0));
