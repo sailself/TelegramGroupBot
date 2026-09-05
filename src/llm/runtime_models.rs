@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 
@@ -70,14 +70,13 @@ struct RuntimeModelsState {
     explicit_codex_records_by_id: HashMap<String, CodexSelectedModelRecord>,
 }
 
-static RUNTIME_MODELS: Lazy<RwLock<RuntimeModelsState>> =
-    Lazy::new(|| RwLock::new(build_runtime_models_state()));
-static CODEX_MODEL_STATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-static CODEX_MODEL_REFRESH_STATE: Lazy<AsyncMutex<CodexModelRefreshState>> =
-    Lazy::new(|| AsyncMutex::new(CodexModelRefreshState::default()));
-#[allow(dead_code)] // Consumed by the explicit-model request path added in Task 2.
-static EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK: Lazy<AsyncMutex<()>> =
-    Lazy::new(|| AsyncMutex::new(()));
+static RUNTIME_MODELS: LazyLock<RwLock<RuntimeModelsState>> =
+    LazyLock::new(|| RwLock::new(build_runtime_models_state()));
+static CODEX_MODEL_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static CODEX_MODEL_REFRESH_STATE: LazyLock<AsyncMutex<CodexModelRefreshState>> =
+    LazyLock::new(|| AsyncMutex::new(CodexModelRefreshState::default()));
+static EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK: LazyLock<AsyncMutex<()>> =
+    LazyLock::new(|| AsyncMutex::new(()));
 static CODEX_MODEL_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const CODEX_MODEL_REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -380,15 +379,6 @@ fn codex_model_record_for_request_with_state(
     Ok(None)
 }
 
-#[allow(dead_code)] // The full request selector delegates explicit IDs here.
-pub(crate) fn explicit_codex_model_record_for_request(
-    model_config: &ThirdPartyModelConfig,
-) -> Result<Option<CodexSelectedModelRecord>> {
-    let current_account_id = current_codex_account_id();
-    let state = RUNTIME_MODELS.read();
-    explicit_codex_model_record_from_state(&state, model_config, current_account_id.as_deref())
-}
-
 pub fn codex_model_record_for_request(
     model_config: &ThirdPartyModelConfig,
 ) -> Result<Option<CodexSelectedModelRecord>> {
@@ -512,7 +502,6 @@ fn cached_explicit_codex_model_from_state(
     })
 }
 
-#[allow(dead_code)] // The Quick request path invokes this in Task 2.
 pub async fn ensure_explicit_codex_model(model_id: &str) -> Result<ResolvedExplicitCodexModel> {
     let (provider, slug) = parse_third_party_model_id(model_id)
         .ok_or_else(|| anyhow!("Invalid explicit Codex model id"))?;

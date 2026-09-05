@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::LazyLock;
 use teloxide::types::{MessageEntityKind, MessageEntityRef};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -24,51 +24,42 @@ use crate::tools::twitter_extractor::{
     canonical_status_key, extract_twitter_content, is_supported_status_url, TwitterContent,
 };
 use crate::utils::http::get_http_client;
+use crate::utils::text::truncate_with_ellipsis;
+use crate::utils::ttl_cache::TtlCache;
 
 const EXTRACTION_CACHE_TTL: Duration = Duration::from_secs(900);
 const EXTRACTION_CACHE_MAX_ENTRIES: usize = 64;
 
-static YOUTUBE_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
+static YOUTUBE_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"((?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})(?:[\?&][^\s]*)?)",
     )
     .expect("valid youtube regex")
 });
-static TELEGRAPH_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
+static TELEGRAPH_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"https?://(?:telegra\.ph|t\.me)/[^\s\)>"]+"#).expect("valid telegraph url regex")
 });
-static HTTP_URL_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?i)https?://[^\s<>\"']+"#).expect("valid HTTP URL regex"));
-static MARKDOWN_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
+static HTTP_URL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)https?://[^\s<>\"']+"#).expect("valid HTTP URL regex"));
+static MARKDOWN_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\[[^\]]*\]\((https?://[^)]+)\)"#).expect("valid markdown link regex")
 });
-static HTML_LINK_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"href=["'](https?://[^"']+)["']"#).expect("valid html link regex"));
+static HTML_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"href=["'](https?://[^"']+)["']"#).expect("valid html link regex")
+});
 
-#[derive(Debug, Clone)]
-struct TelegraphCacheEntry {
-    stored_at: Instant,
-    content: TelegraphContent,
-}
-
-#[derive(Debug, Clone)]
-struct TwitterCacheEntry {
-    stored_at: Instant,
-    content: TwitterContent,
-}
-
-static TELEGRAPH_CACHE: Lazy<Mutex<HashMap<String, TelegraphCacheEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static TWITTER_CACHE: Lazy<Mutex<HashMap<String, TwitterCacheEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-fn truncate_for_log(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(limit).collect();
-    format!("{}...", truncated)
-}
+static TELEGRAPH_CACHE: LazyLock<Mutex<TtlCache<String, TelegraphContent>>> = LazyLock::new(|| {
+    Mutex::new(TtlCache::new(
+        EXTRACTION_CACHE_TTL,
+        EXTRACTION_CACHE_MAX_ENTRIES,
+    ))
+});
+static TWITTER_CACHE: LazyLock<Mutex<TtlCache<String, TwitterContent>>> = LazyLock::new(|| {
+    Mutex::new(TtlCache::new(
+        EXTRACTION_CACHE_TTL,
+        EXTRACTION_CACHE_MAX_ENTRIES,
+    ))
+});
 
 fn log_extracted_content(
     source: &str,
@@ -85,7 +76,7 @@ fn log_extracted_content(
         images = images,
         videos = videos,
         audios = audios,
-        text = %truncate_for_log(text, 200)
+        text = %truncate_with_ellipsis(text, 200)
     );
 }
 
@@ -628,94 +619,29 @@ fn is_telegraph_url(url: &str) -> bool {
     lowered.contains("telegra.ph") || lowered.contains("t.me/")
 }
 
-fn prune_telegraph_cache(cache: &mut HashMap<String, TelegraphCacheEntry>) {
-    cache.retain(|_, entry| entry.stored_at.elapsed() <= EXTRACTION_CACHE_TTL);
-    if cache.len() <= EXTRACTION_CACHE_MAX_ENTRIES {
-        return;
-    }
-
-    let mut ordered = cache
-        .iter()
-        .map(|(url, entry)| (url.clone(), entry.stored_at))
-        .collect::<Vec<_>>();
-    ordered.sort_by_key(|(_, stored_at)| *stored_at);
-    let remove_count = cache.len().saturating_sub(EXTRACTION_CACHE_MAX_ENTRIES);
-    for (url, _) in ordered.into_iter().take(remove_count) {
-        cache.remove(&url);
-    }
-}
-
-fn prune_twitter_cache(cache: &mut HashMap<String, TwitterCacheEntry>) {
-    cache.retain(|_, entry| entry.stored_at.elapsed() <= EXTRACTION_CACHE_TTL);
-    if cache.len() <= EXTRACTION_CACHE_MAX_ENTRIES {
-        return;
-    }
-
-    let mut ordered = cache
-        .iter()
-        .map(|(url, entry)| (url.clone(), entry.stored_at))
-        .collect::<Vec<_>>();
-    ordered.sort_by_key(|(_, stored_at)| *stored_at);
-    let remove_count = cache.len().saturating_sub(EXTRACTION_CACHE_MAX_ENTRIES);
-    for (url, _) in ordered.into_iter().take(remove_count) {
-        cache.remove(&url);
-    }
-}
-
-fn insert_twitter_cache_entry(
-    cache: &mut HashMap<String, TwitterCacheEntry>,
-    key: &str,
-    content: TwitterContent,
-) {
-    cache.insert(
-        key.to_string(),
-        TwitterCacheEntry {
-            stored_at: Instant::now(),
-            content,
-        },
-    );
-    prune_twitter_cache(cache);
-}
-
 async fn extract_cached_telegraph_content(url: &str) -> anyhow::Result<TelegraphContent> {
-    {
-        let mut cache = TELEGRAPH_CACHE.lock();
-        prune_telegraph_cache(&mut cache);
-        if let Some(entry) = cache.get(url) {
-            return Ok(entry.content.clone());
-        }
+    if let Some(content) = TELEGRAPH_CACHE.lock().get(url) {
+        return Ok(content);
     }
 
     let content = extract_telegraph_content(url).await?;
-    let mut cache = TELEGRAPH_CACHE.lock();
-    prune_telegraph_cache(&mut cache);
-    cache.insert(
-        url.to_string(),
-        TelegraphCacheEntry {
-            stored_at: Instant::now(),
-            content: content.clone(),
-        },
-    );
+    TELEGRAPH_CACHE
+        .lock()
+        .insert(url.to_string(), content.clone());
     Ok(content)
 }
 
 async fn extract_cached_twitter_content(url: &str) -> anyhow::Result<TwitterContent> {
     let cache_key = twitter_cache_key(url).ok();
-    {
-        let mut cache = TWITTER_CACHE.lock();
-        prune_twitter_cache(&mut cache);
-        if let Some(cache_key) = cache_key.as_ref() {
-            if let Some(entry) = cache.get(cache_key) {
-                return Ok(entry.content.clone());
-            }
+    if let Some(cache_key) = cache_key.as_ref() {
+        if let Some(content) = TWITTER_CACHE.lock().get(cache_key) {
+            return Ok(content);
         }
     }
 
     let content = extract_twitter_content(url).await?;
     if let Some(cache_key) = cache_key {
-        let mut cache = TWITTER_CACHE.lock();
-        prune_twitter_cache(&mut cache);
-        insert_twitter_cache_entry(&mut cache, &cache_key, content.clone());
+        TWITTER_CACHE.lock().insert(cache_key, content.clone());
     }
     Ok(content)
 }
@@ -999,25 +925,24 @@ mod tests {
 
     #[test]
     fn twitter_cache_insert_never_leaves_more_than_64_entries() {
-        let mut cache = HashMap::new();
-        for id in 0..64 {
+        let mut cache = TWITTER_CACHE.lock();
+        for id in 0..=EXTRACTION_CACHE_MAX_ENTRIES {
             cache.insert(
-                id.to_string(),
-                TwitterCacheEntry {
-                    stored_at: Instant::now(),
-                    content: TwitterContent {
-                        url: format!("https://x.com/a/status/{id}"),
-                        text_content: String::new(),
-                        image_urls: Vec::new(),
-                        video_urls: Vec::new(),
-                        formatted_content: String::new(),
-                        attachment_plan: Vec::new(),
-                    },
+                format!("capacity-test-{id}"),
+                TwitterContent {
+                    text_content: String::new(),
+                    image_urls: Vec::new(),
+                    video_urls: Vec::new(),
+                    formatted_content: String::new(),
+                    attachment_plan: Vec::new(),
                 },
             );
         }
-        let sample = cache.values().next().unwrap().content.clone();
-        insert_twitter_cache_entry(&mut cache, "64", sample);
-        assert_eq!(cache.len(), 64);
+        // The oldest insertion is evicted; the newest 64 survive.
+        assert!(cache.get("capacity-test-0").is_none());
+        assert!(cache.get("capacity-test-1").is_some());
+        assert!(cache
+            .get(&format!("capacity-test-{EXTRACTION_CACHE_MAX_ENTRIES}"))
+            .is_some());
     }
 }

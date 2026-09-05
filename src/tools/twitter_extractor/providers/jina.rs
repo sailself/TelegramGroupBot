@@ -1,7 +1,7 @@
 use std::{collections::HashSet, time::Duration};
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{
     read_limited_body, run_blocking_parser, ProviderError, ProviderErrorKind, TwitterFetchConfig,
@@ -14,14 +14,15 @@ use crate::tools::twitter_extractor::model::{
 use crate::tools::twitter_extractor::url::XStatusIdentity;
 use crate::utils::http::NoRedirectClient;
 
-static TIMESTAMP_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d{1,2}:\d{2}\s?[AP]M").unwrap());
-static MEDIA_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"!\[[^\]]*?\]\((https?://[^\)]+)\)").unwrap());
-static LINK_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[([^\]]*?)\]\((https?://[^\)]+)\)").unwrap());
-static EMPTY_LINK_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[\s*\]\((https?://[^\)]+)\)").unwrap());
-static WHITESPACE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+static TIMESTAMP_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d{1,2}:\d{2}\s?[AP]M").unwrap());
+static MEDIA_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"!\[[^\]]*?\]\((https?://[^\)]+)\)").unwrap());
+static LINK_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\]]*?)\]\((https?://[^\)]+)\)").unwrap());
+static EMPTY_LINK_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\s*\]\((https?://[^\)]+)\)").unwrap());
+static WHITESPACE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 type MediaBuckets = (Vec<String>, Vec<String>, Vec<String>);
 
 fn error(
@@ -498,7 +499,7 @@ mod tests {
         )
         .with_header("authorization", "Bearer test-jina-key")]);
         let post = fetch(
-            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config(server.base_url(), Some("test-jina-key")),
             &identity("123"),
             Duration::from_secs(1),
@@ -519,7 +520,7 @@ mod tests {
         )
         .without_header("authorization")]);
         fetch(
-            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config(server.base_url(), None),
             &identity("123"),
             Duration::from_secs(1),
@@ -539,7 +540,7 @@ mod tests {
         )
         .without_header("authorization")]);
         fetch(
-            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config(server.base_url(), Some("   ")),
             &identity("123"),
             Duration::from_secs(1),
@@ -562,7 +563,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let started = std::time::Instant::now();
         let error = fetch_with_parser(
-            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config(server.base_url(), None),
             &identity("123"),
             Duration::from_millis(20),

@@ -10,10 +10,10 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::LazyLock;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -28,8 +28,8 @@ const ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
 const TOKEN_REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DPAPI_AUTH_FORMAT: &str = "openai-codex-auth-dpapi-v1";
 
-static AUTH_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-static AUTH_FILE_LOCK: Lazy<RwLock<()>> = Lazy::new(|| RwLock::new(()));
+static AUTH_LIFECYCLE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static AUTH_FILE_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 static AUTH_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

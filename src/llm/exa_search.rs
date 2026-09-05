@@ -6,6 +6,7 @@ use tracing::info;
 
 use crate::config::CONFIG;
 use crate::utils::http::get_http_client;
+use crate::utils::text::truncate_with_ellipsis;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const MAX_DEFAULT_RESULTS: usize = 5;
@@ -31,13 +32,7 @@ pub struct ExaResult {
 
 fn normalise_snippet(value: Option<&str>) -> String {
     let snippet = value.unwrap_or("").replace('\n', " ");
-    let snippet = snippet.trim();
-    if snippet.chars().count() > 240 {
-        let truncated: String = snippet.chars().take(240).collect();
-        format!("{truncated}...")
-    } else {
-        snippet.to_string()
-    }
+    truncate_with_ellipsis(snippet.trim(), 240)
 }
 
 fn extract_results(payload: ExaResponse) -> Vec<(String, String, String)> {

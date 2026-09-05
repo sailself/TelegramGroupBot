@@ -1,12 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::StatusCode;
+use std::sync::LazyLock;
 use tracing::{error, warn};
 
 use crate::utils::http::get_http_client;
+use crate::utils::text::truncate_for_log;
 
 pub fn detect_mime_type(data: &[u8]) -> Option<String> {
     if data.len() > 12 {
@@ -26,18 +27,10 @@ const MEDIA_DOWNLOAD_MAX_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_BASE_DELAY_MS: u64 = 400;
 const MEDIA_DOWNLOAD_ERROR_BODY_LIMIT: usize = 800;
 
-fn truncate_for_log(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(limit).collect();
-    format!("{truncated}... (truncated)")
-}
-
 /// Mask the bot token embedded in Telegram file-download URLs so the URL can
 /// be logged safely. Other URLs pass through unchanged.
 pub fn redact_url_for_log(url: &str) -> String {
-    static TELEGRAM_FILE_TOKEN: Lazy<Regex> = Lazy::new(|| {
+    static TELEGRAM_FILE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(https?://api\.telegram\.org/file/bot)[^/]+/")
             .expect("valid telegram file url regex")
     });

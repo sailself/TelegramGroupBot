@@ -386,17 +386,17 @@ Top refactors: R1 (M) shared pipeline primitives in `agents/step.rs`/`common.rs`
 - [x] `Dockerfile` base `rust:1.88` (or `rust:latest`); add `rust-version` to `Cargo.toml`
 - [x] Flaky deadline tests: `start_paused` + `advance`, or relax thresholds
 
-### Phase 1: shared utilities (mechanical, low risk)
+### Phase 1: shared utilities (mechanical, low risk) — done on `refactor/phase1-shared-utilities` (2026-09-04)
 
-- [ ] `utils/text.rs`: `truncate_chars`, `truncate_for_log`, `escape_html`, `split_for_telegram` (replace 16 + 2 + 2 copies)
-- [ ] `utils/telegram.rs`: `retry_telegram<T>` (replace 5 loops; retry only retryable errors), `run_with_status_message`
-- [ ] `utils/ttl_cache.rs`: generic TTL+LRU (replace 4 copies)
-- [ ] `main.rs`: `spawn_logged(name, fut)`; drop redundant clones; `bot.set_my_commands`; command list derived from `Command::bot_commands()`; callback-prefix constants
-- [ ] `AppState::PendingRequests<T>` with `insert_with_timeout`, `take_if_owner`, abort-on-resolve (replace 4 flows)
-- [ ] `Database::shutdown()` + `SqliteConnectOptions` (pragmas on every connection, `create_if_missing`)
-- [ ] Delete every `#[allow(dead_code)]`/`#[allow(unused_imports)]`; remove what the compiler then reports
-- [ ] `once_cell::Lazy` -> `std::sync::LazyLock`; drop the dependency
-- [ ] `CommandTimer` -> tracing fields; decide on one file log format
+- [x] `utils/text.rs`: `truncate_with_suffix`/`truncate_with_ellipsis`/`truncate_for_log`, `escape_html`, `split_for_telegram` (replaced 16 + 2 + 2 copies)
+- [x] `utils/telegram.rs`: `retry_telegram` (replaced 6 loops incl. `responses.rs`; retries only transient errors). `run_with_status_message` deferred to Phase 3 — it belongs with `begin_command` and the handler split
+- [x] `utils/ttl_cache.rs`: `TtlCache<K, V>` (replaced 4 copies; `web_search` dropped its tokio Mutex)
+- [x] `main.rs`: `spawn_logged`; clones dropped; `bot.set_my_commands`/`get_my_commands` via teloxide; published list derived from `Command::bot_commands()` (`/qq` description now matches `/help`; menu order follows the enum); image callback prefixes exported from `handlers::commands`
+- [x] `AppState`: `PendingRequests<T>` with `insert_with_timeout` and a lock guard (`get`/`get_mut`/`take`) that aborts the timeout task on take (replaced 4 flows; `/image` aspect step still waits without a deadline, as before)
+- [x] `Database::shutdown()` (writer drains + flushes on `WriterCommand::Shutdown`, called after `dispatch()`) + `SqliteConnectOptions` (pragmas per connection, `create_if_missing`)
+- [x] All 26 `dead_code`/`unused_imports` allows deleted; 10 items removed or made test-only (`ProviderError.detail` is now surfaced in the aggregated fetch error instead)
+- [x] `once_cell::Lazy` -> `std::sync::LazyLock`; dependency dropped (also dropped `webhooks-axum`, `OPENROUTER_ALPHA_BASE_URL`, `NVIDIA_TOP_K`)
+- [x] `CommandTimer` and audit emitters -> tracing fields. **Open:** whether to keep both text and JSON timing/bot files or standardize on one (five subscriber layers today)
 
 ### Phase 2: LLM layer
 

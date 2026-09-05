@@ -76,12 +76,12 @@ pub fn log_llm_request_started(
 ) {
     info!(
         target: "bot.timing",
-        "event=llm_request provider={} model={} operation={} started_at={} metadata={}",
+        event = "llm_request",
         provider,
         model,
         operation,
-        started_at.to_rfc3339(),
-        json_text(metadata)
+        started_at = %started_at.to_rfc3339(),
+        metadata = %json_text(metadata),
     );
 }
 
@@ -97,14 +97,15 @@ pub async fn record_llm_request_success(
     let duration_ms = (completed_at - started_at).num_milliseconds().max(0);
     info!(
         target: "bot.timing",
-        "event=llm_response provider={} model={} operation={} completed_at={} duration_ms={} status=success response_id={:?} usage={}",
+        event = "llm_response",
         provider,
         model,
         operation,
-        completed_at.to_rfc3339(),
+        completed_at = %completed_at.to_rfc3339(),
         duration_ms,
-        usage.response_id,
-        usage.raw_usage_json.as_deref().unwrap_or("{}")
+        status = "success",
+        response_id = usage.response_id.as_deref(),
+        usage = usage.raw_usage_json.as_deref().unwrap_or("{}"),
     );
 
     let Some(audit_context) = audit_context else {
@@ -137,5 +138,34 @@ pub async fn record_llm_request_success(
             model,
             operation
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::log_capture::capture_json_events;
+
+    #[test]
+    fn llm_request_started_emits_structured_fields_for_the_json_layer() {
+        let events = capture_json_events(|| {
+            log_llm_request_started(
+                "gemini",
+                "gemini-2.5-flash",
+                "generate_content",
+                Utc::now(),
+                Some(&serde_json::json!({"thinking": "low"})),
+            );
+        });
+
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["target"], "bot.timing");
+        let fields = &events[0]["fields"];
+        assert_eq!(fields["event"], "llm_request");
+        assert_eq!(fields["provider"], "gemini");
+        assert_eq!(fields["model"], "gemini-2.5-flash");
+        assert_eq!(fields["operation"], "generate_content");
+        assert_eq!(fields["metadata"], r#"{"thinking":"low"}"#);
+        assert!(fields["started_at"].is_string(), "{fields:?}");
     }
 }

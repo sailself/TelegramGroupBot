@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use serde::Deserialize;
+use std::sync::LazyLock;
 use tracing::{info, warn};
 use url::Url;
 
@@ -100,7 +100,6 @@ pub fn parse_third_party_model_id(identifier: &str) -> Option<(ThirdPartyProvide
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bot_token: String,
@@ -127,7 +126,6 @@ pub struct Config {
     pub enable_openrouter: bool,
     pub openrouter_api_key: String,
     pub openrouter_base_url: String,
-    pub openrouter_alpha_base_url: String,
     pub openrouter_temperature: f32,
     pub openrouter_top_k: i32,
     pub openrouter_top_p: f32,
@@ -136,7 +134,6 @@ pub struct Config {
     pub nvidia_api_key: String,
     pub nvidia_base_url: String,
     pub nvidia_temperature: f32,
-    pub nvidia_top_k: i32,
     pub nvidia_top_p: f32,
     pub nvidia_request_timeout_secs: u64,
     pub enable_ollama: bool,
@@ -204,7 +201,6 @@ pub struct Config {
     pub default_quick_text_model: String,
     pub quick_reasoning_effort: String,
     pub default_image_model: String,
-    pub default_q_model: String,
     pub telegram_max_length: usize,
     pub media_group_max_items: usize,
     pub external_enrich_fanout: usize,
@@ -240,8 +236,8 @@ pub struct Config {
     pub third_party_models_by_id: HashMap<String, ThirdPartyModelConfig>,
 }
 
-pub static CONFIG: Lazy<Config> =
-    Lazy::new(|| Config::load().expect("Failed to load configuration"));
+pub static CONFIG: LazyLock<Config> =
+    LazyLock::new(|| Config::load().expect("Failed to load configuration"));
 
 fn env_bool(name: &str, default: bool) -> bool {
     env::var(name)
@@ -714,10 +710,6 @@ impl Config {
             enable_openrouter: env_bool("ENABLE_OPENROUTER", true),
             openrouter_api_key: env_string("OPENROUTER_API_KEY", ""),
             openrouter_base_url: env_string("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-            openrouter_alpha_base_url: env_string(
-                "OPENROUTER_ALPHA_BASE_URL",
-                "https://openrouter.ai/api/alpha",
-            ),
             openrouter_temperature: env_f32("OPENROUTER_TEMPERATURE", 0.7),
             openrouter_top_k: env_i32("OPENROUTER_TOP_K", 40),
             openrouter_top_p: env_f32("OPENROUTER_TOP_P", 0.95),
@@ -729,7 +721,6 @@ impl Config {
             nvidia_api_key: env_string("NVIDIA_API_KEY", ""),
             nvidia_base_url: env_string("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
             nvidia_temperature: env_f32("NVIDIA_TEMPERATURE", 0.7),
-            nvidia_top_k: env_i32("NVIDIA_TOP_K", 40),
             nvidia_top_p: env_f32("NVIDIA_TOP_P", 0.95),
             nvidia_request_timeout_secs: env_timeout_secs("NVIDIA_REQUEST_TIMEOUT_SECS", 60),
             enable_ollama: env_bool("ENABLE_OLLAMA", true),
@@ -824,7 +815,6 @@ impl Config {
             default_quick_text_model,
             quick_reasoning_effort,
             default_image_model: env_string("DEFAULT_IMAGE_MODEL", "gemini"),
-            default_q_model: env_string("DEFAULT_Q_MODEL", "gemini"),
             telegram_max_length: env_usize("TELEGRAM_MAX_LENGTH", 4000),
             media_group_max_items: env_usize("MEDIA_GROUP_MAX_ITEMS", 256).max(1),
             external_enrich_fanout: env_usize("EXTERNAL_ENRICH_FANOUT", 4).max(1),

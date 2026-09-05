@@ -11,10 +11,8 @@ pub(crate) mod providers;
 pub(crate) mod test_support;
 pub(crate) mod url;
 pub(crate) use model::parse_allowed_media_url;
-#[allow(unused_imports)]
 pub(crate) use model::TwitterAttachment;
 pub use model::TwitterContent;
-#[allow(unused_imports)]
 pub(crate) use url::{
     canonical_status_key, is_supported_status_url, parse_status_identity, XStatusIdentity,
 };
@@ -164,7 +162,7 @@ mod tests {
         );
         let jina = TestServer::expect_no_requests();
         let extractor = TwitterExtractor::new(
-            providers::get_http_client_no_redirect(),
+            get_http_client_no_redirect(),
             test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
         );
 
@@ -188,7 +186,7 @@ mod tests {
         let vx = TestServer::expect_no_requests();
         let jina = TestServer::expect_no_requests();
         let extractor = TwitterExtractor::new(
-            providers::get_http_client_no_redirect(),
+            get_http_client_no_redirect(),
             test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
         );
 
@@ -211,7 +209,7 @@ mod tests {
         );
         let jina = TestServer::expect_no_requests();
         let extractor = TwitterExtractor::new(
-            providers::get_http_client_no_redirect(),
+            get_http_client_no_redirect(),
             test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
         );
 
@@ -236,7 +234,7 @@ mod tests {
         );
         let jina = TestServer::expect_no_requests();
         let extractor = TwitterExtractor::new(
-            providers::get_http_client_no_redirect(),
+            get_http_client_no_redirect(),
             test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
         );
 
@@ -264,7 +262,7 @@ mod tests {
             ),
         ]);
         let extractor = TwitterExtractor::new(
-            providers::get_http_client_no_redirect(),
+            get_http_client_no_redirect(),
             test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
         );
 
@@ -293,7 +291,7 @@ mod tests {
         ]);
         let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
         config.providers = vec![TwitterProvider::Jina];
-        let extractor = TwitterExtractor::new(providers::get_http_client_no_redirect(), config);
+        let extractor = TwitterExtractor::new(get_http_client_no_redirect(), config);
 
         extractor
             .fetch("https://x.com/alice/status/123")
@@ -318,7 +316,7 @@ mod tests {
         config.total_timeout = Duration::from_millis(30);
         config.provider_timeout = Duration::from_millis(15);
         let started = tokio::time::Instant::now();
-        let error = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+        let error = TwitterExtractor::new(get_http_client_no_redirect(), config)
             .fetch("https://x.com/a/status/123")
             .await
             .unwrap_err()
@@ -357,7 +355,7 @@ mod tests {
         let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
         config.jina_reader_endpoint = jina.base_url().join("custom-endpoint-secret").unwrap();
         config.jina_api_key = Some("secret-bearer-value".to_string());
-        let error = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+        let error = TwitterExtractor::new(get_http_client_no_redirect(), config)
             .fetch("https://x.com/a/status/123")
             .await
             .unwrap_err()
@@ -389,7 +387,7 @@ mod tests {
         let jina = TestServer::expect_no_requests();
         let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
         config.provider_timeout = Duration::from_millis(15);
-        let content = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+        let content = TwitterExtractor::new(get_http_client_no_redirect(), config)
             .fetch("https://x.com/a/status/123")
             .await
             .unwrap();
@@ -410,7 +408,7 @@ mod tests {
         let jina = TestServer::expect_no_requests();
         let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
         config.response_max_bytes = 1_024;
-        let content = TwitterExtractor::new(providers::get_http_client_no_redirect(), config)
+        let content = TwitterExtractor::new(get_http_client_no_redirect(), config)
             .fetch("https://x.com/a/status/123")
             .await
             .unwrap();
@@ -436,7 +434,7 @@ mod tests {
         );
         let jina = TestServer::expect_no_requests();
         let content = TwitterExtractor::new(
-            providers::get_http_client_no_redirect(),
+            get_http_client_no_redirect(),
             test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
         )
         .fetch("https://x.com/a/status/123")

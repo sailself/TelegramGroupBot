@@ -8,7 +8,6 @@ use teloxide::types::{
     ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef,
     MessageId, ParseMode, ReplyParameters,
 };
-use teloxide::RequestError;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::config::{
@@ -47,10 +46,11 @@ use crate::llm::{
     call_gemini, call_gemini_with_tool_runtime, call_third_party,
     call_third_party_with_tool_runtime,
 };
-use crate::state::{AppState, PendingQRequest, QaCommandMode};
+use crate::state::{AppState, PendingEntryGuard, PendingQRequest, QaCommandMode};
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::telegram::{build_message_link, start_chat_action_heartbeat};
+use crate::utils::telegram::{build_message_link, retry_telegram, start_chat_action_heartbeat};
+use crate::utils::text::{escape_html, split_for_telegram, truncate_with_ellipsis};
 use crate::utils::timing::{complete_command_timer, start_command_timer, CommandTimer};
 use tracing::{error, info, warn};
 
@@ -58,7 +58,6 @@ pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 pub const MODEL_GEMINI: &str = "gemini";
 const MODEL_CALLBACK_COMPACT_PREFIX: &str = "m:";
 const TELEGRAM_CALLBACK_DATA_LIMIT: usize = 64;
-const SEND_MESSAGE_RETRY_ATTEMPTS: usize = 3;
 const USER_ERROR_DETAIL_LIMIT: usize = 400;
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
 const QUICK_SEARCH_FOOTER: &str =
@@ -257,14 +256,6 @@ pub fn build_auto_q_query(
     }
 }
 
-fn truncate_for_user(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(limit).collect();
-    format!("{truncated}...")
-}
-
 fn build_media_only_qa_prompt(media_summary: &MediaSummary) -> Option<String> {
     if media_summary.images > 0 {
         Some("Please analyze the attached image(s).".to_string())
@@ -435,7 +426,7 @@ fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
         ),
     };
 
-    let detail = truncate_for_user(&err_text, USER_ERROR_DETAIL_LIMIT);
+    let detail = truncate_with_ellipsis(&err_text, USER_ERROR_DETAIL_LIMIT);
     format!("{friendly}\n\nError: {detail}")
 }
 
@@ -447,12 +438,8 @@ async fn send_message_with_retry(
     parse_mode: Option<ParseMode>,
     reply_markup: Option<InlineKeyboardMarkup>,
 ) -> Result<Message> {
-    let text = text.to_string();
-    let mut delay = Duration::from_secs_f32(1.5);
-    let mut last_err: Option<RequestError> = None;
-
-    for attempt in 0..SEND_MESSAGE_RETRY_ATTEMPTS {
-        let mut request = bot.send_message(chat_id, text.clone());
+    retry_telegram("send_message", || {
+        let mut request = bot.send_message(chat_id, text.to_string());
         if let Some(reply_to) = reply_to {
             request = request.reply_parameters(ReplyParameters::new(reply_to));
         }
@@ -462,31 +449,10 @@ async fn send_message_with_retry(
         if let Some(markup) = reply_markup.clone() {
             request = request.reply_markup(markup);
         }
-
-        match request.await {
-            Ok(message) => return Ok(message),
-            Err(err) => {
-                let retryable = matches!(
-                    err,
-                    RequestError::Network(_) | RequestError::RetryAfter(_) | RequestError::Io(_)
-                );
-                if !retryable || attempt + 1 == SEND_MESSAGE_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-
-                warn!("send_message attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-                last_err = Some(err);
-            }
-        }
-    }
-
-    Err(last_err.expect("send_message retry exhausted").into())
+        request
+    })
+    .await
+    .map_err(Into::into)
 }
 
 fn resolve_exact_model_identifier_with_models(
@@ -803,8 +769,7 @@ enum PendingQRequestCallbackAction {
 }
 
 fn take_pending_q_request_for_callback<F>(
-    pending: &mut std::collections::HashMap<String, PendingQRequest>,
-    request_key: &str,
+    pending: &mut PendingEntryGuard<'_, PendingQRequest>,
     query_user_id: i64,
     now: i64,
     timeout_secs: u64,
@@ -813,7 +778,7 @@ fn take_pending_q_request_for_callback<F>(
 where
     F: FnOnce(&PendingQRequest) -> bool,
 {
-    let Some(request) = pending.get(request_key) else {
+    let Some(request) = pending.get() else {
         return PendingQRequestCallbackAction::Missing;
     };
 
@@ -824,7 +789,7 @@ where
     let timeout_secs = i64::try_from(timeout_secs).unwrap_or(i64::MAX);
     if now.saturating_sub(request.timestamp) > timeout_secs {
         return pending
-            .remove(request_key)
+            .take()
             .map(PendingQRequestCallbackAction::UseDefault)
             .unwrap_or(PendingQRequestCallbackAction::Missing);
     }
@@ -834,7 +799,7 @@ where
     }
 
     pending
-        .remove(request_key)
+        .take()
         .map(PendingQRequestCallbackAction::UseSelected)
         .unwrap_or(PendingQRequestCallbackAction::Missing)
 }
@@ -1419,31 +1384,6 @@ fn chat_search_rebuilding_message(command_name: &str) -> String {
     )
 }
 
-fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-fn truncate_for_display(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-
-    let mut truncated: String = text.chars().take(max_chars).collect();
-    truncated.push_str("...");
-    truncated
-}
-
 #[derive(Debug, Deserialize)]
 struct ChatSearchSelection {
     selected_message_ids: Vec<i64>,
@@ -1543,7 +1483,7 @@ fn format_chat_search_results_html(
                 .unwrap_or_else(|| hit.username.as_deref().unwrap_or("Anonymous"));
             let username = escape_html(raw_label);
             let timestamp = escape_html(&hit.date.format("%Y-%m-%d %H:%M:%S UTC").to_string());
-            let snippet = escape_html(&truncate_for_display(&hit.snippet, 120));
+            let snippet = escape_html(&truncate_with_ellipsis(&hit.snippet, 120));
             let provenance_prefix = if hit.asks_ai {
                 let command = hit.ai_command.as_deref().unwrap_or("q");
                 format!("[AI ask /{}] ", escape_html(command))
@@ -1577,46 +1517,13 @@ fn format_chat_search_results_html(
     lines.join("\n")
 }
 
-fn split_html_for_telegram(text: &str, max_chars: usize) -> Vec<String> {
-    if text.chars().count() <= max_chars {
-        return vec![text.to_string()];
-    }
-
-    let mut parts = Vec::new();
-    let mut current = String::new();
-
-    for line in text.lines() {
-        let line = if current.is_empty() {
-            line.to_string()
-        } else {
-            format!("\n{line}")
-        };
-        if current.chars().count() + line.chars().count() > max_chars && !current.is_empty() {
-            parts.push(current);
-            current = line.trim_start_matches('\n').to_string();
-        } else {
-            current.push_str(&line);
-        }
-    }
-
-    if !current.is_empty() {
-        parts.push(current);
-    }
-
-    if parts.is_empty() {
-        vec![text.to_string()]
-    } else {
-        parts
-    }
-}
-
 async fn send_chat_search_response(
     bot: &Bot,
     chat_id: ChatId,
     message_id: MessageId,
     response_html: &str,
 ) -> Result<()> {
-    let chunks = split_html_for_telegram(response_html, CHAT_SEARCH_MESSAGE_LIMIT);
+    let chunks = split_for_telegram(response_html, CHAT_SEARCH_MESSAGE_LIMIT);
     let mut chunks_iter = chunks.into_iter();
     let first_chunk = chunks_iter.next().unwrap_or_default();
 
@@ -1772,14 +1679,7 @@ fn build_chat_search_pending_request(
 ) -> PendingQRequest {
     PendingQRequest {
         user_id,
-        username: message
-            .from
-            .as_ref()
-            .map(|user| user.full_name())
-            .unwrap_or_else(|| "Anonymous".to_string()),
         query: query_text.to_string(),
-        original_query: query_text.to_string(),
-        db_query_text: query_text.to_string(),
         telegram_language_code: message
             .from
             .as_ref()
@@ -1793,7 +1693,6 @@ fn build_chat_search_pending_request(
         message_id: message.id.0 as i64,
         selection_message_id,
         original_user_id: user_id,
-        reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
         llm_invocation_id: audit_context.map(|context| context.invocation_id),
         timestamp: now_unix_seconds(),
         command_timer,
@@ -2186,8 +2085,8 @@ async fn process_request(
 mod tests {
     use super::*;
     use crate::handlers::media::MediaSummary;
+    use crate::state::PendingRequests;
     use serde_json::json;
-    use std::collections::HashMap;
     use teloxide::types::InlineKeyboardButtonKind;
 
     #[test]
@@ -2285,10 +2184,7 @@ mod tests {
     fn pending_q_request(original_user_id: i64, timestamp: i64) -> PendingQRequest {
         PendingQRequest {
             user_id: original_user_id,
-            username: "Test User".to_string(),
             query: "question".to_string(),
-            original_query: "question".to_string(),
-            db_query_text: "question".to_string(),
             telegram_language_code: None,
             media_files: Vec::new(),
             youtube_urls: Vec::new(),
@@ -2298,7 +2194,6 @@ mod tests {
             message_id: 456,
             selection_message_id: 789,
             original_user_id,
-            reply_to_message_id: None,
             llm_invocation_id: None,
             timestamp,
             command_timer: None,
@@ -2306,57 +2201,77 @@ mod tests {
         }
     }
 
+    fn pending_with_request(
+        original_user_id: i64,
+        timestamp: i64,
+    ) -> PendingRequests<PendingQRequest> {
+        let pending = PendingRequests::new();
+        pending.insert(
+            "request".to_string(),
+            pending_q_request(original_user_id, timestamp),
+        );
+        pending
+    }
+
     #[test]
     fn callback_take_keeps_pending_request_for_wrong_user() {
-        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+        let pending = pending_with_request(10, 100);
 
         let action =
-            take_pending_q_request_for_callback(&mut pending, "request", 20, 105, 30, |_| true);
+            take_pending_q_request_for_callback(&mut pending.entry("request"), 20, 105, 30, |_| {
+                true
+            });
 
         assert!(matches!(action, PendingQRequestCallbackAction::Ignored));
-        assert!(pending.contains_key("request"));
+        assert!(pending.entry("request").get().is_some());
     }
 
     #[test]
     fn callback_take_uses_default_model_when_selection_arrives_after_timeout() {
-        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+        let pending = pending_with_request(10, 100);
 
         let action =
-            take_pending_q_request_for_callback(&mut pending, "request", 10, 131, 30, |_| true);
+            take_pending_q_request_for_callback(&mut pending.entry("request"), 10, 131, 30, |_| {
+                true
+            });
 
         let PendingQRequestCallbackAction::UseDefault(request) = action else {
             panic!("expected expired callback to use the default model");
         };
         assert_eq!(request.original_user_id, 10);
-        assert!(pending.is_empty());
+        assert_eq!(pending.count(), 0);
     }
 
     #[test]
     fn callback_take_keeps_pending_request_for_invalid_model_selection() {
-        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+        let pending = pending_with_request(10, 100);
 
         let action =
-            take_pending_q_request_for_callback(&mut pending, "request", 10, 105, 30, |_| false);
+            take_pending_q_request_for_callback(&mut pending.entry("request"), 10, 105, 30, |_| {
+                false
+            });
 
         assert!(matches!(
             action,
             PendingQRequestCallbackAction::InvalidSelection
         ));
-        assert!(pending.contains_key("request"));
+        assert!(pending.entry("request").get().is_some());
     }
 
     #[test]
     fn callback_take_consumes_pending_request_for_valid_selection() {
-        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+        let pending = pending_with_request(10, 100);
 
         let action =
-            take_pending_q_request_for_callback(&mut pending, "request", 10, 105, 30, |_| true);
+            take_pending_q_request_for_callback(&mut pending.entry("request"), 10, 105, 30, |_| {
+                true
+            });
 
         let PendingQRequestCallbackAction::UseSelected(request) = action else {
             panic!("expected valid callback to use the selected model");
         };
         assert_eq!(request.original_user_id, 10);
-        assert!(pending.is_empty());
+        assert_eq!(pending.count(), 0);
     }
 
     fn text_message_from(
@@ -3959,10 +3874,7 @@ async fn q_handler_internal(
         let mut timer = start_command_timer(command_name, &message);
         let pending_request = PendingQRequest {
             user_id,
-            username: username.clone(),
             query: query_text.clone(),
-            original_query: original_query.clone(),
-            db_query_text: db_query_text.clone(),
             telegram_language_code: user_language_code.map(str::to_string),
             media_files,
             youtube_urls,
@@ -3978,7 +3890,6 @@ async fn q_handler_internal(
             message_id: message.id.0 as i64,
             selection_message_id: processing_message.id.0 as i64,
             original_user_id: user_id,
-            reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
             llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
             timestamp: now_unix_seconds(),
             command_timer: None,
@@ -4028,10 +3939,7 @@ async fn q_handler_internal(
 
     let pending_request = PendingQRequest {
         user_id,
-        username: username.clone(),
         query: query_text.clone(),
-        original_query: original_query.clone(),
-        db_query_text: db_query_text.clone(),
         telegram_language_code: user_language_code.map(str::to_string),
         media_files,
         youtube_urls,
@@ -4047,23 +3955,23 @@ async fn q_handler_internal(
         message_id: message.id.0 as i64,
         selection_message_id: selection_message.id.0 as i64,
         original_user_id: user_id,
-        reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
         llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
         timestamp: now_unix_seconds(),
         command_timer: Some(timer),
         mode,
     };
 
-    state
-        .pending_q_requests
-        .lock()
-        .insert(request_key.clone(), pending_request);
-
-    let bot_clone = bot.clone();
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        handle_model_timeout(bot_clone, state_clone, request_key).await;
-    });
+    let timeout_bot = bot.clone();
+    let timeout_state = state.clone();
+    state.pending_q_requests.insert_with_timeout(
+        request_key,
+        pending_request,
+        Duration::from_secs(CONFIG.model_selection_timeout),
+        move |request| async move {
+            process_timed_out_q_request_with_default_model(&timeout_bot, &timeout_state, request)
+                .await;
+        },
+    );
 
     Ok(())
 }
@@ -4278,16 +4186,17 @@ pub async fn s_handler(
         Some(timer),
     );
 
-    state
-        .pending_q_requests
-        .lock()
-        .insert(request_key.clone(), pending_request);
-
-    let bot_clone = bot.clone();
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        handle_model_timeout(bot_clone, state_clone, request_key).await;
-    });
+    let timeout_bot = bot.clone();
+    let timeout_state = state.clone();
+    state.pending_q_requests.insert_with_timeout(
+        request_key,
+        pending_request,
+        Duration::from_secs(CONFIG.model_selection_timeout),
+        move |request| async move {
+            process_timed_out_q_request_with_default_model(&timeout_bot, &timeout_state, request)
+                .await;
+        },
+    );
 
     Ok(())
 }
@@ -4299,16 +4208,6 @@ pub async fn qq_handler(
     query: Option<String>,
 ) -> Result<()> {
     q_handler_internal(bot, state, message, query, "qq", QaCommandMode::Quick).await
-}
-
-pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String) {
-    tokio::time::sleep(Duration::from_secs(CONFIG.model_selection_timeout)).await;
-    let request = state.pending_q_requests.lock().remove(&request_key);
-    let Some(request) = request else {
-        return;
-    };
-
-    process_timed_out_q_request_with_default_model(&bot, &state, request).await;
 }
 
 async fn process_timed_out_q_request_with_default_model(
@@ -4408,10 +4307,9 @@ pub async fn model_selection_callback(
     let request_key = format!("{}_{}", message.chat().id.0, message.id().0);
     let query_user_id = i64::try_from(query.from.id.0).unwrap_or_default();
     let action = {
-        let mut pending = state.pending_q_requests.lock();
+        let mut pending = state.pending_q_requests.entry(&request_key);
         take_pending_q_request_for_callback(
             &mut pending,
-            &request_key,
             query_user_id,
             now_unix_seconds(),
             CONFIG.model_selection_timeout,

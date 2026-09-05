@@ -1,7 +1,8 @@
 use std::collections::{hash_map::DefaultHasher, HashSet};
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -51,7 +52,10 @@ use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::logging::read_recent_log_lines;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::telegram::start_chat_action_heartbeat;
+use crate::utils::telegram::{retry_telegram, start_chat_action_heartbeat};
+use crate::utils::text::{
+    escape_html, split_for_telegram, truncate_with_ellipsis, truncate_with_suffix,
+};
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::{error, info, warn};
 
@@ -60,15 +64,14 @@ const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 14] = [
     "4:3", "3:4", "16:9", "9:16", "1:1", "21:9", "3:2", "2:3", "5:4", "4:5", "4:1", "1:4", "8:1",
     "1:8",
 ];
-const IMAGE_RESOLUTION_CALLBACK_PREFIX: &str = "image_res:";
-const IMAGE_ASPECT_RATIO_CALLBACK_PREFIX: &str = "image_aspect:";
-const IMAGE_MODEL_CALLBACK_PREFIX: &str = "image_model:";
-const IMAGE_CODEX_SIZE_CALLBACK_PREFIX: &str = "image_codex_size:";
+pub const IMAGE_RESOLUTION_CALLBACK_PREFIX: &str = "image_res:";
+pub const IMAGE_ASPECT_RATIO_CALLBACK_PREFIX: &str = "image_aspect:";
+pub const IMAGE_MODEL_CALLBACK_PREFIX: &str = "image_model:";
+pub const IMAGE_CODEX_SIZE_CALLBACK_PREFIX: &str = "image_codex_size:";
 const IMAGE_DEFAULT_RESOLUTION: &str = "2K";
 const IMAGE_ASPECT_RATIO_AUTO_CALLBACK: &str = "auto";
 const IMAGE_CAPTION_LIMIT: usize = 1000;
 const IMAGE_CAPTION_PROMPT_PREVIEW: usize = 900;
-const VID_TELEGRAM_RETRY_ATTEMPTS: usize = 3;
 const DIAGNOSE_LOG_TAIL_LINES: usize = 12;
 const DIAGNOSE_TEXT_LIMIT: usize = 3900;
 const MYSONG_LLM_MAX_ATTEMPTS: usize = 3;
@@ -140,7 +143,6 @@ struct ImageRequestContext {
     prompt: String,
     image_urls: Vec<String>,
     telegraph_contents: Vec<String>,
-    original_message_text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,39 +420,6 @@ fn build_token_stats_user_response(rows: &[TokenUserStat]) -> String {
     lines.join("\n")
 }
 
-fn split_plain_text_for_telegram(text: &str, max_chars: usize) -> Vec<String> {
-    if text.chars().count() <= max_chars {
-        return vec![text.to_string()];
-    }
-
-    let mut parts = Vec::new();
-    let mut current = String::new();
-
-    for line in text.lines() {
-        let line = if current.is_empty() {
-            line.to_string()
-        } else {
-            format!("\n{line}")
-        };
-        if current.chars().count() + line.chars().count() > max_chars && !current.is_empty() {
-            parts.push(current);
-            current = line.trim_start_matches('\n').to_string();
-        } else {
-            current.push_str(&line);
-        }
-    }
-
-    if !current.is_empty() {
-        parts.push(current);
-    }
-
-    if parts.is_empty() {
-        vec![text.to_string()]
-    } else {
-        parts
-    }
-}
-
 async fn send_plain_text_report(
     bot: &Bot,
     message: &Message,
@@ -470,7 +439,7 @@ async fn send_plain_text_report(
         return Ok(());
     }
 
-    let chunks = split_plain_text_for_telegram(
+    let chunks = split_for_telegram(
         report,
         CONFIG.telegram_max_length.saturating_sub(100).max(1),
     );
@@ -692,12 +661,7 @@ async fn build_mysong_audio_caption(
         );
     }
 
-    let (preview, was_truncated) = truncate_chars(lyrics_message, 700);
-    let preview = if was_truncated {
-        format!("{}...", preview)
-    } else {
-        preview
-    };
+    let preview = truncate_with_ellipsis(lyrics_message, 700);
 
     let caption = format!("{}\n<pre>{}</pre>", base_caption, escape_html(&preview));
     if caption.chars().count() <= IMAGE_CAPTION_LIMIT {
@@ -800,28 +764,6 @@ fn build_factcheck_statement(
     String::new()
 }
 
-fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
-    let mut iter = text.chars();
-    let truncated: String = iter.by_ref().take(max_chars).collect();
-    let was_truncated = iter.next().is_some();
-    (truncated, was_truncated)
-}
-
 fn bool_label(value: bool) -> &'static str {
     if value {
         "yes"
@@ -921,10 +863,10 @@ async fn build_status_report(state: &AppState) -> String {
     let heavy_active = state.heavy_command_active();
     let heavy_waiting = state.heavy_command_waiting();
     let media_group_count = state.media_group_count();
-    let pending_q_requests = state.pending_q_requests.lock().len();
-    let pending_image_requests = state.pending_image_requests.lock().len();
-    let pending_codex_model_requests = state.pending_codex_model_requests.lock().len();
-    let pending_codex_reasoning_requests = state.pending_codex_reasoning_requests.lock().len();
+    let pending_q_requests = state.pending_q_requests.count();
+    let pending_image_requests = state.pending_image_requests.count();
+    let pending_codex_model_requests = state.pending_codex_model_requests.count();
+    let pending_codex_reasoning_requests = state.pending_codex_reasoning_requests.count();
 
     let brave_ready = CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty();
     let exa_ready = CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty();
@@ -1193,12 +1135,11 @@ async fn build_diagnose_report(state: &AppState) -> String {
     );
 
     let report = redact_sensitive_text(&report);
-    let (truncated, was_truncated) = truncate_chars(&report, DIAGNOSE_TEXT_LIMIT);
-    if was_truncated {
-        format!("{truncated}\n\n[truncated to fit Telegram message size]")
-    } else {
-        truncated
-    }
+    truncate_with_suffix(
+        &report,
+        DIAGNOSE_TEXT_LIMIT,
+        "\n\n[truncated to fit Telegram message size]",
+    )
 }
 
 async fn build_image_caption(model_name: &str, prompt: &str) -> String {
@@ -1229,12 +1170,7 @@ async fn build_image_caption(model_name: &str, prompt: &str) -> String {
         }
     }
 
-    let (preview, was_truncated) = truncate_chars(clean_prompt, IMAGE_CAPTION_PROMPT_PREVIEW);
-    let prompt_preview = if was_truncated {
-        format!("{}...", preview)
-    } else {
-        preview
-    };
+    let prompt_preview = truncate_with_ellipsis(clean_prompt, IMAGE_CAPTION_PROMPT_PREVIEW);
     caption = format!(
         "{} with prompt:\n<pre>{}</pre>",
         base_caption,
@@ -1297,13 +1233,6 @@ pub(crate) fn message_has_image(message: &Message) -> bool {
     false
 }
 
-fn telegram_retryable_error(err: &RequestError) -> bool {
-    matches!(
-        err,
-        RequestError::Network(_) | RequestError::RetryAfter(_) | RequestError::Io(_)
-    )
-}
-
 async fn send_message_with_retry(
     bot: &Bot,
     chat_id: ChatId,
@@ -1320,8 +1249,7 @@ async fn send_message_with_retry_parse_mode(
     reply_to: Option<MessageId>,
     parse_mode: Option<ParseMode>,
 ) -> Result<Message> {
-    let mut delay = Duration::from_secs_f32(1.5);
-    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+    retry_telegram("send_message", || {
         let mut request = bot.send_message(chat_id, text.to_string());
         if let Some(reply_to) = reply_to {
             request = request.reply_parameters(ReplyParameters::new(reply_to));
@@ -1329,24 +1257,10 @@ async fn send_message_with_retry_parse_mode(
         if let Some(parse_mode) = parse_mode {
             request = request.parse_mode(parse_mode);
         }
-        match request.await {
-            Ok(message) => return Ok(message),
-            Err(err) => {
-                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-                warn!("send_message attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-            }
-        }
-    }
-
-    unreachable!("send_message retry loop exhausted")
+        request
+    })
+    .await
+    .map_err(Into::into)
 }
 
 async fn edit_message_text_with_retry(
@@ -1355,28 +1269,10 @@ async fn edit_message_text_with_retry(
     message_id: MessageId,
     text: &str,
 ) -> Result<()> {
-    let mut delay = Duration::from_secs_f32(1.5);
-    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
-        match bot
-            .edit_message_text(chat_id, message_id, text.to_string())
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-                warn!("edit_message_text attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-            }
-        }
-    }
-
+    retry_telegram("edit_message_text", || {
+        bot.edit_message_text(chat_id, message_id, text.to_string())
+    })
+    .await?;
     Ok(())
 }
 
@@ -1386,32 +1282,19 @@ async fn send_video_with_retry(
     video_bytes: &[u8],
     reply_to: Option<MessageId>,
 ) -> Result<Message> {
-    let mut delay = Duration::from_secs_f32(1.5);
-    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+    retry_telegram("send_video", || {
         let input = InputFile::memory(video_bytes.to_vec()).file_name("video.mp4");
         let mut request = bot.send_video(chat_id, input);
         if let Some(reply_to) = reply_to {
             request = request.reply_parameters(ReplyParameters::new(reply_to));
         }
-        match request.await {
-            Ok(message) => return Ok(message),
-            Err(err) => {
-                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-                warn!("send_video attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-            }
-        }
-    }
-
-    unreachable!("send_video retry loop exhausted")
+        request
+    })
+    .await
+    .map_err(Into::into)
 }
+
+type TelegramSendFuture = Pin<Box<dyn Future<Output = Result<Message, RequestError>> + Send>>;
 
 async fn send_audio_file_with_retry(
     bot: &Bot,
@@ -1421,55 +1304,39 @@ async fn send_audio_file_with_retry(
     caption: Option<&str>,
     reply_to: Option<MessageId>,
 ) -> Result<Message> {
-    let mut delay = Duration::from_secs_f32(1.5);
     let file_name = audio_file_name_for_mime(mime_type);
+    let send_audio = audio_should_use_send_audio(mime_type);
+    let caption = caption.filter(|value| !value.trim().is_empty());
 
-    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+    retry_telegram("send_audio/document", || {
         let input = InputFile::memory(audio_bytes.to_vec()).file_name(file_name.to_string());
-        let send_audio = audio_should_use_send_audio(mime_type);
-
-        let result = if send_audio {
+        let future: TelegramSendFuture = if send_audio {
             let mut request = bot.send_audio(chat_id, input);
             if let Some(reply_to) = reply_to {
                 request = request.reply_parameters(ReplyParameters::new(reply_to));
             }
-            if let Some(caption) = caption.filter(|value| !value.trim().is_empty()) {
+            if let Some(caption) = caption {
                 request = request
                     .caption(caption.to_string())
                     .parse_mode(ParseMode::Html);
             }
-            request.await
+            Box::pin(request.into_future())
         } else {
             let mut request = bot.send_document(chat_id, input);
             if let Some(reply_to) = reply_to {
                 request = request.reply_parameters(ReplyParameters::new(reply_to));
             }
-            if let Some(caption) = caption.filter(|value| !value.trim().is_empty()) {
+            if let Some(caption) = caption {
                 request = request
                     .caption(caption.to_string())
                     .parse_mode(ParseMode::Html);
             }
-            request.await
+            Box::pin(request.into_future())
         };
-
-        match result {
-            Ok(message) => return Ok(message),
-            Err(err) => {
-                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-                warn!("send_audio/document attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-            }
-        }
-    }
-
-    unreachable!("send_audio/document retry loop exhausted")
+        future
+    })
+    .await
+    .map_err(Into::into)
 }
 
 async fn retry_mysong_llm_step<T, F, Fut>(
@@ -1630,7 +1497,6 @@ async fn prepare_image_request(
         prompt,
         image_urls,
         telegraph_contents: telegraph_texts,
-        original_message_text,
     })
 }
 
@@ -1883,15 +1749,11 @@ fn resolve_image_request_settings(
 async fn finalize_image_request(
     bot: &Bot,
     state: &AppState,
-    request_key: &str,
+    request: PendingImageRequest,
     resolution: Option<&str>,
     aspect_ratio: Option<&str>,
 ) -> Result<()> {
     let _heavy_permit = state.acquire_heavy_command_permit().await;
-    let request = state.pending_image_requests.lock().remove(request_key);
-    let Some(request) = request else {
-        return Ok(());
-    };
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
     let selected_model = match request.model {
         Some(model) => model,
@@ -2098,21 +1960,30 @@ pub async fn image_selection_callback(
             return Ok(());
         }
 
-        let next_command = {
-            let mut requests = state.pending_image_requests.lock();
-            let Some(request) = requests.get_mut(request_key) else {
+        let (next_command, ready_request) = {
+            let mut entry = state.pending_image_requests.entry(request_key);
+            let Some(request) = entry.get_mut() else {
                 return Ok(());
             };
             if request.user_id != query_user_id {
                 return Ok(());
             }
             request.model = Some(model);
-            request.command
+            let command = request.command;
+            // /img has nothing more to ask: take the request now so the
+            // timeout task can no longer race this selection.
+            let ready_request = match command {
+                PendingImageCommand::Img => entry.take(),
+                PendingImageCommand::Image => None,
+            };
+            (command, ready_request)
         };
 
         match (next_command, model) {
             (PendingImageCommand::Img, _) => {
-                finalize_image_request(&bot, &state, request_key, None, None).await?;
+                if let Some(request) = ready_request {
+                    finalize_image_request(&bot, &state, request, None, None).await?;
+                }
             }
             (PendingImageCommand::Image, ImageGenerationModel::Gemini) => {
                 if let Some(message) = &query.message {
@@ -2155,15 +2026,21 @@ pub async fn image_selection_callback(
             return Ok(());
         }
 
-        if let Some(request) = state.pending_image_requests.lock().get_mut(request_key) {
-            if request.user_id != query_user_id {
-                return Ok(());
+        let ready_request = {
+            let mut entry = state.pending_image_requests.entry(request_key);
+            match entry.get_mut() {
+                Some(request) if request.user_id != query_user_id => return Ok(()),
+                Some(request) => {
+                    request.model = Some(ImageGenerationModel::CodexGptImage2);
+                    request.codex_size = Some(size.to_string());
+                }
+                None => {}
             }
-            request.model = Some(ImageGenerationModel::CodexGptImage2);
-            request.codex_size = Some(size.to_string());
+            entry.take()
+        };
+        if let Some(request) = ready_request {
+            finalize_image_request(&bot, &state, request, None, None).await?;
         }
-
-        finalize_image_request(&bot, &state, request_key, None, None).await?;
         return Ok(());
     }
 
@@ -2176,7 +2053,7 @@ pub async fn image_selection_callback(
             return Ok(());
         }
 
-        if let Some(request) = state.pending_image_requests.lock().get_mut(request_key) {
+        if let Some(request) = state.pending_image_requests.entry(request_key).get_mut() {
             if request.user_id != query_user_id {
                 return Ok(());
             }
@@ -2209,23 +2086,30 @@ pub async fn image_selection_callback(
             return Ok(());
         }
 
-        if let Some(request) = state.pending_image_requests.lock().get_mut(request_key) {
-            if request.user_id != query_user_id {
-                return Ok(());
+        let ready_request = {
+            let mut entry = state.pending_image_requests.entry(request_key);
+            match entry.get_mut() {
+                Some(request) if request.user_id != query_user_id => return Ok(()),
+                Some(request) => {
+                    request.aspect_ratio = if aspect == IMAGE_ASPECT_RATIO_AUTO_CALLBACK {
+                        None
+                    } else {
+                        Some(aspect.to_string())
+                    };
+                }
+                None => {}
             }
-            request.aspect_ratio = if aspect == IMAGE_ASPECT_RATIO_AUTO_CALLBACK {
-                None
-            } else {
-                Some(aspect.to_string())
-            };
-        }
+            entry.take()
+        };
 
         let selected_aspect = if aspect == IMAGE_ASPECT_RATIO_AUTO_CALLBACK {
             None
         } else {
             Some(aspect)
         };
-        finalize_image_request(&bot, &state, request_key, None, selected_aspect).await?;
+        if let Some(request) = ready_request {
+            finalize_image_request(&bot, &state, request, None, selected_aspect).await?;
+        }
     }
 
     Ok(())
@@ -2309,7 +2193,6 @@ pub async fn img_handler(
             prompt: context.prompt,
             image_urls: context.image_urls,
             telegraph_contents: context.telegraph_contents,
-            original_message_text: context.original_message_text,
             selection_message_id: selection_message.id.0 as i64,
             llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
             model: None,
@@ -2317,27 +2200,17 @@ pub async fn img_handler(
             resolution: None,
             aspect_ratio: None,
         };
-        state
-            .pending_image_requests
-            .lock()
-            .insert(request_key.clone(), pending);
-        let bot_clone = bot.clone();
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(CONFIG.model_selection_timeout)).await;
-            let request = state_clone
-                .pending_image_requests
-                .lock()
-                .get(&request_key)
-                .cloned();
-            if let Some(request) = request {
-                if request.model.is_none() {
-                    let _ =
-                        finalize_image_request(&bot_clone, &state_clone, &request_key, None, None)
-                            .await;
-                }
-            }
-        });
+        let timeout_bot = bot.clone();
+        let timeout_state = state.clone();
+        state.pending_image_requests.insert_with_timeout(
+            request_key,
+            pending,
+            Duration::from_secs(CONFIG.model_selection_timeout),
+            move |request| async move {
+                let _ =
+                    finalize_image_request(&timeout_bot, &timeout_state, request, None, None).await;
+            },
+        );
         return Ok(());
     }
 
@@ -2640,7 +2513,6 @@ pub async fn image_handler(
         prompt: context.prompt,
         image_urls: context.image_urls,
         telegraph_contents: context.telegraph_contents,
-        original_message_text: context.original_message_text,
         selection_message_id: selection_message.id.0 as i64,
         llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
         model: initial_model,
@@ -2649,20 +2521,14 @@ pub async fn image_handler(
         aspect_ratio: None,
     };
 
-    state
-        .pending_image_requests
-        .lock()
-        .insert(request_key.clone(), pending);
-    let bot_clone = bot.clone();
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(CONFIG.model_selection_timeout)).await;
-        let request = state_clone
-            .pending_image_requests
-            .lock()
-            .get(&request_key)
-            .cloned();
-        if let Some(request) = request {
+    let timeout_bot = bot.clone();
+    let timeout_state = state.clone();
+    let timeout_key = request_key.clone();
+    state.pending_image_requests.insert_with_timeout(
+        request_key,
+        pending,
+        Duration::from_secs(CONFIG.model_selection_timeout),
+        move |request| async move {
             let should_finalize = match request.model {
                 None => true,
                 Some(ImageGenerationModel::Gemini) => request.resolution.is_none(),
@@ -2670,16 +2536,23 @@ pub async fn image_handler(
             };
             if should_finalize {
                 let _ = finalize_image_request(
-                    &bot_clone,
-                    &state_clone,
-                    &request_key,
+                    &timeout_bot,
+                    &timeout_state,
+                    request,
                     Some(IMAGE_DEFAULT_RESOLUTION),
                     None,
                 )
                 .await;
+            } else {
+                // The user already picked a resolution and is choosing an
+                // aspect ratio; keep waiting for that click (no deadline, as
+                // before).
+                timeout_state
+                    .pending_image_requests
+                    .insert(timeout_key, request);
             }
-        }
-    });
+        },
+    );
 
     Ok(())
 }
@@ -4407,7 +4280,6 @@ external_media_total_max_bytes: 52428800\n"
             prompt: "test".to_string(),
             image_urls: Vec::new(),
             telegraph_contents: Vec::new(),
-            original_message_text: "test".to_string(),
             selection_message_id: 4,
             llm_invocation_id: None,
             model: Some(ImageGenerationModel::Gemini),
@@ -4433,7 +4305,6 @@ external_media_total_max_bytes: 52428800\n"
             prompt: "test".to_string(),
             image_urls: Vec::new(),
             telegraph_contents: Vec::new(),
-            original_message_text: "test".to_string(),
             selection_message_id: 4,
             llm_invocation_id: None,
             model: Some(ImageGenerationModel::Gemini),

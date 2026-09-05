@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use std::sync::LazyLock;
 use tracing::{debug, warn};
 
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
@@ -22,6 +22,7 @@ use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::CodexPromptStyle;
 use crate::utils::http::get_http_client;
+use crate::utils::text::truncate_for_log;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const THIRD_PARTY_MAX_ATTEMPTS: usize = 3;
@@ -98,14 +99,6 @@ struct ProviderRequestDetails {
     headers: Vec<(String, String)>,
     payload: Value,
     request_timeout_secs: u64,
-}
-
-fn truncate_for_log(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(limit).collect();
-    format!("{truncated}... (truncated)")
 }
 
 fn summarize_payload(payload: &Value) -> String {
@@ -197,11 +190,11 @@ fn build_third_party_system_prompt(
     format!("{system_prompt}\n\n{guidance}")
 }
 
-static HARMONY_TAG_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<\|.*?\|>").expect("valid harmony tag regex"));
+static HARMONY_TAG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<\|.*?\|>").expect("valid harmony tag regex"));
 // `(?s)` lets `.` span newlines: reasoning blocks are normally multi-line.
-static THINK_BLOCK_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?s)<think>(.*?)</think>(.*)").expect("valid think block regex"));
+static THINK_BLOCK_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<think>(.*?)</think>(.*)").expect("valid think block regex"));
 
 fn parse_gpt_content(content: &str) -> String {
     if let Some(last_pos) = content.rfind("<|message|>") {

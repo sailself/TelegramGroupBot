@@ -17,6 +17,7 @@ use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::build_message_link;
+use crate::utils::text::truncate_for_log;
 
 const MAX_TOPIC_MAP_CONCURRENCY: usize = 4;
 
@@ -362,7 +363,7 @@ fn validate_map_response(
             Some(TopicCandidate {
                 id: format!("c{chunk_index}_{candidate_index}"),
                 label,
-                description: truncate_chars(raw.description.trim(), 240),
+                description: truncate_for_log(raw.description.trim(), 240),
                 keywords,
                 message_ids,
                 representative_message_ids,
@@ -902,14 +903,6 @@ pub async fn run_topic_discovery_lane(
         gemini_model_used,
         valid_message_ids,
     }))
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(max_chars).collect();
-    format!("{truncated}... (truncated)")
 }
 
 #[cfg(test)]

@@ -2,20 +2,20 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use tracing::info;
 
 use crate::config::CONFIG;
 use crate::utils::http::get_http_client;
 
 const DEFAULT_READ_TIMEOUT: u64 = 30;
-static TITLE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[(\d+)\]\s+Title:\s*(.+)").expect("valid jina title regex"));
-static URL_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[(\d+)\]\s+URL Source:\s*(.+)").expect("valid jina url regex"));
-static SNIPPET_REGEX: Lazy<Regex> = Lazy::new(|| {
+static TITLE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[(\d+)\]\s+Title:\s*(.+)").expect("valid jina title regex"));
+static URL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[(\d+)\]\s+URL Source:\s*(.+)").expect("valid jina url regex"));
+static SNIPPET_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[(\d+)\]\s+(Description|Snippet):\s*(.+)").expect("valid jina snippet regex")
 });
 
