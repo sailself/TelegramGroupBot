@@ -864,10 +864,10 @@ async fn build_status_report(state: &AppState) -> String {
     let heavy_active = state.heavy_command_active();
     let heavy_waiting = state.heavy_command_waiting();
     let media_group_count = state.media_group_count();
-    let pending_q_requests = state.pending_q_requests.lock().len();
-    let pending_image_requests = state.pending_image_requests.lock().len();
-    let pending_codex_model_requests = state.pending_codex_model_requests.lock().len();
-    let pending_codex_reasoning_requests = state.pending_codex_reasoning_requests.lock().len();
+    let pending_q_requests = state.pending_q_requests.count();
+    let pending_image_requests = state.pending_image_requests.count();
+    let pending_codex_model_requests = state.pending_codex_model_requests.count();
+    let pending_codex_reasoning_requests = state.pending_codex_reasoning_requests.count();
 
     let brave_ready = CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty();
     let exa_ready = CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty();
@@ -1751,15 +1751,11 @@ fn resolve_image_request_settings(
 async fn finalize_image_request(
     bot: &Bot,
     state: &AppState,
-    request_key: &str,
+    request: PendingImageRequest,
     resolution: Option<&str>,
     aspect_ratio: Option<&str>,
 ) -> Result<()> {
     let _heavy_permit = state.acquire_heavy_command_permit().await;
-    let request = state.pending_image_requests.lock().remove(request_key);
-    let Some(request) = request else {
-        return Ok(());
-    };
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
     let selected_model = match request.model {
         Some(model) => model,
@@ -1966,21 +1962,30 @@ pub async fn image_selection_callback(
             return Ok(());
         }
 
-        let next_command = {
-            let mut requests = state.pending_image_requests.lock();
-            let Some(request) = requests.get_mut(request_key) else {
+        let (next_command, ready_request) = {
+            let mut entry = state.pending_image_requests.entry(request_key);
+            let Some(request) = entry.get_mut() else {
                 return Ok(());
             };
             if request.user_id != query_user_id {
                 return Ok(());
             }
             request.model = Some(model);
-            request.command
+            let command = request.command;
+            // /img has nothing more to ask: take the request now so the
+            // timeout task can no longer race this selection.
+            let ready_request = match command {
+                PendingImageCommand::Img => entry.take(),
+                PendingImageCommand::Image => None,
+            };
+            (command, ready_request)
         };
 
         match (next_command, model) {
             (PendingImageCommand::Img, _) => {
-                finalize_image_request(&bot, &state, request_key, None, None).await?;
+                if let Some(request) = ready_request {
+                    finalize_image_request(&bot, &state, request, None, None).await?;
+                }
             }
             (PendingImageCommand::Image, ImageGenerationModel::Gemini) => {
                 if let Some(message) = &query.message {
@@ -2023,15 +2028,21 @@ pub async fn image_selection_callback(
             return Ok(());
         }
 
-        if let Some(request) = state.pending_image_requests.lock().get_mut(request_key) {
-            if request.user_id != query_user_id {
-                return Ok(());
+        let ready_request = {
+            let mut entry = state.pending_image_requests.entry(request_key);
+            match entry.get_mut() {
+                Some(request) if request.user_id != query_user_id => return Ok(()),
+                Some(request) => {
+                    request.model = Some(ImageGenerationModel::CodexGptImage2);
+                    request.codex_size = Some(size.to_string());
+                }
+                None => {}
             }
-            request.model = Some(ImageGenerationModel::CodexGptImage2);
-            request.codex_size = Some(size.to_string());
+            entry.take()
+        };
+        if let Some(request) = ready_request {
+            finalize_image_request(&bot, &state, request, None, None).await?;
         }
-
-        finalize_image_request(&bot, &state, request_key, None, None).await?;
         return Ok(());
     }
 
@@ -2044,7 +2055,7 @@ pub async fn image_selection_callback(
             return Ok(());
         }
 
-        if let Some(request) = state.pending_image_requests.lock().get_mut(request_key) {
+        if let Some(request) = state.pending_image_requests.entry(request_key).get_mut() {
             if request.user_id != query_user_id {
                 return Ok(());
             }
@@ -2077,23 +2088,30 @@ pub async fn image_selection_callback(
             return Ok(());
         }
 
-        if let Some(request) = state.pending_image_requests.lock().get_mut(request_key) {
-            if request.user_id != query_user_id {
-                return Ok(());
+        let ready_request = {
+            let mut entry = state.pending_image_requests.entry(request_key);
+            match entry.get_mut() {
+                Some(request) if request.user_id != query_user_id => return Ok(()),
+                Some(request) => {
+                    request.aspect_ratio = if aspect == IMAGE_ASPECT_RATIO_AUTO_CALLBACK {
+                        None
+                    } else {
+                        Some(aspect.to_string())
+                    };
+                }
+                None => {}
             }
-            request.aspect_ratio = if aspect == IMAGE_ASPECT_RATIO_AUTO_CALLBACK {
-                None
-            } else {
-                Some(aspect.to_string())
-            };
-        }
+            entry.take()
+        };
 
         let selected_aspect = if aspect == IMAGE_ASPECT_RATIO_AUTO_CALLBACK {
             None
         } else {
             Some(aspect)
         };
-        finalize_image_request(&bot, &state, request_key, None, selected_aspect).await?;
+        if let Some(request) = ready_request {
+            finalize_image_request(&bot, &state, request, None, selected_aspect).await?;
+        }
     }
 
     Ok(())
@@ -2185,27 +2203,17 @@ pub async fn img_handler(
             resolution: None,
             aspect_ratio: None,
         };
-        state
-            .pending_image_requests
-            .lock()
-            .insert(request_key.clone(), pending);
-        let bot_clone = bot.clone();
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(CONFIG.model_selection_timeout)).await;
-            let request = state_clone
-                .pending_image_requests
-                .lock()
-                .get(&request_key)
-                .cloned();
-            if let Some(request) = request {
-                if request.model.is_none() {
-                    let _ =
-                        finalize_image_request(&bot_clone, &state_clone, &request_key, None, None)
-                            .await;
-                }
-            }
-        });
+        let timeout_bot = bot.clone();
+        let timeout_state = state.clone();
+        state.pending_image_requests.insert_with_timeout(
+            request_key,
+            pending,
+            Duration::from_secs(CONFIG.model_selection_timeout),
+            move |request| async move {
+                let _ =
+                    finalize_image_request(&timeout_bot, &timeout_state, request, None, None).await;
+            },
+        );
         return Ok(());
     }
 
@@ -2517,20 +2525,14 @@ pub async fn image_handler(
         aspect_ratio: None,
     };
 
-    state
-        .pending_image_requests
-        .lock()
-        .insert(request_key.clone(), pending);
-    let bot_clone = bot.clone();
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(CONFIG.model_selection_timeout)).await;
-        let request = state_clone
-            .pending_image_requests
-            .lock()
-            .get(&request_key)
-            .cloned();
-        if let Some(request) = request {
+    let timeout_bot = bot.clone();
+    let timeout_state = state.clone();
+    let timeout_key = request_key.clone();
+    state.pending_image_requests.insert_with_timeout(
+        request_key,
+        pending,
+        Duration::from_secs(CONFIG.model_selection_timeout),
+        move |request| async move {
             let should_finalize = match request.model {
                 None => true,
                 Some(ImageGenerationModel::Gemini) => request.resolution.is_none(),
@@ -2538,16 +2540,23 @@ pub async fn image_handler(
             };
             if should_finalize {
                 let _ = finalize_image_request(
-                    &bot_clone,
-                    &state_clone,
-                    &request_key,
+                    &timeout_bot,
+                    &timeout_state,
+                    request,
                     Some(IMAGE_DEFAULT_RESOLUTION),
                     None,
                 )
                 .await;
+            } else {
+                // The user already picked a resolution and is choosing an
+                // aspect ratio; keep waiting for that click (no deadline, as
+                // before).
+                timeout_state
+                    .pending_image_requests
+                    .insert(timeout_key, request);
             }
-        }
-    });
+        },
+    );
 
     Ok(())
 }

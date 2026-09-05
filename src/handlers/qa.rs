@@ -46,7 +46,7 @@ use crate::llm::{
     call_gemini, call_gemini_with_tool_runtime, call_third_party,
     call_third_party_with_tool_runtime,
 };
-use crate::state::{AppState, PendingQRequest, QaCommandMode};
+use crate::state::{AppState, PendingEntryGuard, PendingQRequest, QaCommandMode};
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::{build_message_link, retry_telegram, start_chat_action_heartbeat};
@@ -769,8 +769,7 @@ enum PendingQRequestCallbackAction {
 }
 
 fn take_pending_q_request_for_callback<F>(
-    pending: &mut std::collections::HashMap<String, PendingQRequest>,
-    request_key: &str,
+    pending: &mut PendingEntryGuard<'_, PendingQRequest>,
     query_user_id: i64,
     now: i64,
     timeout_secs: u64,
@@ -779,7 +778,7 @@ fn take_pending_q_request_for_callback<F>(
 where
     F: FnOnce(&PendingQRequest) -> bool,
 {
-    let Some(request) = pending.get(request_key) else {
+    let Some(request) = pending.get() else {
         return PendingQRequestCallbackAction::Missing;
     };
 
@@ -790,7 +789,7 @@ where
     let timeout_secs = i64::try_from(timeout_secs).unwrap_or(i64::MAX);
     if now.saturating_sub(request.timestamp) > timeout_secs {
         return pending
-            .remove(request_key)
+            .take()
             .map(PendingQRequestCallbackAction::UseDefault)
             .unwrap_or(PendingQRequestCallbackAction::Missing);
     }
@@ -800,7 +799,7 @@ where
     }
 
     pending
-        .remove(request_key)
+        .take()
         .map(PendingQRequestCallbackAction::UseSelected)
         .unwrap_or(PendingQRequestCallbackAction::Missing)
 }
@@ -2094,8 +2093,8 @@ async fn process_request(
 mod tests {
     use super::*;
     use crate::handlers::media::MediaSummary;
+    use crate::state::PendingRequests;
     use serde_json::json;
-    use std::collections::HashMap;
     use teloxide::types::InlineKeyboardButtonKind;
 
     #[test]
@@ -2214,57 +2213,77 @@ mod tests {
         }
     }
 
+    fn pending_with_request(
+        original_user_id: i64,
+        timestamp: i64,
+    ) -> PendingRequests<PendingQRequest> {
+        let pending = PendingRequests::new();
+        pending.insert(
+            "request".to_string(),
+            pending_q_request(original_user_id, timestamp),
+        );
+        pending
+    }
+
     #[test]
     fn callback_take_keeps_pending_request_for_wrong_user() {
-        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+        let pending = pending_with_request(10, 100);
 
         let action =
-            take_pending_q_request_for_callback(&mut pending, "request", 20, 105, 30, |_| true);
+            take_pending_q_request_for_callback(&mut pending.entry("request"), 20, 105, 30, |_| {
+                true
+            });
 
         assert!(matches!(action, PendingQRequestCallbackAction::Ignored));
-        assert!(pending.contains_key("request"));
+        assert!(pending.entry("request").get().is_some());
     }
 
     #[test]
     fn callback_take_uses_default_model_when_selection_arrives_after_timeout() {
-        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+        let pending = pending_with_request(10, 100);
 
         let action =
-            take_pending_q_request_for_callback(&mut pending, "request", 10, 131, 30, |_| true);
+            take_pending_q_request_for_callback(&mut pending.entry("request"), 10, 131, 30, |_| {
+                true
+            });
 
         let PendingQRequestCallbackAction::UseDefault(request) = action else {
             panic!("expected expired callback to use the default model");
         };
         assert_eq!(request.original_user_id, 10);
-        assert!(pending.is_empty());
+        assert_eq!(pending.count(), 0);
     }
 
     #[test]
     fn callback_take_keeps_pending_request_for_invalid_model_selection() {
-        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+        let pending = pending_with_request(10, 100);
 
         let action =
-            take_pending_q_request_for_callback(&mut pending, "request", 10, 105, 30, |_| false);
+            take_pending_q_request_for_callback(&mut pending.entry("request"), 10, 105, 30, |_| {
+                false
+            });
 
         assert!(matches!(
             action,
             PendingQRequestCallbackAction::InvalidSelection
         ));
-        assert!(pending.contains_key("request"));
+        assert!(pending.entry("request").get().is_some());
     }
 
     #[test]
     fn callback_take_consumes_pending_request_for_valid_selection() {
-        let mut pending = HashMap::from([("request".to_string(), pending_q_request(10, 100))]);
+        let pending = pending_with_request(10, 100);
 
         let action =
-            take_pending_q_request_for_callback(&mut pending, "request", 10, 105, 30, |_| true);
+            take_pending_q_request_for_callback(&mut pending.entry("request"), 10, 105, 30, |_| {
+                true
+            });
 
         let PendingQRequestCallbackAction::UseSelected(request) = action else {
             panic!("expected valid callback to use the selected model");
         };
         assert_eq!(request.original_user_id, 10);
-        assert!(pending.is_empty());
+        assert_eq!(pending.count(), 0);
     }
 
     fn text_message_from(
@@ -3962,16 +3981,17 @@ async fn q_handler_internal(
         mode,
     };
 
-    state
-        .pending_q_requests
-        .lock()
-        .insert(request_key.clone(), pending_request);
-
-    let bot_clone = bot.clone();
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        handle_model_timeout(bot_clone, state_clone, request_key).await;
-    });
+    let timeout_bot = bot.clone();
+    let timeout_state = state.clone();
+    state.pending_q_requests.insert_with_timeout(
+        request_key,
+        pending_request,
+        Duration::from_secs(CONFIG.model_selection_timeout),
+        move |request| async move {
+            process_timed_out_q_request_with_default_model(&timeout_bot, &timeout_state, request)
+                .await;
+        },
+    );
 
     Ok(())
 }
@@ -4186,16 +4206,17 @@ pub async fn s_handler(
         Some(timer),
     );
 
-    state
-        .pending_q_requests
-        .lock()
-        .insert(request_key.clone(), pending_request);
-
-    let bot_clone = bot.clone();
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        handle_model_timeout(bot_clone, state_clone, request_key).await;
-    });
+    let timeout_bot = bot.clone();
+    let timeout_state = state.clone();
+    state.pending_q_requests.insert_with_timeout(
+        request_key,
+        pending_request,
+        Duration::from_secs(CONFIG.model_selection_timeout),
+        move |request| async move {
+            process_timed_out_q_request_with_default_model(&timeout_bot, &timeout_state, request)
+                .await;
+        },
+    );
 
     Ok(())
 }
@@ -4207,16 +4228,6 @@ pub async fn qq_handler(
     query: Option<String>,
 ) -> Result<()> {
     q_handler_internal(bot, state, message, query, "qq", QaCommandMode::Quick).await
-}
-
-pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String) {
-    tokio::time::sleep(Duration::from_secs(CONFIG.model_selection_timeout)).await;
-    let request = state.pending_q_requests.lock().remove(&request_key);
-    let Some(request) = request else {
-        return;
-    };
-
-    process_timed_out_q_request_with_default_model(&bot, &state, request).await;
 }
 
 async fn process_timed_out_q_request_with_default_model(
@@ -4316,10 +4327,9 @@ pub async fn model_selection_callback(
     let request_key = format!("{}_{}", message.chat().id.0, message.id().0);
     let query_user_id = i64::try_from(query.from.id.0).unwrap_or_default();
     let action = {
-        let mut pending = state.pending_q_requests.lock();
+        let mut pending = state.pending_q_requests.entry(&request_key);
         take_pending_q_request_for_callback(
             &mut pending,
-            &request_key,
             query_user_id,
             now_unix_seconds(),
             CONFIG.model_selection_timeout,

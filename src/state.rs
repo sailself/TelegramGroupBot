@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use teloxide::types::{FileId, MediaGroupId};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::task::AbortHandle;
 
 use crate::config::CONFIG;
 use crate::db::database::Database;
@@ -122,6 +124,151 @@ pub struct ActiveCodexLogin {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
+struct PendingEntry<T> {
+    request: T,
+    /// Handle of the timeout task armed by [`PendingRequests::insert_with_timeout`].
+    timeout: Option<AbortHandle>,
+}
+
+impl<T> PendingEntry<T> {
+    fn cancel_timeout(self) -> T {
+        if let Some(timeout) = self.timeout {
+            timeout.abort();
+        }
+        self.request
+    }
+}
+
+/// Interactive requests waiting on a user's inline-keyboard choice, keyed by
+/// the selection message. Each entry may carry a timeout task that removes
+/// the request and hands it to a fallback once the user stops responding;
+/// resolving the request through [`PendingEntryGuard::take`] cancels that
+/// task so a late timeout can never double-process a request.
+pub struct PendingRequests<T> {
+    entries: Arc<Mutex<HashMap<String, PendingEntry<T>>>>,
+}
+
+impl<T> Clone for PendingRequests<T> {
+    fn clone(&self) -> Self {
+        Self {
+            entries: Arc::clone(&self.entries),
+        }
+    }
+}
+
+impl<T> Default for PendingRequests<T> {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<T> PendingRequests<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store `request` under `key` with no deadline. Replaces (and cancels the
+    /// timeout of) any request already stored under the same key.
+    pub fn insert(&self, key: String, request: T) {
+        let previous = self.entries.lock().insert(
+            key,
+            PendingEntry {
+                request,
+                timeout: None,
+            },
+        );
+        if let Some(previous) = previous {
+            previous.cancel_timeout();
+        }
+    }
+
+    /// Store `request` under `key` and, unless it is taken first, remove it
+    /// after `timeout` and pass it to `on_timeout`.
+    pub fn insert_with_timeout<F, Fut>(
+        &self,
+        key: String,
+        request: T,
+        timeout: Duration,
+        on_timeout: F,
+    ) where
+        T: Send + 'static,
+        F: FnOnce(T) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        // Insert and arm under one lock so the timeout task can never observe
+        // the map before its own handle is recorded.
+        let mut entries = self.entries.lock();
+        let previous = entries.insert(
+            key.clone(),
+            PendingEntry {
+                request,
+                timeout: None,
+            },
+        );
+        let timeout_entries = Arc::clone(&self.entries);
+        let timeout_key = key.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            // This *is* the timeout task, so remove without cancelling.
+            let expired = timeout_entries
+                .lock()
+                .remove(&timeout_key)
+                .map(|entry| entry.request);
+            if let Some(request) = expired {
+                on_timeout(request).await;
+            }
+        });
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.timeout = Some(task.abort_handle());
+        }
+        drop(entries);
+        if let Some(previous) = previous {
+            previous.cancel_timeout();
+        }
+    }
+
+    /// Lock the entry under `key` for inspection, mutation, or removal.
+    pub fn entry<'a>(&'a self, key: &'a str) -> PendingEntryGuard<'a, T> {
+        PendingEntryGuard {
+            key,
+            entries: self.entries.lock(),
+        }
+    }
+
+    /// Number of requests currently waiting on a selection.
+    pub fn count(&self) -> usize {
+        self.entries.lock().len()
+    }
+}
+
+/// Locked view of one pending request; holds the map lock until dropped, so
+/// a read-decide-take sequence is atomic with respect to other callbacks.
+pub struct PendingEntryGuard<'a, T> {
+    key: &'a str,
+    entries: MutexGuard<'a, HashMap<String, PendingEntry<T>>>,
+}
+
+impl<T> PendingEntryGuard<'_, T> {
+    pub fn get(&self) -> Option<&T> {
+        self.entries.get(self.key).map(|entry| &entry.request)
+    }
+
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        self.entries
+            .get_mut(self.key)
+            .map(|entry| &mut entry.request)
+    }
+
+    /// Remove the request, cancelling its timeout task.
+    pub fn take(&mut self) -> Option<T> {
+        self.entries
+            .remove(self.key)
+            .map(PendingEntry::cancel_timeout)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MediaGroupItem {
     pub file_id: FileId,
@@ -138,10 +285,10 @@ pub struct AppState {
     pub db: Database,
     pub bot_user_id: i64,
     pub bot_username_lower: String,
-    pub pending_q_requests: Arc<Mutex<HashMap<String, PendingQRequest>>>,
-    pub pending_image_requests: Arc<Mutex<HashMap<String, PendingImageRequest>>>,
-    pub pending_codex_model_requests: Arc<Mutex<HashMap<String, PendingCodexModelRequest>>>,
-    pub pending_codex_reasoning_requests: Arc<Mutex<HashMap<String, PendingCodexReasoningRequest>>>,
+    pub pending_q_requests: PendingRequests<PendingQRequest>,
+    pub pending_image_requests: PendingRequests<PendingImageRequest>,
+    pub pending_codex_model_requests: PendingRequests<PendingCodexModelRequest>,
+    pub pending_codex_reasoning_requests: PendingRequests<PendingCodexReasoningRequest>,
     pub active_codex_login: Arc<Mutex<Option<ActiveCodexLogin>>>,
     pub codex_auth_flow_lock: Arc<AsyncMutex<()>>,
     pub media_groups: Arc<Mutex<HashMap<MediaGroupId, MediaGroupState>>>,
@@ -155,10 +302,10 @@ impl AppState {
             db,
             bot_user_id,
             bot_username_lower,
-            pending_q_requests: Arc::new(Mutex::new(HashMap::new())),
-            pending_image_requests: Arc::new(Mutex::new(HashMap::new())),
-            pending_codex_model_requests: Arc::new(Mutex::new(HashMap::new())),
-            pending_codex_reasoning_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_q_requests: PendingRequests::new(),
+            pending_image_requests: PendingRequests::new(),
+            pending_codex_model_requests: PendingRequests::new(),
+            pending_codex_reasoning_requests: PendingRequests::new(),
             active_codex_login: Arc::new(Mutex::new(None)),
             codex_auth_flow_lock: Arc::new(AsyncMutex::new(())),
             media_groups: Arc::new(Mutex::new(HashMap::new())),
@@ -290,5 +437,94 @@ mod tests {
         drop(reused);
         drop(fresh);
         assert_eq!(state.heavy_command_active(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_request_times_out_with_its_request_when_nobody_resolves_it() {
+        let pending: PendingRequests<u32> = PendingRequests::new();
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let sink = fired.clone();
+        pending.insert_with_timeout(
+            "k".to_string(),
+            7,
+            Duration::from_secs(30),
+            move |request| async move {
+                sink.lock().push(request);
+            },
+        );
+        assert_eq!(pending.count(), 1);
+
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(*fired.lock(), vec![7]);
+        assert_eq!(pending.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn taking_a_pending_request_cancels_its_timeout() {
+        let pending: PendingRequests<u32> = PendingRequests::new();
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = fired.clone();
+        pending.insert_with_timeout(
+            "k".to_string(),
+            7,
+            Duration::from_secs(30),
+            move |_| async move {
+                flag.store(true, Ordering::SeqCst);
+            },
+        );
+
+        assert_eq!(pending.entry("k").take(), Some(7));
+        assert_eq!(pending.entry("k").take(), None);
+
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "timeout must not fire after the request was resolved"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn re_inserting_a_key_cancels_the_previous_timeout() {
+        let pending: PendingRequests<u32> = PendingRequests::new();
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let first = fired.clone();
+        pending.insert_with_timeout(
+            "k".to_string(),
+            1,
+            Duration::from_secs(10),
+            move |request| async move {
+                first.lock().push(request);
+            },
+        );
+        let second = fired.clone();
+        pending.insert_with_timeout(
+            "k".to_string(),
+            2,
+            Duration::from_secs(20),
+            move |request| async move {
+                second.lock().push(request);
+            },
+        );
+
+        tokio::time::sleep(Duration::from_secs(21)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*fired.lock(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn entry_guard_reads_mutates_and_takes_in_place() {
+        let pending: PendingRequests<String> = PendingRequests::new();
+        pending.insert("k".to_string(), "a".to_string());
+        {
+            let mut entry = pending.entry("k");
+            assert_eq!(entry.get().map(String::as_str), Some("a"));
+            entry.get_mut().unwrap().push('b');
+        }
+        assert_eq!(pending.entry("k").take(), Some("ab".to_string()));
+        assert!(pending.entry("k").get().is_none());
+        assert_eq!(pending.count(), 0);
     }
 }

@@ -328,24 +328,19 @@ fn build_usage_report(snapshot: &openai_codex::CodexUsageSnapshot) -> String {
     lines.join("\n")
 }
 
-async fn handle_model_selection_timeout(bot: Bot, state: AppState, request_id: String) {
-    tokio::time::sleep(Duration::from_secs(
-        crate::config::CONFIG.model_selection_timeout,
-    ))
-    .await;
-    let pending = state
-        .pending_codex_model_requests
-        .lock()
-        .remove(&request_id);
-    let Some(pending) = pending else {
-        return;
-    };
-
+/// Timeout fallback shared by the Codex model and reasoning pickers: clear
+/// the keyboard and tell the admin to start over.
+async fn expire_codex_selection_message(
+    bot: Bot,
+    chat_id: i64,
+    selection_message_id: i64,
+    text: &'static str,
+) {
     let _ = bot
         .edit_message_text(
-            ChatId(pending.chat_id),
-            MessageId(pending.selection_message_id as i32),
-            "Codex model selection timed out. Run /codexmodel again when you want to change it.",
+            ChatId(chat_id),
+            MessageId(selection_message_id as i32),
+            text,
         )
         .reply_markup(InlineKeyboardMarkup::new(
             Vec::<Vec<InlineKeyboardButton>>::new(),
@@ -523,8 +518,9 @@ pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) ->
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     let request_id = request_key(message.chat.id, selection_message.id);
-    state.pending_codex_model_requests.lock().insert(
-        request_id.clone(),
+    let timeout_bot = bot.clone();
+    state.pending_codex_model_requests.insert_with_timeout(
+        request_id,
         PendingCodexModelRequest {
             admin_user_id,
             account_id,
@@ -535,13 +531,17 @@ pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) ->
             etag: list.etag,
             models,
         },
+        Duration::from_secs(crate::config::CONFIG.model_selection_timeout),
+        move |pending| async move {
+            expire_codex_selection_message(
+                timeout_bot,
+                pending.chat_id,
+                pending.selection_message_id,
+                "Codex model selection timed out. Run /codexmodel again when you want to change it.",
+            )
+            .await;
+        },
     );
-
-    let bot_clone = bot.clone();
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        handle_model_selection_timeout(bot_clone, state_clone, request_id).await;
-    });
 
     Ok(())
 }
@@ -646,8 +646,9 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     let request_id = request_key(message.chat.id, selection_message.id);
-    state.pending_codex_reasoning_requests.lock().insert(
-        request_id.clone(),
+    let timeout_bot = bot.clone();
+    state.pending_codex_reasoning_requests.insert_with_timeout(
+        request_id,
         PendingCodexReasoningRequest {
             admin_user_id,
             account_id,
@@ -657,33 +658,17 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
             timestamp: now_unix_seconds(),
             supported_levels: record.supported_reasoning_levels.clone(),
         },
-    );
-
-    let bot_clone = bot.clone();
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(
-            crate::config::CONFIG.model_selection_timeout,
-        ))
-        .await;
-        let pending = state_clone
-            .pending_codex_reasoning_requests
-            .lock()
-            .remove(&request_id);
-        let Some(pending) = pending else {
-            return;
-        };
-        let _ = bot_clone
-            .edit_message_text(
-                ChatId(pending.chat_id),
-                MessageId(pending.selection_message_id as i32),
+        Duration::from_secs(crate::config::CONFIG.model_selection_timeout),
+        move |pending| async move {
+            expire_codex_selection_message(
+                timeout_bot,
+                pending.chat_id,
+                pending.selection_message_id,
                 "Codex reasoning selection timed out. Run /codexreasoning again when you want to change it.",
             )
-            .reply_markup(InlineKeyboardMarkup::new(
-                Vec::<Vec<InlineKeyboardButton>>::new(),
-            ))
             .await;
-    });
+        },
+    );
 
     Ok(())
 }
@@ -745,21 +730,21 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
         }
 
         let action = {
-            let mut pending_map = state.pending_codex_reasoning_requests.lock();
-            match pending_map.get(&request_id) {
+            let mut pending_map = state.pending_codex_reasoning_requests.entry(&request_id);
+            match pending_map.get() {
                 None => ReasoningAction::Expired,
                 Some(pending) if pending.admin_user_id != query_user_id => ReasoningAction::Ignore,
                 Some(pending)
                     if callback_account_id.as_deref() != Some(pending.account_id.as_str()) =>
                 {
-                    pending_map.remove(&request_id);
+                    pending_map.take();
                     ReasoningAction::Expired
                 }
                 Some(pending)
                     if now_unix_seconds() - pending.timestamp
                         > crate::config::CONFIG.model_selection_timeout as i64 =>
                 {
-                    pending_map.remove(&request_id);
+                    pending_map.take();
                     ReasoningAction::Expired
                 }
                 Some(pending) => {
@@ -784,7 +769,7 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                     let model_slug = pending.model_slug.clone();
                     let display_name = runtime_models::selected_codex_model_record()
                         .map(|record| record.display_name);
-                    pending_map.remove(&request_id);
+                    pending_map.take();
                     ReasoningAction::Apply {
                         level: selected_level,
                         display_name,
@@ -875,8 +860,8 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
     }
 
     let action = {
-        let mut pending_map = state.pending_codex_model_requests.lock();
-        match pending_map.get_mut(&request_id) {
+        let mut pending_map = state.pending_codex_model_requests.entry(&request_id);
+        match pending_map.get_mut() {
             None => CallbackAction::Expired,
             Some(pending) => {
                 if pending.admin_user_id != query_user_id {
@@ -885,7 +870,7 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                     || now_unix_seconds() - pending.timestamp
                         > crate::config::CONFIG.model_selection_timeout as i64
                 {
-                    pending_map.remove(&request_id);
+                    pending_map.take();
                     CallbackAction::Expired
                 } else if let Some(page_raw) = data.strip_prefix(CODEX_MODEL_PAGE_CALLBACK_PREFIX) {
                     let page = page_raw.parse::<usize>().unwrap_or(0);
@@ -906,12 +891,12 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                     };
                     let Some(model) = resolve_model_callback_token(token, &pending.models).cloned()
                     else {
-                        pending_map.remove(&request_id);
+                        pending_map.take();
                         return Ok(());
                     };
                     let etag = pending.etag.clone();
                     let account_id = pending.account_id.clone();
-                    pending_map.remove(&request_id);
+                    pending_map.take();
                     CallbackAction::SelectModel {
                         model,
                         etag,
