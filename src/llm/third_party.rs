@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -196,24 +197,34 @@ fn build_third_party_system_prompt(
     format!("{system_prompt}\n\n{guidance}")
 }
 
+static HARMONY_TAG_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"<\|.*?\|>").expect("valid harmony tag regex"));
+// `(?s)` lets `.` span newlines: reasoning blocks are normally multi-line.
+static THINK_BLOCK_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?s)<think>(.*?)</think>(.*)").expect("valid think block regex"));
+
 fn parse_gpt_content(content: &str) -> String {
     if let Some(last_pos) = content.rfind("<|message|>") {
         let analysis = &content[..last_pos];
         let final_text = &content[last_pos + "<|message|>".len()..];
-        let cleanup = Regex::new(r"<\|.*?\|>").unwrap();
-        let final_clean = cleanup.replace_all(final_text, "").trim().to_string();
+        let final_clean = HARMONY_TAG_REGEX
+            .replace_all(final_text, "")
+            .trim()
+            .to_string();
         if !final_clean.is_empty() {
             return final_clean;
         }
-        let analysis_clean = cleanup.replace_all(analysis, "").trim().to_string();
+        let analysis_clean = HARMONY_TAG_REGEX
+            .replace_all(analysis, "")
+            .trim()
+            .to_string();
         return analysis_clean;
     }
     content.to_string()
 }
 
 fn parse_qwen_content(content: &str) -> String {
-    let re = Regex::new(r"<think>(.*?)</think>(.*)").unwrap();
-    if let Some(caps) = re.captures(content) {
+    if let Some(caps) = THINK_BLOCK_REGEX.captures(content) {
         let final_text = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         let final_text = final_text.trim();
         if !final_text.is_empty() {
@@ -1328,5 +1339,32 @@ mod tests {
             build_third_party_system_prompt("Base prompt", false),
             "Base prompt"
         );
+    }
+
+    #[test]
+    fn parse_qwen_content_strips_multiline_think_block() {
+        let content = "<think>\nLet me reason.\nStep two.\n</think>\n\nThe answer is 42.";
+        assert_eq!(parse_qwen_content(content), "The answer is 42.");
+    }
+
+    #[test]
+    fn parse_qwen_content_strips_single_line_think_block() {
+        assert_eq!(
+            parse_qwen_content("<think>hmm</think> Final answer"),
+            "Final answer"
+        );
+    }
+
+    #[test]
+    fn parse_qwen_content_falls_back_to_reasoning_when_answer_is_empty() {
+        assert_eq!(
+            parse_qwen_content("<think>\nonly reasoning\n</think>"),
+            "only reasoning"
+        );
+    }
+
+    #[test]
+    fn parse_qwen_content_returns_plain_text_unchanged() {
+        assert_eq!(parse_qwen_content("  plain answer  "), "plain answer");
     }
 }
