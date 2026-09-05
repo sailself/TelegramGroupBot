@@ -242,6 +242,11 @@ fn serve(
     }
 
     if !expected.is_empty() {
+        // When the client is allowed to give up (deadline tests), it may do so
+        // before the request ever reaches this server; that is not a failure.
+        if allow_client_disconnect.load(Ordering::Acquire) {
+            return Ok(());
+        }
         return Err(format!("unmet expectations: {}", expected.len()));
     }
     first_error.map_or(Ok(()), |error| {
