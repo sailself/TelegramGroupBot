@@ -2780,6 +2780,17 @@ async fn tldr_single_call(
     .await
 }
 
+const TLDR_DEFAULT_MESSAGE_COUNT: i64 = 100;
+
+/// Number of messages `/tldr <n>` should summarize, clamped to a sane range so
+/// a negative or huge argument cannot turn into an unbounded fetch.
+fn resolve_tldr_count(arg: Option<&str>, max_messages: usize) -> i64 {
+    let max = i64::try_from(max_messages).unwrap_or(i64::MAX).max(1);
+    arg.and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(TLDR_DEFAULT_MESSAGE_COUNT)
+        .clamp(1, max)
+}
+
 #[allow(deprecated)]
 pub async fn tldr_handler(
     bot: Bot,
@@ -2816,15 +2827,15 @@ pub async fn tldr_handler(
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
 
     let mut messages = if let Some(reply) = message.reply_to_message() {
+        // Fetch one past the cap so the truncation notice below still fires
+        // without pulling the whole chat into memory.
+        let fetch_limit = (CONFIG.tldr_max_messages + 1) as i64;
         state
             .db
-            .select_messages_from_id(message.chat.id.0, reply.id.0 as i64)
+            .select_messages_from_id(message.chat.id.0, reply.id.0 as i64, fetch_limit)
             .await?
     } else {
-        let n = count
-            .as_ref()
-            .and_then(|value| value.trim().parse::<i64>().ok())
-            .unwrap_or(100);
+        let n = resolve_tldr_count(count.as_deref(), CONFIG.tldr_max_messages);
         state.db.select_messages(message.chat.id.0, n).await?
     };
 
@@ -4592,5 +4603,22 @@ external_media_total_max_bytes: 52428800\n"
             build_token_stats_user_response(&rows),
             "Token usage by user:\n\n1. Alice: 9.9k tokens"
         );
+    }
+
+    #[test]
+    fn tldr_count_defaults_when_missing_or_unparsable() {
+        assert_eq!(resolve_tldr_count(None, 2_000), TLDR_DEFAULT_MESSAGE_COUNT);
+        assert_eq!(
+            resolve_tldr_count(Some("lots"), 2_000),
+            TLDR_DEFAULT_MESSAGE_COUNT
+        );
+        assert_eq!(resolve_tldr_count(Some(" 50 "), 2_000), 50);
+    }
+
+    #[test]
+    fn tldr_count_is_clamped_to_a_bounded_range() {
+        assert_eq!(resolve_tldr_count(Some("-1"), 2_000), 1);
+        assert_eq!(resolve_tldr_count(Some("0"), 2_000), 1);
+        assert_eq!(resolve_tldr_count(Some("9999999"), 2_000), 2_000);
     }
 }
