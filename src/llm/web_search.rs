@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use parking_lot::Mutex;
 use std::sync::LazyLock;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::config::CONFIG;
@@ -11,6 +10,7 @@ use crate::llm::brave_search::brave_search;
 use crate::llm::exa_search::exa_search;
 use crate::llm::jina_search::search_jina_web;
 use crate::utils::text::truncate_with_ellipsis;
+use crate::utils::ttl_cache::TtlCache;
 
 const DEFAULT_MAX_RESULTS: usize = 5;
 const MAX_RESULTS_LIMIT: usize = 10;
@@ -23,14 +23,12 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    stored_at: Instant,
-    results: Vec<SearchResult>,
-}
-
-static SEARCH_CACHE: LazyLock<Mutex<HashMap<String, CacheEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SEARCH_CACHE: LazyLock<Mutex<TtlCache<String, Vec<SearchResult>>>> = LazyLock::new(|| {
+    Mutex::new(TtlCache::new(
+        cache_ttl(),
+        CONFIG.web_search_cache_max_entries,
+    ))
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSearchProvider {
@@ -88,66 +86,20 @@ fn cache_ttl() -> Duration {
     Duration::from_secs(CONFIG.web_search_cache_ttl_seconds)
 }
 
-async fn get_cached(query: &str, max_results: usize) -> Option<Vec<SearchResult>> {
-    let ttl = cache_ttl();
-    if ttl.is_zero() {
-        return None;
-    }
-
-    let key = cache_key(query, max_results);
-    let mut cache = SEARCH_CACHE.lock().await;
-    prune_cache(&mut cache, ttl);
-    if let Some(entry) = cache.get(&key) {
-        if entry.stored_at.elapsed() < ttl {
-            return Some(entry.results.clone());
-        }
-    }
-    cache.remove(&key);
-    None
-}
-
-async fn set_cached(query: &str, max_results: usize, results: Vec<SearchResult>) {
-    if cache_ttl().is_zero() {
-        return;
-    }
-
-    let key = cache_key(query, max_results);
-    let entry = CacheEntry {
-        stored_at: Instant::now(),
-        results,
-    };
-    let mut cache = SEARCH_CACHE.lock().await;
-    prune_cache(&mut cache, cache_ttl());
-    cache.insert(key, entry);
-    prune_cache(&mut cache, cache_ttl());
+fn get_cached(query: &str, max_results: usize) -> Option<Vec<SearchResult>> {
+    SEARCH_CACHE.lock().get(&cache_key(query, max_results))
 }
 
 /// Cache a completed search. Empty result sets are not cached: they are
 /// usually a provider hiccup, and caching them would pin "no results" for
-/// the whole TTL.
-async fn cache_search_results(query: &str, max_results: usize, results: &[SearchResult]) {
+/// the whole TTL. A zero WEB_SEARCH_CACHE_TTL_SECONDS disables the cache.
+fn cache_search_results(query: &str, max_results: usize, results: &[SearchResult]) {
     if results.is_empty() {
         return;
     }
-    set_cached(query, max_results, results.to_vec()).await;
-}
-
-fn prune_cache(cache: &mut HashMap<String, CacheEntry>, ttl: Duration) {
-    cache.retain(|_, entry| entry.stored_at.elapsed() < ttl);
-    let max_entries = CONFIG.web_search_cache_max_entries;
-    if cache.len() <= max_entries {
-        return;
-    }
-
-    let mut ordered = cache
-        .iter()
-        .map(|(key, entry)| (key.clone(), entry.stored_at))
-        .collect::<Vec<_>>();
-    ordered.sort_by_key(|(_, stored_at)| *stored_at);
-    let remove_count = cache.len().saturating_sub(max_entries);
-    for (key, _) in ordered.into_iter().take(remove_count) {
-        cache.remove(&key);
-    }
+    SEARCH_CACHE
+        .lock()
+        .insert(cache_key(query, max_results), results.to_vec());
 }
 
 fn provider_order() -> Vec<WebSearchProvider> {
@@ -246,7 +198,7 @@ pub async fn search_web(query: &str, max_results: Option<usize>) -> Result<Vec<S
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, MAX_RESULTS_LIMIT);
 
-    if let Some(results) = get_cached(query, max_results).await {
+    if let Some(results) = get_cached(query, max_results) {
         return Ok(results);
     }
 
@@ -270,7 +222,7 @@ pub async fn search_web(query: &str, max_results: Option<usize>) -> Result<Vec<S
                     trimmed.truncate(max_results);
                 }
                 if !trimmed.is_empty() {
-                    cache_search_results(query, max_results, &trimmed).await;
+                    cache_search_results(query, max_results, &trimmed);
                     return Ok(trimmed);
                 }
             }
@@ -327,17 +279,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn empty_search_results_are_not_cached() {
+    #[test]
+    fn empty_search_results_are_not_cached() {
         let query = "phase0 cache policy empty 7f3a";
-        cache_search_results(query, 5, &[]).await;
-        assert!(get_cached(query, 5).await.is_none());
+        cache_search_results(query, 5, &[]);
+        assert!(get_cached(query, 5).is_none());
     }
 
-    #[tokio::test]
-    async fn non_empty_search_results_are_cached() {
+    #[test]
+    fn non_empty_search_results_are_cached() {
         let query = "phase0 cache policy nonempty 7f3a";
-        cache_search_results(query, 5, &[result("https://example.com")]).await;
-        assert_eq!(get_cached(query, 5).await.map(|r| r.len()), Some(1));
+        cache_search_results(query, 5, &[result("https://example.com")]);
+        assert_eq!(get_cached(query, 5).map(|r| r.len()), Some(1));
     }
 }
