@@ -1,14 +1,19 @@
 //! Response-body helpers: bounded reads, JSON decoding with diagnostics, and
 //! error-body summaries.
 
+use reqwest::header::CONTENT_TYPE;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::error::ProviderError;
 use crate::utils::text::truncate_for_log;
 
+/// Generous ceiling for JSON API responses (image payloads are base64).
+pub const DEFAULT_JSON_BODY_LIMIT: usize = 16 * 1024 * 1024;
 /// Error bodies are only summarized for logs; anything larger is noise.
 pub const ERROR_BODY_LIMIT: usize = 64 * 1024;
 const ERROR_SNIPPET_CHARS: usize = 2_000;
+const DECODE_SNIPPET_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorBodySummary {
@@ -85,6 +90,41 @@ pub async fn read_body_limited(
             }
         }
     }
+}
+
+/// Decode a 2xx JSON response, reporting status, content type and a body
+/// excerpt when the payload is empty or malformed.
+pub async fn read_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    provider: &str,
+) -> Result<T, ProviderError> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let bytes = read_body_limited(response, provider, DEFAULT_JSON_BODY_LIMIT).await?;
+    if bytes.is_empty() {
+        return Err(ProviderError::decode(
+            provider,
+            format!("empty response body (status {status}, content-type {content_type})"),
+            false,
+        ));
+    }
+
+    serde_json::from_slice::<T>(&bytes).map_err(|err| {
+        let body = String::from_utf8_lossy(&bytes);
+        ProviderError::decode(
+            provider,
+            format!(
+                "{err} (status {status}, content-type {content_type}) | body={}",
+                truncate_for_log(&body, DECODE_SNIPPET_CHARS)
+            ),
+            false,
+        )
+    })
 }
 
 #[cfg(test)]

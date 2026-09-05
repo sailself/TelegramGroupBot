@@ -6,6 +6,7 @@
 pub mod body;
 pub mod error;
 pub mod retry;
+pub mod usage;
 
 use std::future::Future;
 
@@ -14,7 +15,7 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
-pub use body::read_body_limited;
+pub use body::{read_body_limited, read_json};
 pub use error::ProviderError;
 pub use retry::RetryPolicy;
 
@@ -333,9 +334,61 @@ mod tests {
     }
 
     async fn read_json_value(response: reqwest::Response) -> Result<Value, ProviderError> {
-        let bytes = read_body_limited(response, "test-provider", 1 << 20).await?;
-        serde_json::from_slice(&bytes)
-            .map_err(|err| ProviderError::decode("test-provider", err.to_string(), false))
+        read_json::<Value>(response, "test-provider").await
+    }
+
+    #[tokio::test]
+    async fn read_json_reports_decode_failures_with_a_snippet() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/j",
+            response_with_headers(
+                200,
+                &[("content-type", "text/html")],
+                b"<html>not json</html>".to_vec(),
+            ),
+        )]);
+        let response = get_http_client()
+            .get(server.url("/j"))
+            .send()
+            .await
+            .expect("request");
+
+        let err = read_json::<Value>(response, "test-provider")
+            .await
+            .expect_err("html is not json");
+        match err {
+            ProviderError::Decode {
+                detail, retryable, ..
+            } => {
+                assert!(!retryable);
+                assert!(detail.contains("text/html"), "{detail}");
+                assert!(detail.contains("not json"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        server.join().expect("one request was served");
+    }
+
+    #[tokio::test]
+    async fn read_json_rejects_an_empty_body_without_retrying() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/j",
+            response_with_headers(200, &[], Vec::new()),
+        )]);
+        let response = get_http_client()
+            .get(server.url("/j"))
+            .send()
+            .await
+            .expect("request");
+
+        let err = read_json::<Value>(response, "test-provider")
+            .await
+            .expect_err("empty body is not json");
+        assert!(!err.is_retryable());
+        assert!(err.to_string().contains("empty response body"), "{err}");
+        server.join().expect("one request was served");
     }
 
     #[tokio::test]
