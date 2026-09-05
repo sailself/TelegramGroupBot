@@ -1,7 +1,8 @@
 use std::collections::{hash_map::DefaultHasher, HashSet};
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -51,7 +52,7 @@ use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::logging::read_recent_log_lines;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::telegram::start_chat_action_heartbeat;
+use crate::utils::telegram::{retry_telegram, start_chat_action_heartbeat};
 use crate::utils::text::{
     escape_html, split_for_telegram, truncate_with_ellipsis, truncate_with_suffix,
 };
@@ -71,7 +72,6 @@ const IMAGE_DEFAULT_RESOLUTION: &str = "2K";
 const IMAGE_ASPECT_RATIO_AUTO_CALLBACK: &str = "auto";
 const IMAGE_CAPTION_LIMIT: usize = 1000;
 const IMAGE_CAPTION_PROMPT_PREVIEW: usize = 900;
-const VID_TELEGRAM_RETRY_ATTEMPTS: usize = 3;
 const DIAGNOSE_LOG_TAIL_LINES: usize = 12;
 const DIAGNOSE_TEXT_LIMIT: usize = 3900;
 const MYSONG_LLM_MAX_ATTEMPTS: usize = 3;
@@ -1234,13 +1234,6 @@ pub(crate) fn message_has_image(message: &Message) -> bool {
     false
 }
 
-fn telegram_retryable_error(err: &RequestError) -> bool {
-    matches!(
-        err,
-        RequestError::Network(_) | RequestError::RetryAfter(_) | RequestError::Io(_)
-    )
-}
-
 async fn send_message_with_retry(
     bot: &Bot,
     chat_id: ChatId,
@@ -1257,8 +1250,7 @@ async fn send_message_with_retry_parse_mode(
     reply_to: Option<MessageId>,
     parse_mode: Option<ParseMode>,
 ) -> Result<Message> {
-    let mut delay = Duration::from_secs_f32(1.5);
-    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+    retry_telegram("send_message", || {
         let mut request = bot.send_message(chat_id, text.to_string());
         if let Some(reply_to) = reply_to {
             request = request.reply_parameters(ReplyParameters::new(reply_to));
@@ -1266,24 +1258,10 @@ async fn send_message_with_retry_parse_mode(
         if let Some(parse_mode) = parse_mode {
             request = request.parse_mode(parse_mode);
         }
-        match request.await {
-            Ok(message) => return Ok(message),
-            Err(err) => {
-                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-                warn!("send_message attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-            }
-        }
-    }
-
-    unreachable!("send_message retry loop exhausted")
+        request
+    })
+    .await
+    .map_err(Into::into)
 }
 
 async fn edit_message_text_with_retry(
@@ -1292,28 +1270,10 @@ async fn edit_message_text_with_retry(
     message_id: MessageId,
     text: &str,
 ) -> Result<()> {
-    let mut delay = Duration::from_secs_f32(1.5);
-    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
-        match bot
-            .edit_message_text(chat_id, message_id, text.to_string())
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-                warn!("edit_message_text attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-            }
-        }
-    }
-
+    retry_telegram("edit_message_text", || {
+        bot.edit_message_text(chat_id, message_id, text.to_string())
+    })
+    .await?;
     Ok(())
 }
 
@@ -1323,32 +1283,19 @@ async fn send_video_with_retry(
     video_bytes: &[u8],
     reply_to: Option<MessageId>,
 ) -> Result<Message> {
-    let mut delay = Duration::from_secs_f32(1.5);
-    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+    retry_telegram("send_video", || {
         let input = InputFile::memory(video_bytes.to_vec()).file_name("video.mp4");
         let mut request = bot.send_video(chat_id, input);
         if let Some(reply_to) = reply_to {
             request = request.reply_parameters(ReplyParameters::new(reply_to));
         }
-        match request.await {
-            Ok(message) => return Ok(message),
-            Err(err) => {
-                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-                warn!("send_video attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-            }
-        }
-    }
-
-    unreachable!("send_video retry loop exhausted")
+        request
+    })
+    .await
+    .map_err(Into::into)
 }
+
+type TelegramSendFuture = Pin<Box<dyn Future<Output = Result<Message, RequestError>> + Send>>;
 
 async fn send_audio_file_with_retry(
     bot: &Bot,
@@ -1358,55 +1305,39 @@ async fn send_audio_file_with_retry(
     caption: Option<&str>,
     reply_to: Option<MessageId>,
 ) -> Result<Message> {
-    let mut delay = Duration::from_secs_f32(1.5);
     let file_name = audio_file_name_for_mime(mime_type);
+    let send_audio = audio_should_use_send_audio(mime_type);
+    let caption = caption.filter(|value| !value.trim().is_empty());
 
-    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+    retry_telegram("send_audio/document", || {
         let input = InputFile::memory(audio_bytes.to_vec()).file_name(file_name.to_string());
-        let send_audio = audio_should_use_send_audio(mime_type);
-
-        let result = if send_audio {
+        let future: TelegramSendFuture = if send_audio {
             let mut request = bot.send_audio(chat_id, input);
             if let Some(reply_to) = reply_to {
                 request = request.reply_parameters(ReplyParameters::new(reply_to));
             }
-            if let Some(caption) = caption.filter(|value| !value.trim().is_empty()) {
+            if let Some(caption) = caption {
                 request = request
                     .caption(caption.to_string())
                     .parse_mode(ParseMode::Html);
             }
-            request.await
+            Box::pin(request.into_future())
         } else {
             let mut request = bot.send_document(chat_id, input);
             if let Some(reply_to) = reply_to {
                 request = request.reply_parameters(ReplyParameters::new(reply_to));
             }
-            if let Some(caption) = caption.filter(|value| !value.trim().is_empty()) {
+            if let Some(caption) = caption {
                 request = request
                     .caption(caption.to_string())
                     .parse_mode(ParseMode::Html);
             }
-            request.await
+            Box::pin(request.into_future())
         };
-
-        match result {
-            Ok(message) => return Ok(message),
-            Err(err) => {
-                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-                warn!("send_audio/document attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-            }
-        }
-    }
-
-    unreachable!("send_audio/document retry loop exhausted")
+        future
+    })
+    .await
+    .map_err(Into::into)
 }
 
 async fn retry_mysong_llm_step<T, F, Fut>(

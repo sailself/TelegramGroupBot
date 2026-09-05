@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ParseMode};
@@ -10,8 +8,12 @@ use crate::db::database::build_message_insert;
 use crate::db::search::derive_search_provenance;
 use crate::handlers::content::create_telegraph_page;
 use crate::state::AppState;
+use crate::utils::telegram::retry_telegram;
 use crate::utils::text::truncate_to_chars;
 
+/// Edit a message, retrying only transient Telegram failures. Permanent
+/// rejections (bad markup, unmodified text) surface immediately so callers
+/// can fall back to plain text without a multi-second retry delay.
 async fn edit_text_with_retry(
     bot: &Bot,
     chat_id: ChatId,
@@ -19,28 +21,14 @@ async fn edit_text_with_retry(
     text: &str,
     parse_mode: Option<ParseMode>,
 ) -> Result<()> {
-    let mut delay = Duration::from_secs_f32(1.5);
-    for attempt in 0..3 {
+    retry_telegram("edit_message_text", || {
         let request = bot.edit_message_text(chat_id, message_id, text.to_string());
-        let request = if let Some(mode) = parse_mode {
-            request.parse_mode(mode)
-        } else {
-            request
-        };
-
-        match request.await {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                if attempt == 2 {
-                    return Err(err.into());
-                }
-                warn!("edit_message_text failed: {err}");
-                tokio::time::sleep(delay).await;
-                delay *= 2;
-            }
+        match parse_mode {
+            Some(mode) => request.parse_mode(mode),
+            None => request,
         }
-    }
-
+    })
+    .await?;
     Ok(())
 }
 

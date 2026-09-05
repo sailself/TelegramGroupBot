@@ -8,7 +8,6 @@ use teloxide::types::{
     ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef,
     MessageId, ParseMode, ReplyParameters,
 };
-use teloxide::RequestError;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::config::{
@@ -50,7 +49,7 @@ use crate::llm::{
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::telegram::{build_message_link, start_chat_action_heartbeat};
+use crate::utils::telegram::{build_message_link, retry_telegram, start_chat_action_heartbeat};
 use crate::utils::text::{escape_html, split_for_telegram, truncate_with_ellipsis};
 use crate::utils::timing::{complete_command_timer, start_command_timer, CommandTimer};
 use tracing::{error, info, warn};
@@ -59,7 +58,6 @@ pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 pub const MODEL_GEMINI: &str = "gemini";
 const MODEL_CALLBACK_COMPACT_PREFIX: &str = "m:";
 const TELEGRAM_CALLBACK_DATA_LIMIT: usize = 64;
-const SEND_MESSAGE_RETRY_ATTEMPTS: usize = 3;
 const USER_ERROR_DETAIL_LIMIT: usize = 400;
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
 const QUICK_SEARCH_FOOTER: &str =
@@ -440,12 +438,8 @@ async fn send_message_with_retry(
     parse_mode: Option<ParseMode>,
     reply_markup: Option<InlineKeyboardMarkup>,
 ) -> Result<Message> {
-    let text = text.to_string();
-    let mut delay = Duration::from_secs_f32(1.5);
-    let mut last_err: Option<RequestError> = None;
-
-    for attempt in 0..SEND_MESSAGE_RETRY_ATTEMPTS {
-        let mut request = bot.send_message(chat_id, text.clone());
+    retry_telegram("send_message", || {
+        let mut request = bot.send_message(chat_id, text.to_string());
         if let Some(reply_to) = reply_to {
             request = request.reply_parameters(ReplyParameters::new(reply_to));
         }
@@ -455,31 +449,10 @@ async fn send_message_with_retry(
         if let Some(markup) = reply_markup.clone() {
             request = request.reply_markup(markup);
         }
-
-        match request.await {
-            Ok(message) => return Ok(message),
-            Err(err) => {
-                let retryable = matches!(
-                    err,
-                    RequestError::Network(_) | RequestError::RetryAfter(_) | RequestError::Io(_)
-                );
-                if !retryable || attempt + 1 == SEND_MESSAGE_RETRY_ATTEMPTS {
-                    return Err(err.into());
-                }
-
-                warn!("send_message attempt {} failed: {err}", attempt + 1);
-                if let RequestError::RetryAfter(wait) = err {
-                    tokio::time::sleep(wait.duration()).await;
-                } else {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-                last_err = Some(err);
-            }
-        }
-    }
-
-    Err(last_err.expect("send_message retry exhausted").into())
+        request
+    })
+    .await
+    .map_err(Into::into)
 }
 
 fn resolve_exact_model_identifier_with_models(
