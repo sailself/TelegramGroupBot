@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::StatusCode;
+use std::sync::LazyLock;
 use tracing::{error, warn};
 
 use crate::utils::http::get_http_client;
@@ -37,7 +37,7 @@ fn truncate_for_log(value: &str, limit: usize) -> String {
 /// Mask the bot token embedded in Telegram file-download URLs so the URL can
 /// be logged safely. Other URLs pass through unchanged.
 pub fn redact_url_for_log(url: &str) -> String {
-    static TELEGRAM_FILE_TOKEN: Lazy<Regex> = Lazy::new(|| {
+    static TELEGRAM_FILE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(https?://api\.telegram\.org/file/bot)[^/]+/")
             .expect("valid telegram file url regex")
     });

@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::LazyLock;
 use teloxide::types::{MessageEntityKind, MessageEntityRef};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -28,22 +28,23 @@ use crate::utils::http::get_http_client;
 const EXTRACTION_CACHE_TTL: Duration = Duration::from_secs(900);
 const EXTRACTION_CACHE_MAX_ENTRIES: usize = 64;
 
-static YOUTUBE_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
+static YOUTUBE_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"((?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})(?:[\?&][^\s]*)?)",
     )
     .expect("valid youtube regex")
 });
-static TELEGRAPH_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
+static TELEGRAPH_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"https?://(?:telegra\.ph|t\.me)/[^\s\)>"]+"#).expect("valid telegraph url regex")
 });
-static HTTP_URL_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?i)https?://[^\s<>\"']+"#).expect("valid HTTP URL regex"));
-static MARKDOWN_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
+static HTTP_URL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)https?://[^\s<>\"']+"#).expect("valid HTTP URL regex"));
+static MARKDOWN_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\[[^\]]*\]\((https?://[^)]+)\)"#).expect("valid markdown link regex")
 });
-static HTML_LINK_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"href=["'](https?://[^"']+)["']"#).expect("valid html link regex"));
+static HTML_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"href=["'](https?://[^"']+)["']"#).expect("valid html link regex")
+});
 
 #[derive(Debug, Clone)]
 struct TelegraphCacheEntry {
@@ -57,10 +58,10 @@ struct TwitterCacheEntry {
     content: TwitterContent,
 }
 
-static TELEGRAPH_CACHE: Lazy<Mutex<HashMap<String, TelegraphCacheEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static TWITTER_CACHE: Lazy<Mutex<HashMap<String, TwitterCacheEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static TELEGRAPH_CACHE: LazyLock<Mutex<HashMap<String, TelegraphCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TWITTER_CACHE: LazyLock<Mutex<HashMap<String, TwitterCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn truncate_for_log(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {

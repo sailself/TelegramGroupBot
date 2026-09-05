@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use serde::Deserialize;
+use std::sync::LazyLock;
 use tracing::{info, warn};
 use url::Url;
 
@@ -240,8 +240,8 @@ pub struct Config {
     pub third_party_models_by_id: HashMap<String, ThirdPartyModelConfig>,
 }
 
-pub static CONFIG: Lazy<Config> =
-    Lazy::new(|| Config::load().expect("Failed to load configuration"));
+pub static CONFIG: LazyLock<Config> =
+    LazyLock::new(|| Config::load().expect("Failed to load configuration"));
 
 fn env_bool(name: &str, default: bool) -> bool {
     env::var(name)

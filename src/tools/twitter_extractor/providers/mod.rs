@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
-use once_cell::sync::Lazy;
 use reqwest::Response;
+use std::sync::LazyLock;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinHandle};
 use url::Url;
@@ -16,7 +16,8 @@ pub(crate) mod fxtwitter;
 pub(crate) mod jina;
 pub(crate) mod vxtwitter;
 
-static BLOCKING_PARSER_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
+static BLOCKING_PARSER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(4)));
 
 const TWITTER_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 

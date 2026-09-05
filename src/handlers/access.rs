@@ -2,16 +2,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::sync::LazyLock;
 use teloxide::prelude::*;
 use teloxide::types::ReplyParameters;
 use tracing::{info, warn};
 
 use crate::config::CONFIG;
 
-static RATE_LIMITS: Lazy<Mutex<HashMap<i64, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static WHITELIST_CACHE: Lazy<Mutex<Option<HashSet<i64>>>> = Lazy::new(|| Mutex::new(None));
+static RATE_LIMITS: LazyLock<Mutex<HashMap<i64, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static WHITELIST_CACHE: LazyLock<Mutex<Option<HashSet<i64>>>> = LazyLock::new(|| Mutex::new(None));
 static WHITELIST_LOADED: AtomicBool = AtomicBool::new(false);
 
 fn prune_rate_limits(limits: &mut HashMap<i64, Instant>, now: Instant) {

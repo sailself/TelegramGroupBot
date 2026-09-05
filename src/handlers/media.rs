@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::sync::LazyLock;
 use teloxide::prelude::*;
 use teloxide::types::FileId;
 
@@ -21,8 +21,8 @@ struct FileUrlCacheEntry {
     url: String,
 }
 
-static FILE_URL_CACHE: Lazy<Mutex<HashMap<String, FileUrlCacheEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static FILE_URL_CACHE: LazyLock<Mutex<HashMap<String, FileUrlCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Default, Clone)]
 pub struct MediaCollection {

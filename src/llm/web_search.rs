@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -28,8 +28,8 @@ struct CacheEntry {
     results: Vec<SearchResult>,
 }
 
-static SEARCH_CACHE: Lazy<Mutex<HashMap<String, CacheEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static SEARCH_CACHE: LazyLock<Mutex<HashMap<String, CacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSearchProvider {

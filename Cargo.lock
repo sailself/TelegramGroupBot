@@ -2811,7 +2811,6 @@ dependencies = [
  "image",
  "infer",
  "jieba-rs",
- "once_cell",
  "parking_lot",
  "pulldown-cmark",
  "regex",

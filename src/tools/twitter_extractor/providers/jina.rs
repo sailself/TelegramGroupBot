@@ -1,7 +1,7 @@
 use std::{collections::HashSet, time::Duration};
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::{
     read_limited_body, run_blocking_parser, ProviderError, ProviderErrorKind, TwitterFetchConfig,
@@ -14,14 +14,15 @@ use crate::tools::twitter_extractor::model::{
 use crate::tools::twitter_extractor::url::XStatusIdentity;
 use crate::utils::http::NoRedirectClient;
 
-static TIMESTAMP_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d{1,2}:\d{2}\s?[AP]M").unwrap());
-static MEDIA_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"!\[[^\]]*?\]\((https?://[^\)]+)\)").unwrap());
-static LINK_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[([^\]]*?)\]\((https?://[^\)]+)\)").unwrap());
-static EMPTY_LINK_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[\s*\]\((https?://[^\)]+)\)").unwrap());
-static WHITESPACE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+static TIMESTAMP_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d{1,2}:\d{2}\s?[AP]M").unwrap());
+static MEDIA_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"!\[[^\]]*?\]\((https?://[^\)]+)\)").unwrap());
+static LINK_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\]]*?)\]\((https?://[^\)]+)\)").unwrap());
+static EMPTY_LINK_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\s*\]\((https?://[^\)]+)\)").unwrap());
+static WHITESPACE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 type MediaBuckets = (Vec<String>, Vec<String>, Vec<String>);
 
 fn error(

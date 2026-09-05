@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use jieba_rs::Jieba;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use url::Url;
 
 pub const CURRENT_SEARCH_SCHEMA_VERSION: i64 = 1;
@@ -11,43 +11,45 @@ pub const SEARCH_INDEX_REBUILDING_ERROR: &str = "search_index_rebuilding";
 const MAX_SEARCH_TEXT_CHARS: usize = 4_000;
 const MAX_SNIPPET_SOURCE_CHARS: usize = 2_000;
 
-static JIEBA: Lazy<Jieba> = Lazy::new(Jieba::new);
-static URL_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"https?://[^\s<>"'()\[\]]+"#).expect("valid url regex"));
-static HTML_TAG_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?is)<[^>]+>").expect("valid html regex"));
-static ZERO_WIDTH_REGEX: Lazy<Regex> = Lazy::new(|| {
+static JIEBA: LazyLock<Jieba> = LazyLock::new(Jieba::new);
+static URL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https?://[^\s<>"'()\[\]]+"#).expect("valid url regex"));
+static HTML_TAG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").expect("valid html regex"));
+static ZERO_WIDTH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[\u{200B}\u{200C}\u{200D}\u{2060}\u{FEFF}]").expect("valid zero width regex")
 });
-static MODEL_LINE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?im)(?:^|\s)Model:\s*[^\n]+$").expect("valid model regex"));
-static TELEGRAPH_WRAPPER_REGEX: Lazy<Regex> = Lazy::new(|| {
+static MODEL_LINE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?im)(?:^|\s)Model:\s*[^\n]+$").expect("valid model regex"));
+static TELEGRAPH_WRAPPER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\[(?:Telegraph|Twitter) content extracted from [^\]]+\]")
         .expect("valid telegraph wrapper regex")
 });
-static VIEW_IT_HERE_REGEX: Lazy<Regex> = Lazy::new(|| {
+static VIEW_IT_HERE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)I have too much to say\.?\s*View it here").expect("valid telegraph view regex")
 });
-static ASK_PREFIX_REGEX: Lazy<Regex> = Lazy::new(|| {
+static ASK_PREFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*Ask(?: about chat)? [^:]{0,100}:\s*").expect("valid ask prefix regex")
 });
-static REPLY_CONTEXT_LABEL_REGEX: Lazy<Regex> = Lazy::new(|| {
+static REPLY_CONTEXT_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bContext from replied message\s*:").expect("valid reply label regex")
 });
-static QUESTION_LABEL_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\bQuestion\s*:").expect("valid question label regex"));
-static COMMAND_REGEX: Lazy<Regex> = Lazy::new(|| {
+static QUESTION_LABEL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bQuestion\s*:").expect("valid question label regex"));
+static COMMAND_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)^\s*/([a-z0-9_]+)(?:@\w+)?(?:\s|$)"#).expect("valid command regex")
 });
-static WHITESPACE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\s+").expect("valid whitespace regex"));
-static MARKDOWN_FORMATTING_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"[*_`~]+"#).expect("valid markdown regex"));
-static NON_TOKEN_EDGE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"^[^[:alnum:]_#@]+|[^[:alnum:]_#@]+$"#).expect("valid edge regex"));
-static HAN_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\p{Han}").expect("valid Han regex"));
-static QUERY_TOKEN_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"[\p{L}\p{N}_#@.]+"#).expect("valid query token regex"));
+static WHITESPACE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s+").expect("valid whitespace regex"));
+static MARKDOWN_FORMATTING_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[*_`~]+"#).expect("valid markdown regex"));
+static NON_TOKEN_EDGE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^[^[:alnum:]_#@]+|[^[:alnum:]_#@]+$"#).expect("valid edge regex")
+});
+static HAN_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\p{Han}").expect("valid Han regex"));
+static QUERY_TOKEN_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[\p{L}\p{N}_#@.]+"#).expect("valid query token regex"));
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]

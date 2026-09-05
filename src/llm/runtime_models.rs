@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 
@@ -70,14 +70,14 @@ struct RuntimeModelsState {
     explicit_codex_records_by_id: HashMap<String, CodexSelectedModelRecord>,
 }
 
-static RUNTIME_MODELS: Lazy<RwLock<RuntimeModelsState>> =
-    Lazy::new(|| RwLock::new(build_runtime_models_state()));
-static CODEX_MODEL_STATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-static CODEX_MODEL_REFRESH_STATE: Lazy<AsyncMutex<CodexModelRefreshState>> =
-    Lazy::new(|| AsyncMutex::new(CodexModelRefreshState::default()));
+static RUNTIME_MODELS: LazyLock<RwLock<RuntimeModelsState>> =
+    LazyLock::new(|| RwLock::new(build_runtime_models_state()));
+static CODEX_MODEL_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static CODEX_MODEL_REFRESH_STATE: LazyLock<AsyncMutex<CodexModelRefreshState>> =
+    LazyLock::new(|| AsyncMutex::new(CodexModelRefreshState::default()));
 #[allow(dead_code)] // Consumed by the explicit-model request path added in Task 2.
-static EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK: Lazy<AsyncMutex<()>> =
-    Lazy::new(|| AsyncMutex::new(()));
+static EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK: LazyLock<AsyncMutex<()>> =
+    LazyLock::new(|| AsyncMutex::new(()));
 static CODEX_MODEL_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const CODEX_MODEL_REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 
