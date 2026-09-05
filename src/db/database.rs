@@ -299,8 +299,10 @@ impl Database {
                  reasoning_tokens, \
                  cached_input_tokens, \
                  cache_write_tokens, \
-                 raw_usage_json\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 raw_usage_json, \
+                 status, \
+                 error_summary\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(insert.invocation_id)
         .bind(insert.provider)
@@ -317,6 +319,8 @@ impl Database {
         .bind(insert.cached_input_tokens)
         .bind(insert.cache_write_tokens)
         .bind(insert.raw_usage_json)
+        .bind(insert.status)
+        .bind(insert.error_summary)
         .execute(&self.pool)
         .await?;
 
@@ -1113,6 +1117,8 @@ async fn ensure_llm_audit_schema(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
     ensure_llm_requests_column(pool, "cache_write_tokens", "INTEGER").await?;
+    ensure_llm_requests_column(pool, "status", "TEXT NOT NULL DEFAULT 'success'").await?;
+    ensure_llm_requests_column(pool, "error_summary", "TEXT").await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_llm_invocations_chat_message \
          ON llm_invocations(chat_id, message_id);",
@@ -1807,6 +1813,8 @@ mod tests {
             cached_input_tokens: Some(3),
             cache_write_tokens: Some(4),
             raw_usage_json: Some("{\"totalTokenCount\":46}".to_string()),
+            status: "success".to_string(),
+            error_summary: None,
         })
         .await
         .expect("request insert should succeed");
@@ -1908,6 +1916,8 @@ mod tests {
             cached_input_tokens: None,
             cache_write_tokens: None,
             raw_usage_json: None,
+            status: "success".to_string(),
+            error_summary: None,
         })
         .await
         .expect("request insert should succeed");

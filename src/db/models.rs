@@ -103,6 +103,9 @@ pub struct LlmRequestInsert {
     pub cached_input_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
     pub raw_usage_json: Option<String>,
+    /// `success` or `error`; failed calls carry no token counts.
+    pub status: String,
+    pub error_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
