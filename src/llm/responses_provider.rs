@@ -22,18 +22,16 @@ use crate::llm::tool_loop::{
     clamp_request_timeout_secs, run_tool_loop, BoxFuture, ModelTurn, ToolCall, ToolProtocol,
     TurnDeadline,
 };
-use crate::llm::tool_prompts::{fence_tool_result, tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
+use crate::llm::tool_prompts::TOOL_LIMIT_SYSTEM_PROMPT;
 use crate::llm::tool_runtime::{ToolKind, ToolRuntime};
 use crate::llm::transport::sse::parse_sse_data_events;
 use crate::llm::transport::{
     call_with_retry, read_body_limited_or_partial, usage, BodyRead, LlmCall, ProviderError,
     RetryPolicy,
 };
-use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::{get_http_client, get_http_client_no_compression};
 use crate::utils::text::truncate_for_log;
 
-const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const RESPONSES_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(3, Duration::from_millis(900));
 const RESPONSES_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
@@ -469,10 +467,6 @@ fn responses_request_timeout_secs(provider: ThirdPartyProvider) -> u64 {
     }
 }
 
-fn responses_tool_limit_guidance() -> String {
-    tool_limit_guidance(MAX_TOOL_CALL_ITERATIONS)
-}
-
 fn build_responses_system_prompt(
     system_prompt: &str,
     model_config: &ThirdPartyModelConfig,
@@ -519,35 +513,6 @@ fn build_responses_user_input(user_content: &str, image_data_list: &[Vec<u8>]) -
         "type": "message",
         "role": "user",
         "content": content,
-    })]
-}
-
-fn build_responses_function_tools() -> Vec<Value> {
-    if !web_search::is_search_enabled() {
-        return Vec::new();
-    }
-
-    vec![json!({
-        "type": "function",
-        "name": "web_search",
-        "description": "Search the web using the configured providers (Brave, Exa, Jina) and return a concise Markdown summary of the results.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query to look up."
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return (default 5).",
-                    "minimum": 1,
-                    "maximum": 10
-                }
-            },
-            "required": ["query"]
-        },
-        "strict": false,
     })]
 }
 
@@ -1429,140 +1394,6 @@ fn extract_response_tool_calls(output_items: &[Value]) -> Vec<ResponsesToolCall>
         .collect()
 }
 
-async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> {
-    let argument_keys = arguments
-        .as_object()
-        .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
-    debug!(
-        "Responses tool call requested: name={}, argument_keys={:?}, argument_bytes={}",
-        name,
-        argument_keys,
-        arguments.to_string().len()
-    );
-    match name {
-        "web_search" => {
-            let query = arguments
-                .get("query")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let max_results = arguments
-                .get("max_results")
-                .and_then(|value| value.as_u64())
-                .map(|value| value as usize);
-            match web_search_tool(query, max_results).await {
-                Ok(result) => {
-                    debug!(
-                        "Responses tool call web_search completed: chars={}",
-                        result.chars().count()
-                    );
-                    Ok(result)
-                }
-                Err(err) => Err(err),
-            }
-        }
-        _ => Ok(String::from("Unsupported tool call")),
-    }
-}
-
-async fn responses_completion_with_tools(
-    instructions: &str,
-    mut input_items: Vec<Value>,
-    model_config: &ThirdPartyModelConfig,
-    audit_context: Option<&LlmAuditContext>,
-    operation: &str,
-    reasoning_override: Option<&str>,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
-) -> Result<String> {
-    let tools = build_responses_function_tools();
-    let session_id = generate_session_id();
-    let mut turn_state = CodexTurnState::default();
-    let model_label = debug_model_label(model_config);
-    debug!(
-        "Responses tool loop starting: model={}, session_id={}, tools_enabled={}",
-        model_label,
-        session_id,
-        !tools.is_empty()
-    );
-
-    for iteration in 0..MAX_TOOL_CALL_ITERATIONS {
-        debug!(
-            "Responses tool iteration {}/{} for model={} session_id={}",
-            iteration + 1,
-            MAX_TOOL_CALL_ITERATIONS,
-            model_label,
-            session_id
-        );
-        let details = build_request_details(
-            model_config,
-            instructions,
-            input_items.clone(),
-            Some(tools.clone()),
-            &session_id,
-            reasoning_override,
-            pinned_codex,
-        )?;
-        let ResponsesApiResult {
-            response,
-            metadata: _,
-        } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
-        let output_items = extract_response_output_items(&response);
-        let tool_calls = extract_response_tool_calls(&output_items);
-        let content = extract_response_text(&output_items);
-
-        if tool_calls.is_empty() {
-            return Ok(content);
-        }
-
-        debug!(
-            "Responses tool iteration {}/{} returned {} tool call(s) for model={} session_id={}",
-            iteration + 1,
-            MAX_TOOL_CALL_ITERATIONS,
-            tool_calls.len(),
-            model_label,
-            session_id
-        );
-
-        input_items.extend(output_items.clone());
-
-        for tool_call in tool_calls {
-            let args_value: Value =
-                serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
-            let result = execute_function_tool(&tool_call.name, &args_value)
-                .await
-                .unwrap_or_else(|err| err.to_string());
-            let result = fence_tool_result(&tool_call.name, &result);
-            input_items.push(json!({
-                "type": "function_call_output",
-                "call_id": tool_call.call_id,
-                "output": result,
-            }));
-        }
-
-        if iteration + 1 == MAX_TOOL_CALL_ITERATIONS {
-            let final_instructions = format!("{instructions}\n\n{TOOL_LIMIT_SYSTEM_PROMPT}");
-            let details = build_request_details(
-                model_config,
-                &final_instructions,
-                input_items,
-                None,
-                &session_id,
-                reasoning_override,
-                pinned_codex,
-            )?;
-            let ResponsesApiResult {
-                response,
-                metadata: _,
-            } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
-            return Ok(extract_response_text(&extract_response_output_items(
-                &response,
-            )));
-        }
-    }
-
-    unreachable!("responses tool loop exhausted without returning")
-}
-
 /// OpenAI Responses half of the shared tool loop.
 struct ResponsesProtocol<'a> {
     model_config: &'a ThirdPartyModelConfig,
@@ -1684,6 +1515,9 @@ async fn responses_completion_with_tool_runtime(
     run_tool_loop(&mut protocol, runtime, input_items, &deadline).await
 }
 
+/// Answer with an OpenAI Responses provider. `tools` runs the shared tool
+/// loop over that runtime's budget, letting Codex use its native web search
+/// where the profile allows; `None` is a single request without tools.
 #[allow(clippy::too_many_arguments)]
 pub async fn call_responses_provider(
     system_prompt: &str,
@@ -1691,87 +1525,47 @@ pub async fn call_responses_provider(
     model_config: &ThirdPartyModelConfig,
     response_title: &str,
     image_data_list: &[Vec<u8>],
-    supports_tools: bool,
+    tools: Option<&mut ToolRuntime>,
     audit_context: Option<&LlmAuditContext>,
     reasoning_override: Option<&str>,
     pinned_codex: Option<&PinnedCodexRequestContract>,
     codex_prompt_style: crate::llm::CodexPromptStyle,
 ) -> Result<String> {
     crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
-    let native_codex_web_search_tool = if supports_tools {
-        build_native_codex_web_search_tool(model_config)?
-    } else {
-        None
-    };
-    let custom_tools_enabled =
-        supports_tools && native_codex_web_search_tool.is_none() && web_search::is_search_enabled();
     let model_label = debug_model_label(model_config);
-    debug!(
-        "Responses provider selected: provider={}, model={}, response_title={}, supports_tools={}, custom_tools_enabled={}, native_codex_web_search={}, image_count={}",
-        model_config.provider.as_str(),
-        model_label,
-        response_title,
-        supports_tools,
-        custom_tools_enabled,
-        native_codex_web_search_tool.is_some(),
-        image_data_list.len()
-    );
-    let tool_limit_guidance = custom_tools_enabled.then(responses_tool_limit_guidance);
-    let instructions = build_responses_system_prompt(
-        system_prompt,
-        model_config,
-        codex_prompt_style,
-        tool_limit_guidance.as_deref(),
-    );
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
-    if custom_tools_enabled {
-        return responses_completion_with_tools(
+
+    let Some(runtime) = tools else {
+        debug!(
+            "Responses provider selected: provider={}, model={}, response_title={}, tools=false, image_count={}",
+            model_config.provider.as_str(),
+            model_label,
+            response_title,
+            image_data_list.len()
+        );
+        let instructions =
+            build_responses_system_prompt(system_prompt, model_config, codex_prompt_style, None);
+        let session_id = generate_session_id();
+        let mut turn_state = CodexTurnState::default();
+        let details = build_request_details(
+            model_config,
             &instructions,
             input_items,
-            model_config,
-            audit_context,
-            &operation,
+            None,
+            &session_id,
             reasoning_override,
             pinned_codex,
-        )
-        .await;
-    }
+        )?;
+        let ResponsesApiResult {
+            response,
+            metadata: _,
+        } = call_provider_api(&details, audit_context, &operation, &mut turn_state).await?;
+        return Ok(extract_response_text(&extract_response_output_items(
+            &response,
+        )));
+    };
 
-    let session_id = generate_session_id();
-    let mut turn_state = CodexTurnState::default();
-    let details = build_request_details(
-        model_config,
-        &instructions,
-        input_items,
-        native_codex_web_search_tool.map(|tool| vec![tool]),
-        &session_id,
-        reasoning_override,
-        pinned_codex,
-    )?;
-    let ResponsesApiResult {
-        response,
-        metadata: _,
-    } = call_provider_api(&details, audit_context, &operation, &mut turn_state).await?;
-    Ok(extract_response_text(&extract_response_output_items(
-        &response,
-    )))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn call_responses_provider_with_tool_runtime(
-    system_prompt: &str,
-    user_content: &str,
-    model_config: &ThirdPartyModelConfig,
-    response_title: &str,
-    image_data_list: &[Vec<u8>],
-    runtime: &mut ToolRuntime,
-    audit_context: Option<&LlmAuditContext>,
-    reasoning_override: Option<&str>,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
-    codex_prompt_style: crate::llm::CodexPromptStyle,
-) -> Result<String> {
-    crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
     let runtime_guidance = runtime.tool_limit_guidance();
     let instructions = build_responses_system_prompt(
         system_prompt,
@@ -1779,29 +1573,25 @@ pub async fn call_responses_provider_with_tool_runtime(
         codex_prompt_style,
         Some(&runtime_guidance),
     );
-    let input_items = build_responses_user_input(user_content, image_data_list);
-    let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
     let native_codex_web_search_tool = if runtime.allows_native_web_search() {
         build_native_codex_web_search_tool(model_config)?
     } else {
         None
     };
-    let model_label = debug_model_label(model_config);
     debug!(
-        "Responses provider runtime selected: provider={}, model={}, response_title={}, native_codex_web_search={}, image_count={}",
+        "Responses provider selected: provider={}, model={}, response_title={}, tools=true, native_codex_web_search={}, image_count={}",
         model_config.provider.as_str(),
         model_label,
         response_title,
         native_codex_web_search_tool.is_some(),
         image_data_list.len()
     );
-
     responses_completion_with_tool_runtime(
         &instructions,
         input_items,
         model_config,
         runtime,
-        native_codex_web_search_tool.clone(),
+        native_codex_web_search_tool,
         audit_context,
         &operation,
         reasoning_override,

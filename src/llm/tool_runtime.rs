@@ -25,6 +25,9 @@ pub enum ToolProfile {
     ChatQuestion,
     ChatSearch,
     ChatAnalytics,
+    /// Web search only, for answers that need no chat history (and no chat
+    /// database): `/q` in standard mode, `/tldr`, `/factcheck`.
+    WebSearch,
 }
 
 /// Every tool a model may call, in the order they are offered.
@@ -228,7 +231,9 @@ struct ToolBudgetError {
 
 #[derive(Clone)]
 pub struct ToolRuntime {
-    db: Database,
+    /// Chat database behind the chat tools; `None` for web-only profiles,
+    /// whose zero chat budgets keep those tools from ever being charged.
+    db: Option<Database>,
     chat_id: i64,
     profile: ToolProfile,
     budget: ToolBudget,
@@ -292,7 +297,7 @@ struct ToolSearchHit {
 }
 
 impl ToolRuntime {
-    fn new(db: Database, chat_id: i64, profile: ToolProfile, budget: ToolBudget) -> Self {
+    fn new(db: Option<Database>, chat_id: i64, profile: ToolProfile, budget: ToolBudget) -> Self {
         Self {
             db,
             chat_id,
@@ -310,7 +315,7 @@ impl ToolRuntime {
 
     pub fn for_quick(db: Database, chat_id: i64) -> Self {
         Self::new(
-            db,
+            Some(db),
             chat_id,
             ToolProfile::QuickQuestion,
             ToolBudget::new(1).with(ToolKind::WebSearch, 1),
@@ -319,7 +324,7 @@ impl ToolRuntime {
 
     pub fn for_qc(db: Database, chat_id: i64) -> Self {
         Self::new(
-            db,
+            Some(db),
             chat_id,
             ToolProfile::ChatQuestion,
             ToolBudget::new(8)
@@ -330,7 +335,7 @@ impl ToolRuntime {
 
     pub fn for_search(db: Database, chat_id: i64) -> Self {
         Self::new(
-            db,
+            Some(db),
             chat_id,
             ToolProfile::ChatSearch,
             ToolBudget::new(5).with(ToolKind::ChatContextQuery, 5),
@@ -339,13 +344,29 @@ impl ToolRuntime {
 
     pub fn for_analytics(db: Database, chat_id: i64) -> Self {
         Self::new(
-            db,
+            Some(db),
             chat_id,
             ToolProfile::ChatAnalytics,
             ToolBudget::new(CONFIG.qc_analytics_max_total_calls)
                 .with(ToolKind::ChatContextQuery, 1)
                 .with(ToolKind::ChatAnalytics, CONFIG.qc_analytics_max_query_calls),
         )
+    }
+
+    /// Web search only (up to three calls), no chat tools and no database.
+    pub fn for_web_search() -> Self {
+        Self::new(
+            None,
+            0,
+            ToolProfile::WebSearch,
+            ToolBudget::new(3).with(ToolKind::WebSearch, 3),
+        )
+    }
+
+    fn chat_db(&self) -> Result<&Database> {
+        self.db
+            .as_ref()
+            .ok_or_else(|| anyhow!("chat tools are unavailable for this request"))
     }
 
     #[cfg(test)]
@@ -384,8 +405,13 @@ impl ToolRuntime {
         self.calls[kind.index()]
     }
 
+    /// Whether Codex may answer with its native web search instead of the
+    /// budgeted `web_search` function.
     pub fn allows_native_web_search(&self) -> bool {
-        self.profile == ToolProfile::ChatQuestion
+        matches!(
+            self.profile,
+            ToolProfile::ChatQuestion | ToolProfile::WebSearch
+        )
     }
 
     pub fn web_search_attempted(&self) -> bool {
@@ -429,7 +455,7 @@ impl ToolRuntime {
             ToolProfile::QuickQuestion => self.offers(ToolKind::WebSearch).then_some(
                 "After that one call succeeds or fails, answer immediately without any more tools and recommend /q if deeper verification is needed.",
             ),
-            ToolProfile::ChatQuestion => None,
+            ToolProfile::ChatQuestion | ToolProfile::WebSearch => None,
             ToolProfile::ChatSearch => Some(
                 "Search is keyword-based FTS, not semantic, so inspect snippets carefully and refine your query if needed.",
             ),
@@ -674,8 +700,9 @@ impl ToolRuntime {
                 }
 
                 let default_limit = match self.profile {
-                    ToolProfile::QuickQuestion => DEFAULT_QC_SEARCH_LIMIT,
-                    ToolProfile::ChatQuestion => DEFAULT_QC_SEARCH_LIMIT,
+                    ToolProfile::QuickQuestion
+                    | ToolProfile::ChatQuestion
+                    | ToolProfile::WebSearch => DEFAULT_QC_SEARCH_LIMIT,
                     ToolProfile::ChatSearch => DEFAULT_S_SEARCH_LIMIT,
                     ToolProfile::ChatAnalytics => 3, // Decision 1: only a representative quote
                 };
@@ -691,7 +718,7 @@ impl ToolRuntime {
                 }
 
                 let hits = self
-                    .db
+                    .chat_db()?
                     .search_chat_messages(self.chat_id, query, limit as i64, offset as i64)
                     .await?;
                 for hit in &hits {
@@ -703,7 +730,7 @@ impl ToolRuntime {
                 for hit in hits {
                     let context_messages: Vec<ToolMessage> =
                         if context_before > 0 || context_after > 0 {
-                            self.db
+                            self.chat_db()?
                                 .get_message_window(
                                     self.chat_id,
                                     hit.message_id,
@@ -745,7 +772,7 @@ impl ToolRuntime {
                     context_after = 0;
                 }
                 let Some(messages) = self
-                    .db
+                    .chat_db()?
                     .get_message_window(
                         self.chat_id,
                         message_id,
@@ -802,7 +829,7 @@ impl ToolRuntime {
         let spec: QuerySpec = serde_json::from_value(arguments.clone())
             .map_err(|error| anyhow!("invalid analytics arguments: {error}"))?;
         let (spec, rows) = self
-            .db
+            .chat_db()?
             .run_chat_analytics(self.chat_id, &spec)
             .await
             .map_err(|error| {
@@ -1036,6 +1063,7 @@ mod tests {
             ToolRuntime::for_qc(db.clone(), -100),
             ToolRuntime::for_search(db.clone(), -100),
             ToolRuntime::for_analytics(db.clone(), -100),
+            ToolRuntime::for_web_search(),
         ] {
             let guidance = runtime.tool_limit_guidance();
             assert!(
@@ -1143,6 +1171,37 @@ mod tests {
             ["chat_context_query", "chat_analytics"]
         );
         assert!(analytics.build_gemini_tools()[0]["functionDeclarations"].is_array());
+    }
+
+    #[tokio::test]
+    async fn web_search_profile_needs_no_database_and_offers_only_web_search() {
+        let mut runtime = ToolRuntime::for_web_search().with_web_search_available(true);
+
+        assert_eq!(runtime.budget.total(), 3);
+        assert_eq!(runtime.budget.limit(ToolKind::WebSearch), 3);
+        assert_eq!(openai_tool_names(&runtime), ["web_search"]);
+        assert!(
+            runtime.allows_native_web_search(),
+            "Codex may use its native web search instead of the function tool"
+        );
+        let guidance = runtime.budget_guidance();
+        assert!(
+            guidance.contains("web_search at most 3 times"),
+            "{guidance}"
+        );
+
+        // Chat tools are refused by the budget gate, so the missing database is never touched.
+        let err = runtime
+            .run_search_query("anything", None, 0, 0)
+            .await
+            .expect_err("chat tools are unavailable without a chat database");
+        assert!(err.to_string().contains("unavailable"), "{err}");
+        assert!(runtime.force_final_answer());
+
+        let offline = ToolRuntime::for_web_search().with_web_search_available(false);
+        assert!(offline.build_openai_function_tools().is_empty());
+        assert!(offline.build_responses_tools().is_empty());
+        assert!(offline.build_gemini_tools().is_empty());
     }
 
     #[test]

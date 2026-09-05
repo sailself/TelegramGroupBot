@@ -1837,13 +1837,14 @@ async fn process_request(
                 .await
                 .map(|result| (result.text, Some(result.model_used)))
             } else {
+                let mut web_tools = supports_tools.then(ToolRuntime::for_web_search);
                 call_third_party(
                     &system_prompt,
                     &query,
                     model_name,
                     "Answer to Your Question",
                     &request.media_files,
-                    supports_tools,
+                    web_tools.as_mut(),
                     crate::llm::ThirdPartyCallOptions::new(
                         audit_context.as_ref(),
                         crate::llm::CodexPromptStyle::FreeformAnswer,
@@ -1914,7 +1915,7 @@ async fn process_request(
                     model_name,
                     "Quick Answer",
                     &request.media_files,
-                    false,
+                    None,
                     crate::llm::ThirdPartyCallOptions::new(
                         audit_context.as_ref(),
                         crate::llm::CodexPromptStyle::FreeformAnswer,
