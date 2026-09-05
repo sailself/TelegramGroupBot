@@ -1,28 +1,32 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
-use reqwest::StatusCode;
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE};
 use serde_json::{json, Value};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::{ThirdPartyProvider, CONFIG};
-use crate::llm::audit::{
-    log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
-};
+use crate::llm::audit::{LlmAuditContext, LlmUsageRecord};
 use crate::llm::gemini::ImageGenerationError;
 use crate::llm::media::{detect_mime_type, download_media};
 use crate::llm::openai_codex;
+use crate::llm::transport::sse::parse_sse_data_events;
+use crate::llm::transport::{
+    call_with_retry, read_body_limited, usage, LlmCall, ProviderError, RetryPolicy,
+};
 use crate::utils::http::get_http_client_no_compression;
-use crate::utils::text::truncate_for_log;
 
 pub const CODEX_IMAGE_RESPONSES_MODEL: &str = "gpt-5.5";
 pub const CODEX_IMAGE_TOOL_MODEL: &str = "gpt-image-2";
 pub const CODEX_IMAGE_INSTRUCTIONS: &str = "You are an image generation assistant.";
 pub const CODEX_IMAGE_MAX_INPUT_IMAGES: usize = 5;
 
-const CODEX_IMAGE_MAX_ATTEMPTS: usize = 3;
-const CODEX_IMAGE_RETRY_BASE_DELAY_MS: u64 = 1_000;
+const CODEX_IMAGE_PROVIDER: &str = "OpenAI Codex";
+/// Three attempts a second apart; a 401 triggers a token refresh first.
+const CODEX_IMAGE_RETRY_POLICY: RetryPolicy = RetryPolicy {
+    refresh_auth_on_unauthorized: true,
+    ..RetryPolicy::linear(3, Duration::from_millis(1_000))
+};
 const MAX_CODEX_IMAGE_SSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CODEX_IMAGE_BASE64_CHARS: usize = 64 * 1024 * 1024;
 
@@ -50,7 +54,6 @@ pub struct ImageInput {
 #[derive(Debug, Clone)]
 struct CodexImageGenerationResult {
     images: Vec<Vec<u8>>,
-    usage_model: Option<String>,
     usage: LlmUsageRecord,
 }
 
@@ -143,43 +146,6 @@ pub fn build_codex_image_generation_payload(
     })
 }
 
-fn parse_sse_events(body: &str) -> Result<Vec<Value>> {
-    let mut events = Vec::new();
-    let mut current_data_lines = Vec::new();
-
-    let flush_event = |lines: &mut Vec<String>, events: &mut Vec<Value>| -> Result<()> {
-        if lines.is_empty() {
-            return Ok(());
-        }
-        let payload = lines.join("\n");
-        lines.clear();
-        if payload.trim().is_empty() || payload.trim() == "[DONE]" {
-            return Ok(());
-        }
-        let value = serde_json::from_str::<Value>(&payload).with_context(|| {
-            format!(
-                "Failed to parse Codex image SSE event payload: {}",
-                truncate_for_log(&payload, 500)
-            )
-        })?;
-        events.push(value);
-        Ok(())
-    };
-
-    for line in body.lines() {
-        if line.trim().is_empty() {
-            flush_event(&mut current_data_lines, &mut events)?;
-            continue;
-        }
-        if let Some(data) = line.strip_prefix("data:") {
-            current_data_lines.push(data.trim_start().to_string());
-        }
-    }
-    flush_event(&mut current_data_lines, &mut events)?;
-
-    Ok(events)
-}
-
 fn failure_message(event: &Value) -> Option<String> {
     event
         .pointer("/response/error/message")
@@ -216,38 +182,6 @@ fn usage_has_counts(usage: &LlmUsageRecord) -> bool {
     usage.input_tokens.is_some() || usage.output_tokens.is_some() || usage.total_tokens.is_some()
 }
 
-fn usage_record_from_value(usage: &Value, response_id: Option<String>) -> LlmUsageRecord {
-    let input_tokens = usage.get("input_tokens").and_then(|value| value.as_i64());
-    let output_tokens = usage.get("output_tokens").and_then(|value| value.as_i64());
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(|value| value.as_i64())
-        .or_else(|| match (input_tokens, output_tokens) {
-            (Some(input_tokens), Some(output_tokens)) => Some(input_tokens + output_tokens),
-            _ => None,
-        });
-    let reasoning_tokens = usage
-        .pointer("/output_tokens_details/reasoning_tokens")
-        .and_then(|value| value.as_i64());
-    let cached_input_tokens = usage
-        .pointer("/input_tokens_details/cached_tokens")
-        .and_then(|value| value.as_i64());
-    let cache_write_tokens = usage
-        .pointer("/input_tokens_details/cache_write_tokens")
-        .and_then(|value| value.as_i64());
-
-    LlmUsageRecord {
-        response_id,
-        input_tokens,
-        output_tokens,
-        total_tokens,
-        reasoning_tokens,
-        cached_input_tokens,
-        cache_write_tokens,
-        raw_usage_json: Some(usage.to_string()),
-    }
-}
-
 fn usage_value(value: &Value) -> Option<&Value> {
     value.get("usage").filter(|usage| !usage.is_null())
 }
@@ -255,7 +189,9 @@ fn usage_value(value: &Value) -> Option<&Value> {
 fn extract_codex_image_generation_result(
     body: &str,
 ) -> Result<CodexImageGenerationResult, ImageGenerationError> {
-    let events = parse_sse_events(body).map_err(|err| ImageGenerationError(err.to_string()))?;
+    let events = parse_sse_data_events(body).map_err(|err| {
+        ImageGenerationError(format!("Failed to parse Codex image SSE stream: {err}"))
+    })?;
     let mut output_item_images = Vec::new();
     let mut completed_output_images = Vec::new();
     let mut response_id = None;
@@ -276,7 +212,8 @@ fn extract_codex_image_generation_result(
                         == Some("image_generation_call")
                     {
                         if let Some(usage) = usage_value(item) {
-                            image_usage = usage_record_from_value(usage, response_id.clone());
+                            image_usage =
+                                usage::from_responses_usage_object(usage, response_id.clone());
                         }
                     }
                 }
@@ -290,7 +227,7 @@ fn extract_codex_image_generation_result(
                     .pointer("/response/usage")
                     .filter(|usage| !usage.is_null())
                 {
-                    response_usage = usage_record_from_value(usage, response_id.clone());
+                    response_usage = usage::from_responses_usage_object(usage, response_id.clone());
                 }
                 if let Some(output) = event
                     .pointer("/response/output")
@@ -305,7 +242,8 @@ fn extract_codex_image_generation_result(
                             == Some("image_generation_call")
                         {
                             if let Some(usage) = usage_value(item) {
-                                image_usage = usage_record_from_value(usage, response_id.clone());
+                                image_usage =
+                                    usage::from_responses_usage_object(usage, response_id.clone());
                             }
                         }
                     }
@@ -340,67 +278,16 @@ fn extract_codex_image_generation_result(
         ));
     }
 
-    let (usage_model, usage) = if usage_has_counts(&image_usage) {
-        (Some(codex_image_display_model()), image_usage)
+    // Prefer the image tool's own usage; fall back to the response total.
+    let usage = if usage_has_counts(&image_usage) {
+        image_usage
     } else if usage_has_counts(&response_usage) {
-        (Some(codex_image_display_model()), response_usage)
+        response_usage
     } else {
-        (None, LlmUsageRecord::default())
+        LlmUsageRecord::default()
     };
 
-    Ok(CodexImageGenerationResult {
-        images,
-        usage_model,
-        usage,
-    })
-}
-
-/// Failure reading a streaming Codex image response body.
-///
-/// `Stream` wraps a transient connection/stream read error (e.g. an idle
-/// chunked connection dropped by an intermediary mid-reasoning) and is safe to
-/// retry. `Fatal` covers deterministic failures (oversized or non-UTF-8 body)
-/// that will not succeed on a re-issue.
-enum CodexImageBodyError {
-    Stream(reqwest::Error),
-    Fatal(String),
-}
-
-async fn read_response_body_limited(
-    mut response: reqwest::Response,
-) -> std::result::Result<String, CodexImageBodyError> {
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                body.extend_from_slice(&chunk);
-                if body.len() > MAX_CODEX_IMAGE_SSE_BYTES {
-                    return Err(CodexImageBodyError::Fatal(
-                        "OpenAI Codex image response exceeded the maximum size".to_string(),
-                    ));
-                }
-            }
-            Ok(None) => break,
-            Err(err) => return Err(CodexImageBodyError::Stream(err)),
-        }
-    }
-    String::from_utf8(body).map_err(|_| {
-        CodexImageBodyError::Fatal("OpenAI Codex image response was not valid UTF-8".to_string())
-    })
-}
-
-fn should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
-}
-
-fn should_retry_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status.is_server_error()
-}
-
-fn retry_delay(attempt: usize) -> Duration {
-    Duration::from_millis(CODEX_IMAGE_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64))
+    Ok(CodexImageGenerationResult { images, usage })
 }
 
 async fn call_codex_image_api(
@@ -408,160 +295,102 @@ async fn call_codex_image_api(
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<Vec<Vec<u8>>, ImageGenerationError> {
     let url = codex_image_response_url();
+    let url = url.as_str();
     let model = codex_image_display_model();
-    let started_at = chrono::Utc::now();
+    let model_ref = model.as_str();
     let metadata = json!({
         "responses_model": payload.get("model").cloned().unwrap_or(Value::Null),
         "timeout_secs": CONFIG.openai_codex_request_timeout_secs,
         "streaming_sse": true,
     });
-    log_llm_request_started(
+    let call = LlmCall::begin(
         ThirdPartyProvider::OpenAICodex.as_str(),
-        &model,
+        model_ref,
         "generate_image_with_codex",
-        started_at,
+        audit_context,
         Some(&metadata),
-    );
+    )
+    .with_label(CODEX_IMAGE_PROVIDER);
+    let timeout = Duration::from_secs(CONFIG.openai_codex_request_timeout_secs);
 
-    let client = get_http_client_no_compression();
-    for attempt in 1..=CODEX_IMAGE_MAX_ATTEMPTS {
-        let auth = openai_codex::get_valid_auth_context()
-            .await
-            .map_err(|err| ImageGenerationError(err.to_string()))?;
-        let mut request = client
-            .post(&url)
-            .timeout(Duration::from_secs(
-                CONFIG.openai_codex_request_timeout_secs,
-            ))
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .header(reqwest::header::CONTENT_TYPE, "application/json");
-        for (name, value) in openai_codex::codex_headers(&auth, None) {
-            request = request.header(name, value);
-        }
-
-        debug!(
-            "OpenAI Codex image request starting: model={}, responses_model={}, size={}, attempt={}/{}",
-            model,
-            payload.get("model").and_then(|value| value.as_str()).unwrap_or("unknown"),
-            payload.pointer("/tools/0/size").and_then(|value| value.as_str()).unwrap_or("unknown"),
-            attempt,
-            CODEX_IMAGE_MAX_ATTEMPTS
-        );
-
-        let response = match request.json(payload).send().await {
-            Ok(response) => response,
-            Err(err) => {
-                let retrying = should_retry_error(&err) && attempt < CODEX_IMAGE_MAX_ATTEMPTS;
-                warn!(
-                    "OpenAI Codex image request failed to send: model={}, error={}, timeout={}, connect={}, status={:?}, attempt={}/{}, retrying={}",
-                    model,
-                    err,
-                    err.is_timeout(),
-                    err.is_connect(),
-                    err.status(),
-                    attempt,
-                    CODEX_IMAGE_MAX_ATTEMPTS,
-                    retrying
-                );
-                if retrying {
-                    tokio::time::sleep(retry_delay(attempt)).await;
-                    continue;
-                }
-                return Err(ImageGenerationError(format!(
-                    "OpenAI Codex image request failed: {err}"
-                )));
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if status == StatusCode::UNAUTHORIZED && attempt < CODEX_IMAGE_MAX_ATTEMPTS {
-                warn!(
-                    "OpenAI Codex image request unauthorized; refreshing auth and retrying (attempt={}/{})",
-                    attempt,
-                    CODEX_IMAGE_MAX_ATTEMPTS
-                );
+    let result = call_with_retry(
+        &call,
+        &CODEX_IMAGE_RETRY_POLICY,
+        |attempt| async move {
+            if attempt.previous_unauthorized {
                 openai_codex::force_refresh_auth_tokens()
                     .await
-                    .map_err(|err| ImageGenerationError(err.to_string()))?;
-                continue;
+                    .map_err(|err| ProviderError::rejected(err.to_string()))?;
             }
-            let retrying = should_retry_status(status) && attempt < CODEX_IMAGE_MAX_ATTEMPTS;
-            warn!(
-                "OpenAI Codex image API error: model={}, status={}, body={}, attempt={}/{}, retrying={}",
-                model,
-                status,
-                truncate_for_log(&body, 1000),
-                attempt,
-                CODEX_IMAGE_MAX_ATTEMPTS,
-                retrying
+            let auth = openai_codex::get_valid_auth_context()
+                .await
+                .map_err(|err| ProviderError::rejected(err.to_string()))?;
+            let mut request = get_http_client_no_compression()
+                .post(url)
+                .timeout(timeout)
+                .header(ACCEPT, "text/event-stream")
+                .header(ACCEPT_ENCODING, "identity")
+                .header(CONTENT_TYPE, "application/json");
+            for (name, value) in openai_codex::codex_headers(&auth, None) {
+                request = request.header(name, value);
+            }
+            debug!(
+                "OpenAI Codex image request starting: model={}, responses_model={}, size={}, attempt={}/{}",
+                model_ref,
+                payload
+                    .get("model")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                payload
+                    .pointer("/tools/0/size")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                attempt.number,
+                attempt.max_attempts
             );
-            if retrying {
-                tokio::time::sleep(retry_delay(attempt)).await;
-                continue;
-            }
-            return Err(ImageGenerationError(format!(
-                "OpenAI Codex image request failed with status {}: {}",
-                status,
-                truncate_for_log(&body, 1000)
-            )));
+            Ok(request.json(payload))
+        },
+        |_| {},
+        |response| async move {
+            // A stream interrupted mid-body surfaces as a retryable transport
+            // error and is re-issued; `store=false` leaves no server state.
+            let bytes =
+                read_body_limited(response, CODEX_IMAGE_PROVIDER, MAX_CODEX_IMAGE_SSE_BYTES)
+                    .await?;
+            let body = String::from_utf8(bytes).map_err(|_| {
+                ProviderError::decode(
+                    CODEX_IMAGE_PROVIDER,
+                    "OpenAI Codex image response was not valid UTF-8",
+                    false,
+                )
+            })?;
+            extract_codex_image_generation_result(&body)
+                .map_err(|err| ProviderError::decode(CODEX_IMAGE_PROVIDER, err.0, false))
+        },
+        |result: &CodexImageGenerationResult| result.usage.clone(),
+    )
+    .await;
+
+    match result {
+        Ok(result) => {
+            info!(
+                "OpenAI Codex image request completed: model={}, images={}",
+                model,
+                result.images.len()
+            );
+            Ok(result.images)
         }
-
-        let body = match read_response_body_limited(response).await {
-            Ok(body) => body,
-            // The body stream was interrupted (the same idle chunked-connection
-            // drop that affects Codex text streaming). Re-issue the identical
-            // request instead of failing the user outright.
-            Err(CodexImageBodyError::Stream(err)) => {
-                let retrying = attempt < CODEX_IMAGE_MAX_ATTEMPTS;
-                warn!(
-                    "OpenAI Codex image response body decode failed: model={}, error={}, timeout={}, connect={}, attempt={}/{}, retrying={}",
-                    model,
-                    err,
-                    err.is_timeout(),
-                    err.is_connect(),
-                    attempt,
-                    CODEX_IMAGE_MAX_ATTEMPTS,
-                    retrying
-                );
-                if retrying {
-                    tokio::time::sleep(retry_delay(attempt)).await;
-                    continue;
-                }
-                return Err(ImageGenerationError(format!(
-                    "OpenAI Codex image response body decode failed: {err}"
-                )));
-            }
-            Err(CodexImageBodyError::Fatal(message)) => {
-                return Err(ImageGenerationError(message));
-            }
-        };
-        let result = extract_codex_image_generation_result(&body)?;
-        let images = result.images;
-        info!(
-            "OpenAI Codex image request completed: model={}, images={}",
-            model,
-            images.len()
-        );
-        let usage_model = result.usage_model.unwrap_or_else(|| model.clone());
-        record_llm_request_success(
-            audit_context,
-            ThirdPartyProvider::OpenAICodex.as_str(),
-            &usage_model,
-            "generate_image_with_codex",
-            started_at,
-            chrono::Utc::now(),
-            result.usage,
-        )
-        .await;
-        return Ok(images);
+        Err(err) => Err(codex_image_error(err)),
     }
+}
 
-    Err(ImageGenerationError(
-        "OpenAI Codex image request exhausted retries".to_string(),
-    ))
+/// Decode failures already carry the user-facing message (`response.failed`
+/// reasons, payload limits); other failures keep the transport's wording.
+fn codex_image_error(err: ProviderError) -> ImageGenerationError {
+    match err {
+        ProviderError::Decode { detail, .. } => ImageGenerationError(detail),
+        other => ImageGenerationError(other.to_string()),
+    }
 }
 
 pub async fn generate_image_with_codex(
@@ -751,10 +580,6 @@ mod tests {
         let result = extract_codex_image_generation_result(&body).unwrap();
 
         assert_eq!(result.images, vec![b"completed-image".to_vec()]);
-        assert_eq!(
-            result.usage_model.as_deref(),
-            Some(codex_image_display_model().as_str())
-        );
         assert_eq!(result.usage.response_id.as_deref(), Some("resp_123"));
         assert_eq!(result.usage.input_tokens, Some(10));
         assert_eq!(result.usage.output_tokens, Some(20));
@@ -799,14 +624,25 @@ mod tests {
 
         let result = extract_codex_image_generation_result(&body).unwrap();
 
-        assert_eq!(
-            result.usage_model.as_deref(),
-            Some(codex_image_display_model().as_str())
-        );
         assert_eq!(result.usage.response_id.as_deref(), Some("resp_123"));
         assert_eq!(result.usage.input_tokens, Some(100));
         assert_eq!(result.usage.output_tokens, Some(200));
         assert_eq!(result.usage.total_tokens, Some(300));
+    }
+
+    #[test]
+    fn invalid_sse_payloads_are_reported_by_the_shared_decoder() {
+        let err = extract_codex_image_generation_result(
+            "data: {not json
+
+",
+        )
+        .expect_err("invalid payload");
+        assert!(
+            err.0.contains("9-byte SSE event payload"),
+            "expected the shared SSE decoder's message, got: {}",
+            err.0
+        );
     }
 
     #[test]

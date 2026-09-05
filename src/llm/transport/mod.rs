@@ -6,6 +6,7 @@
 pub mod body;
 pub mod error;
 pub mod retry;
+pub mod sse;
 pub mod usage;
 
 use std::future::Future;
@@ -45,7 +46,10 @@ fn no_redaction(text: &str) -> String {
 /// begins and records the audit row (success with usage, or failure with an
 /// error summary) when it ends.
 pub struct LlmCall<'a> {
+    /// Audit/stats key (`gemini`, `openai-codex`, ...).
     provider: &'a str,
+    /// Human-readable name for log lines and error text; defaults to `provider`.
+    label: &'a str,
     model: &'a str,
     operation: &'a str,
     audit: Option<&'a LlmAuditContext>,
@@ -68,6 +72,7 @@ impl<'a> LlmCall<'a> {
         log_llm_request_started(provider, model, operation, started_at, metadata);
         Self {
             provider,
+            label: provider,
             model,
             operation,
             audit,
@@ -83,6 +88,7 @@ impl<'a> LlmCall<'a> {
     pub fn untracked(provider: &'a str, label: &'a str) -> Self {
         Self {
             provider,
+            label: provider,
             model: label,
             operation: "",
             audit: None,
@@ -92,6 +98,13 @@ impl<'a> LlmCall<'a> {
         }
     }
 
+    /// Use a different name than the audit key in logs and error messages
+    /// (e.g. `OpenAI Codex` while audit rows stay keyed `openai-codex`).
+    pub fn with_label(mut self, label: &'a str) -> Self {
+        self.label = label;
+        self
+    }
+
     /// Scrub secrets (API keys or tokens embedded in URLs) from error text
     /// before it is logged or stored.
     pub fn with_redaction(mut self, redact: fn(&str) -> String) -> Self {
@@ -99,8 +112,8 @@ impl<'a> LlmCall<'a> {
         self
     }
 
-    pub fn provider(&self) -> &'a str {
-        self.provider
+    pub fn label(&self) -> &'a str {
+        self.label
     }
 
     pub fn model(&self) -> &'a str {
@@ -173,7 +186,7 @@ where
     RFut: Future<Output = Result<T, ProviderError>>,
     U: Fn(&T) -> LlmUsageRecord,
 {
-    let provider = call.provider();
+    let provider = call.label();
     let model = call.model();
     let mut previous_unauthorized = false;
     let mut attempt = 0usize;
@@ -430,6 +443,37 @@ mod tests {
             started.elapsed()
         );
         server.join().expect("both requests were served");
+    }
+
+    #[tokio::test]
+    async fn error_text_uses_the_display_label_not_the_audit_key() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "POST",
+            "/v1",
+            raw_response(400, &[], "nope"),
+        )]);
+        let url = server.url("/v1").to_string();
+        let url = url.as_str();
+        let call =
+            LlmCall::begin("openai-codex", "model", "op", None, None).with_label("OpenAI Codex");
+
+        let err = call_with_retry(
+            &call,
+            &fast_policy(1),
+            |_| async move { Ok(get_http_client().post(url).json(&json!({}))) },
+            |_| {},
+            read_json_value,
+            no_usage,
+        )
+        .await
+        .expect_err("400 is permanent");
+
+        assert!(
+            err.to_string()
+                .starts_with("OpenAI Codex request failed with status 400"),
+            "{err}"
+        );
+        server.join().expect("one request was served");
     }
 
     #[tokio::test]

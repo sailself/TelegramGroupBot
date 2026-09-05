@@ -36,6 +36,28 @@ pub fn from_chat_completions(response: &Value) -> LlmUsageRecord {
     }
 }
 
+/// A bare Responses `usage` object, as found on `response.completed` events and
+/// on `image_generation_call` output items.
+pub fn from_responses_usage_object(usage: &Value, response_id: Option<String>) -> LlmUsageRecord {
+    let input_tokens = i64_at(usage, "/input_tokens");
+    let output_tokens = i64_at(usage, "/output_tokens");
+    let total_tokens =
+        i64_at(usage, "/total_tokens").or_else(|| match (input_tokens, output_tokens) {
+            (Some(input), Some(output)) => Some(input + output),
+            _ => None,
+        });
+    LlmUsageRecord {
+        response_id,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        reasoning_tokens: i64_at(usage, "/output_tokens_details/reasoning_tokens"),
+        cached_input_tokens: i64_at(usage, "/input_tokens_details/cached_tokens"),
+        cache_write_tokens: i64_at(usage, "/input_tokens_details/cache_write_tokens"),
+        raw_usage_json: Some(usage.to_string()),
+    }
+}
+
 /// Gemini `usageMetadata`.
 pub fn from_gemini(response: &Value) -> LlmUsageRecord {
     let Some(usage) = response
@@ -83,6 +105,17 @@ mod tests {
         assert_eq!(usage.reasoning_tokens, Some(5));
         assert_eq!(usage.cached_input_tokens, Some(8));
         assert_eq!(usage.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn responses_usage_object_can_be_read_with_an_explicit_response_id() {
+        let usage = from_responses_usage_object(
+            &json!({ "input_tokens": 5, "output_tokens": 6 }),
+            Some("resp_img".to_string()),
+        );
+        assert_eq!(usage.response_id.as_deref(), Some("resp_img"));
+        assert_eq!(usage.total_tokens, Some(11));
+        assert!(usage.raw_usage_json.is_some());
     }
 
     #[test]
