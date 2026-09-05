@@ -100,7 +100,6 @@ pub fn parse_third_party_model_id(identifier: &str) -> Option<(ThirdPartyProvide
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bot_token: String,
@@ -202,7 +201,6 @@ pub struct Config {
     pub default_quick_text_model: String,
     pub quick_reasoning_effort: String,
     pub default_image_model: String,
-    pub default_q_model: String,
     pub telegram_max_length: usize,
     pub media_group_max_items: usize,
     pub external_enrich_fanout: usize,
@@ -817,7 +815,6 @@ impl Config {
             default_quick_text_model,
             quick_reasoning_effort,
             default_image_model: env_string("DEFAULT_IMAGE_MODEL", "gemini"),
-            default_q_model: env_string("DEFAULT_Q_MODEL", "gemini"),
             telegram_max_length: env_usize("TELEGRAM_MAX_LENGTH", 4000),
             media_group_max_items: env_usize("MEDIA_GROUP_MAX_ITEMS", 256).max(1),
             external_enrich_fanout: env_usize("EXTERNAL_ENRICH_FANOUT", 4).max(1),

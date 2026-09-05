@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -477,7 +475,7 @@ mod tests {
         );
         let config = test_config_with_vx_base(server.base_url());
         let post = fetch(
-            super::super::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config,
             &identity("123"),
             Duration::from_secs(1),
@@ -502,7 +500,7 @@ mod tests {
         let config = test_config_with_vx_base(server.base_url());
 
         let result = fetch(
-            super::super::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config,
             &identity("123"),
             Duration::from_secs(1),
@@ -525,7 +523,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let started = std::time::Instant::now();
         let error = fetch_with_parser(
-            super::super::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config,
             &identity("123"),
             Duration::from_millis(20),
@@ -547,7 +545,7 @@ mod tests {
         let server = TestServer::single_json("GET", "/Twitter/status/123", b"not json");
         let config = test_config_with_vx_base(server.base_url());
         let error = fetch(
-            super::super::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config,
             &identity("123"),
             Duration::from_secs(1),

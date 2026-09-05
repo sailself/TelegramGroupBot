@@ -930,7 +930,6 @@ mod tests {
             cache.insert(
                 format!("capacity-test-{id}"),
                 TwitterContent {
-                    url: format!("https://x.com/a/status/{id}"),
                     text_content: String::new(),
                     image_urls: Vec::new(),
                     video_urls: Vec::new(),

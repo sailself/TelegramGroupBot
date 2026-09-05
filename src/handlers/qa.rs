@@ -1679,14 +1679,7 @@ fn build_chat_search_pending_request(
 ) -> PendingQRequest {
     PendingQRequest {
         user_id,
-        username: message
-            .from
-            .as_ref()
-            .map(|user| user.full_name())
-            .unwrap_or_else(|| "Anonymous".to_string()),
         query: query_text.to_string(),
-        original_query: query_text.to_string(),
-        db_query_text: query_text.to_string(),
         telegram_language_code: message
             .from
             .as_ref()
@@ -1700,7 +1693,6 @@ fn build_chat_search_pending_request(
         message_id: message.id.0 as i64,
         selection_message_id,
         original_user_id: user_id,
-        reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
         llm_invocation_id: audit_context.map(|context| context.invocation_id),
         timestamp: now_unix_seconds(),
         command_timer,
@@ -2192,10 +2184,7 @@ mod tests {
     fn pending_q_request(original_user_id: i64, timestamp: i64) -> PendingQRequest {
         PendingQRequest {
             user_id: original_user_id,
-            username: "Test User".to_string(),
             query: "question".to_string(),
-            original_query: "question".to_string(),
-            db_query_text: "question".to_string(),
             telegram_language_code: None,
             media_files: Vec::new(),
             youtube_urls: Vec::new(),
@@ -2205,7 +2194,6 @@ mod tests {
             message_id: 456,
             selection_message_id: 789,
             original_user_id,
-            reply_to_message_id: None,
             llm_invocation_id: None,
             timestamp,
             command_timer: None,
@@ -3886,10 +3874,7 @@ async fn q_handler_internal(
         let mut timer = start_command_timer(command_name, &message);
         let pending_request = PendingQRequest {
             user_id,
-            username: username.clone(),
             query: query_text.clone(),
-            original_query: original_query.clone(),
-            db_query_text: db_query_text.clone(),
             telegram_language_code: user_language_code.map(str::to_string),
             media_files,
             youtube_urls,
@@ -3905,7 +3890,6 @@ async fn q_handler_internal(
             message_id: message.id.0 as i64,
             selection_message_id: processing_message.id.0 as i64,
             original_user_id: user_id,
-            reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
             llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
             timestamp: now_unix_seconds(),
             command_timer: None,
@@ -3955,10 +3939,7 @@ async fn q_handler_internal(
 
     let pending_request = PendingQRequest {
         user_id,
-        username: username.clone(),
         query: query_text.clone(),
-        original_query: original_query.clone(),
-        db_query_text: db_query_text.clone(),
         telegram_language_code: user_language_code.map(str::to_string),
         media_files,
         youtube_urls,
@@ -3974,7 +3955,6 @@ async fn q_handler_internal(
         message_id: message.id.0 as i64,
         selection_message_id: selection_message.id.0 as i64,
         original_user_id: user_id,
-        reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
         llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
         timestamp: now_unix_seconds(),
         command_timer: Some(timer),

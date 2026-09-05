@@ -499,7 +499,7 @@ mod tests {
         )
         .with_header("authorization", "Bearer test-jina-key")]);
         let post = fetch(
-            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config(server.base_url(), Some("test-jina-key")),
             &identity("123"),
             Duration::from_secs(1),
@@ -520,7 +520,7 @@ mod tests {
         )
         .without_header("authorization")]);
         fetch(
-            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config(server.base_url(), None),
             &identity("123"),
             Duration::from_secs(1),
@@ -540,7 +540,7 @@ mod tests {
         )
         .without_header("authorization")]);
         fetch(
-            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config(server.base_url(), Some("   ")),
             &identity("123"),
             Duration::from_secs(1),
@@ -563,7 +563,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let started = std::time::Instant::now();
         let error = fetch_with_parser(
-            crate::tools::twitter_extractor::providers::get_http_client_no_redirect(),
+            crate::utils::http::get_http_client_no_redirect(),
             &config(server.base_url(), None),
             &identity("123"),
             Duration::from_millis(20),

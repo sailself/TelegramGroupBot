@@ -857,7 +857,7 @@ impl Database {
         Ok(Some(messages))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
@@ -1554,10 +1554,25 @@ pub fn build_message_insert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::{
-        LlmInvocationInsert, LlmInvocationRow, LlmRequestInsert, LlmRequestRow, TopicWindowSpec,
-    };
+    use crate::db::models::{LlmInvocationInsert, LlmRequestInsert, TopicWindowSpec};
     use chrono::Utc;
+
+    /// The audit columns the tests assert on; `SELECT *` maps by name, so
+    /// unlisted columns are simply ignored.
+    #[derive(Debug, FromRow)]
+    struct LlmInvocationRow {
+        trigger_name: String,
+    }
+
+    #[derive(Debug, FromRow)]
+    struct LlmRequestRow {
+        invocation_id: i64,
+        provider: String,
+        total_tokens: Option<i64>,
+        reasoning_tokens: Option<i64>,
+        cached_input_tokens: Option<i64>,
+        cache_write_tokens: Option<i64>,
+    }
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use tokio::time::{sleep, Duration};

@@ -7,13 +7,10 @@ use super::url::XStatusIdentity;
 
 #[derive(Debug, Clone)]
 pub struct TwitterContent {
-    #[allow(dead_code)]
-    pub url: String,
     pub text_content: String,
     pub image_urls: Vec<String>,
     pub video_urls: Vec<String>,
     pub formatted_content: String,
-    #[allow(dead_code)]
     pub(crate) attachment_plan: Vec<TwitterAttachment>,
 }
 
@@ -219,7 +216,6 @@ pub(crate) fn build_twitter_content(
     formatted_content.push_str("\n--- End Twitter Content ---\n\n");
 
     Ok(TwitterContent {
-        url: identity.canonical_url.to_string(),
         text_content,
         image_urls,
         video_urls,

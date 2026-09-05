@@ -33,14 +33,10 @@ impl QaCommandMode {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PendingQRequest {
     pub user_id: i64,
-    pub username: String,
     pub query: String,
-    pub original_query: String,
-    pub db_query_text: String,
     pub telegram_language_code: Option<String>,
     pub media_files: Vec<MediaFile>,
     pub youtube_urls: Vec<String>,
@@ -50,28 +46,24 @@ pub struct PendingQRequest {
     pub message_id: i64,
     pub selection_message_id: i64,
     pub original_user_id: i64,
-    pub reply_to_message_id: Option<i64>,
     pub llm_invocation_id: Option<i64>,
     pub timestamp: i64,
     pub command_timer: Option<CommandTimer>,
     pub mode: QaCommandMode,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageGenerationModel {
     Gemini,
     CodexGptImage2,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingImageCommand {
     Img,
     Image,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PendingImageRequest {
     pub user_id: i64,
@@ -81,7 +73,6 @@ pub struct PendingImageRequest {
     pub prompt: String,
     pub image_urls: Vec<String>,
     pub telegraph_contents: Vec<String>,
-    pub original_message_text: String,
     pub selection_message_id: i64,
     pub llm_invocation_id: Option<i64>,
     pub model: Option<ImageGenerationModel>,

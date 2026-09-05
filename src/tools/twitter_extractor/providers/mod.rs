@@ -8,9 +8,6 @@ use tokio::task::{JoinError, JoinHandle};
 use url::Url;
 
 use crate::config::Config;
-use crate::utils::http::{
-    get_http_client_no_redirect as shared_http_client_no_redirect, NoRedirectClient,
-};
 
 pub(crate) mod fxtwitter;
 pub(crate) mod jina;
@@ -107,7 +104,6 @@ impl TwitterProvider {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct TwitterFetchConfig {
     pub(crate) providers: Vec<TwitterProvider>,
@@ -120,7 +116,6 @@ pub(crate) struct TwitterFetchConfig {
     pub(crate) response_max_bytes: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderErrorKind {
     Timeout,
@@ -132,7 +127,6 @@ pub(crate) enum ProviderErrorKind {
     DeadlineExhausted,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderError {
     pub(crate) provider: TwitterProvider,
@@ -176,12 +170,23 @@ pub(crate) fn aggregate_provider_failures(
             let status = failure
                 .status
                 .map_or_else(|| "-".to_string(), |status| status.as_u16().to_string());
-            format!(
-                "{}:{}/{}",
-                failure.provider.as_str(),
-                failure.kind.as_str(),
-                status
-            )
+            let detail = failure.detail.trim();
+            if detail.is_empty() {
+                format!(
+                    "{}:{}/{}",
+                    failure.provider.as_str(),
+                    failure.kind.as_str(),
+                    status
+                )
+            } else {
+                format!(
+                    "{}:{}/{} ({})",
+                    failure.provider.as_str(),
+                    failure.kind.as_str(),
+                    status,
+                    detail
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -216,7 +221,6 @@ impl TryFrom<&Config> for TwitterFetchConfig {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) async fn read_limited_body(
     provider: TwitterProvider,
     mut response: Response,
@@ -253,11 +257,6 @@ pub(crate) async fn read_limited_body(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
-}
-
-#[allow(dead_code)]
-pub(crate) fn get_http_client_no_redirect() -> &'static NoRedirectClient {
-    shared_http_client_no_redirect()
 }
 
 #[cfg(test)]

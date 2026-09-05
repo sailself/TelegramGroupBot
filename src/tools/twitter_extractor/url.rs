@@ -115,12 +115,10 @@ pub(crate) fn parse_status_identity(raw_url: &str) -> Result<XStatusIdentity> {
     Ok(XStatusIdentity { id, canonical_url })
 }
 
-#[allow(dead_code)]
 pub(crate) fn canonical_status_key(raw_url: &str) -> Result<String> {
     Ok(parse_status_identity(raw_url)?.id)
 }
 
-#[allow(dead_code)]
 pub(crate) fn is_supported_status_url(raw_url: &str) -> bool {
     parse_status_identity(raw_url).is_ok()
 }

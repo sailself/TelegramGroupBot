@@ -143,7 +143,6 @@ struct ImageRequestContext {
     prompt: String,
     image_urls: Vec<String>,
     telegraph_contents: Vec<String>,
-    original_message_text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1498,7 +1497,6 @@ async fn prepare_image_request(
         prompt,
         image_urls,
         telegraph_contents: telegraph_texts,
-        original_message_text,
     })
 }
 
@@ -2195,7 +2193,6 @@ pub async fn img_handler(
             prompt: context.prompt,
             image_urls: context.image_urls,
             telegraph_contents: context.telegraph_contents,
-            original_message_text: context.original_message_text,
             selection_message_id: selection_message.id.0 as i64,
             llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
             model: None,
@@ -2516,7 +2513,6 @@ pub async fn image_handler(
         prompt: context.prompt,
         image_urls: context.image_urls,
         telegraph_contents: context.telegraph_contents,
-        original_message_text: context.original_message_text,
         selection_message_id: selection_message.id.0 as i64,
         llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
         model: initial_model,
@@ -4284,7 +4280,6 @@ external_media_total_max_bytes: 52428800\n"
             prompt: "test".to_string(),
             image_urls: Vec::new(),
             telegraph_contents: Vec::new(),
-            original_message_text: "test".to_string(),
             selection_message_id: 4,
             llm_invocation_id: None,
             model: Some(ImageGenerationModel::Gemini),
@@ -4310,7 +4305,6 @@ external_media_total_max_bytes: 52428800\n"
             prompt: "test".to_string(),
             image_urls: Vec::new(),
             telegraph_contents: Vec::new(),
-            original_message_text: "test".to_string(),
             selection_message_id: 4,
             llm_invocation_id: None,
             model: Some(ImageGenerationModel::Gemini),

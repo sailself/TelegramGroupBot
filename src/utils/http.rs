@@ -60,7 +60,6 @@ pub fn get_http_client_no_compression() -> &'static Client {
     &HTTP_CLIENT_NO_COMPRESSION
 }
 
-#[allow(dead_code)]
 pub fn get_http_client_no_redirect() -> &'static NoRedirectClient {
     &NO_REDIRECT_CLIENT
 }
