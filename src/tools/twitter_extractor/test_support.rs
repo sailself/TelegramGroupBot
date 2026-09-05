@@ -338,11 +338,15 @@ enum RequestError {
 }
 
 pub(crate) fn is_client_disconnect_kind(kind: std::io::ErrorKind) -> bool {
+    // `TimedOut` / `WouldBlock` cover the socket read timeout that fires when
+    // the client hit its own deadline and never sent (or finished) the request.
     matches!(
         kind,
         std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
     )
 }
 
