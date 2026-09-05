@@ -18,8 +18,12 @@ use crate::llm::runtime_models::{
     codex_model_record_for_request, CodexSelectedModelRecord,
     CODEX_SELECTED_MODEL_METADATA_VERSION, OPENAI_CODEX_SELECTED_MODEL_ID,
 };
+use crate::llm::tool_loop::{
+    clamp_request_timeout_secs, run_tool_loop, BoxFuture, ModelTurn, ToolCall, ToolProtocol,
+    TurnDeadline,
+};
 use crate::llm::tool_prompts::{fence_tool_result, tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
-use crate::llm::tool_runtime::ToolRuntime;
+use crate::llm::tool_runtime::{ToolKind, ToolRuntime};
 use crate::llm::transport::sse::parse_sse_data_events;
 use crate::llm::transport::{
     call_with_retry, read_body_limited_or_partial, usage, BodyRead, LlmCall, ProviderError,
@@ -1559,10 +1563,97 @@ async fn responses_completion_with_tools(
     unreachable!("responses tool loop exhausted without returning")
 }
 
+/// OpenAI Responses half of the shared tool loop.
+struct ResponsesProtocol<'a> {
+    model_config: &'a ThirdPartyModelConfig,
+    instructions: String,
+    session_id: String,
+    turn_state: CodexTurnState,
+    native_codex_web_search_tool: Option<Value>,
+    audit_context: Option<&'a LlmAuditContext>,
+    operation: &'a str,
+    reasoning_override: Option<&'a str>,
+    pinned_codex: Option<&'a PinnedCodexRequestContract>,
+}
+
+impl ToolProtocol for ResponsesProtocol<'_> {
+    type Item = Value;
+
+    fn tool_declarations(&self, runtime: &ToolRuntime) -> Vec<Value> {
+        let mut tools = runtime.build_responses_tools();
+        if let Some(native_tool) = &self.native_codex_web_search_tool {
+            // Codex's native web search supersedes the function-call variant.
+            tools.retain(|tool| {
+                tool.get("name").and_then(Value::as_str) != Some(ToolKind::WebSearch.name())
+            });
+            tools.push(native_tool.clone());
+        }
+        tools
+    }
+
+    fn complete<'a>(
+        &'a mut self,
+        transcript: &'a [Value],
+        tools: Option<&'a [Value]>,
+        request_timeout: Duration,
+    ) -> BoxFuture<'a, Result<ModelTurn<Value>>> {
+        Box::pin(async move {
+            let mut details = build_request_details(
+                self.model_config,
+                &self.instructions,
+                transcript.to_vec(),
+                tools.map(<[Value]>::to_vec),
+                &self.session_id,
+                self.reasoning_override,
+                self.pinned_codex,
+            )?;
+            details.request_timeout_secs =
+                clamp_request_timeout_secs(details.request_timeout_secs, request_timeout);
+            let ResponsesApiResult {
+                response,
+                metadata: _,
+            } = call_provider_api(
+                &details,
+                self.audit_context,
+                self.operation,
+                &mut self.turn_state,
+            )
+            .await?;
+            let output_items = extract_response_output_items(&response);
+            let tool_calls = extract_response_tool_calls(&output_items)
+                .into_iter()
+                .map(|call| ToolCall::from_argument_text(call.call_id, call.name, &call.arguments))
+                .collect();
+            Ok(ModelTurn {
+                text: extract_response_text(&output_items),
+                tool_calls,
+                transcript: output_items,
+            })
+        })
+    }
+
+    fn tool_results(&self, results: Vec<(ToolCall, String)>) -> Vec<Value> {
+        results
+            .into_iter()
+            .map(|(call, output)| {
+                json!({
+                    "type": "function_call_output",
+                    "call_id": call.id,
+                    "output": output,
+                })
+            })
+            .collect()
+    }
+
+    fn begin_final_pass(&mut self) {
+        self.instructions = format!("{}\n\n{TOOL_LIMIT_SYSTEM_PROMPT}", self.instructions);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn responses_completion_with_tool_runtime(
     instructions: &str,
-    mut input_items: Vec<Value>,
+    input_items: Vec<Value>,
     model_config: &ThirdPartyModelConfig,
     runtime: &mut ToolRuntime,
     native_codex_web_search_tool: Option<Value>,
@@ -1571,104 +1662,26 @@ async fn responses_completion_with_tool_runtime(
     reasoning_override: Option<&str>,
     pinned_codex: Option<&PinnedCodexRequestContract>,
 ) -> Result<String> {
-    let mut tools = runtime.build_responses_tools();
-    let has_native_codex_web_search = native_codex_web_search_tool.is_some();
-    let model_label = debug_model_label(model_config);
-    if has_native_codex_web_search {
-        tools
-            .retain(|tool| tool.get("name").and_then(|value| value.as_str()) != Some("web_search"));
-    }
-    if let Some(native_tool) = native_codex_web_search_tool {
-        tools.push(native_tool);
-    }
-    let mut tools_enabled = !tools.is_empty();
-    let session_id = generate_session_id();
-    let mut turn_state = CodexTurnState::default();
-    let mut final_answer_requested = false;
-    debug!(
-        "Responses runtime tool loop starting: model={}, session_id={}, tools_enabled={}, native_codex_web_search={}",
-        model_label,
-        session_id,
-        tools_enabled,
-        has_native_codex_web_search
-    );
-
-    for iteration in 0..runtime.max_total_successful_calls().saturating_add(2) {
-        debug!(
-            "Responses runtime iteration {} for model={} session_id={} tools_enabled={}",
-            iteration + 1,
-            model_label,
-            session_id,
-            tools_enabled
-        );
-        let details = build_request_details(
-            model_config,
-            instructions,
-            input_items.clone(),
-            tools_enabled.then_some(tools.clone()),
-            &session_id,
-            reasoning_override,
-            pinned_codex,
-        )?;
-        let ResponsesApiResult {
-            response,
-            metadata: _,
-        } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
-        let output_items = extract_response_output_items(&response);
-        let tool_calls = if tools_enabled {
-            extract_response_tool_calls(&output_items)
-        } else {
-            Vec::new()
-        };
-
-        if tool_calls.is_empty() {
-            return Ok(extract_response_text(&output_items));
-        }
-
-        debug!(
-            "Responses runtime iteration {} returned {} tool call(s) for model={} session_id={}",
-            iteration + 1,
-            tool_calls.len(),
-            model_label,
-            session_id
-        );
-
-        input_items.extend(output_items.clone());
-
-        for tool_call in tool_calls {
-            let args_value: Value =
-                serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
-            let result = runtime.execute_tool(&tool_call.name, &args_value).await;
-            input_items.push(json!({
-                "type": "function_call_output",
-                "call_id": tool_call.call_id,
-                "output": result,
-            }));
-        }
-
-        if runtime.force_final_answer() && !final_answer_requested {
-            final_answer_requested = true;
-            tools_enabled = false;
-        }
-    }
-
-    let final_instructions = format!("{instructions}\n\n{TOOL_LIMIT_SYSTEM_PROMPT}");
-    let details = build_request_details(
+    let per_request = Duration::from_secs(responses_request_timeout_secs(model_config.provider));
+    let deadline = TurnDeadline::for_runtime(per_request, runtime);
+    let mut protocol = ResponsesProtocol {
         model_config,
-        &final_instructions,
-        input_items,
-        None,
-        &session_id,
+        instructions: instructions.to_string(),
+        session_id: generate_session_id(),
+        turn_state: CodexTurnState::default(),
+        native_codex_web_search_tool,
+        audit_context,
+        operation,
         reasoning_override,
         pinned_codex,
-    )?;
-    let ResponsesApiResult {
-        response,
-        metadata: _,
-    } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
-    Ok(extract_response_text(&extract_response_output_items(
-        &response,
-    )))
+    };
+    debug!(
+        "Responses runtime tool loop starting: model={}, session_id={}, native_codex_web_search={}",
+        debug_model_label(model_config),
+        protocol.session_id,
+        protocol.native_codex_web_search_tool.is_some()
+    );
+    run_tool_loop(&mut protocol, runtime, input_items, &deadline).await
 }
 
 #[allow(clippy::too_many_arguments)]

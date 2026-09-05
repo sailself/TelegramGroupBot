@@ -349,7 +349,7 @@ impl ToolRuntime {
     }
 
     #[cfg(test)]
-    fn with_web_search_available(mut self, available: bool) -> Self {
+    pub(crate) fn with_web_search_available(mut self, available: bool) -> Self {
         self.web_search_available = available;
         self
     }
@@ -970,12 +970,11 @@ fn hit_to_tool_search_hit(hit: ChatSearchHit, context_messages: Vec<ToolMessage>
     }
 }
 
+/// Test-only helpers shared with the tool-loop tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
     use crate::db::database::Database;
     use chrono::Utc;
-    use tokio::runtime::Runtime;
 
     fn test_db_path(test_name: &str) -> std::path::PathBuf {
         let mut path = std::path::PathBuf::from("target");
@@ -995,12 +994,22 @@ mod tests {
         format!("sqlite://{}", path.to_string_lossy().replace('\\', "/"))
     }
 
-    async fn init_test_db(test_name: &str) -> Database {
+    /// A fresh on-disk SQLite database for one test.
+    pub(crate) async fn init_test_db(test_name: &str) -> Database {
         let path = test_db_path(test_name);
         Database::init(&sqlite_url_for_path(&path))
             .await
             .expect("test database should initialize")
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::init_test_db;
+    use super::*;
+    use crate::db::database::Database;
+    use chrono::Utc;
+    use tokio::runtime::Runtime;
 
     #[tokio::test]
     async fn model_driven_tool_results_are_fenced_as_untrusted_data() {

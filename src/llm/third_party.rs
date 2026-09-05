@@ -14,6 +14,10 @@ use crate::llm::responses_provider::{
     call_responses_provider, call_responses_provider_with_tool_runtime, PinnedCodexRequestContract,
 };
 use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config};
+use crate::llm::tool_loop::{
+    clamp_request_timeout_secs, run_tool_loop, BoxFuture, ModelTurn, ToolCall, ToolProtocol,
+    TurnDeadline,
+};
 use crate::llm::tool_prompts::{fence_tool_result, tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::transport::{call_with_retry, read_json, usage, LlmCall, RetryPolicy};
@@ -701,78 +705,110 @@ async fn chat_completion_with_tools(
     unreachable!("third-party tool loop exhausted without returning")
 }
 
+/// Chat Completions half of the shared tool loop.
+struct ChatCompletionsProtocol<'a> {
+    model_config: &'a ThirdPartyModelConfig,
+    audit_context: Option<&'a LlmAuditContext>,
+    operation: &'a str,
+}
+
+impl ToolProtocol for ChatCompletionsProtocol<'_> {
+    type Item = Value;
+
+    fn tool_declarations(&self, runtime: &ToolRuntime) -> Vec<Value> {
+        runtime.build_openai_function_tools()
+    }
+
+    fn complete<'a>(
+        &'a mut self,
+        transcript: &'a [Value],
+        tools: Option<&'a [Value]>,
+        request_timeout: Duration,
+    ) -> BoxFuture<'a, Result<ModelTurn<Value>>> {
+        Box::pin(async move {
+            let mut details = build_request_details(
+                self.model_config,
+                transcript.to_vec(),
+                tools.map(<[Value]>::to_vec),
+                tools.is_some().then_some("auto"),
+            )?;
+            details.request_timeout_secs =
+                clamp_request_timeout_secs(details.request_timeout_secs, request_timeout);
+            let response = call_provider_api(&details, self.audit_context, self.operation).await?;
+            let message = extract_response_message(&response);
+            let content = extract_message_content(&message);
+            let tool_calls = extract_tool_calls(&message)
+                .iter()
+                .map(chat_tool_call)
+                .collect::<Vec<_>>();
+            if tool_calls.is_empty() && content.trim().is_empty() {
+                warn!(
+                    "{} response had empty content and no tool calls: {}",
+                    details.display_name,
+                    truncate_for_log(&response.to_string(), 2000)
+                );
+            }
+            Ok(ModelTurn {
+                text: parse_third_party_response(self.model_config, &content),
+                tool_calls,
+                transcript: vec![message],
+            })
+        })
+    }
+
+    fn tool_results(&self, results: Vec<(ToolCall, String)>) -> Vec<Value> {
+        results
+            .into_iter()
+            .map(|(call, output)| {
+                json!({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": output,
+                })
+            })
+            .collect()
+    }
+
+    fn budget_exhausted_notice(&self) -> Option<Value> {
+        Some(json!({
+            "role": "system",
+            "content": TOOL_LIMIT_SYSTEM_PROMPT,
+        }))
+    }
+}
+
+/// A Chat Completions `tool_calls[]` entry as a [`ToolCall`].
+fn chat_tool_call(tool_call: &Value) -> ToolCall {
+    let function = tool_call.get("function");
+    ToolCall::from_argument_text(
+        tool_call.get("id").and_then(Value::as_str).unwrap_or(""),
+        function
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        function
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("{}"),
+    )
+}
+
 async fn chat_completion_with_tool_runtime(
-    mut messages: Vec<Value>,
+    messages: Vec<Value>,
     model_config: &ThirdPartyModelConfig,
     runtime: &mut ToolRuntime,
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
 ) -> Result<String> {
-    let tools = runtime.build_openai_function_tools();
-    let mut tools_enabled = !tools.is_empty();
-    let mut final_answer_requested = false;
-
-    for _ in 0..runtime.max_total_successful_calls().saturating_add(2) {
-        let details = build_request_details(
-            model_config,
-            messages.clone(),
-            tools_enabled.then_some(tools.clone()),
-            Some("auto"),
-        )?;
-        let response = call_provider_api(&details, audit_context, operation).await?;
-        let message = extract_response_message(&response);
-        let content = extract_message_content(&message);
-        let tool_calls = if tools_enabled {
-            extract_tool_calls(&message)
-        } else {
-            Vec::new()
-        };
-
-        if tool_calls.is_empty() {
-            if content.trim().is_empty() {
-                warn!(
-                    "{} custom-tool response had empty content and no tool calls: {}",
-                    details.display_name,
-                    truncate_for_log(&response.to_string(), 2000)
-                );
-            }
-            return Ok(parse_third_party_response(model_config, &content));
-        }
-
-        messages.push(message.clone());
-
-        for tool_call in tool_calls {
-            let tool_name = tool_call
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let args_text = tool_call
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            let args_value: Value = serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
-            let result = runtime.execute_tool(tool_name, &args_value).await;
-
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": tool_call.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                "content": result,
-            }));
-        }
-
-        if runtime.force_final_answer() && !final_answer_requested {
-            messages.push(json!({
-                "role": "system",
-                "content": TOOL_LIMIT_SYSTEM_PROMPT,
-            }));
-            final_answer_requested = true;
-            tools_enabled = false;
-        }
-    }
-
-    request_final_answer_after_tool_limit(messages, model_config, audit_context, operation).await
+    let per_request =
+        Duration::from_secs(provider_runtime_config(model_config.provider)?.request_timeout_secs);
+    let deadline = TurnDeadline::for_runtime(per_request, runtime);
+    let mut protocol = ChatCompletionsProtocol {
+        model_config,
+        audit_context,
+        operation,
+    };
+    run_tool_loop(&mut protocol, runtime, messages, &deadline).await
 }
 
 pub async fn call_third_party_with_tool_runtime(
