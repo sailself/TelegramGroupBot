@@ -10,8 +10,10 @@ use tracing::{debug, warn};
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
 use crate::llm::audit::LlmAuditContext;
 use crate::llm::media::{MediaFile, MediaKind};
-use crate::llm::responses_provider::{call_responses_provider, PinnedCodexRequestContract};
-use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config};
+use crate::llm::responses_provider::call_responses_provider;
+use crate::llm::runtime_models::{
+    is_runtime_provider_ready, runtime_model_config, ResolvedExplicitCodexModel,
+};
 use crate::llm::tool_loop::{
     clamp_request_timeout_secs, run_tool_loop, BoxFuture, ModelTurn, ToolCall, ToolProtocol,
     TurnDeadline,
@@ -31,7 +33,9 @@ const OPENROUTER_TITLE: &str = "TelegramGroupHelperBot";
 pub struct ThirdPartyCallOptions<'a> {
     audit_context: Option<&'a LlmAuditContext>,
     reasoning_override: Option<&'a str>,
-    pinned_codex: Option<&'a PinnedCodexRequestContract>,
+    /// An explicit Codex model (config plus catalog record) the caller already
+    /// resolved, so the call does not depend on the runtime catalog for it.
+    explicit_codex: Option<&'a ResolvedExplicitCodexModel>,
     codex_prompt_style: CodexPromptStyle,
 }
 
@@ -43,7 +47,7 @@ impl<'a> ThirdPartyCallOptions<'a> {
         Self {
             audit_context,
             reasoning_override: None,
-            pinned_codex: None,
+            explicit_codex: None,
             codex_prompt_style,
         }
     }
@@ -53,21 +57,24 @@ impl<'a> ThirdPartyCallOptions<'a> {
         self
     }
 
-    pub(crate) fn with_pinned_codex_request(
+    pub(crate) fn with_explicit_codex_model(
         mut self,
-        pinned_codex: Option<&'a PinnedCodexRequestContract>,
+        explicit_codex: Option<&'a ResolvedExplicitCodexModel>,
     ) -> Self {
-        self.pinned_codex = pinned_codex;
+        self.explicit_codex = explicit_codex;
         self
     }
 }
 
 fn model_config_for_call(
     model_id: &str,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
+    explicit_codex: Option<&ResolvedExplicitCodexModel>,
 ) -> Result<ThirdPartyModelConfig> {
-    if let Some(pinned) = pinned_codex {
-        return Ok(pinned.model_config_for_request(model_id)?.clone());
+    if let Some(explicit) = explicit_codex {
+        if explicit.config.id != model_id {
+            return Err(anyhow!("The explicit Codex model changed"));
+        }
+        return Ok(explicit.config.clone());
     }
 
     CONFIG
@@ -651,7 +658,7 @@ pub async fn call_third_party(
         return Err(anyhow!("Model identifier is required"));
     }
 
-    let model_config = model_config_for_call(model_id, options.pinned_codex)?;
+    let model_config = model_config_for_call(model_id, options.explicit_codex)?;
     call_third_party_with_reasoning_config(
         system_prompt,
         user_content,
@@ -679,7 +686,7 @@ pub async fn call_third_party_with_reasoning_config(
     let ThirdPartyCallOptions {
         audit_context,
         reasoning_override,
-        pinned_codex,
+        explicit_codex,
         codex_prompt_style,
     } = options;
     if matches!(
@@ -696,7 +703,7 @@ pub async fn call_third_party_with_reasoning_config(
             tools,
             audit_context,
             reasoning_override,
-            pinned_codex,
+            explicit_codex,
             codex_prompt_style,
         )
         .await;

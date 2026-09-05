@@ -30,10 +30,7 @@ use crate::llm::audit::{
     audit_context_from_id, create_audit_context_from_message, LlmAuditContext,
     LLM_TRIGGER_KIND_AUTO_Q, LLM_TRIGGER_KIND_COMMAND,
 };
-use crate::llm::responses_provider::{
-    pin_quick_codex_request_contract, quick_reasoning_effort_for_request,
-    PinnedCodexRequestContract,
-};
+use crate::llm::responses_provider::effective_reasoning_effort;
 use crate::llm::runtime_models::{
     codex_model_record_for_request, codex_selected_model_label, ensure_explicit_codex_model,
     is_runtime_provider_ready, resolve_runtime_model_identifier, runtime_model_config,
@@ -321,7 +318,7 @@ fn codex_quick_result_label(
     record: Option<&CodexSelectedModelRecord>,
     requested_effort: Option<&str>,
 ) -> String {
-    quick_reasoning_effort_for_request(config.provider, &config.model, requested_effort, record)
+    effective_reasoning_effort(&config.model, record, requested_effort)
         .map(|effort| format!("{} {effort}", config.model))
         .unwrap_or_else(|| config.model.clone())
 }
@@ -330,11 +327,15 @@ fn result_model_display_name(
     model_name: &str,
     gemini_model_used: Option<&str>,
     mode: QaCommandMode,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
+    explicit_codex: Option<&ResolvedExplicitCodexModel>,
 ) -> String {
     if mode == QaCommandMode::Quick {
-        if let Some(pinned) = pinned_codex {
-            return pinned.result_label();
+        if let Some(explicit) = explicit_codex {
+            return codex_quick_result_label(
+                &explicit.config,
+                Some(&explicit.record),
+                Some(&CONFIG.quick_reasoning_effort),
+            );
         }
     }
     if model_name == MODEL_GEMINI {
@@ -732,7 +733,9 @@ struct ExplicitCodexReadiness<'a> {
 #[derive(Debug, Clone)]
 struct PreparedQuickTextModel {
     model_id: String,
-    pinned_codex: Option<PinnedCodexRequestContract>,
+    /// Set when the explicit Codex quick model was chosen, so the request
+    /// keeps its config and catalog record even if the runtime catalog reloads.
+    explicit_codex: Option<ResolvedExplicitCodexModel>,
 }
 
 fn explicit_codex_model_is_ready(
@@ -942,7 +945,6 @@ fn resolve_prepared_quick_text_model_with_models(
     gemini_available: bool,
     request: ModelRequestCapabilities,
     explicit: Option<ResolvedExplicitCodexModel>,
-    requested_effort: Option<&str>,
     readiness: ExplicitCodexReadiness<'_>,
 ) -> std::result::Result<PreparedQuickTextModel, String> {
     let explicit_model_id = parse_third_party_model_id(quick_model)
@@ -970,21 +972,9 @@ fn resolve_prepared_quick_text_model_with_models(
         ready_explicit_model_id,
     )?;
     let explicit_codex = explicit.filter(|resolved| resolved.config.id == model_id);
-    let pinned_codex = explicit_codex
-        .as_ref()
-        .map(|resolved| {
-            pin_quick_codex_request_contract(
-                &resolved.config,
-                &resolved.record,
-                readiness.current_account_id,
-                requested_effort,
-            )
-            .map_err(|err| format!("Failed to pin explicit Codex Quick metadata: {err}"))
-        })
-        .transpose()?;
     Ok(PreparedQuickTextModel {
         model_id,
-        pinned_codex,
+        explicit_codex,
     })
 }
 
@@ -1058,7 +1048,6 @@ async fn resolve_quick_text_model_for_request(
             require_tools: false,
         },
         explicit,
-        Some(&CONFIG.quick_reasoning_effort),
         ExplicitCodexReadiness {
             enabled: CONFIG.enable_openai_codex,
             auth_ready: crate::llm::openai_codex::is_auth_ready(),
@@ -1710,7 +1699,7 @@ async fn process_request(
     state: &AppState,
     request: PendingQRequest,
     model_name: &str,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
+    explicit_codex: Option<&ResolvedExplicitCodexModel>,
     heavy_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<()> {
     if model_name == MODEL_GEMINI && !CONFIG.gemini_api_available() {
@@ -1726,13 +1715,18 @@ async fn process_request(
         return Ok(());
     }
 
-    let runtime_config = if pinned_codex.is_none() && model_name != MODEL_GEMINI {
+    let runtime_config = if explicit_codex.is_none() && model_name != MODEL_GEMINI {
         runtime_model_config(model_name)
     } else {
         None
     };
-    let request_model_config = match pinned_codex {
-        Some(pinned) => Some(pinned.model_config_for_request(model_name)?),
+    let request_model_config = match explicit_codex {
+        Some(explicit) => {
+            if explicit.config.id != model_name {
+                return Err(anyhow!("The explicit Codex model changed"));
+            }
+            Some(&explicit.config)
+        }
         None => runtime_config.as_ref(),
     };
 
@@ -1782,8 +1776,14 @@ async fn process_request(
             .map(|config| third_party_provider_label(config.provider).to_string())
             .unwrap_or_else(|| "Unknown".to_string())
     };
-    let logged_model_name = pinned_codex
-        .map(PinnedCodexRequestContract::result_label)
+    let logged_model_name = explicit_codex
+        .map(|explicit| {
+            codex_quick_result_label(
+                &explicit.config,
+                Some(&explicit.record),
+                Some(&CONFIG.quick_reasoning_effort),
+            )
+        })
         .unwrap_or_else(|| configured_model_display_name(model_name));
 
     info!(
@@ -1893,7 +1893,7 @@ async fn process_request(
                             crate::llm::CodexPromptStyle::FreeformAnswer,
                         )
                         .with_reasoning_override(reasoning_override)
-                        .with_pinned_codex_request(pinned_codex),
+                        .with_explicit_codex_model(explicit_codex),
                     )
                     .await
                     .map(|result| (result, None))
@@ -1921,7 +1921,7 @@ async fn process_request(
                         crate::llm::CodexPromptStyle::FreeformAnswer,
                     )
                     .with_reasoning_override(reasoning_override)
-                    .with_pinned_codex_request(pinned_codex),
+                    .with_explicit_codex_model(explicit_codex),
                 )
                 .await
                 .map(|result| (result, None))
@@ -2056,7 +2056,7 @@ async fn process_request(
             model_name,
             gemini_model_used.as_deref(),
             request.mode,
-            pinned_codex,
+            explicit_codex,
         );
         response_text.push_str(&format!("\n\nModel: {}", display_model));
     }
@@ -2717,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_result_label_uses_the_pinned_contract_after_runtime_cache_loss() {
+    fn quick_result_label_uses_the_explicit_record_after_runtime_cache_loss() {
         let config = model(
             ThirdPartyProvider::OpenAICodex,
             "GPT-5.6-Terra",
@@ -2745,14 +2745,10 @@ mod tests {
             use_responses_lite: true,
             fetched_at: chrono::Utc::now(),
         });
-        let pinned = pin_quick_codex_request_contract(
-            &config,
-            source_record.as_ref().expect("record fixture"),
-            Some("acct-1"),
-            Some("low"),
-        )
-        .expect("the exact Quick contract should pin");
-        source_record = None;
+        let explicit = ResolvedExplicitCodexModel {
+            config,
+            record: source_record.take().expect("record fixture"),
+        };
         assert!(
             source_record.is_none(),
             "simulated runtime reload clears metadata"
@@ -2763,7 +2759,7 @@ mod tests {
                 "openai-codex:gpt-5.6-terra",
                 None,
                 QaCommandMode::Quick,
-                Some(&pinned),
+                Some(&explicit),
             ),
             "gpt-5.6-terra medium"
         );
@@ -2988,7 +2984,6 @@ mod tests {
             true,
             ModelRequestCapabilities::default(),
             Some(explicit.clone()),
-            Some("low"),
             ExplicitCodexReadiness {
                 enabled: true,
                 auth_ready: true,
@@ -2999,9 +2994,9 @@ mod tests {
         assert_eq!(prepared.model_id, "openai-codex:gpt-5.6-terra");
         assert_eq!(
             prepared
-                .pinned_codex
+                .explicit_codex
                 .as_ref()
-                .map(|pinned| pinned.record.slug.as_str()),
+                .map(|explicit| explicit.record.slug.as_str()),
             Some("gpt-5.6-terra")
         );
 
@@ -3013,7 +3008,6 @@ mod tests {
             true,
             ModelRequestCapabilities::default(),
             Some(explicit),
-            Some("low"),
             ExplicitCodexReadiness {
                 enabled: true,
                 auth_ready: true,
@@ -3022,7 +3016,7 @@ mod tests {
         )
         .expect("an account mismatch should use the configured fallback");
         assert_eq!(mismatched.model_id, MODEL_GEMINI);
-        assert!(mismatched.pinned_codex.is_none());
+        assert!(mismatched.explicit_codex.is_none());
     }
 
     #[test]
@@ -3766,7 +3760,7 @@ async fn q_handler_internal(
                     (
                         model.model_id,
                         "default_quick_text_model",
-                        model.pinned_codex,
+                        model.explicit_codex,
                     )
                 })
         } else {
@@ -3812,7 +3806,7 @@ async fn q_handler_internal(
         }
     };
 
-    if let Some((selected_model, timer_detail, pinned_codex)) = direct_model {
+    if let Some((selected_model, timer_detail, explicit_codex)) = direct_model {
         if mode == QaCommandMode::Quick {
             (query_text, youtube_urls) = prepare_youtube_inputs_for_qa(
                 &query_base,
@@ -3821,9 +3815,9 @@ async fn q_handler_internal(
                 CONFIG.gemini_api_available(),
             );
         }
-        let display_name = pinned_codex
+        let display_name = explicit_codex
             .as_ref()
-            .map(|pinned| pinned.model_config().name.clone())
+            .map(|explicit| explicit.config.name.clone())
             .unwrap_or_else(|| configured_model_display_name(&selected_model));
         let processing_message_text = if has_video {
             format!(
@@ -3899,7 +3893,7 @@ async fn q_handler_internal(
             &state,
             pending_request,
             &selected_model,
-            pinned_codex.as_ref(),
+            explicit_codex.as_ref(),
             Some(heavy_permit),
         )
         .await;
