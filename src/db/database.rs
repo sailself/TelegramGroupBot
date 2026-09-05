@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -19,11 +20,13 @@ use crate::db::search::{
 };
 use crate::utils::telegram::build_message_link;
 use anyhow::{anyhow, Result};
+use parking_lot::Mutex;
 use serde::Serialize;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{FromRow, SqlitePool};
 use teloxide::types::Message;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 const SEARCH_LIMIT_MAX: i64 = 20;
@@ -40,11 +43,20 @@ fn topic_window_is_capped(total_eligible: i64, selected_messages: usize) -> bool
     total_eligible > selected_messages as i64
 }
 
+/// Work items for the background writer task.
+enum WriterCommand {
+    Insert(MessageInsert),
+    /// Flush everything queued so far (and anything that races in), close the
+    /// pool, and exit.
+    Shutdown,
+}
+
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
-    sender: mpsc::Sender<MessageInsert>,
+    sender: mpsc::Sender<WriterCommand>,
     search_ready: Arc<AtomicBool>,
+    writer_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -125,30 +137,22 @@ fn build_snippet(text: &str, terms: &[String]) -> String {
 
 impl Database {
     pub async fn init(database_url: &str) -> Result<Self> {
+        // Connection-level settings go on the connect options so every pooled
+        // connection gets them, not just whichever one ran a one-off PRAGMA.
+        let connect_options = SqliteConnectOptions::from_str(database_url)?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true)
+            .pragma("cache_size", "-65536")
+            .pragma("mmap_size", "134217728");
         let pool = SqlitePoolOptions::new()
             .max_connections(CONFIG.db_max_connections)
-            .connect(database_url)
+            .connect_with(connect_options)
             .await?;
         let search_ready = Arc::new(AtomicBool::new(false));
 
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA busy_timeout = 5000")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA cache_size = -65536")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA mmap_size = 134217728")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&pool)
-            .await?;
         ensure_messages_schema(&pool).await?;
         ensure_search_support_schema(&pool).await?;
         ensure_llm_audit_schema(&pool).await?;
@@ -165,10 +169,7 @@ impl Database {
         info!("Database tables created successfully");
 
         let (sender, receiver) = mpsc::channel(CONFIG.db_queue_capacity);
-        let writer_pool = pool.clone();
-        tokio::spawn(async move {
-            db_writer(writer_pool, receiver).await;
-        });
+        let writer_task = tokio::spawn(db_writer(pool.clone(), receiver));
 
         info!("Database writer task started");
 
@@ -186,14 +187,30 @@ impl Database {
             pool,
             sender,
             search_ready,
+            writer_task: Arc::new(Mutex::new(Some(writer_task))),
         })
     }
 
     pub async fn queue_message_insert(&self, insert: MessageInsert) -> Result<()> {
         self.sender
-            .send(insert)
+            .send(WriterCommand::Insert(insert))
             .await
-            .map_err(|err| anyhow!("Failed to queue message insert: {err}"))
+            .map_err(|_| anyhow!("Failed to queue message insert: writer is not accepting work"))
+    }
+
+    /// Flush everything queued for the background writer and close the pool.
+    /// Safe to call while other `Database` clones are still alive; only the
+    /// first caller waits for the writer, later calls return immediately.
+    pub async fn shutdown(&self) {
+        // A closed channel means the writer already finished a previous
+        // shutdown; there is nothing left to flush.
+        let _ = self.sender.send(WriterCommand::Shutdown).await;
+        let task = self.writer_task.lock().take();
+        if let Some(task) = task {
+            if let Err(err) = task.await {
+                error!("Database writer task ended abnormally during shutdown: {err}");
+            }
+        }
     }
 
     pub async fn health_check(&self) -> Result<()> {
@@ -1280,22 +1297,43 @@ async fn count_pending_search_rows(pool: &SqlitePool) -> Result<i64> {
         .map_err(Into::into)
 }
 
-async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<MessageInsert>) {
+async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<WriterCommand>) {
     let flush_deadline = Duration::from_millis(CONFIG.db_write_flush_ms);
     let batch_size = CONFIG.db_write_batch_size.max(1);
     let mut buffer = Vec::with_capacity(batch_size);
+    let mut shutting_down = false;
 
-    loop {
-        let Some(message) = receiver.recv().await else {
+    while !shutting_down {
+        let Some(command) = receiver.recv().await else {
             break;
         };
-        buffer.push(message);
-        let flush_at = tokio::time::Instant::now() + flush_deadline;
+        match command {
+            WriterCommand::Insert(message) => buffer.push(message),
+            WriterCommand::Shutdown => shutting_down = true,
+        }
 
-        while buffer.len() < batch_size {
-            match tokio::time::timeout_at(flush_at, receiver.recv()).await {
-                Ok(Some(message)) => buffer.push(message),
-                Ok(None) | Err(_) => break,
+        if !shutting_down {
+            let flush_at = tokio::time::Instant::now() + flush_deadline;
+            while buffer.len() < batch_size {
+                match tokio::time::timeout_at(flush_at, receiver.recv()).await {
+                    Ok(Some(WriterCommand::Insert(message))) => buffer.push(message),
+                    Ok(Some(WriterCommand::Shutdown)) => {
+                        shutting_down = true;
+                        break;
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+
+        if shutting_down {
+            // Refuse new work, then drain inserts that raced the shutdown
+            // request so nothing already accepted is lost.
+            receiver.close();
+            while let Some(command) = receiver.recv().await {
+                if let WriterCommand::Insert(message) = command {
+                    buffer.push(message);
+                }
             }
         }
 
@@ -1577,6 +1615,107 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         panic!("message row did not become visible in time");
+    }
+
+    #[tokio::test]
+    async fn init_creates_a_missing_database_file() {
+        let path = test_db_path("create-if-missing");
+        std::fs::remove_file(&path).expect("test db placeholder should be removable");
+        assert!(!path.exists());
+
+        let db = Database::init(&sqlite_url_for_path(&path))
+            .await
+            .expect("init should create the database file when it is missing");
+
+        assert!(path.exists());
+        db.health_check()
+            .await
+            .expect("fresh database should answer queries");
+    }
+
+    #[tokio::test]
+    async fn connection_pragmas_apply_to_every_pooled_connection() {
+        let db = init_test_db("pragmas-per-connection").await;
+        let mut first = db.pool().acquire().await.expect("first connection");
+        let mut second = db.pool().acquire().await.expect("second connection");
+
+        // sqlx already applies foreign_keys/busy_timeout per connection; these
+        // three are the ones a one-off `PRAGMA` via the pool leaves unset on
+        // every connection but the first.
+        for conn in [&mut first, &mut second] {
+            let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut **conn)
+                .await
+                .expect("synchronous pragma should be readable");
+            assert_eq!(
+                synchronous, 1,
+                "synchronous must be NORMAL on every connection"
+            );
+
+            let cache_size: i64 = sqlx::query_scalar("PRAGMA cache_size")
+                .fetch_one(&mut **conn)
+                .await
+                .expect("cache_size pragma should be readable");
+            assert_eq!(
+                cache_size, -65_536,
+                "cache_size must be set on every connection"
+            );
+
+            let mmap_size: i64 = sqlx::query_scalar("PRAGMA mmap_size")
+                .fetch_one(&mut **conn)
+                .await
+                .expect("mmap_size pragma should be readable");
+            assert_eq!(
+                mmap_size, 134_217_728,
+                "mmap_size must be set on every connection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_queued_inserts_before_returning() {
+        let path = test_db_path("shutdown-flush");
+        let url = sqlite_url_for_path(&path);
+        let db = Database::init(&url)
+            .await
+            .expect("database should initialize");
+        // Handlers still running at shutdown hold their own Database clones.
+        let still_alive = db.clone();
+
+        for message_id in 1..=3 {
+            let insert = build_message_insert(
+                Some(1),
+                Some("alice".to_string()),
+                Some(format!("message {message_id}")),
+                Some("en".to_string()),
+                Utc::now(),
+                None,
+                Some(-100),
+                Some(message_id),
+                None,
+                false,
+                None,
+                false,
+                false,
+            );
+            db.queue_message_insert(insert)
+                .await
+                .expect("queue should accept inserts before shutdown");
+        }
+
+        db.shutdown().await;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("raw pool should reopen the database");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE chat_id = -100")
+            .fetch_one(&pool)
+            .await
+            .expect("count query should succeed");
+        assert_eq!(count, 3, "every queued insert must be flushed by shutdown");
+        drop(still_alive);
     }
 
     #[tokio::test]

@@ -204,7 +204,7 @@ async fn main() -> HandlerResult {
     info!("Starting TelegramGroupHelperBot (Rust)");
 
     let db = Database::init(&CONFIG.database_url).await?;
-    let state = AppState::new(db, bot_user_id, bot_username_lower);
+    let state = AppState::new(db.clone(), bot_user_id, bot_username_lower);
 
     handlers::access::load_whitelist();
     if CONFIG.publish_bot_commands {
@@ -257,6 +257,11 @@ async fn main() -> HandlerResult {
         .build()
         .dispatch()
         .await;
+
+    // The dispatcher has stopped taking updates; flush what handlers already
+    // queued before the process exits.
+    info!("Dispatcher stopped; flushing queued database writes");
+    db.shutdown().await;
 
     Ok(())
 }
