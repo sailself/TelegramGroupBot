@@ -408,13 +408,13 @@ Part A — shared transport (`refactor/phase2-llm-transport`, 2026-09-05):
 - [x] `download_media` capped (32 MiB) and token-redacted error text
 - [x] Codex: observe model metadata only on success (rest of the identity item is Part B)
 
-Part B — tool loop, search, Codex identity (next):
+Part B — tool loop, search, Codex identity (`refactor/phase2-llm-tools`, 2026-09-05):
 
-- [ ] `ToolSpec` registry + `HashMap<ToolKind, Budget>`; single `run_tool_loop` over a provider trait; delete legacy loops and schemas in `third_party.rs` / `responses_provider.rs`; `tool_limit_guidance` from budget
-- [ ] `SearchProvider` trait; overall deadline in `search_web`
-- [ ] `CodexRequestIdentity` once per turn; in-memory auth cache; one `effective_reasoning_effort`; delete `PinnedCodexRequestContract` and wrapper pairs; refresh-token `invalid_grant` handling
-- [ ] Overall turn deadline derived from remaining budget
-- [ ] Tool results wrapped in an untrusted-data block
+- [x] `ToolKind` + `ToolSpec` registry (one schema rendered for Chat Completions, Responses, Gemini) + `ToolBudget` (per-kind caps; zero hides the tool); `tool_loop.rs`: one `run_tool_loop<P: ToolProtocol>` with `ChatCompletionsProtocol`, `ResponsesProtocol`, `GeminiProtocol`; legacy loops, schemas, `MAX_TOOL_CALL_ITERATIONS`, `TOOL_LIMIT_GUIDANCE` deleted; `supports_tools` flags replaced by `Option<&mut ToolRuntime>` with a database-free `ToolRuntime::for_web_search()` profile; budget guidance generated from the budget
+- [x] `SearchProvider` trait (Brave/Exa/Jina on the shared transport), one normalizer, `WEB_SEARCH_TOTAL_DEADLINE` across providers
+- [x] `CodexRequestIdentity` resolved once per turn (account, record, effective effort, lite flag); one `effective_reasoning_effort` (override when supported, else selected level, else catalog default); `PinnedCodexRequestContract`, `codex_account_id_for_request` and both wrapper pairs deleted; fingerprint-validated in-memory auth cache; `invalid_grant` marks the login expired until `/codexlogin`; recent-refresh short-circuit; redacting `Debug` for auth types
+- [x] `TurnDeadline`: provider timeout x model turns the budget allows, per-request timeout clamped to the remainder, expired loops fail before requesting
+- [x] `fence_tool_result` (`<tool_result tool=...>`, forged closers neutralized) + `TOOL_RESULT_GUIDANCE` in every tool-using system prompt
 
 ### Phase 3: structure
 
