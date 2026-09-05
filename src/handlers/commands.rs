@@ -64,10 +64,10 @@ const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 14] = [
     "4:3", "3:4", "16:9", "9:16", "1:1", "21:9", "3:2", "2:3", "5:4", "4:5", "4:1", "1:4", "8:1",
     "1:8",
 ];
-const IMAGE_RESOLUTION_CALLBACK_PREFIX: &str = "image_res:";
-const IMAGE_ASPECT_RATIO_CALLBACK_PREFIX: &str = "image_aspect:";
-const IMAGE_MODEL_CALLBACK_PREFIX: &str = "image_model:";
-const IMAGE_CODEX_SIZE_CALLBACK_PREFIX: &str = "image_codex_size:";
+pub const IMAGE_RESOLUTION_CALLBACK_PREFIX: &str = "image_res:";
+pub const IMAGE_ASPECT_RATIO_CALLBACK_PREFIX: &str = "image_aspect:";
+pub const IMAGE_MODEL_CALLBACK_PREFIX: &str = "image_model:";
+pub const IMAGE_CODEX_SIZE_CALLBACK_PREFIX: &str = "image_codex_size:";
 const IMAGE_DEFAULT_RESOLUTION: &str = "2K";
 const IMAGE_ASPECT_RATIO_AUTO_CALLBACK: &str = "auto";
 const IMAGE_CAPTION_LIMIT: usize = 1000;
