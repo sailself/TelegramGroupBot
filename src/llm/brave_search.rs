@@ -1,13 +1,14 @@
-use std::time::Duration;
-
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use tracing::info;
 
 use crate::config::CONFIG;
+use crate::llm::audit::LlmUsageRecord;
+use crate::llm::transport::{call_with_retry, read_json, LlmCall};
+use crate::llm::web_search::{
+    BoxFuture, SearchProvider, SearchResult, WEB_SEARCH_REQUEST_TIMEOUT, WEB_SEARCH_RETRY_POLICY,
+};
 use crate::utils::http::get_http_client;
-
-const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug, Deserialize)]
 struct BraveSearchResponse {
@@ -27,14 +28,39 @@ struct BraveWebResult {
     extra_snippets: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct BraveSearchResult {
-    pub title: String,
-    pub url: String,
-    pub snippet: String,
+/// Brave Search API backend.
+pub struct BraveSearch;
+
+impl SearchProvider for BraveSearch {
+    fn name(&self) -> &'static str {
+        "brave"
+    }
+
+    fn is_enabled(&self) -> bool {
+        CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty()
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        max_results: usize,
+    ) -> BoxFuture<'a, Result<Vec<SearchResult>>> {
+        Box::pin(async move {
+            if !self.is_enabled() {
+                return Err(anyhow!("BRAVE_SEARCH_API_KEY is not configured."));
+            }
+            brave_search_at(
+                &CONFIG.brave_search_endpoint,
+                &CONFIG.brave_search_api_key,
+                query,
+                max_results,
+            )
+            .await
+        })
+    }
 }
 
-fn extract_results(payload: BraveSearchResponse) -> Vec<BraveSearchResult> {
+fn extract_results(payload: BraveSearchResponse) -> Vec<SearchResult> {
     let mut results = Vec::new();
     for item in payload.web.and_then(|web| web.results).unwrap_or_default() {
         let url = item.url.unwrap_or_default();
@@ -49,7 +75,7 @@ fn extract_results(payload: BraveSearchResponse) -> Vec<BraveSearchResult> {
                     .and_then(|snippets| snippets.into_iter().next())
             })
             .unwrap_or_default();
-        results.push(BraveSearchResult {
+        results.push(SearchResult {
             title,
             url,
             snippet,
@@ -58,41 +84,69 @@ fn extract_results(payload: BraveSearchResponse) -> Vec<BraveSearchResult> {
     results
 }
 
-pub async fn brave_search(query: &str, max_results: usize) -> Result<Vec<BraveSearchResult>> {
-    if !CONFIG.enable_brave_search || CONFIG.brave_search_api_key.trim().is_empty() {
-        return Err(anyhow!("BRAVE_SEARCH_API_KEY is not configured."));
-    }
+async fn brave_search_at(
+    endpoint: &str,
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>> {
     if query.trim().is_empty() {
         return Err(anyhow!("query must not be empty"));
     }
 
-    let count = max_results.clamp(1, 20);
-    info!(
-        "Calling Brave search endpoint {} with query: {}",
-        CONFIG.brave_search_endpoint, query
-    );
+    let count = max_results.clamp(1, 20).to_string();
+    let count = count.as_str();
+    info!("Calling Brave search endpoint {endpoint} with query: {query}");
 
-    let client = get_http_client();
-    let response = client
-        .get(&CONFIG.brave_search_endpoint)
-        .header("X-Subscription-Token", CONFIG.brave_search_api_key.clone())
-        .query(&[("q", query), ("count", &count.to_string())])
-        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECONDS))
-        .send()
-        .await
-        .map_err(|err| anyhow!("Brave search request failed: {err}"))?;
-
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Brave search request failed with status {}",
-            response.status()
-        ));
-    }
-
-    let data: BraveSearchResponse = response
-        .json()
-        .await
-        .map_err(|err| anyhow!("Invalid Brave response: {err}"))?;
+    let call = LlmCall::untracked("web-search", "brave");
+    let data: BraveSearchResponse = call_with_retry(
+        &call,
+        &WEB_SEARCH_RETRY_POLICY,
+        |_| async move {
+            Ok(get_http_client()
+                .get(endpoint)
+                .header("X-Subscription-Token", api_key)
+                .query(&[("q", query), ("count", count)])
+                .timeout(WEB_SEARCH_REQUEST_TIMEOUT))
+        },
+        |_| {},
+        |response| read_json::<BraveSearchResponse>(response, "brave"),
+        |_| LlmUsageRecord::default(),
+    )
+    .await?;
 
     Ok(extract_results(data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::twitter_extractor::test_support::{
+        response_with_headers, ExpectedRequest, TestServer,
+    };
+
+    #[tokio::test]
+    async fn brave_results_are_parsed_and_transient_failures_retried() {
+        let body = br#"{"web":{"results":[{"title":"Rust","url":"https://www.rust-lang.org","description":"A language"},{"url":"https://no-title.example","extra_snippets":["fallback snippet"]}]}}"#;
+        // The query string is part of the path the mock sees, so match any
+        // path and pin the behaviour through the header check instead.
+        let server = TestServer::new(vec![
+            ExpectedRequest::any(response_with_headers(503, &[], b"busy".to_vec())),
+            ExpectedRequest::any(response_with_headers(200, &[], body.to_vec()))
+                .with_header("x-subscription-token", "brave-key"),
+        ]);
+        let endpoint = server.url("/search").to_string();
+
+        let results = brave_search_at(&endpoint, "brave-key", "rust language", 5)
+            .await
+            .expect("second attempt succeeds");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Rust");
+        assert_eq!(results[0].url, "https://www.rust-lang.org");
+        assert_eq!(results[0].snippet, "A language");
+        assert_eq!(results[1].title, "https://no-title.example");
+        assert_eq!(results[1].snippet, "fallback snippet");
+        server.join().expect("both requests were served");
+    }
 }
