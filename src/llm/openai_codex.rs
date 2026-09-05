@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 #[cfg(windows)]
@@ -27,10 +29,24 @@ const TOKEN_REFRESH_INTERVAL_DAYS: i64 = 8;
 const ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
 const TOKEN_REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DPAPI_AUTH_FORMAT: &str = "openai-codex-auth-dpapi-v1";
+/// A 401 arriving this soon after a refresh raced that refresh; retrying with
+/// the new tokens is enough and another refresh would only burn the grant.
+const RECENT_REFRESH_GRACE_SECS: i64 = 30;
+const REDACTED: &str = "<redacted>";
+
+/// Stable operator-facing error once the refresh token has been rejected.
+pub const CODEX_LOGIN_EXPIRED_MESSAGE: &str =
+    "Codex login expired: the refresh token was rejected (invalid_grant). Re-login with /codexlogin.";
 
 static AUTH_LIFECYCLE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static AUTH_FILE_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 static AUTH_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Decrypted auth files by path, keyed to the file fingerprint they were read
+/// from, so per-request identity checks stop re-reading and re-decrypting.
+static AUTH_CACHE: LazyLock<parking_lot::Mutex<HashMap<PathBuf, CachedAuth>>> =
+    LazyLock::new(Default::default);
+/// Set once a refresh is rejected with `invalid_grant`; only a new login clears it.
+static AUTH_INVALID_REASON: RwLock<Option<String>> = RwLock::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexAuthStorageMode {
@@ -56,10 +72,32 @@ enum AuthFileEncoding {
     Dpapi,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 struct LoadedAuthFile {
     auth: OpenAICodexAuthFile,
     encoding: AuthFileEncoding,
+}
+
+/// Size and modification time of the auth file when it was last read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AuthFileFingerprint {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+struct CachedAuth {
+    /// `None` when the file was absent.
+    fingerprint: Option<AuthFileFingerprint>,
+    loaded: Option<LoadedAuthFile>,
+}
+
+/// How a token refresh failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshFailure {
+    /// The refresh token was rejected; only a new login can recover.
+    InvalidGrant,
+    /// Transient or unknown; a later attempt may succeed.
+    Other,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,7 +106,7 @@ struct DpapiAuthEnvelope {
     protected_data: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct OpenAICodexAuthFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
@@ -84,7 +122,7 @@ pub struct OpenAICodexAuthFile {
     pub last_refresh: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct OpenAICodexTokenData {
     pub id_token: String,
     pub access_token: String,
@@ -99,10 +137,49 @@ pub struct OpenAICodexTokenData {
     pub email: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAICodexAuthContext {
     pub access_token: String,
     pub account_id: String,
+}
+
+// Redacting Debug impls: these values reach logs and error chains, and one
+// `{:?}` must never print a credential.
+impl fmt::Debug for OpenAICodexAuthFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAICodexAuthFile")
+            .field("auth_mode", &self.auth_mode)
+            .field(
+                "openai_api_key",
+                &self.openai_api_key.as_ref().map(|_| REDACTED),
+            )
+            .field("tokens", &self.tokens)
+            .field("last_refresh", &self.last_refresh)
+            .finish()
+    }
+}
+
+impl fmt::Debug for OpenAICodexTokenData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAICodexTokenData")
+            .field("id_token", &REDACTED)
+            .field("access_token", &REDACTED)
+            .field("refresh_token", &REDACTED)
+            .field("account_id", &self.account_id)
+            .field("plan_type", &self.plan_type)
+            .field("user_id", &self.user_id)
+            .field("email", &self.email)
+            .finish()
+    }
+}
+
+impl fmt::Debug for OpenAICodexAuthContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAICodexAuthContext")
+            .field("access_token", &REDACTED)
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -234,7 +311,7 @@ struct DeviceCodeUserCodeResponse {
     interval: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DeviceCodeTokenResponse {
     authorization_code: String,
     #[serde(rename = "code_challenge")]
@@ -242,14 +319,14 @@ struct DeviceCodeTokenResponse {
     code_verifier: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct OAuthTokenResponse {
     id_token: String,
     access_token: String,
     refresh_token: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RefreshTokenResponse {
     #[serde(default)]
     id_token: Option<String>,
@@ -526,21 +603,60 @@ fn decode_auth_file(raw: &[u8], path: &Path) -> Result<LoadedAuthFile> {
     })
 }
 
+fn auth_file_fingerprint(path: &Path) -> Result<Option<AuthFileFingerprint>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(AuthFileFingerprint {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow!(
+            "Failed to read Codex auth file {}: {}",
+            path.display(),
+            err
+        )),
+    }
+}
+
+/// Load (and decrypt) the auth file, serving repeated loads from memory while
+/// its size and modification time are unchanged. Our own writes drop the
+/// entry; a file an operator replaces by hand is noticed by its fingerprint.
 fn load_auth_file_record_from_path(path: &Path) -> Result<Option<LoadedAuthFile>> {
     let _guard = AUTH_FILE_LOCK.read();
-    let raw = match fs::read(path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(anyhow!(
-                "Failed to read Codex auth file {}: {}",
-                path.display(),
-                err
-            ));
+    let fingerprint = auth_file_fingerprint(path)?;
+    if let Some(cached) = AUTH_CACHE.lock().get(path) {
+        if cached.fingerprint == fingerprint {
+            return Ok(cached.loaded.clone());
         }
-    };
+    }
 
-    decode_auth_file(&raw, path).map(Some)
+    let loaded = if fingerprint.is_some() {
+        match fs::read(path) {
+            Ok(raw) => Some(decode_auth_file(&raw, path)?),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(anyhow!(
+                    "Failed to read Codex auth file {}: {}",
+                    path.display(),
+                    err
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    AUTH_CACHE.lock().insert(
+        path.to_path_buf(),
+        CachedAuth {
+            fingerprint,
+            loaded: loaded.clone(),
+        },
+    );
+    Ok(loaded)
+}
+
+fn forget_cached_auth(path: &Path) {
+    AUTH_CACHE.lock().remove(path);
 }
 
 fn load_auth_file_internal() -> Result<Option<OpenAICodexAuthFile>> {
@@ -588,7 +704,9 @@ fn encode_auth_file(auth: &OpenAICodexAuthFile, mode: CodexAuthStorageMode) -> R
 }
 
 fn save_auth_file(auth: &OpenAICodexAuthFile) -> Result<()> {
-    save_auth_file_to_path_with_mode(auth_file_path(), auth, configured_auth_storage_mode()?)
+    save_auth_file_to_path_with_mode(auth_file_path(), auth, configured_auth_storage_mode()?)?;
+    clear_auth_invalid();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -606,7 +724,9 @@ fn save_auth_file_to_path_with_mode(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    write_private_file(path, &contents)
+    write_private_file(path, &contents)?;
+    forget_cached_auth(path);
+    Ok(())
 }
 
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
@@ -647,10 +767,32 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
 
 fn delete_auth_file(path: &Path) -> Result<bool> {
     let _guard = AUTH_FILE_LOCK.write();
-    match fs::remove_file(path) {
+    let removed = match fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err.into()),
+    };
+    forget_cached_auth(path);
+    removed
+}
+
+fn mark_auth_invalid(reason: &str) {
+    *AUTH_INVALID_REASON.write() = Some(reason.to_string());
+}
+
+fn clear_auth_invalid() {
+    *AUTH_INVALID_REASON.write() = None;
+}
+
+/// Why Codex auth is known to be unusable until the operator logs in again.
+pub fn auth_invalid_reason() -> Option<String> {
+    AUTH_INVALID_REASON.read().clone()
+}
+
+fn ensure_auth_not_invalid() -> Result<()> {
+    match auth_invalid_reason() {
+        Some(reason) => Err(anyhow!(reason)),
+        None => Ok(()),
     }
 }
 
@@ -679,11 +821,12 @@ pub fn current_auth_secrets() -> Vec<String> {
 }
 
 pub fn is_auth_ready() -> bool {
-    load_auth_file_internal()
-        .ok()
-        .flatten()
-        .and_then(|auth| auth.tokens)
-        .is_some()
+    auth_invalid_reason().is_none()
+        && load_auth_file_internal()
+            .ok()
+            .flatten()
+            .and_then(|auth| auth.tokens)
+            .is_some()
 }
 
 pub fn auth_summary() -> OpenAICodexAuthSummary {
@@ -791,7 +934,40 @@ fn auth_requires_refresh(auth: &OpenAICodexAuthFile) -> bool {
         .is_some_and(|last| last < Utc::now() - chrono::Duration::days(TOKEN_REFRESH_INTERVAL_DAYS))
 }
 
+fn auth_refreshed_recently(auth: &OpenAICodexAuthFile) -> bool {
+    auth.last_refresh.is_some_and(|last| {
+        last > Utc::now() - chrono::Duration::seconds(RECENT_REFRESH_GRACE_SECS)
+    })
+}
+
+/// Read the OAuth `error` code (top-level string or `{"code": ...}`) from a
+/// failed token response. Only client errors can be a rejected grant.
+fn classify_refresh_failure(status: reqwest::StatusCode, body: &str) -> RefreshFailure {
+    if !status.is_client_error() {
+        return RefreshFailure::Other;
+    }
+    let code = serde_json::from_str::<Value>(body).ok().and_then(|value| {
+        let error = value.get("error")?;
+        error
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| error.get("code")?.as_str().map(str::to_string))
+    });
+    if code.as_deref() == Some("invalid_grant") {
+        RefreshFailure::InvalidGrant
+    } else {
+        RefreshFailure::Other
+    }
+}
+
 async fn refresh_auth_tokens(auth: &OpenAICodexAuthFile) -> Result<OpenAICodexAuthFile> {
+    refresh_auth_tokens_at(OPENAI_CODEX_DEFAULT_ISSUER, auth).await
+}
+
+async fn refresh_auth_tokens_at(
+    issuer: &str,
+    auth: &OpenAICodexAuthFile,
+) -> Result<OpenAICodexAuthFile> {
     let refresh_token = auth
         .tokens
         .as_ref()
@@ -800,7 +976,7 @@ async fn refresh_auth_tokens(auth: &OpenAICodexAuthFile) -> Result<OpenAICodexAu
         .ok_or_else(|| anyhow!("Missing Codex refresh token"))?;
 
     let response = get_http_client()
-        .post(format!("{}/oauth/token", OPENAI_CODEX_DEFAULT_ISSUER))
+        .post(format!("{issuer}/oauth/token"))
         .json(&serde_json::json!({
             "client_id": OPENAI_CODEX_CLIENT_ID,
             "grant_type": "refresh_token",
@@ -812,8 +988,18 @@ async fn refresh_auth_tokens(auth: &OpenAICodexAuthFile) -> Result<OpenAICodexAu
 
     if !response.status().is_success() {
         let status = response.status();
-        error!("Codex token refresh failed: status={status}");
-        return Err(anyhow!("Codex token refresh failed with status {status}"));
+        let body = response.text().await.unwrap_or_default();
+        match classify_refresh_failure(status, &body) {
+            RefreshFailure::InvalidGrant => {
+                error!("Codex token refresh rejected (invalid_grant); operator must re-login");
+                mark_auth_invalid(CODEX_LOGIN_EXPIRED_MESSAGE);
+                return Err(anyhow!(CODEX_LOGIN_EXPIRED_MESSAGE));
+            }
+            RefreshFailure::Other => {
+                error!("Codex token refresh failed: status={status}");
+                return Err(anyhow!("Codex token refresh failed with status {status}"));
+            }
+        }
     }
 
     let refresh = response
@@ -857,14 +1043,23 @@ async fn refresh_auth_tokens(auth: &OpenAICodexAuthFile) -> Result<OpenAICodexAu
     Ok(updated)
 }
 
-pub async fn force_refresh_auth_tokens() -> Result<OpenAICodexAuthFile> {
+/// Refresh after a 401, unless the login is known to be expired or another
+/// request refreshed moments ago (the retry then picks up the new tokens).
+pub async fn force_refresh_auth_tokens() -> Result<()> {
+    ensure_auth_not_invalid()?;
     let _guard = AUTH_LIFECYCLE_LOCK.lock().await;
     let auth = load_auth_file_for_lifecycle()?.ok_or_else(|| anyhow!("Codex is not logged in"))?;
+    if auth_refreshed_recently(&auth) {
+        info!("Codex auth tokens were refreshed moments ago; retrying with them instead");
+        return Ok(());
+    }
     info!("Forcing Codex auth token refresh");
-    refresh_auth_tokens(&auth).await
+    refresh_auth_tokens(&auth).await?;
+    Ok(())
 }
 
 pub async fn get_valid_auth_context() -> Result<OpenAICodexAuthContext> {
+    ensure_auth_not_invalid()?;
     let _guard = AUTH_LIFECYCLE_LOCK.lock().await;
     let mut auth =
         load_auth_file_for_lifecycle()?.ok_or_else(|| anyhow!("Codex is not logged in"))?;
@@ -1029,7 +1224,7 @@ pub async fn fetch_usage_snapshot() -> Result<CodexUsageSnapshot> {
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
             warn!("Codex usage request unauthorized; refreshing auth and retrying");
-            let _ = force_refresh_auth_tokens().await?;
+            force_refresh_auth_tokens().await?;
             continue;
         }
 
@@ -1133,7 +1328,7 @@ pub async fn fetch_models() -> Result<CodexModelList> {
             warn!(
                 "Codex models request unauthorized with client_version={version}; refreshing auth and retrying"
             );
-            let _ = force_refresh_auth_tokens().await?;
+            force_refresh_auth_tokens().await?;
             continue;
         }
 
@@ -1416,6 +1611,7 @@ pub async fn logout() -> Result<bool> {
         }
     };
     let removed = delete_auth_file(auth_file_path());
+    clear_auth_invalid();
     drop(guard);
 
     revoke_auth_tokens_best_effort(auth.as_ref()).await;
@@ -1468,6 +1664,188 @@ mod tests {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ))
+    }
+
+    #[test]
+    fn auth_file_loads_are_served_from_memory_until_the_file_fingerprint_changes() {
+        let path = temp_auth_path("cache");
+        let auth = test_auth();
+        save_auth_file_to_path(&path, &auth).expect("auth file should save");
+        let first = load_auth_file_record_from_path(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(first.auth, auth);
+
+        // Same length and mtime: a byte-level change is invisible to the cache.
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let original_modified = metadata.modified().expect("mtime");
+        std::fs::write(&path, vec![b'x'; metadata.len() as usize]).expect("overwrite");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(original_modified)
+            .expect("restore mtime");
+        let cached = load_auth_file_record_from_path(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            cached.auth, auth,
+            "an unchanged fingerprint serves the cached auth"
+        );
+
+        // A changed fingerprint forces a re-read, which now sees the garbage.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(original_modified + Duration::from_secs(5))
+            .expect("bump mtime");
+        assert!(
+            load_auth_file_record_from_path(&path).is_err(),
+            "garbage is re-read once the file changes"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saving_and_deleting_the_auth_file_refresh_the_cache() {
+        let path = temp_auth_path("cache-writes");
+        let first = test_auth();
+        save_auth_file_to_path(&path, &first).expect("save");
+        assert_eq!(
+            load_auth_file_record_from_path(&path)
+                .expect("load")
+                .expect("present")
+                .auth,
+            first
+        );
+
+        let mut second = test_auth();
+        second.tokens.as_mut().expect("tokens").access_token = "access-2".to_string();
+        save_auth_file_to_path(&path, &second).expect("save again");
+        assert_eq!(
+            load_auth_file_record_from_path(&path)
+                .expect("load")
+                .expect("present")
+                .auth,
+            second
+        );
+
+        assert!(delete_auth_file(&path).expect("delete"));
+        assert!(load_auth_file_record_from_path(&path)
+            .expect("load")
+            .is_none());
+    }
+
+    #[test]
+    fn refresh_failures_are_classified_by_the_oauth_error_code() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            classify_refresh_failure(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid_grant","error_description":"expired"}"#
+            ),
+            RefreshFailure::InvalidGrant
+        );
+        assert_eq!(
+            classify_refresh_failure(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"invalid_grant"}}"#
+            ),
+            RefreshFailure::InvalidGrant
+        );
+        assert_eq!(
+            classify_refresh_failure(StatusCode::BAD_REQUEST, r#"{"error":"invalid_request"}"#),
+            RefreshFailure::Other
+        );
+        assert_eq!(
+            classify_refresh_failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"invalid_grant"}"#
+            ),
+            RefreshFailure::Other,
+            "server errors are transient whatever the body says"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_refresh_token_marks_the_login_expired_until_the_operator_logs_in_again() {
+        use crate::tools::twitter_extractor::test_support::{
+            response_with_headers, ExpectedRequest, TestServer,
+        };
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "POST",
+            "/oauth/token",
+            response_with_headers(
+                400,
+                &[("content-type", "application/json")],
+                br#"{"error":"invalid_grant","error_description":"refresh token revoked"}"#
+                    .to_vec(),
+            ),
+        )]);
+        let issuer = server.base_url().to_string();
+        clear_auth_invalid();
+
+        let err = refresh_auth_tokens_at(issuer.trim_end_matches('/'), &test_auth())
+            .await
+            .expect_err("invalid_grant fails the refresh");
+        assert!(err.to_string().contains("/codexlogin"), "{err}");
+        assert_eq!(
+            auth_invalid_reason().as_deref(),
+            Some(CODEX_LOGIN_EXPIRED_MESSAGE)
+        );
+        assert!(!is_auth_ready(), "an expired login is not ready");
+
+        // Every later auth resolution is refused up front, without touching
+        // the token endpoint again.
+        let err = get_valid_auth_context()
+            .await
+            .expect_err("the expired login is refused");
+        assert!(err.to_string().contains("/codexlogin"), "{err}");
+        let err = force_refresh_auth_tokens()
+            .await
+            .expect_err("no refresh is attempted while the login is expired");
+        assert!(err.to_string().contains("/codexlogin"), "{err}");
+
+        clear_auth_invalid();
+        assert!(auth_invalid_reason().is_none());
+        server.join().expect("exactly one refresh request was made");
+    }
+
+    #[test]
+    fn a_login_refreshed_moments_ago_is_not_refreshed_again() {
+        let mut auth = test_auth();
+        auth.last_refresh = Some(Utc::now() - chrono::Duration::seconds(5));
+        assert!(auth_refreshed_recently(&auth));
+        auth.last_refresh = Some(Utc::now() - chrono::Duration::minutes(5));
+        assert!(!auth_refreshed_recently(&auth));
+        auth.last_refresh = None;
+        assert!(!auth_refreshed_recently(&auth));
+    }
+
+    #[test]
+    fn auth_debug_output_redacts_every_token() {
+        let mut auth = test_auth();
+        auth.openai_api_key = Some("sk-api-key-secret".to_string());
+        let tokens = auth.tokens.as_mut().expect("tokens");
+        tokens.id_token = "id-token-secret".to_string();
+        tokens.access_token = "access-token-secret".to_string();
+        tokens.refresh_token = "refresh-token-secret".to_string();
+
+        let rendered = format!("{auth:?}");
+        for secret in auth_secrets_from_file(&auth) {
+            assert!(!rendered.contains(&secret), "{rendered}");
+        }
+        assert!(rendered.contains("acct"), "{rendered}");
+
+        let context = OpenAICodexAuthContext {
+            access_token: "access-token-secret".to_string(),
+            account_id: "acct".to_string(),
+        };
+        let rendered = format!("{context:?}");
+        assert!(!rendered.contains("access-token-secret"), "{rendered}");
+        assert!(rendered.contains("acct"), "{rendered}");
     }
 
     #[test]

@@ -42,7 +42,7 @@ const CODEX_FREEFORM_STYLE_GUIDANCE: &str = r#"Keep the answer substantive: reta
 Task-specific format and length requirements take precedence."#;
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ResponsesRequestDetails {
     provider: ThirdPartyProvider,
     display_name: &'static str,
