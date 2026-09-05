@@ -574,25 +574,6 @@ fn build_native_codex_web_search_tool(
         .and_then(|record| build_native_codex_web_search_tool_from_record(model_config, &record)))
 }
 
-fn convert_openai_function_tools_to_responses(tools: Vec<Value>) -> Vec<Value> {
-    tools
-        .into_iter()
-        .filter_map(|tool| {
-            let function = tool.get("function")?;
-            Some(json!({
-                "type": "function",
-                "name": function.get("name")?.as_str()?,
-                "description": function
-                    .get("description")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(""),
-                "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({})),
-                "strict": false,
-            }))
-        })
-        .collect()
-}
-
 fn responses_base_url(base_url: &str) -> String {
     let normalized = base_url.trim().trim_end_matches('/');
     if normalized.ends_with("/responses") {
@@ -1590,8 +1571,7 @@ async fn responses_completion_with_tool_runtime(
     reasoning_override: Option<&str>,
     pinned_codex: Option<&PinnedCodexRequestContract>,
 ) -> Result<String> {
-    let mut tools =
-        convert_openai_function_tools_to_responses(runtime.build_openai_function_tools());
+    let mut tools = runtime.build_responses_tools();
     let has_native_codex_web_search = native_codex_web_search_tool.is_some();
     let model_label = debug_model_label(model_config);
     if has_native_codex_web_search {

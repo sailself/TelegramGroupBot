@@ -27,28 +27,197 @@ pub enum ToolProfile {
     ChatAnalytics,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ToolBudgetConfig {
-    pub max_total_successful_calls: usize,
-    pub max_web_search_calls: usize,
-    pub max_chat_context_query_calls: usize,
-    pub max_chat_analytics_query_calls: usize,
+/// Every tool a model may call, in the order they are offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ToolKind {
+    WebSearch,
+    ChatContextQuery,
+    ChatAnalytics,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-struct ToolBudgetSnapshot {
-    total_remaining: usize,
-    web_search_remaining: usize,
-    chat_context_query_remaining: usize,
-    chat_analytics_query_remaining: usize,
+impl ToolKind {
+    pub const ALL: [ToolKind; 3] = [
+        ToolKind::WebSearch,
+        ToolKind::ChatContextQuery,
+        ToolKind::ChatAnalytics,
+    ];
+
+    /// Wire name the model uses to call the tool.
+    pub fn name(self) -> &'static str {
+        match self {
+            ToolKind::WebSearch => "web_search",
+            ToolKind::ChatContextQuery => "chat_context_query",
+            ToolKind::ChatAnalytics => "chat_analytics",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The single declaration of this tool. Provider adapters render it with
+    /// [`ToolSpec::openai_function`], [`ToolSpec::responses_function`] or
+    /// [`ToolSpec::gemini_declaration`], so a schema change lands everywhere.
+    pub fn spec(self) -> ToolSpec {
+        match self {
+            ToolKind::WebSearch => ToolSpec {
+                name: self.name(),
+                description: "Search the web using the configured providers and return a concise Markdown summary.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query to look up on the public web."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_WEB_RESULTS,
+                            "description": "Maximum number of results to return."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            ToolKind::ChatContextQuery => ToolSpec {
+                name: self.name(),
+                description: "Retrieve messages from the current Telegram chat only. This tool never accesses other chats.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": ["search", "window"]
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Plain text search intent for keyword/FTS search. Never send SQL or raw FTS syntax."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_SEARCH_LIMIT,
+                            "description": "Maximum number of hits to return."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": MAX_SEARCH_OFFSET,
+                            "description": "Offset for additional pages of search hits."
+                        },
+                        "context_before": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": MAX_CONTEXT_WINDOW,
+                            "description": "Number of earlier messages to include around each hit."
+                        },
+                        "context_after": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": MAX_CONTEXT_WINDOW,
+                            "description": "Number of later messages to include around each hit."
+                        },
+                        "message_id": {
+                            "type": "integer",
+                            "description": "Target message ID for the window operation."
+                        }
+                    },
+                    "required": ["operation"]
+                }),
+            },
+            ToolKind::ChatAnalytics => ToolSpec {
+                name: self.name(),
+                description: "Run a structured analytics query over this chat's message history. Returns counts, rankings, trends, and date metrics. Never accesses other chats.",
+                parameters: crate::llm::analytics::query_spec_schema(),
+            },
+        }
+    }
+}
+
+/// One tool declaration, independent of any provider's wire format.
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    /// JSON Schema for the tool's arguments.
+    pub parameters: Value,
+}
+
+impl ToolSpec {
+    /// Chat Completions `tools[]` entry.
+    pub fn openai_function(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            }
+        })
+    }
+
+    /// OpenAI Responses `tools[]` entry.
+    pub fn responses_function(&self) -> Value {
+        json!({
+            "type": "function",
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+            "strict": false,
+        })
+    }
+
+    /// Gemini `functionDeclarations[]` entry. Gemini accepts the same JSON
+    /// Schema subset (including numeric bounds), so the parameters are shared
+    /// verbatim.
+    pub fn gemini_declaration(&self) -> Value {
+        json!({
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        })
+    }
+}
+
+/// Per-request tool budget: a cap on successful calls overall plus a cap per
+/// tool. A tool with a zero cap is not offered to the model at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolBudget {
+    total: usize,
+    per_tool: [usize; ToolKind::ALL.len()],
+}
+
+impl ToolBudget {
+    pub fn new(total: usize) -> Self {
+        Self {
+            total,
+            per_tool: [0; ToolKind::ALL.len()],
+        }
+    }
+
+    pub fn with(mut self, kind: ToolKind, limit: usize) -> Self {
+        self.per_tool[kind.index()] = limit;
+        self
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    pub fn limit(&self, kind: ToolKind) -> usize {
+        self.per_tool[kind.index()]
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ToolBudgetErrorKind {
     Total,
-    WebSearch,
-    ChatContextQuery,
-    ChatAnalytics,
+    Exhausted(ToolKind),
     Disabled,
 }
 
@@ -62,11 +231,12 @@ pub struct ToolRuntime {
     db: Database,
     chat_id: i64,
     profile: ToolProfile,
-    budget: ToolBudgetConfig,
+    budget: ToolBudget,
+    // Whether a web-search provider is configured; decided once per request
+    // so the offered tools, the guidance and the budget gate cannot disagree.
+    web_search_available: bool,
     successful_calls: usize,
-    web_search_calls: usize,
-    chat_context_query_calls: usize,
-    chat_analytics_query_calls: usize,
+    calls: [usize; ToolKind::ALL.len()],
     force_final_answer: bool,
     accumulated_hits: BTreeMap<i64, ChatSearchHit>,
     // Every message id surfaced to the model — search hits plus their context
@@ -122,92 +292,66 @@ struct ToolSearchHit {
 }
 
 impl ToolRuntime {
-    pub fn for_quick(db: Database, chat_id: i64) -> Self {
+    fn new(db: Database, chat_id: i64, profile: ToolProfile, budget: ToolBudget) -> Self {
         Self {
             db,
             chat_id,
-            profile: ToolProfile::QuickQuestion,
-            budget: ToolBudgetConfig {
-                max_total_successful_calls: 1,
-                max_web_search_calls: 1,
-                max_chat_context_query_calls: 0,
-                max_chat_analytics_query_calls: 0,
-            },
+            profile,
+            budget,
+            web_search_available: web_search::is_search_enabled(),
             successful_calls: 0,
-            web_search_calls: 0,
-            chat_context_query_calls: 0,
-            chat_analytics_query_calls: 0,
+            calls: [0; ToolKind::ALL.len()],
             force_final_answer: false,
             accumulated_hits: BTreeMap::new(),
             returned_message_ids: BTreeSet::new(),
             analytics_results: Vec::new(),
         }
+    }
+
+    pub fn for_quick(db: Database, chat_id: i64) -> Self {
+        Self::new(
+            db,
+            chat_id,
+            ToolProfile::QuickQuestion,
+            ToolBudget::new(1).with(ToolKind::WebSearch, 1),
+        )
     }
 
     pub fn for_qc(db: Database, chat_id: i64) -> Self {
-        Self {
+        Self::new(
             db,
             chat_id,
-            profile: ToolProfile::ChatQuestion,
-            budget: ToolBudgetConfig {
-                max_total_successful_calls: 8,
-                max_web_search_calls: 3,
-                max_chat_context_query_calls: 5,
-                max_chat_analytics_query_calls: 0,
-            },
-            successful_calls: 0,
-            web_search_calls: 0,
-            chat_context_query_calls: 0,
-            chat_analytics_query_calls: 0,
-            force_final_answer: false,
-            accumulated_hits: BTreeMap::new(),
-            returned_message_ids: BTreeSet::new(),
-            analytics_results: Vec::new(),
-        }
+            ToolProfile::ChatQuestion,
+            ToolBudget::new(8)
+                .with(ToolKind::WebSearch, 3)
+                .with(ToolKind::ChatContextQuery, 5),
+        )
     }
 
     pub fn for_search(db: Database, chat_id: i64) -> Self {
-        Self {
+        Self::new(
             db,
             chat_id,
-            profile: ToolProfile::ChatSearch,
-            budget: ToolBudgetConfig {
-                max_total_successful_calls: 5,
-                max_web_search_calls: 0,
-                max_chat_context_query_calls: 5,
-                max_chat_analytics_query_calls: 0,
-            },
-            successful_calls: 0,
-            web_search_calls: 0,
-            chat_context_query_calls: 0,
-            chat_analytics_query_calls: 0,
-            force_final_answer: false,
-            accumulated_hits: BTreeMap::new(),
-            returned_message_ids: BTreeSet::new(),
-            analytics_results: Vec::new(),
-        }
+            ToolProfile::ChatSearch,
+            ToolBudget::new(5).with(ToolKind::ChatContextQuery, 5),
+        )
     }
 
     pub fn for_analytics(db: Database, chat_id: i64) -> Self {
-        Self {
+        Self::new(
             db,
             chat_id,
-            profile: ToolProfile::ChatAnalytics,
-            budget: ToolBudgetConfig {
-                max_total_successful_calls: CONFIG.qc_analytics_max_total_calls,
-                max_web_search_calls: 0,
-                max_chat_context_query_calls: 1,
-                max_chat_analytics_query_calls: CONFIG.qc_analytics_max_query_calls,
-            },
-            successful_calls: 0,
-            web_search_calls: 0,
-            chat_context_query_calls: 0,
-            chat_analytics_query_calls: 0,
-            force_final_answer: false,
-            accumulated_hits: BTreeMap::new(),
-            returned_message_ids: BTreeSet::new(),
-            analytics_results: Vec::new(),
-        }
+            ToolProfile::ChatAnalytics,
+            ToolBudget::new(CONFIG.qc_analytics_max_total_calls)
+                .with(ToolKind::ChatContextQuery, 1)
+                .with(ToolKind::ChatAnalytics, CONFIG.qc_analytics_max_query_calls),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_web_search_available(mut self, available: bool) -> Self {
+        self.web_search_available = available;
+        self
     }
 
     pub fn analytics_results(&self) -> &[Value] {
@@ -219,14 +363,25 @@ impl ToolRuntime {
     }
 
     pub fn max_total_successful_calls(&self) -> usize {
-        self.budget.max_total_successful_calls
+        self.budget.total()
     }
 
-    pub fn allows_web_search(&self) -> bool {
-        matches!(
-            self.profile,
-            ToolProfile::QuickQuestion | ToolProfile::ChatQuestion
-        )
+    /// Whether the model is offered `kind` on this request: it needs a
+    /// non-zero budget, and web search additionally needs a configured
+    /// provider.
+    pub fn offers(&self, kind: ToolKind) -> bool {
+        self.budget.limit(kind) > 0 && (kind != ToolKind::WebSearch || self.web_search_available)
+    }
+
+    fn offered_kinds(&self) -> impl Iterator<Item = ToolKind> + '_ {
+        ToolKind::ALL
+            .into_iter()
+            .filter(move |kind| self.offers(*kind))
+    }
+
+    /// Successful calls of `kind` so far.
+    pub fn calls(&self, kind: ToolKind) -> usize {
+        self.calls[kind.index()]
     }
 
     pub fn allows_native_web_search(&self) -> bool {
@@ -234,11 +389,7 @@ impl ToolRuntime {
     }
 
     pub fn web_search_attempted(&self) -> bool {
-        self.web_search_calls > 0
-    }
-
-    fn allows_chat_context_query(&self) -> bool {
-        self.profile != ToolProfile::QuickQuestion
+        self.calls(ToolKind::WebSearch) > 0
     }
 
     /// Budget guidance for the system prompt, plus the clause that marks
@@ -248,192 +399,67 @@ impl ToolRuntime {
         format!("{budget}\n\n{TOOL_RESULT_GUIDANCE}")
     }
 
+    /// Generated from the offered tools and their caps, so the numbers the
+    /// model reads can never drift from the ones [`Self::begin_tool_call`]
+    /// enforces.
     fn budget_guidance(&self) -> String {
+        let offered = self
+            .offered_kinds()
+            .map(|kind| format!("{} at most {}", kind.name(), times(self.budget.limit(kind))))
+            .collect::<Vec<_>>();
+        let mut guidance = if offered.is_empty() {
+            "No tools are available for this request; answer from the information you already have."
+                .to_string()
+        } else {
+            format!(
+                "Tool budgets for this request: use {} ({} in total). Once a budget is exhausted, answer with the evidence you already have.",
+                join_naturally(&offered),
+                plural(self.budget.total(), "tool call")
+            )
+        };
+        if let Some(advice) = self.profile_advice() {
+            guidance.push(' ');
+            guidance.push_str(advice);
+        }
+        guidance
+    }
+
+    fn profile_advice(&self) -> Option<&'static str> {
         match self.profile {
-            ToolProfile::QuickQuestion => {
-                "Tool budget for quick mode: use web_search at most once. After that one call succeeds or fails, answer immediately without any more tools and recommend /q if deeper verification is needed.".to_string()
-            }
-            ToolProfile::ChatQuestion => {
-                "Tool budgets for this request: use web_search at most 3 times and chat_context_query at most 5 times. Once a budget is exhausted, answer with the evidence you already have.".to_string()
-            }
-            ToolProfile::ChatSearch => {
-                "Tool budgets for this request: use chat_context_query at most 5 times total. Search is keyword-based FTS, not semantic, so inspect snippets carefully and refine your query if needed.".to_string()
-            }
-            ToolProfile::ChatAnalytics => {
-                format!(
-                    "Tool budgets for this request: use chat_analytics for any counting/ranking/trend question (up to {} calls; refine the spec between calls). chat_context_query is limited to 1 small lookup to quote one example message.",
-                    self.budget.max_chat_analytics_query_calls
-                )
-            }
+            ToolProfile::QuickQuestion => self.offers(ToolKind::WebSearch).then_some(
+                "After that one call succeeds or fails, answer immediately without any more tools and recommend /q if deeper verification is needed.",
+            ),
+            ToolProfile::ChatQuestion => None,
+            ToolProfile::ChatSearch => Some(
+                "Search is keyword-based FTS, not semantic, so inspect snippets carefully and refine your query if needed.",
+            ),
+            ToolProfile::ChatAnalytics => Some(
+                "Use chat_analytics for any counting/ranking/trend question and refine the spec between calls; keep chat_context_query for one small lookup to quote an example message.",
+            ),
         }
     }
 
+    /// Chat Completions `tools` array for the tools offered on this request.
     pub fn build_openai_function_tools(&self) -> Vec<Value> {
-        let mut tools = Vec::new();
-        if self.allows_web_search() && web_search::is_search_enabled() {
-            tools.push(json!({
-                "type": "function",
-                "function": {
-                    "name": "web_search",
-                    "description": "Search the web using the configured providers and return a concise Markdown summary.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Search query to look up on the public web."
-                            },
-                            "max_results": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": MAX_WEB_RESULTS,
-                                "description": "Maximum number of results to return."
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                }
-            }));
-        }
-
-        if self.profile == ToolProfile::ChatAnalytics {
-            tools.push(json!({
-                "type": "function",
-                "function": {
-                    "name": "chat_analytics",
-                    "description": "Run a structured analytics query over this chat's message history. Returns counts, rankings, trends, and date metrics. Never accesses other chats.",
-                    "parameters": crate::llm::analytics::query_spec_schema()
-                }
-            }));
-        }
-
-        if self.allows_chat_context_query() {
-            tools.push(json!({
-                "type": "function",
-                "function": {
-                    "name": "chat_context_query",
-                    "description": "Retrieve messages from the current Telegram chat only. This tool never accesses other chats.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "operation": {
-                                "type": "string",
-                                "enum": ["search", "window"]
-                            },
-                            "query": {
-                                "type": "string",
-                                "description": "Plain text search intent for keyword/FTS search. Never send SQL or raw FTS syntax."
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": MAX_SEARCH_LIMIT,
-                                "description": "Maximum number of hits to return."
-                            },
-                            "offset": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": MAX_SEARCH_OFFSET,
-                                "description": "Offset for additional pages of search hits."
-                            },
-                            "context_before": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": MAX_CONTEXT_WINDOW,
-                                "description": "Number of earlier messages to include around each hit."
-                            },
-                            "context_after": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": MAX_CONTEXT_WINDOW,
-                                "description": "Number of later messages to include around each hit."
-                            },
-                            "message_id": {
-                                "type": "integer",
-                                "description": "Target message ID for the window operation."
-                            }
-                        },
-                        "required": ["operation"]
-                    }
-                }
-            }));
-        }
-
-        tools
+        self.offered_kinds()
+            .map(|kind| kind.spec().openai_function())
+            .collect()
     }
 
+    /// OpenAI Responses `tools` array for the tools offered on this request.
+    pub fn build_responses_tools(&self) -> Vec<Value> {
+        self.offered_kinds()
+            .map(|kind| kind.spec().responses_function())
+            .collect()
+    }
+
+    /// Gemini `tools` array (one `functionDeclarations` group) for the tools
+    /// offered on this request; empty when nothing is offered.
     pub fn build_gemini_tools(&self) -> Vec<Value> {
-        let mut declarations = Vec::new();
-        if self.allows_web_search() && web_search::is_search_enabled() {
-            declarations.push(json!({
-                "name": "web_search",
-                "description": "Search the web using the configured providers and return a concise Markdown summary.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query to look up on the public web."
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return."
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }));
-        }
-
-        if self.profile == ToolProfile::ChatAnalytics {
-            declarations.push(json!({
-                "name": "chat_analytics",
-                "description": "Run a structured analytics query over this chat's message history. Returns counts, rankings, trends, and date metrics. Never accesses other chats.",
-                "parameters": crate::llm::analytics::query_spec_schema()
-            }));
-        }
-
-        if self.allows_chat_context_query() {
-            declarations.push(json!({
-                "name": "chat_context_query",
-                "description": "Retrieve messages from the current Telegram chat only. This tool never accesses other chats.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "operation": {
-                            "type": "string",
-                            "enum": ["search", "window"]
-                        },
-                        "query": {
-                            "type": "string",
-                            "description": "Plain text search intent for keyword/FTS search. Never send SQL or raw FTS syntax."
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of hits to return."
-                        },
-                        "offset": {
-                            "type": "integer",
-                            "description": "Offset for additional pages of search hits."
-                        },
-                        "context_before": {
-                            "type": "integer",
-                            "description": "Number of earlier messages to include around each hit."
-                        },
-                        "context_after": {
-                            "type": "integer",
-                            "description": "Number of later messages to include around each hit."
-                        },
-                        "message_id": {
-                            "type": "integer",
-                            "description": "Target message ID for the window operation."
-                        }
-                    },
-                    "required": ["operation"]
-                }
-            }));
-        }
-
+        let declarations = self
+            .offered_kinds()
+            .map(|kind| kind.spec().gemini_declaration())
+            .collect::<Vec<_>>();
         if declarations.is_empty() {
             Vec::new()
         } else {
@@ -476,7 +502,7 @@ impl ToolRuntime {
         context_before: usize,
         context_after: usize,
     ) -> Result<Value> {
-        self.begin_tool_call(ToolName::ChatContextQuery)
+        self.begin_tool_call(ToolKind::ChatContextQuery)
             .map_err(|err| anyhow!(tool_budget_error_parts(err).1))?;
         self.run_chat_context_query(ChatContextQueryArgs::Search {
             query: query.to_string(),
@@ -491,7 +517,7 @@ impl ToolRuntime {
     /// Programmatic web search consuming the same `web_search` budget (and
     /// profile gating) as a model-driven call.
     pub async fn run_web_search(&mut self, query: &str, max_results: usize) -> Result<String> {
-        self.begin_tool_call(ToolName::WebSearch)
+        self.begin_tool_call(ToolKind::WebSearch)
             .map_err(|err| anyhow!(tool_budget_error_parts(err).1))?;
         web_search_tool(query, Some(max_results.clamp(1, MAX_WEB_RESULTS))).await
     }
@@ -504,117 +530,71 @@ impl ToolRuntime {
     }
 
     async fn execute_tool_unfenced(&mut self, name: &str, arguments: &Value) -> String {
-        match name {
-            "web_search" => match self.begin_tool_call(ToolName::WebSearch) {
-                Ok(()) => self.execute_web_search(arguments).await,
-                Err(err) => self.tool_budget_error_payload("web_search", err),
-            },
-            "chat_context_query" => match self.begin_tool_call(ToolName::ChatContextQuery) {
-                Ok(()) => self.execute_chat_context_query(arguments).await,
-                Err(err) => self.tool_budget_error_payload("chat_context_query", err),
-            },
-            "chat_analytics" => match self.begin_tool_call(ToolName::ChatAnalytics) {
-                Ok(()) => self.execute_analytics(arguments).await,
-                Err(err) => self.tool_budget_error_payload("chat_analytics", err),
-            },
-            _ => {
-                self.force_final_answer = true;
-                self.error_payload(
-                    name,
-                    "unsupported_tool",
-                    "Unsupported tool call requested by the model.",
-                )
-            }
+        let Some(kind) = ToolKind::from_name(name) else {
+            self.force_final_answer = true;
+            return self.error_payload(
+                name,
+                "unsupported_tool",
+                "Unsupported tool call requested by the model.",
+            );
+        };
+        if let Err(err) = self.begin_tool_call(kind) {
+            return self.tool_budget_error_payload(name, err);
+        }
+        match kind {
+            ToolKind::WebSearch => self.execute_web_search(arguments).await,
+            ToolKind::ChatContextQuery => self.execute_chat_context_query(arguments).await,
+            ToolKind::ChatAnalytics => self.execute_analytics(arguments).await,
         }
     }
 
-    fn begin_tool_call(&mut self, tool: ToolName) -> std::result::Result<(), ToolBudgetError> {
+    /// Charge one call of `kind` against the budget. Any refusal also forces
+    /// the final answer so the loop stops offering tools.
+    fn begin_tool_call(&mut self, kind: ToolKind) -> std::result::Result<(), ToolBudgetError> {
         if self.force_final_answer {
             return Err(ToolBudgetError {
                 kind: ToolBudgetErrorKind::Disabled,
             });
         }
-        if self.successful_calls >= self.budget.max_total_successful_calls {
+        if self.successful_calls >= self.budget.total() {
             self.force_final_answer = true;
             return Err(ToolBudgetError {
                 kind: ToolBudgetErrorKind::Total,
             });
         }
-
-        match tool {
-            ToolName::WebSearch => {
-                if !self.allows_web_search()
-                    || (self.profile != ToolProfile::QuickQuestion
-                        && !web_search::is_search_enabled())
-                {
-                    self.force_final_answer = true;
-                    return Err(ToolBudgetError {
-                        kind: ToolBudgetErrorKind::Disabled,
-                    });
-                }
-                if self.web_search_calls >= self.budget.max_web_search_calls {
-                    self.force_final_answer = true;
-                    return Err(ToolBudgetError {
-                        kind: ToolBudgetErrorKind::WebSearch,
-                    });
-                }
-                self.web_search_calls += 1;
-            }
-            ToolName::ChatContextQuery => {
-                if !self.allows_chat_context_query() {
-                    self.force_final_answer = true;
-                    return Err(ToolBudgetError {
-                        kind: ToolBudgetErrorKind::Disabled,
-                    });
-                }
-                if self.chat_context_query_calls >= self.budget.max_chat_context_query_calls {
-                    self.force_final_answer = true;
-                    return Err(ToolBudgetError {
-                        kind: ToolBudgetErrorKind::ChatContextQuery,
-                    });
-                }
-                self.chat_context_query_calls += 1;
-            }
-            ToolName::ChatAnalytics => {
-                if self.profile != ToolProfile::ChatAnalytics {
-                    self.force_final_answer = true;
-                    return Err(ToolBudgetError {
-                        kind: ToolBudgetErrorKind::Disabled,
-                    });
-                }
-                if self.chat_analytics_query_calls >= self.budget.max_chat_analytics_query_calls {
-                    self.force_final_answer = true;
-                    return Err(ToolBudgetError {
-                        kind: ToolBudgetErrorKind::ChatAnalytics,
-                    });
-                }
-                self.chat_analytics_query_calls += 1;
-            }
+        if !self.offers(kind) {
+            self.force_final_answer = true;
+            return Err(ToolBudgetError {
+                kind: ToolBudgetErrorKind::Disabled,
+            });
+        }
+        if self.calls(kind) >= self.budget.limit(kind) {
+            self.force_final_answer = true;
+            return Err(ToolBudgetError {
+                kind: ToolBudgetErrorKind::Exhausted(kind),
+            });
         }
 
+        self.calls[kind.index()] += 1;
         self.successful_calls += 1;
         Ok(())
     }
 
-    fn remaining_budget_snapshot(&self) -> ToolBudgetSnapshot {
-        ToolBudgetSnapshot {
-            total_remaining: self
-                .budget
-                .max_total_successful_calls
-                .saturating_sub(self.successful_calls),
-            web_search_remaining: self
-                .budget
-                .max_web_search_calls
-                .saturating_sub(self.web_search_calls),
-            chat_context_query_remaining: self
-                .budget
-                .max_chat_context_query_calls
-                .saturating_sub(self.chat_context_query_calls),
-            chat_analytics_query_remaining: self
-                .budget
-                .max_chat_analytics_query_calls
-                .saturating_sub(self.chat_analytics_query_calls),
+    /// `{"total_remaining": n, "<tool>_remaining": n, ...}` attached to every
+    /// tool payload so the model can plan its remaining calls.
+    fn remaining_budget_snapshot(&self) -> Value {
+        let mut snapshot = serde_json::Map::new();
+        snapshot.insert(
+            "total_remaining".to_string(),
+            json!(self.budget.total().saturating_sub(self.successful_calls)),
+        );
+        for kind in ToolKind::ALL {
+            snapshot.insert(
+                format!("{}_remaining", kind.name()),
+                json!(self.budget.limit(kind).saturating_sub(self.calls(kind))),
+            );
         }
+        Value::Object(snapshot)
     }
 
     async fn execute_web_search(&self, arguments: &Value) -> String {
@@ -916,15 +896,15 @@ fn tool_budget_error_parts(error: ToolBudgetError) -> (&'static str, &'static st
             "total_budget_exhausted",
             "The total tool-call budget for this request is exhausted. Answer using the evidence already gathered.",
         ),
-        ToolBudgetErrorKind::WebSearch => (
+        ToolBudgetErrorKind::Exhausted(ToolKind::WebSearch) => (
             "web_search_budget_exhausted",
             "The web_search budget for this request is exhausted. Answer using the evidence already gathered.",
         ),
-        ToolBudgetErrorKind::ChatContextQuery => (
+        ToolBudgetErrorKind::Exhausted(ToolKind::ChatContextQuery) => (
             "chat_context_query_budget_exhausted",
             "The chat_context_query budget for this request is exhausted. Answer using the evidence already gathered.",
         ),
-        ToolBudgetErrorKind::ChatAnalytics => (
+        ToolBudgetErrorKind::Exhausted(ToolKind::ChatAnalytics) => (
             "chat_analytics_budget_exhausted",
             "The chat_analytics budget for this request is exhausted. Answer using the results already gathered.",
         ),
@@ -935,11 +915,29 @@ fn tool_budget_error_parts(error: ToolBudgetError) -> (&'static str, &'static st
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ToolName {
-    WebSearch,
-    ChatContextQuery,
-    ChatAnalytics,
+fn times(count: usize) -> String {
+    match count {
+        1 => "once".to_string(),
+        2 => "twice".to_string(),
+        n => format!("{n} times"),
+    }
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn join_naturally(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
 }
 
 fn message_row_to_tool_message(row: MessageRow) -> ToolMessage {
@@ -1038,6 +1036,189 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_tool_kind_renders_one_spec_into_all_provider_formats() {
+        for kind in ToolKind::ALL {
+            let spec = kind.spec();
+            assert_eq!(spec.name, kind.name());
+            assert_eq!(ToolKind::from_name(spec.name), Some(kind));
+            assert!(!spec.description.is_empty());
+            assert_eq!(spec.parameters["type"], "object");
+
+            let openai = spec.openai_function();
+            assert_eq!(openai["type"], "function");
+            assert_eq!(openai["function"]["name"], spec.name);
+            assert_eq!(openai["function"]["description"], spec.description);
+            assert_eq!(openai["function"]["parameters"], spec.parameters);
+
+            let responses = spec.responses_function();
+            assert_eq!(responses["type"], "function");
+            assert_eq!(responses["name"], spec.name);
+            assert_eq!(responses["description"], spec.description);
+            assert_eq!(responses["parameters"], spec.parameters);
+            assert_eq!(responses["strict"], false);
+
+            let gemini = spec.gemini_declaration();
+            assert_eq!(gemini["name"], spec.name);
+            assert_eq!(gemini["description"], spec.description);
+            assert_eq!(gemini["parameters"], spec.parameters);
+        }
+        assert_eq!(ToolKind::from_name("no_such_tool"), None);
+    }
+
+    fn openai_tool_names(runtime: &ToolRuntime) -> Vec<String> {
+        runtime
+            .build_openai_function_tools()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn responses_tool_names(runtime: &ToolRuntime) -> Vec<String> {
+        runtime
+            .build_responses_tools()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn gemini_tool_names(runtime: &ToolRuntime) -> Vec<String> {
+        runtime
+            .build_gemini_tools()
+            .iter()
+            .flat_map(|tool| {
+                tool.get("functionDeclarations")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn offered_tools_follow_the_budget_and_web_search_availability() {
+        let rt = Runtime::new().expect("tokio runtime should initialize");
+        let db = rt.block_on(init_test_db("offered-tools"));
+
+        let qc_without_web = ToolRuntime::for_qc(db.clone(), -100).with_web_search_available(false);
+        assert_eq!(openai_tool_names(&qc_without_web), ["chat_context_query"]);
+        assert!(!qc_without_web.offers(ToolKind::WebSearch));
+        assert!(qc_without_web.offers(ToolKind::ChatContextQuery));
+
+        let qc_with_web = ToolRuntime::for_qc(db.clone(), -100).with_web_search_available(true);
+        assert_eq!(
+            openai_tool_names(&qc_with_web),
+            ["web_search", "chat_context_query"]
+        );
+        assert_eq!(
+            responses_tool_names(&qc_with_web),
+            openai_tool_names(&qc_with_web)
+        );
+        assert_eq!(
+            gemini_tool_names(&qc_with_web),
+            openai_tool_names(&qc_with_web)
+        );
+
+        // A zero budget hides a tool even when nothing else disables it.
+        let search = ToolRuntime::for_search(db.clone(), -100).with_web_search_available(true);
+        assert_eq!(openai_tool_names(&search), ["chat_context_query"]);
+        assert!(!search.offers(ToolKind::ChatAnalytics));
+
+        let analytics = ToolRuntime::for_analytics(db, -100).with_web_search_available(true);
+        assert_eq!(
+            openai_tool_names(&analytics),
+            ["chat_context_query", "chat_analytics"]
+        );
+        assert!(analytics.build_gemini_tools()[0]["functionDeclarations"].is_array());
+    }
+
+    #[test]
+    fn budget_guidance_is_generated_from_the_budget() {
+        let rt = Runtime::new().expect("tokio runtime should initialize");
+        let db = rt.block_on(init_test_db("budget-guidance"));
+
+        let qc = ToolRuntime::for_qc(db.clone(), -100)
+            .with_web_search_available(true)
+            .budget_guidance();
+        assert!(qc.contains("web_search at most 3 times"), "{qc}");
+        assert!(qc.contains("chat_context_query at most 5 times"), "{qc}");
+        assert!(qc.contains("8 tool calls in total"), "{qc}");
+
+        let quick = ToolRuntime::for_quick(db.clone(), -100)
+            .with_web_search_available(true)
+            .budget_guidance();
+        assert!(quick.contains("web_search at most once"), "{quick}");
+        assert!(quick.contains("recommend /q"), "{quick}");
+        assert!(!quick.contains("chat_context_query"), "{quick}");
+
+        let quick_offline = ToolRuntime::for_quick(db.clone(), -100)
+            .with_web_search_available(false)
+            .budget_guidance();
+        assert!(
+            quick_offline.contains("No tools are available"),
+            "{quick_offline}"
+        );
+
+        let search = ToolRuntime::for_search(db.clone(), -100)
+            .with_web_search_available(true)
+            .budget_guidance();
+        assert!(
+            search.contains("chat_context_query at most 5 times"),
+            "{search}"
+        );
+        assert!(!search.contains("web_search"), "{search}");
+        assert!(search.contains("keyword-based"), "{search}");
+
+        let analytics = ToolRuntime::for_analytics(db, -100).budget_guidance();
+        assert!(
+            analytics.contains(&format!(
+                "chat_analytics at most {} times",
+                CONFIG.qc_analytics_max_query_calls
+            )) || analytics.contains("chat_analytics at most once"),
+            "{analytics}"
+        );
+        assert!(
+            analytics.contains("chat_context_query at most once"),
+            "{analytics}"
+        );
+    }
+
+    #[test]
+    fn budget_snapshot_reports_remaining_calls_per_tool() {
+        let rt = Runtime::new().expect("tokio runtime should initialize");
+        let db = rt.block_on(init_test_db("budget-snapshot"));
+        let mut runtime = ToolRuntime::for_qc(db, -100).with_web_search_available(true);
+        assert!(runtime.begin_tool_call(ToolKind::WebSearch).is_ok());
+
+        let snapshot = runtime.remaining_budget_snapshot();
+        assert_eq!(snapshot["total_remaining"], 7);
+        assert_eq!(snapshot["web_search_remaining"], 2);
+        assert_eq!(snapshot["chat_context_query_remaining"], 5);
+        assert_eq!(snapshot["chat_analytics_remaining"], 0);
+        assert_eq!(runtime.calls(ToolKind::WebSearch), 1);
+        assert_eq!(runtime.calls(ToolKind::ChatContextQuery), 0);
+    }
+
+    #[test]
+    fn exhausting_one_tool_reports_that_tool_and_forces_the_final_answer() {
+        let rt = Runtime::new().expect("tokio runtime should initialize");
+        let db = rt.block_on(init_test_db("budget-exhausted-kind"));
+        let mut runtime = ToolRuntime::for_qc(db, -100).with_web_search_available(true);
+        for _ in 0..runtime.budget.limit(ToolKind::WebSearch) {
+            assert!(runtime.begin_tool_call(ToolKind::WebSearch).is_ok());
+        }
+
+        let payload =
+            rt.block_on(runtime.execute_tool_unfenced("web_search", &json!({"query": "one more"})));
+        let payload: Value = serde_json::from_str(&payload).expect("budget response is JSON");
+        assert_eq!(payload["error_code"], "web_search_budget_exhausted");
+        assert!(runtime.force_final_answer());
+    }
+
     async fn insert_test_message(db: &Database, message_id: i64, chat_id: i64, text: &str) {
         let insert = crate::db::database::build_message_insert(
             Some(123_i64),
@@ -1123,7 +1304,7 @@ mod tests {
 
             assert!(tool_runtime.accumulated_message_ids().contains(&21));
             assert_eq!(tool_runtime.successful_calls, 1);
-            assert_eq!(tool_runtime.chat_context_query_calls, 1);
+            assert_eq!(tool_runtime.calls(ToolKind::ChatContextQuery), 1);
         });
     }
 
@@ -1139,7 +1320,7 @@ mod tests {
             let result = tool_runtime.run_web_search("anything", 3).await;
             assert!(result.is_err());
             assert!(tool_runtime.force_final_answer());
-            assert_eq!(tool_runtime.web_search_calls, 0);
+            assert_eq!(tool_runtime.calls(ToolKind::WebSearch), 0);
         });
     }
 
@@ -1149,7 +1330,7 @@ mod tests {
         runtime.block_on(async {
             let db = init_test_db("programmatic-budget-exhausted").await;
             let mut tool_runtime = ToolRuntime::for_qc(db, -1001374348669);
-            tool_runtime.successful_calls = tool_runtime.budget.max_total_successful_calls;
+            tool_runtime.successful_calls = tool_runtime.budget.total();
 
             let result = tool_runtime.run_search_query("anything", None, 0, 0).await;
             assert!(result.is_err());
@@ -1163,8 +1344,8 @@ mod tests {
         let db = runtime.block_on(init_test_db("qc-budget"));
         let mut runtime = ToolRuntime::for_qc(db, -1001374348669);
 
-        runtime.successful_calls = runtime.budget.max_total_successful_calls;
-        assert!(runtime.begin_tool_call(ToolName::ChatContextQuery).is_err());
+        runtime.successful_calls = runtime.budget.total();
+        assert!(runtime.begin_tool_call(ToolKind::ChatContextQuery).is_err());
         assert!(runtime.force_final_answer());
     }
 
@@ -1175,9 +1356,9 @@ mod tests {
         let mut runtime = ToolRuntime::for_search(db, -1001374348669);
 
         for _ in 0..5 {
-            assert!(runtime.begin_tool_call(ToolName::ChatContextQuery).is_ok());
+            assert!(runtime.begin_tool_call(ToolKind::ChatContextQuery).is_ok());
         }
-        assert!(runtime.begin_tool_call(ToolName::ChatContextQuery).is_err());
+        assert!(runtime.begin_tool_call(ToolKind::ChatContextQuery).is_err());
         assert!(runtime.force_final_answer());
     }
 
@@ -1185,14 +1366,15 @@ mod tests {
     fn quick_profile_exposes_only_one_optional_web_search_round() {
         let runtime = Runtime::new().expect("tokio runtime should initialize");
         let db = runtime.block_on(init_test_db("quick-profile"));
-        let runtime = ToolRuntime::for_quick(db.clone(), -1001374348669);
+        let runtime =
+            ToolRuntime::for_quick(db.clone(), -1001374348669).with_web_search_available(true);
 
         assert_eq!(runtime.profile, ToolProfile::QuickQuestion);
-        assert_eq!(runtime.budget.max_total_successful_calls, 1);
-        assert_eq!(runtime.budget.max_web_search_calls, 1);
-        assert_eq!(runtime.budget.max_chat_context_query_calls, 0);
-        assert_eq!(runtime.budget.max_chat_analytics_query_calls, 0);
-        assert!(runtime.allows_web_search());
+        assert_eq!(runtime.budget.total(), 1);
+        assert_eq!(runtime.budget.limit(ToolKind::WebSearch), 1);
+        assert_eq!(runtime.budget.limit(ToolKind::ChatContextQuery), 0);
+        assert_eq!(runtime.budget.limit(ToolKind::ChatAnalytics), 0);
+        assert!(runtime.offers(ToolKind::WebSearch));
         assert!(!runtime.allows_native_web_search());
         assert!(ToolRuntime::for_qc(db, -1001374348669).allows_native_web_search());
 
@@ -1201,8 +1383,7 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert!(!names.contains(&"chat_context_query"));
-        assert!(!names.contains(&"chat_analytics"));
+        assert_eq!(names, ["web_search"]);
 
         let gemini_tools = runtime.build_gemini_tools();
         let gemini_names = gemini_tools
@@ -1223,7 +1404,8 @@ mod tests {
     fn quick_failed_or_parallel_extra_searches_exhaust_the_single_round() {
         let tokio_runtime = Runtime::new().expect("tokio runtime should initialize");
         let db = tokio_runtime.block_on(init_test_db("quick-budget"));
-        let mut tool_runtime = ToolRuntime::for_quick(db, -1001374348669);
+        let mut tool_runtime =
+            ToolRuntime::for_quick(db, -1001374348669).with_web_search_available(true);
 
         let failed = tokio_runtime
             .block_on(tool_runtime.execute_tool_unfenced("web_search", &json!({"query": ""})));
@@ -1450,23 +1632,22 @@ mod tests {
         let mut runtime = ToolRuntime::for_analytics(db, -1001374348669);
 
         // Exhaust the analytics query budget.
-        for _ in 0..runtime.budget.max_chat_analytics_query_calls {
+        for _ in 0..runtime.budget.limit(ToolKind::ChatAnalytics) {
             assert!(
-                runtime.begin_tool_call(ToolName::ChatAnalytics).is_ok(),
+                runtime.begin_tool_call(ToolKind::ChatAnalytics).is_ok(),
                 "should succeed within budget"
             );
-            // begin_tool_call increments successful_calls; make room if total budget is smaller.
         }
         assert!(
-            runtime.begin_tool_call(ToolName::ChatAnalytics).is_err(),
+            runtime.begin_tool_call(ToolKind::ChatAnalytics).is_err(),
             "should fail once analytics budget exhausted"
         );
         assert!(runtime.force_final_answer());
         assert_eq!(
-            runtime.chat_analytics_query_calls,
-            runtime.budget.max_chat_analytics_query_calls
+            runtime.calls(ToolKind::ChatAnalytics),
+            runtime.budget.limit(ToolKind::ChatAnalytics)
         );
-        assert!(runtime.successful_calls < runtime.budget.max_total_successful_calls);
+        assert!(runtime.successful_calls < runtime.budget.total());
         assert!(runtime.force_final_answer());
     }
 
