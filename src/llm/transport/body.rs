@@ -50,14 +50,27 @@ pub fn summarize_error_body(body: &str) -> ErrorBodySummary {
     }
 }
 
-/// Read the whole body, refusing anything above `limit` bytes. A declared
-/// `Content-Length` over the limit is rejected before any byte is read.
-/// Stream interruptions surface as retryable transport errors.
-pub async fn read_body_limited(
+/// Outcome of reading a body whose stream may be cut before the end.
+#[derive(Debug)]
+pub enum BodyRead {
+    Complete(Vec<u8>),
+    /// The connection dropped mid-body. `partial` holds what arrived; `error`
+    /// is the retryable transport error to surface if the partial body is not
+    /// usable on its own.
+    Interrupted {
+        partial: Vec<u8>,
+        error: ProviderError,
+    },
+}
+
+/// Read the whole body, refusing anything above `limit` bytes (a declared
+/// `Content-Length` over the limit is rejected before any byte is read) and
+/// reporting a stream interruption together with the bytes read so far.
+pub async fn read_body_limited_or_partial(
     mut response: reqwest::Response,
     provider: &str,
     limit: usize,
-) -> Result<Vec<u8>, ProviderError> {
+) -> Result<BodyRead, ProviderError> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
@@ -80,15 +93,31 @@ pub async fn read_body_limited(
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(None) => return Ok(body),
+            Ok(None) => return Ok(BodyRead::Complete(body)),
             Err(err) => {
-                return Err(ProviderError::Transport {
-                    provider: provider.to_string(),
-                    message: format!("response body read failed: {err}"),
-                    retryable: true,
+                return Ok(BodyRead::Interrupted {
+                    partial: body,
+                    error: ProviderError::Transport {
+                        provider: provider.to_string(),
+                        message: format!("response body read failed: {err}"),
+                        retryable: true,
+                    },
                 })
             }
         }
+    }
+}
+
+/// Read the whole body, refusing anything above `limit` bytes. Stream
+/// interruptions surface as retryable transport errors.
+pub async fn read_body_limited(
+    response: reqwest::Response,
+    provider: &str,
+    limit: usize,
+) -> Result<Vec<u8>, ProviderError> {
+    match read_body_limited_or_partial(response, provider, limit).await? {
+        BodyRead::Complete(body) => Ok(body),
+        BodyRead::Interrupted { error, .. } => Err(error),
     }
 }
 

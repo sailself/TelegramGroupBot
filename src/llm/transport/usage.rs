@@ -36,6 +36,18 @@ pub fn from_chat_completions(response: &Value) -> LlmUsageRecord {
     }
 }
 
+/// OpenAI Responses shape: `usage.input_tokens`/`output_tokens` (total derived
+/// when absent) with `input_tokens_details` and `output_tokens_details`.
+pub fn from_responses(response: &Value) -> LlmUsageRecord {
+    match usage_object(response) {
+        Some(usage) => from_responses_usage_object(usage, response_id(response)),
+        None => LlmUsageRecord {
+            response_id: response_id(response),
+            ..LlmUsageRecord::default()
+        },
+    }
+}
+
 /// A bare Responses `usage` object, as found on `response.completed` events and
 /// on `image_generation_call` output items.
 pub fn from_responses_usage_object(usage: &Value, response_id: Option<String>) -> LlmUsageRecord {
@@ -105,6 +117,42 @@ mod tests {
         assert_eq!(usage.reasoning_tokens, Some(5));
         assert_eq!(usage.cached_input_tokens, Some(8));
         assert_eq!(usage.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn responses_usage_reads_token_counts_and_derives_the_total() {
+        let response = json!({
+            "id": "resp_123",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "input_tokens_details": { "cached_tokens": 3, "cache_write_tokens": 4 },
+                "output_tokens_details": { "reasoning_tokens": 7 }
+            }
+        });
+
+        let usage = from_responses(&response);
+
+        assert_eq!(usage.response_id.as_deref(), Some("resp_123"));
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.total_tokens, Some(30));
+        assert_eq!(usage.reasoning_tokens, Some(7));
+        assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.cache_write_tokens, Some(4));
+    }
+
+    #[test]
+    fn responses_usage_leaves_cache_write_tokens_none_when_absent() {
+        let usage = from_responses(&json!({
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "input_tokens_details": { "cached_tokens": 0 }
+            }
+        }));
+        assert_eq!(usage.cache_write_tokens, None);
+        assert_eq!(usage.total_tokens, Some(3));
     }
 
     #[test]
