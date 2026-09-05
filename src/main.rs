@@ -92,17 +92,17 @@ enum Command {
         description = "show bot-wide token statistics (admin)"
     )]
     TokenStats(String),
-    #[command(description = "投喂AI小喵")]
-    #[command(description = "ç™»å½• ChatGPT Codexï¼ˆç®¡ç†å‘˜ï¼‰")]
+    #[command(description = "登录 ChatGPT Codex（管理员）")]
     Codexlogin,
-    #[command(description = "é€€å‡º ChatGPT Codexï¼ˆç®¡ç†å‘˜ï¼‰")]
+    #[command(description = "退出 ChatGPT Codex（管理员）")]
     Codexlogout,
-    #[command(description = "é€‰æ‹©å½“å‰ Codex æ¨¡åž‹ï¼ˆç®¡ç†å‘˜ï¼‰")]
+    #[command(description = "选择当前 Codex 模型（管理员）")]
     Codexmodel,
     #[command(description = "set Codex reasoning level (admin)")]
     Codexreasoning,
     #[command(description = "show Codex usage and rate limits (admin)")]
     Codexusage,
+    #[command(description = "投喂AI小喵")]
     Support,
 }
 
@@ -694,6 +694,26 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!commands.iter().any(|command| command == "img2"));
+    }
+
+    #[test]
+    fn command_descriptions_are_readable_and_attached_to_the_right_commands() {
+        let text = <Command as BotCommands>::descriptions().to_string();
+        let line_for = |command: &str| {
+            text.lines()
+                .find(|line| line.starts_with(command))
+                .unwrap_or_else(|| panic!("no description line for {command}: {text}"))
+                .to_string()
+        };
+
+        assert!(
+            !text.contains('ç') && !text.contains('Ã'),
+            "double-encoded UTF-8 in command descriptions: {text}"
+        );
+        assert!(line_for("/codexlogin").contains("登录 ChatGPT Codex"));
+        assert!(line_for("/codexlogout").contains("退出 ChatGPT Codex"));
+        assert!(line_for("/codexmodel").contains("选择当前 Codex 模型"));
+        assert!(line_for("/support").contains("投喂AI小喵"));
     }
 
     #[test]
