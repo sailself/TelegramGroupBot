@@ -94,19 +94,9 @@ pub fn format_tldr_chat_content(messages: &[crate::db::models::MessageRow]) -> S
     chat_content
 }
 
-/// Break any literal `</tag>` inside untrusted content with a zero-width space
-/// so a crafted message cannot close a fence early and smuggle out-of-band
-/// instructions past the data/instruction boundary.
-pub fn neutralize_closing_tag(content: &str, tag: &str) -> String {
-    content.replace(&format!("</{tag}>"), &format!("<\u{200b}/{tag}>"))
-}
-
-/// Like [`neutralize_closing_tag`] but also breaks the opening `<tag>`, for
-/// content that sits *outside* a fence (such as the user's question) and
-/// could otherwise forge a whole block.
-pub fn neutralize_tag(content: &str, tag: &str) -> String {
-    neutralize_closing_tag(content, tag).replace(&format!("<{tag}>"), &format!("<\u{200b}{tag}>"))
-}
+// The fence helpers live with the other text utilities so the LLM layer can
+// use them without depending on the handlers; they stay reachable here.
+pub use crate::utils::text::{neutralize_closing_tag, neutralize_tag};
 
 /// Fence ingested, untrusted chat history inside `<chat_history>` tags so the
 /// model can tell data from instructions. Pairs with the "content inside

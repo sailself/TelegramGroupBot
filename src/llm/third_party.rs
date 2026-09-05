@@ -14,7 +14,7 @@ use crate::llm::responses_provider::{
     call_responses_provider, call_responses_provider_with_tool_runtime, PinnedCodexRequestContract,
 };
 use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config};
-use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
+use crate::llm::tool_prompts::{fence_tool_result, tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::transport::{call_with_retry, read_json, usage, LlmCall, RetryPolicy};
 use crate::llm::web_search::{self, web_search_tool};
@@ -678,6 +678,7 @@ async fn chat_completion_with_tools(
             if result.trim().is_empty() {
                 warn!("Tool call '{}' returned empty content", tool_name);
             }
+            let result = fence_tool_result(tool_name, &result);
 
             messages.push(json!({
                 "role": "tool",

@@ -8,6 +8,7 @@ use crate::config::CONFIG;
 use crate::db::database::Database;
 use crate::db::models::{ChatSearchHit, MessageRow};
 use crate::db::search::SEARCH_INDEX_REBUILDING_ERROR;
+use crate::llm::tool_prompts::{fence_tool_result, TOOL_RESULT_GUIDANCE};
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::telegram::build_message_link;
 
@@ -240,7 +241,14 @@ impl ToolRuntime {
         self.profile != ToolProfile::QuickQuestion
     }
 
+    /// Budget guidance for the system prompt, plus the clause that marks
+    /// fenced tool results as untrusted data.
     pub fn tool_limit_guidance(&self) -> String {
+        let budget = self.budget_guidance();
+        format!("{budget}\n\n{TOOL_RESULT_GUIDANCE}")
+    }
+
+    fn budget_guidance(&self) -> String {
         match self.profile {
             ToolProfile::QuickQuestion => {
                 "Tool budget for quick mode: use web_search at most once. After that one call succeeds or fails, answer immediately without any more tools and recommend /q if deeper verification is needed.".to_string()
@@ -488,7 +496,14 @@ impl ToolRuntime {
         web_search_tool(query, Some(max_results.clamp(1, MAX_WEB_RESULTS))).await
     }
 
+    /// Run a model-requested tool and return its payload fenced as untrusted
+    /// data (see [`fence_tool_result`]).
     pub async fn execute_tool(&mut self, name: &str, arguments: &Value) -> String {
+        let payload = self.execute_tool_unfenced(name, arguments).await;
+        fence_tool_result(name, &payload)
+    }
+
+    async fn execute_tool_unfenced(&mut self, name: &str, arguments: &Value) -> String {
         match name {
             "web_search" => match self.begin_tool_call(ToolName::WebSearch) {
                 Ok(()) => self.execute_web_search(arguments).await,
@@ -989,6 +1004,40 @@ mod tests {
             .expect("test database should initialize")
     }
 
+    #[tokio::test]
+    async fn model_driven_tool_results_are_fenced_as_untrusted_data() {
+        let db = init_test_db("fenced-tool-results").await;
+        let mut runtime = ToolRuntime::for_quick(db, -100);
+
+        let payload = runtime
+            .execute_tool("no_such_tool", &serde_json::json!({}))
+            .await;
+
+        assert!(
+            payload.starts_with(r#"<tool_result tool="no_such_tool">"#),
+            "{payload}"
+        );
+        assert!(payload.trim_end().ends_with("</tool_result>"), "{payload}");
+        assert!(payload.contains("unsupported_tool"), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn every_profile_guidance_declares_tool_results_untrusted() {
+        let db = init_test_db("guidance-untrusted").await;
+        for runtime in [
+            ToolRuntime::for_quick(db.clone(), -100),
+            ToolRuntime::for_qc(db.clone(), -100),
+            ToolRuntime::for_search(db.clone(), -100),
+            ToolRuntime::for_analytics(db.clone(), -100),
+        ] {
+            let guidance = runtime.tool_limit_guidance();
+            assert!(
+                guidance.contains(crate::llm::tool_prompts::TOOL_RESULT_GUIDANCE),
+                "{guidance}"
+            );
+        }
+    }
+
     async fn insert_test_message(db: &Database, message_id: i64, chat_id: i64, text: &str) {
         let insert = crate::db::database::build_message_insert(
             Some(123_i64),
@@ -1176,8 +1225,8 @@ mod tests {
         let db = tokio_runtime.block_on(init_test_db("quick-budget"));
         let mut tool_runtime = ToolRuntime::for_quick(db, -1001374348669);
 
-        let failed =
-            tokio_runtime.block_on(tool_runtime.execute_tool("web_search", &json!({"query": ""})));
+        let failed = tokio_runtime
+            .block_on(tool_runtime.execute_tool_unfenced("web_search", &json!({"query": ""})));
         let failed: Value =
             serde_json::from_str(&failed).expect("failed tool response should be JSON");
         assert_eq!(failed["ok"], false);
@@ -1185,7 +1234,8 @@ mod tests {
         assert!(tool_runtime.web_search_attempted());
 
         let extra = tokio_runtime.block_on(
-            tool_runtime.execute_tool("web_search", &json!({"query": "parallel extra search"})),
+            tool_runtime
+                .execute_tool_unfenced("web_search", &json!({"query": "parallel extra search"})),
         );
         let extra: Value = serde_json::from_str(&extra).expect("budget response should be JSON");
         assert_eq!(extra["ok"], false);
@@ -1199,7 +1249,7 @@ mod tests {
         let db = tokio_runtime.block_on(init_test_db("quick-chat-tools"));
         let mut tool_runtime = ToolRuntime::for_quick(db, -1001374348669);
 
-        let result = tokio_runtime.block_on(tool_runtime.execute_tool(
+        let result = tokio_runtime.block_on(tool_runtime.execute_tool_unfenced(
             "chat_context_query",
             &json!({"operation": "search", "query": "secret history"}),
         ));

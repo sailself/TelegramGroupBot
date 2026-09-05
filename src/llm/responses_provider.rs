@@ -18,7 +18,7 @@ use crate::llm::runtime_models::{
     codex_model_record_for_request, CodexSelectedModelRecord,
     CODEX_SELECTED_MODEL_METADATA_VERSION, OPENAI_CODEX_SELECTED_MODEL_ID,
 };
-use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
+use crate::llm::tool_prompts::{fence_tool_result, tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::transport::sse::parse_sse_data_events;
 use crate::llm::transport::{
@@ -1546,6 +1546,7 @@ async fn responses_completion_with_tools(
             let result = execute_function_tool(&tool_call.name, &args_value)
                 .await
                 .unwrap_or_else(|err| err.to_string());
+            let result = fence_tool_result(&tool_call.name, &result);
             input_items.push(json!({
                 "type": "function_call_output",
                 "call_id": tool_call.call_id,
