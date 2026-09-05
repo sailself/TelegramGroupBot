@@ -127,6 +127,16 @@ async fn set_cached(query: &str, max_results: usize, results: Vec<SearchResult>)
     prune_cache(&mut cache, cache_ttl());
 }
 
+/// Cache a completed search. Empty result sets are not cached: they are
+/// usually a provider hiccup, and caching them would pin "no results" for
+/// the whole TTL.
+async fn cache_search_results(query: &str, max_results: usize, results: &[SearchResult]) {
+    if results.is_empty() {
+        return;
+    }
+    set_cached(query, max_results, results.to_vec()).await;
+}
+
 fn prune_cache(cache: &mut HashMap<String, CacheEntry>, ttl: Duration) {
     cache.retain(|_, entry| entry.stored_at.elapsed() < ttl);
     let max_entries = CONFIG.web_search_cache_max_entries;
@@ -265,7 +275,7 @@ pub async fn search_web(query: &str, max_results: Option<usize>) -> Result<Vec<S
                     trimmed.truncate(max_results);
                 }
                 if !trimmed.is_empty() {
-                    set_cached(query, max_results, trimmed.clone()).await;
+                    cache_search_results(query, max_results, &trimmed).await;
                     return Ok(trimmed);
                 }
             }
@@ -275,13 +285,11 @@ pub async fn search_web(query: &str, max_results: Option<usize>) -> Result<Vec<S
         }
     }
 
-    let empty = Vec::new();
     if had_success {
         if let Some(message) = last_error {
             warn!("Web search had partial failures: {}", message);
         }
-        set_cached(query, max_results, empty.clone()).await;
-        return Ok(empty);
+        return Ok(Vec::new());
     }
 
     if let Some(message) = last_error {
@@ -289,8 +297,7 @@ pub async fn search_web(query: &str, max_results: Option<usize>) -> Result<Vec<S
         return Err(anyhow!("Web search failed: {}", message));
     }
 
-    set_cached(query, max_results, empty.clone()).await;
-    Ok(empty)
+    Ok(Vec::new())
 }
 
 pub fn format_results_markdown(query: &str, results: &[SearchResult]) -> String {
@@ -311,4 +318,31 @@ pub fn format_results_markdown(query: &str, results: &[SearchResult]) -> String 
 pub async fn web_search_tool(query: &str, max_results: Option<usize>) -> Result<String> {
     let results = search_web(query, max_results).await?;
     Ok(format_results_markdown(query, &results))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(url: &str) -> SearchResult {
+        SearchResult {
+            title: "t".to_string(),
+            url: url.to_string(),
+            snippet: "s".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_search_results_are_not_cached() {
+        let query = "phase0 cache policy empty 7f3a";
+        cache_search_results(query, 5, &[]).await;
+        assert!(get_cached(query, 5).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_empty_search_results_are_cached() {
+        let query = "phase0 cache policy nonempty 7f3a";
+        cache_search_results(query, 5, &[result("https://example.com")]).await;
+        assert_eq!(get_cached(query, 5).await.map(|r| r.len()), Some(1));
+    }
 }

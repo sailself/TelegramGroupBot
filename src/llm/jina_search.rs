@@ -87,31 +87,82 @@ fn parse_search_text(payload: &str, max_results: usize) -> Vec<JinaSearchResult>
 }
 
 pub async fn search_jina_web(query: &str, max_results: usize) -> Result<JinaSearchResponse> {
+    search_jina_web_at(
+        &CONFIG.jina_search_endpoint,
+        &CONFIG.jina_ai_api_key,
+        query,
+        max_results,
+    )
+    .await
+}
+
+async fn search_jina_web_at(
+    endpoint: &str,
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<JinaSearchResponse> {
     if query.trim().is_empty() {
         anyhow::bail!("query must not be empty");
     }
 
     let payload = serde_json::json!({ "q": query });
-    info!(
-        "Calling Jina search endpoint {} with query: {}",
-        CONFIG.jina_search_endpoint, query
-    );
+    info!("Calling Jina search endpoint {endpoint} with query: {query}");
 
     let client = get_http_client();
     let mut request = client
-        .post(&CONFIG.jina_search_endpoint)
+        .post(endpoint)
         .timeout(Duration::from_secs(DEFAULT_READ_TIMEOUT))
         .json(&payload);
 
-    if !CONFIG.jina_ai_api_key.trim().is_empty() {
-        request = request.bearer_auth(&CONFIG.jina_ai_api_key);
+    if !api_key.trim().is_empty() {
+        request = request.bearer_auth(api_key);
     }
 
     let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("Jina search request failed with status {status}");
+    }
     let text = response.text().await?;
     let parsed = parse_search_text(&text, max_results);
     Ok(JinaSearchResponse {
         query: query.to_string(),
         results: parsed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::twitter_extractor::test_support::{response_with_status, TestServer};
+
+    #[tokio::test]
+    async fn rejects_non_success_status_instead_of_returning_empty_results() {
+        let server = TestServer::single_status("POST", "/search", 401);
+        let endpoint = server.url("/search").to_string();
+
+        let result = search_jina_web_at(&endpoint, "", "rust language", 5).await;
+
+        assert!(
+            result.is_err(),
+            "a 401 must surface as an error, not as zero results"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn parses_successful_text_response() {
+        let body = b"[1] Title: Rust\n[1] URL Source: https://www.rust-lang.org\n[1] Description: A language\n".to_vec();
+        let server = TestServer::single(response_with_status(200, body));
+        let endpoint = server.url("/search").to_string();
+
+        let response = search_jina_web_at(&endpoint, "", "rust language", 5)
+            .await
+            .unwrap();
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].url, "https://www.rust-lang.org");
+        server.join().unwrap();
+    }
 }
