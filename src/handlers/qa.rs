@@ -9,6 +9,7 @@ use teloxide::types::{
     MessageId, ParseMode, ReplyParameters,
 };
 use teloxide::RequestError;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::config::{
     parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
@@ -1800,12 +1801,17 @@ fn build_chat_search_pending_request(
 }
 
 #[allow(deprecated)]
+/// Run a prepared request against `model_name`. `heavy_permit` is the permit a
+/// caller already holds (the direct `/q` path throttles its own preparation);
+/// passing it through avoids taking a second slot from the same semaphore,
+/// which could exhaust the heavy-command lane and deadlock it.
 async fn process_request(
     bot: &Bot,
     state: &AppState,
     request: PendingQRequest,
     model_name: &str,
     pinned_codex: Option<&PinnedCodexRequestContract>,
+    heavy_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<()> {
     if model_name == MODEL_GEMINI && !CONFIG.gemini_api_available() {
         bot.edit_message_text(
@@ -1830,7 +1836,7 @@ async fn process_request(
         None => runtime_config.as_ref(),
     };
 
-    let _heavy_permit = state.acquire_heavy_command_permit().await;
+    let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
     if request.mode.requires_chat_search_index() && !state.db.is_search_ready() {
         bot.edit_message_text(
@@ -3557,7 +3563,7 @@ async fn q_handler_internal(
         .await?;
         return Ok(());
     }
-    let _heavy_permit = state.acquire_heavy_command_permit().await;
+    let heavy_permit = state.acquire_heavy_command_permit().await;
 
     let query_text_raw = query.unwrap_or_default();
     let query_entities = message_entities_for_text(&message);
@@ -3909,6 +3915,7 @@ async fn q_handler_internal(
             pending_request,
             &selected_model,
             pinned_codex.as_ref(),
+            Some(heavy_permit),
         )
         .await;
         let status = if result.is_ok() { "success" } else { "error" };
@@ -4176,7 +4183,8 @@ pub async fn s_handler(
             None,
         );
 
-        let result = process_request(&bot, &state, pending_request, &selected_model, None).await;
+        let result =
+            process_request(&bot, &state, pending_request, &selected_model, None, None).await;
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(&mut timer, status, Some(timer_detail.to_string()));
         result?;
@@ -4289,7 +4297,7 @@ async fn process_timed_out_q_request_with_default_model(
         .await;
 
     let command_timer = request.command_timer.take();
-    let result = process_request(bot, state, request, &default_model, None).await;
+    let result = process_request(bot, state, request, &default_model, None, None).await;
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(
@@ -4407,7 +4415,7 @@ pub async fn model_selection_callback(
         .await?;
 
     let command_timer = request.command_timer.take();
-    let result = process_request(&bot, &state, request, &selected_model, None).await;
+    let result = process_request(&bot, &state, request, &selected_model, None, None).await;
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(&mut timer, status, None);
