@@ -24,6 +24,7 @@ use crate::tools::twitter_extractor::{
     canonical_status_key, extract_twitter_content, is_supported_status_url, TwitterContent,
 };
 use crate::utils::http::get_http_client;
+use crate::utils::text::truncate_with_ellipsis;
 
 const EXTRACTION_CACHE_TTL: Duration = Duration::from_secs(900);
 const EXTRACTION_CACHE_MAX_ENTRIES: usize = 64;
@@ -63,14 +64,6 @@ static TELEGRAPH_CACHE: LazyLock<Mutex<HashMap<String, TelegraphCacheEntry>>> =
 static TWITTER_CACHE: LazyLock<Mutex<HashMap<String, TwitterCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn truncate_for_log(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(limit).collect();
-    format!("{}...", truncated)
-}
-
 fn log_extracted_content(
     source: &str,
     url: &str,
@@ -86,7 +79,7 @@ fn log_extracted_content(
         images = images,
         videos = videos,
         audios = audios,
-        text = %truncate_for_log(text, 200)
+        text = %truncate_with_ellipsis(text, 200)
     );
 }
 

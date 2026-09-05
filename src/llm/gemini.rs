@@ -19,6 +19,7 @@ use crate::llm::audit::{
 use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::utils::http::get_http_client;
+use crate::utils::text::truncate_for_log;
 
 #[derive(Debug, thiserror::Error)]
 #[error("Image generation failed: {0}")]
@@ -261,14 +262,6 @@ fn build_image_config(config: Option<&GeminiImageConfig>) -> Option<Value> {
     } else {
         Some(Value::Object(map))
     }
-}
-
-fn truncate_for_log(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(limit).collect();
-    format!("{truncated}... (truncated)")
 }
 
 async fn decode_json_response<T: DeserializeOwned>(

@@ -51,6 +51,7 @@ use crate::state::{AppState, PendingQRequest, QaCommandMode};
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::{build_message_link, start_chat_action_heartbeat};
+use crate::utils::text::{escape_html, split_for_telegram, truncate_with_ellipsis};
 use crate::utils::timing::{complete_command_timer, start_command_timer, CommandTimer};
 use tracing::{error, info, warn};
 
@@ -257,14 +258,6 @@ pub fn build_auto_q_query(
     }
 }
 
-fn truncate_for_user(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(limit).collect();
-    format!("{truncated}...")
-}
-
 fn build_media_only_qa_prompt(media_summary: &MediaSummary) -> Option<String> {
     if media_summary.images > 0 {
         Some("Please analyze the attached image(s).".to_string())
@@ -435,7 +428,7 @@ fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
         ),
     };
 
-    let detail = truncate_for_user(&err_text, USER_ERROR_DETAIL_LIMIT);
+    let detail = truncate_with_ellipsis(&err_text, USER_ERROR_DETAIL_LIMIT);
     format!("{friendly}\n\nError: {detail}")
 }
 
@@ -1419,31 +1412,6 @@ fn chat_search_rebuilding_message(command_name: &str) -> String {
     )
 }
 
-fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-fn truncate_for_display(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-
-    let mut truncated: String = text.chars().take(max_chars).collect();
-    truncated.push_str("...");
-    truncated
-}
-
 #[derive(Debug, Deserialize)]
 struct ChatSearchSelection {
     selected_message_ids: Vec<i64>,
@@ -1543,7 +1511,7 @@ fn format_chat_search_results_html(
                 .unwrap_or_else(|| hit.username.as_deref().unwrap_or("Anonymous"));
             let username = escape_html(raw_label);
             let timestamp = escape_html(&hit.date.format("%Y-%m-%d %H:%M:%S UTC").to_string());
-            let snippet = escape_html(&truncate_for_display(&hit.snippet, 120));
+            let snippet = escape_html(&truncate_with_ellipsis(&hit.snippet, 120));
             let provenance_prefix = if hit.asks_ai {
                 let command = hit.ai_command.as_deref().unwrap_or("q");
                 format!("[AI ask /{}] ", escape_html(command))
@@ -1577,46 +1545,13 @@ fn format_chat_search_results_html(
     lines.join("\n")
 }
 
-fn split_html_for_telegram(text: &str, max_chars: usize) -> Vec<String> {
-    if text.chars().count() <= max_chars {
-        return vec![text.to_string()];
-    }
-
-    let mut parts = Vec::new();
-    let mut current = String::new();
-
-    for line in text.lines() {
-        let line = if current.is_empty() {
-            line.to_string()
-        } else {
-            format!("\n{line}")
-        };
-        if current.chars().count() + line.chars().count() > max_chars && !current.is_empty() {
-            parts.push(current);
-            current = line.trim_start_matches('\n').to_string();
-        } else {
-            current.push_str(&line);
-        }
-    }
-
-    if !current.is_empty() {
-        parts.push(current);
-    }
-
-    if parts.is_empty() {
-        vec![text.to_string()]
-    } else {
-        parts
-    }
-}
-
 async fn send_chat_search_response(
     bot: &Bot,
     chat_id: ChatId,
     message_id: MessageId,
     response_html: &str,
 ) -> Result<()> {
-    let chunks = split_html_for_telegram(response_html, CHAT_SEARCH_MESSAGE_LIMIT);
+    let chunks = split_for_telegram(response_html, CHAT_SEARCH_MESSAGE_LIMIT);
     let mut chunks_iter = chunks.into_iter();
     let first_chunk = chunks_iter.next().unwrap_or_default();
 

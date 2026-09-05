@@ -52,6 +52,9 @@ use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::logging::read_recent_log_lines;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::start_chat_action_heartbeat;
+use crate::utils::text::{
+    escape_html, split_for_telegram, truncate_with_ellipsis, truncate_with_suffix,
+};
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::{error, info, warn};
 
@@ -418,39 +421,6 @@ fn build_token_stats_user_response(rows: &[TokenUserStat]) -> String {
     lines.join("\n")
 }
 
-fn split_plain_text_for_telegram(text: &str, max_chars: usize) -> Vec<String> {
-    if text.chars().count() <= max_chars {
-        return vec![text.to_string()];
-    }
-
-    let mut parts = Vec::new();
-    let mut current = String::new();
-
-    for line in text.lines() {
-        let line = if current.is_empty() {
-            line.to_string()
-        } else {
-            format!("\n{line}")
-        };
-        if current.chars().count() + line.chars().count() > max_chars && !current.is_empty() {
-            parts.push(current);
-            current = line.trim_start_matches('\n').to_string();
-        } else {
-            current.push_str(&line);
-        }
-    }
-
-    if !current.is_empty() {
-        parts.push(current);
-    }
-
-    if parts.is_empty() {
-        vec![text.to_string()]
-    } else {
-        parts
-    }
-}
-
 async fn send_plain_text_report(
     bot: &Bot,
     message: &Message,
@@ -470,7 +440,7 @@ async fn send_plain_text_report(
         return Ok(());
     }
 
-    let chunks = split_plain_text_for_telegram(
+    let chunks = split_for_telegram(
         report,
         CONFIG.telegram_max_length.saturating_sub(100).max(1),
     );
@@ -692,12 +662,7 @@ async fn build_mysong_audio_caption(
         );
     }
 
-    let (preview, was_truncated) = truncate_chars(lyrics_message, 700);
-    let preview = if was_truncated {
-        format!("{}...", preview)
-    } else {
-        preview
-    };
+    let preview = truncate_with_ellipsis(lyrics_message, 700);
 
     let caption = format!("{}\n<pre>{}</pre>", base_caption, escape_html(&preview));
     if caption.chars().count() <= IMAGE_CAPTION_LIMIT {
@@ -798,28 +763,6 @@ fn build_factcheck_statement(
     }
 
     String::new()
-}
-
-fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
-    let mut iter = text.chars();
-    let truncated: String = iter.by_ref().take(max_chars).collect();
-    let was_truncated = iter.next().is_some();
-    (truncated, was_truncated)
 }
 
 fn bool_label(value: bool) -> &'static str {
@@ -1193,12 +1136,11 @@ async fn build_diagnose_report(state: &AppState) -> String {
     );
 
     let report = redact_sensitive_text(&report);
-    let (truncated, was_truncated) = truncate_chars(&report, DIAGNOSE_TEXT_LIMIT);
-    if was_truncated {
-        format!("{truncated}\n\n[truncated to fit Telegram message size]")
-    } else {
-        truncated
-    }
+    truncate_with_suffix(
+        &report,
+        DIAGNOSE_TEXT_LIMIT,
+        "\n\n[truncated to fit Telegram message size]",
+    )
 }
 
 async fn build_image_caption(model_name: &str, prompt: &str) -> String {
@@ -1229,12 +1171,7 @@ async fn build_image_caption(model_name: &str, prompt: &str) -> String {
         }
     }
 
-    let (preview, was_truncated) = truncate_chars(clean_prompt, IMAGE_CAPTION_PROMPT_PREVIEW);
-    let prompt_preview = if was_truncated {
-        format!("{}...", preview)
-    } else {
-        preview
-    };
+    let prompt_preview = truncate_with_ellipsis(clean_prompt, IMAGE_CAPTION_PROMPT_PREVIEW);
     caption = format!(
         "{} with prompt:\n<pre>{}</pre>",
         base_caption,

@@ -15,6 +15,7 @@ use crate::handlers::qa::resolve_default_text_model_for_request;
 use crate::handlers::{format_tldr_chat_content, neutralize_closing_tag, wrap_chat_history};
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
+use crate::utils::text::truncate_for_log;
 
 const CHUNK_SUMMARY_MAX_CHARS: usize = 4_000;
 const DEGRADED_TAIL_MESSAGES: usize = 30;
@@ -160,7 +161,7 @@ async fn summarize_chunk(
         .await
         {
             Ok(text) if !text.trim().is_empty() => {
-                return Ok(truncate_chars(text.trim(), CHUNK_SUMMARY_MAX_CHARS));
+                return Ok(truncate_for_log(text.trim(), CHUNK_SUMMARY_MAX_CHARS));
             }
             Ok(_) => last_error = Some(anyhow!("chunk summary was empty")),
             Err(err) => last_error = Some(err),
@@ -179,7 +180,7 @@ fn degraded_chunk_summary(chunk: &[MessageRow], reason: &str) -> ChunkSummary {
             "（本段{}，以下为该段最后 {} 条原始消息节选，请直接从中提炼要点）\n{}",
             reason,
             chunk.len() - tail_start,
-            truncate_chars(&excerpt, DEGRADED_EXCERPT_MAX_CHARS)
+            truncate_for_log(&excerpt, DEGRADED_EXCERPT_MAX_CHARS)
         ),
         degraded: true,
     }
@@ -202,14 +203,6 @@ fn build_merge_input(summaries: &[ChunkSummary]) -> String {
         .join("\n\n");
 
     format!("<chunk_summaries>\n{sections}\n</chunk_summaries>")
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(max_chars).collect();
-    format!("{truncated}... (truncated)")
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ use crate::llm::runtime_models::runtime_model_config;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
+use crate::utils::text::truncate_for_log;
 
 const EVIDENCE_BLOCK_MAX_CHARS: usize = 2_000;
 const EXTRACTION_INPUT_MAX_CHARS: usize = 24_000;
@@ -182,7 +183,7 @@ async fn extract_claims(
         CONFIG.factcheck_max_claims,
         CONFIG.factcheck_searches_per_claim,
     );
-    let input = truncate_chars(statement, EXTRACTION_INPUT_MAX_CHARS);
+    let input = truncate_for_log(statement, EXTRACTION_INPUT_MAX_CHARS);
 
     let response = call_step_text(
         &step_model,
@@ -320,7 +321,7 @@ async fn research_single_claim(claim: &ExtractedClaim) -> Vec<String> {
     {
         match web_search_tool(query, Some(WEB_RESULTS_PER_QUERY)).await {
             Ok(markdown) => {
-                blocks.push(truncate_chars(
+                blocks.push(truncate_for_log(
                     &format!("Search query: {query}\n{markdown}"),
                     EVIDENCE_BLOCK_MAX_CHARS,
                 ));
@@ -415,14 +416,6 @@ fn claim_extraction_schema(max_claims: usize, max_queries: usize) -> Value {
     })
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(max_chars).collect();
-    format!("{truncated}... (truncated)")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,13 +490,5 @@ mod tests {
         assert!(!synthesis.contains("{language_policy}"));
         assert!(!synthesis.contains("{current_datetime}"));
         assert!(!synthesis.contains("{telegram_user_language_hint}"));
-    }
-
-    #[test]
-    fn truncate_chars_appends_marker_only_when_needed() {
-        assert_eq!(truncate_chars("short", 10), "short");
-        let truncated = truncate_chars(&"x".repeat(20), 5);
-        assert!(truncated.starts_with("xxxxx"));
-        assert!(truncated.ends_with("(truncated)"));
     }
 }

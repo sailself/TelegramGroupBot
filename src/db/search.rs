@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use crate::utils::text::truncate_with_ellipsis;
 use jieba_rs::Jieba;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -237,7 +238,7 @@ fn normalize_semantic_text(text: &str, is_synthetic_record: bool) -> String {
         .replace_all(&normalized, " ")
         .trim()
         .to_string();
-    truncate_chars(&normalized.to_lowercase(), MAX_SEARCH_TEXT_CHARS)
+    truncate_with_ellipsis(&normalized.to_lowercase(), MAX_SEARCH_TEXT_CHARS)
 }
 
 fn clean_display_text(text: &str, is_synthetic_record: bool) -> String {
@@ -264,7 +265,7 @@ fn clean_display_text(text: &str, is_synthetic_record: bool) -> String {
         .replace_all(&cleaned, " ")
         .trim()
         .to_string();
-    truncate_chars(&cleaned, MAX_SNIPPET_SOURCE_CHARS)
+    truncate_with_ellipsis(&cleaned, MAX_SNIPPET_SOURCE_CHARS)
 }
 
 fn strip_urls_and_collect_tags(text: &str, tags: &mut BTreeSet<String>) -> String {
@@ -492,7 +493,7 @@ fn build_search_text(normalized_semantic: &str, semantic_tokens: &[String]) -> O
         (true, false) => token_block,
         (false, false) => format!("{semantic}\n{token_block}"),
     };
-    let combined = truncate_chars(combined.trim(), MAX_SEARCH_TEXT_CHARS);
+    let combined = truncate_with_ellipsis(combined.trim(), MAX_SEARCH_TEXT_CHARS);
     (!combined.is_empty()).then_some(combined)
 }
 
@@ -507,15 +508,6 @@ fn domain_tag(domain: &str) -> String {
 
 fn command_tag(command: &str) -> String {
     format!("command_{command}")
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let mut truncated: String = value.chars().take(max_chars).collect();
-    truncated.push_str("...");
-    truncated
 }
 
 fn is_han(ch: char) -> bool {

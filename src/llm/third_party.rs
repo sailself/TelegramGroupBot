@@ -22,6 +22,7 @@ use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::CodexPromptStyle;
 use crate::utils::http::get_http_client;
+use crate::utils::text::truncate_for_log;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const THIRD_PARTY_MAX_ATTEMPTS: usize = 3;
@@ -98,14 +99,6 @@ struct ProviderRequestDetails {
     headers: Vec<(String, String)>,
     payload: Value,
     request_timeout_secs: u64,
-}
-
-fn truncate_for_log(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(limit).collect();
-    format!("{truncated}... (truncated)")
 }
 
 fn summarize_payload(payload: &Value) -> String {

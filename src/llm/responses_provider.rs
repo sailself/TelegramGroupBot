@@ -25,6 +25,7 @@ use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::{get_http_client, get_http_client_no_compression};
+use crate::utils::text::truncate_for_log;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const RESPONSES_MAX_ATTEMPTS: usize = 3;
@@ -279,14 +280,6 @@ fn generate_session_id() -> String {
     let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = chrono::Utc::now().timestamp_millis();
     format!("tg-codex-{now}-{counter}")
-}
-
-fn truncate_for_log(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(limit).collect();
-    format!("{truncated}... (truncated)")
 }
 
 fn classify_incomplete_reason(value: Option<&str>) -> &'static str {

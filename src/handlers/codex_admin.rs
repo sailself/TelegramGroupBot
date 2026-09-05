@@ -13,6 +13,7 @@ use crate::llm::runtime_models;
 use crate::state::{
     ActiveCodexLogin, AppState, PendingCodexModelRequest, PendingCodexReasoningRequest,
 };
+use crate::utils::text::truncate_with_ellipsis;
 use tracing::warn;
 
 pub const CODEX_MODEL_SELECT_CALLBACK_PREFIX: &str = "codex_model_select:";
@@ -110,13 +111,7 @@ fn filter_picker_models(mut models: Vec<CodexRemoteModel>) -> Vec<CodexRemoteMod
 }
 
 fn keyboard_model_label(model: &CodexRemoteModel) -> String {
-    let label = model.display_name.trim();
-    if label.chars().count() <= 28 {
-        label.to_string()
-    } else {
-        let truncated: String = label.chars().take(28).collect();
-        format!("{truncated}...")
-    }
+    truncate_with_ellipsis(model.display_name.trim(), 28)
 }
 
 fn modality_summary(model: &CodexRemoteModel) -> String {

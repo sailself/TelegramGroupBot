@@ -24,6 +24,7 @@ use crate::llm::third_party::call_third_party_with_tool_runtime;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
+use crate::utils::text::truncate_for_log;
 
 const MAX_PLANNED_QUERIES: usize = 3;
 const MAX_REFLECT_ROUNDS: usize = 2;
@@ -102,7 +103,7 @@ async fn classify_lane(
     match call_step_text(
         step_model,
         QC_CLASSIFY_PROMPT,
-        &truncate_chars(query, PLANNER_INPUT_MAX_CHARS),
+        &truncate_for_log(query, PLANNER_INPUT_MAX_CHARS),
         &[],
         Some(&classify_schema()),
         "Chat QC Classify",
@@ -391,7 +392,7 @@ async fn run_analytics_lane(
             "- {} ({}): {}{}\n",
             hit.username.as_deref().unwrap_or("unknown"),
             hit.message_id,
-            truncate_chars(&body.replace('\n', " "), 200),
+            truncate_for_log(&body.replace('\n', " "), 200),
             hit.link
                 .as_deref()
                 .map(|l| format!(" {l}"))
@@ -559,7 +560,7 @@ pub async fn run_qc_pipeline(
                     .run_web_search(web_query, WEB_RESULTS_PER_QUERY)
                     .await
                 {
-                    Ok(markdown) => web_evidence.push(truncate_chars(
+                    Ok(markdown) => web_evidence.push(truncate_for_log(
                         &format!("Web search: {web_query}\n{markdown}"),
                         WEB_EVIDENCE_BLOCK_MAX_CHARS,
                     )),
@@ -600,7 +601,7 @@ async fn plan_queries(
     query: &str,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<Vec<String>> {
-    let input = truncate_chars(query, PLANNER_INPUT_MAX_CHARS);
+    let input = truncate_for_log(query, PLANNER_INPUT_MAX_CHARS);
     let response = call_step_text(
         step_model,
         QC_PLAN_PROMPT,
@@ -628,7 +629,7 @@ async fn reflect(
 ) -> Result<QcReflection> {
     let mut input = format!(
         "Question:\n{}\n\nQueries already run: {}\n\nEvidence so far:\n{}",
-        truncate_chars(query, PLANNER_INPUT_MAX_CHARS),
+        truncate_for_log(query, PLANNER_INPUT_MAX_CHARS),
         if executed_queries.is_empty() {
             "(none)".to_string()
         } else {
@@ -638,7 +639,7 @@ async fn reflect(
     );
     if !web_evidence.is_empty() {
         input.push_str("\n\nWeb evidence:\n");
-        input.push_str(&truncate_chars(
+        input.push_str(&truncate_for_log(
             &web_evidence.join("\n\n"),
             REFLECT_EVIDENCE_MAX_CHARS,
         ));
@@ -730,7 +731,7 @@ fn format_evidence_lines(hits: &[EvidenceHit], max_hits: usize, max_chars: usize
         } else {
             hit.snippet.trim()
         };
-        let body = truncate_chars(
+        let body = truncate_for_log(
             &body_source.replace('\n', " "),
             EVIDENCE_LINE_TEXT_MAX_CHARS,
         );
@@ -835,14 +836,6 @@ fn reflect_schema() -> Value {
         "required": ["action"],
         "additionalProperties": false
     })
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(max_chars).collect();
-    format!("{truncated}... (truncated)")
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use crate::config::CONFIG;
 use crate::llm::brave_search::brave_search;
 use crate::llm::exa_search::exa_search;
 use crate::llm::jina_search::search_jina_web;
+use crate::utils::text::truncate_with_ellipsis;
 
 const DEFAULT_MAX_RESULTS: usize = 5;
 const MAX_RESULTS_LIMIT: usize = 10;
@@ -59,13 +60,7 @@ impl WebSearchProvider {
 
 fn normalize_snippet(value: &str) -> String {
     let snippet = value.replace('\n', " ");
-    let snippet = snippet.trim();
-    if snippet.chars().count() > SNIPPET_LIMIT {
-        let truncated: String = snippet.chars().take(SNIPPET_LIMIT).collect();
-        format!("{truncated}...")
-    } else {
-        snippet.to_string()
-    }
+    truncate_with_ellipsis(snippet.trim(), SNIPPET_LIMIT)
 }
 
 fn normalize_result(mut result: SearchResult) -> Option<SearchResult> {

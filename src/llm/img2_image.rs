@@ -14,6 +14,7 @@ use crate::llm::audit::{
 use crate::llm::gemini::ImageGenerationError;
 use crate::llm::media::{detect_mime_type, download_media};
 use crate::utils::http::get_http_client;
+use crate::utils::text::truncate_for_log;
 
 const IMG2_PROVIDER: &str = "img2";
 const IMG2_MODEL: &str = "img2";
@@ -90,14 +91,6 @@ fn join_base_and_path(base_url: &str, path: &str) -> String {
         base_url.trim().trim_end_matches('/'),
         trimmed_path.trim_start_matches('/')
     )
-}
-
-fn truncate_for_log(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let truncated = value.chars().take(limit).collect::<String>();
-    format!("{truncated}... (truncated)")
 }
 
 fn sanitize_path_component(value: &str) -> String {

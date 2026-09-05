@@ -14,6 +14,7 @@ use crate::llm::gemini::ImageGenerationError;
 use crate::llm::media::{detect_mime_type, download_media};
 use crate::llm::openai_codex;
 use crate::utils::http::get_http_client_no_compression;
+use crate::utils::text::truncate_for_log;
 
 pub const CODEX_IMAGE_RESPONSES_MODEL: &str = "gpt-5.5";
 pub const CODEX_IMAGE_TOOL_MODEL: &str = "gpt-image-2";
@@ -140,14 +141,6 @@ pub fn build_codex_image_generation_payload(
         "stream": true,
         "store": false,
     })
-}
-
-fn truncate_for_log(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(limit).collect();
-    format!("{truncated}... (truncated)")
 }
 
 fn parse_sse_events(body: &str) -> Result<Vec<Value>> {
