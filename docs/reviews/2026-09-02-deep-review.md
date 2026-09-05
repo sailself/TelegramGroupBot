@@ -366,25 +366,25 @@ Top refactors: R1 (M) shared pipeline primitives in `agents/step.rs`/`common.rs`
 
 ## Part 3. Proposed plan
 
-### Phase 0: bug-fix PR (small, no refactoring)
+### Phase 0: bug-fix PR (small, no refactoring) — done on `fix/phase0-bugfixes` (2026-09-04)
 
-- [ ] Semaphore double-acquire in `/q` direct path (`qa.rs:3560` / `:1833`)
-- [ ] UTF-8 byte-slice panics (`responses.rs:74`, `timing.rs:30`); compare in chars
-- [ ] `(?s)` on the `<think>` regex; hoist both regexes to `Lazy`; multi-line test
-- [ ] Gemini fallback only on retryable errors; cap total wall-clock
-- [ ] Jina `error_for_status()`; no caching of empty search results
-- [ ] Stop logging token-bearing Telegram file URLs (`llm/media.rs`, `handlers/media.rs`)
-- [ ] `/tldr` clamp + `LIMIT` on the reply-anchored path
-- [ ] `/img`, `/img2`, `/image` use the parsed argument
-- [ ] `qc_topics` empty window -> coverage answer / `UseLegacy`
-- [ ] Admin gate: user-id (or private chat) required for `/diagnose`
-- [ ] `/profileme <style>` out of the system prompt
-- [ ] Redaction list covers `ollama_api_key`, `img2_api_key`, Codex tokens
-- [ ] `username` neutralized in `<chat_messages>`; `/qc` question fenced
-- [ ] Record `/q` message on all paths
-- [ ] Fix mojibake/stacked attributes in `main.rs:95-106`; remove BOMs; `.gitignore` `*.db-shm`, `*.db-wal`
-- [ ] `Dockerfile` base `rust:1.88` (or `rust:latest`); add `rust-version` to `Cargo.toml`
-- [ ] Flaky deadline tests: `start_paused` + `advance`, or relax thresholds
+- [x] Semaphore double-acquire in `/q` direct path (`qa.rs:3560` / `:1833`)
+- [x] UTF-8 byte-slice panics (`responses.rs:74`, `timing.rs:30`); compare in chars
+- [x] `(?s)` on the `<think>` regex; hoist both regexes to `Lazy`; multi-line test
+- [x] Gemini fallback only on retryable errors; cap total wall-clock
+- [x] Jina `error_for_status()`; no caching of empty search results
+- [x] Stop logging token-bearing Telegram file URLs (`llm/media.rs`, `handlers/media.rs`)
+- [x] `/tldr` clamp + `LIMIT` on the reply-anchored path
+- [x] `/img`, `/img2`, `/image` use the parsed argument
+- [x] `qc_topics` empty window -> coverage answer / `UseLegacy`
+- [x] Admin gate: user-id (or private chat) required for `/diagnose`
+- [x] `/profileme <style>` out of the system prompt
+- [x] Redaction list covers `ollama_api_key`, `img2_api_key`, Codex tokens
+- [x] `username` neutralized in `<chat_messages>`; `/qc` question fenced
+- [x] Record `/q` message on all paths
+- [x] Fix mojibake/stacked attributes in `main.rs:95-106`; remove BOMs; `.gitignore` `*.db-shm`, `*.db-wal`
+- [x] `Dockerfile` base `rust:1.88` (or `rust:latest`); add `rust-version` to `Cargo.toml`
+- [x] Flaky deadline tests: `start_paused` + `advance`, or relax thresholds
 
 ### Phase 1: shared utilities (mechanical, low risk)
 
