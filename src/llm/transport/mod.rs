@@ -253,7 +253,7 @@ where
                 continue;
             }
 
-            let retry_after = retry_after_from_headers(response.headers());
+            let retry_after = retry_after_from_headers(status, response.headers());
             let body = match read_body_limited(response, provider, ERROR_BODY_LIMIT).await {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(_) => String::new(),

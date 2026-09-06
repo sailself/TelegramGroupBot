@@ -109,10 +109,13 @@ pub fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect()
 }
 
-/// The longest wait the server asked for via `Retry-After` (seconds or
-/// HTTP-date), OpenAI-style `x-ratelimit-reset-*` Go durations, or the IETF
-/// `ratelimit-reset` seconds header. `None` when no usable hint is present.
-pub fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
+/// The longest wait the server asked for. `Retry-After` (seconds or
+/// HTTP-date) is an explicit instruction and counts on any status; the
+/// OpenAI-style `x-ratelimit-reset-*` Go durations and the IETF
+/// `ratelimit-reset` seconds are window bookkeeping that providers attach to
+/// ordinary responses too, so they count only for 429. `None` when no usable
+/// hint is present.
+pub fn retry_after_from_headers(status: StatusCode, headers: &HeaderMap) -> Option<Duration> {
     let header = |name: &str| {
         headers
             .get(name)
@@ -127,16 +130,18 @@ pub fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
             waits.push(wait);
         }
     }
-    for name in ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
-        if let Some(wait) = header(name).and_then(parse_go_duration) {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        for name in ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
+            if let Some(wait) = header(name).and_then(parse_go_duration) {
+                waits.push(wait);
+            }
+        }
+        if let Some(wait) = header("ratelimit-reset")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+        {
             waits.push(wait);
         }
-    }
-    if let Some(wait) = header("ratelimit-reset")
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
-    {
-        waits.push(wait);
     }
     waits.into_iter().max()
 }
@@ -300,14 +305,18 @@ mod tests {
     #[test]
     fn retry_after_header_in_seconds_is_parsed() {
         let map = headers(&[("retry-after", "3")]);
-        assert_eq!(retry_after_from_headers(&map), Some(Duration::from_secs(3)));
+        assert_eq!(
+            retry_after_from_headers(StatusCode::TOO_MANY_REQUESTS, &map),
+            Some(Duration::from_secs(3))
+        );
     }
 
     #[test]
     fn retry_after_http_date_is_converted_to_a_wait() {
         let future = (chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc2822();
         let map = headers(&[("retry-after", future.as_str())]);
-        let wait = retry_after_from_headers(&map).expect("date should parse");
+        let wait = retry_after_from_headers(StatusCode::TOO_MANY_REQUESTS, &map)
+            .expect("date should parse");
         assert!(
             wait >= Duration::from_secs(8) && wait <= Duration::from_secs(11),
             "{wait:?}"
@@ -315,7 +324,10 @@ mod tests {
 
         let past = (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc2822();
         let map = headers(&[("retry-after", past.as_str())]);
-        assert_eq!(retry_after_from_headers(&map), Some(Duration::ZERO));
+        assert_eq!(
+            retry_after_from_headers(StatusCode::TOO_MANY_REQUESTS, &map),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
@@ -325,13 +337,13 @@ mod tests {
             ("x-ratelimit-reset-tokens", "6m0s"),
         ]);
         assert_eq!(
-            retry_after_from_headers(&map),
+            retry_after_from_headers(StatusCode::TOO_MANY_REQUESTS, &map),
             Some(Duration::from_secs(360))
         );
 
         let map = headers(&[("ratelimit-reset", "12")]);
         assert_eq!(
-            retry_after_from_headers(&map),
+            retry_after_from_headers(StatusCode::TOO_MANY_REQUESTS, &map),
             Some(Duration::from_secs(12))
         );
     }
@@ -348,10 +360,42 @@ mod tests {
 
     #[test]
     fn missing_headers_yield_no_retry_after() {
-        assert_eq!(retry_after_from_headers(&HeaderMap::new()), None);
         assert_eq!(
-            retry_after_from_headers(&headers(&[("retry-after", "later")])),
+            retry_after_from_headers(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new()),
             None
+        );
+        assert_eq!(
+            retry_after_from_headers(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers(&[("retry-after", "later")])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rate_limit_window_hints_count_only_on_429() {
+        // Providers send the window-reset headers on ordinary responses too;
+        // a 5xx carrying `x-ratelimit-reset-tokens: 6m0s` must keep the
+        // normal backoff.
+        let map = headers(&[
+            ("x-ratelimit-reset-tokens", "6m0s"),
+            ("ratelimit-reset", "12"),
+        ]);
+        assert_eq!(
+            retry_after_from_headers(StatusCode::SERVICE_UNAVAILABLE, &map),
+            None
+        );
+        assert_eq!(
+            retry_after_from_headers(StatusCode::TOO_MANY_REQUESTS, &map),
+            Some(Duration::from_secs(360))
+        );
+
+        // Retry-After itself is an explicit instruction on any status.
+        let map = headers(&[("retry-after", "2"), ("x-ratelimit-reset-tokens", "6m0s")]);
+        assert_eq!(
+            retry_after_from_headers(StatusCode::SERVICE_UNAVAILABLE, &map),
+            Some(Duration::from_secs(2))
         );
     }
 }
