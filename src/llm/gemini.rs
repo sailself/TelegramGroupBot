@@ -1185,6 +1185,23 @@ fn generation_config_for(model: &str, thinking_level: &str) -> Value {
     config
 }
 
+/// The same request retargeted at `model`, with `thinkingConfig` re-derived
+/// for that model: a fallback chain may cross generations, and Gemini 2.5
+/// rejects the `thinkingLevel` that Gemini 3 accepts.
+fn payload_for_model(payload: &Value, model: &str, thinking_level: &str) -> Value {
+    let mut payload = payload.clone();
+    if let Some(config) = payload
+        .get_mut("generationConfig")
+        .and_then(Value::as_object_mut)
+    {
+        config.remove("thinkingConfig");
+        if let Some(thinking) = thinking_config_for(model, thinking_level) {
+            config.insert("thinkingConfig".to_string(), thinking);
+        }
+    }
+    payload
+}
+
 fn with_response_json_schema(config: Value, response_json_schema: Option<&Value>) -> Value {
     let Some(schema) = response_json_schema else {
         return config;
@@ -1430,7 +1447,7 @@ async fn call_gemini_lite_fallback(
         let result = async {
             let response = call_gemini_api(
                 lite_model,
-                payload.clone(),
+                payload_for_model(payload, lite_model, &CONFIG.gemini_thinking_level),
                 system_prompt_label,
                 audit_context,
                 "call_gemini_lite_fallback",
@@ -1529,9 +1546,8 @@ pub async fn call_gemini(request: GeminiCallRequest<'_>) -> Result<GeminiCallRes
     } else {
         &CONFIG.gemini_model
     };
-    // The fallback models reuse this payload; thinkingConfig is keyed on the
-    // primary model, which is what every model in one chain shares in
-    // generation (pro/default/lite are all the same major version).
+    // Fallback models reuse this payload with thinkingConfig re-derived per
+    // model (payload_for_model): the chain may cross generations.
     let payload = json!({
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": [{ "role": "user", "parts": parts }],
@@ -1624,7 +1640,7 @@ async fn run_gemini_model_fallbacks(
     let fallback_text = async {
         let response = call_gemini_api(
             fallback_model,
-            payload.clone(),
+            payload_for_model(payload, fallback_model, &CONFIG.gemini_thinking_level),
             system_prompt_label,
             audit_context,
             "call_gemini_fallback",
@@ -2074,6 +2090,38 @@ mod tests {
         .expect("unknown part kinds must deserialize");
 
         assert_eq!(extract_text_from_response(response), "visible answer");
+    }
+
+    #[test]
+    fn fallback_payloads_carry_the_thinking_config_of_their_own_model() {
+        let mut primary = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generationConfig": generation_config_for("gemini-3-pro-preview", "high"),
+        });
+        primary["generationConfig"]["temperature"] = json!(0.25);
+        assert_eq!(
+            primary["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+
+        let for_flash_25 = payload_for_model(&primary, "gemini-2.5-flash", "high");
+        assert!(
+            for_flash_25["generationConfig"]
+                .get("thinkingConfig")
+                .is_none(),
+            "2.5 models reject thinkingLevel: {for_flash_25}"
+        );
+        assert_eq!(
+            for_flash_25["generationConfig"]["temperature"], 0.25,
+            "other generation settings survive"
+        );
+        assert_eq!(for_flash_25["contents"], primary["contents"]);
+
+        let back_to_3 = payload_for_model(&for_flash_25, "gemini-3-flash", "high");
+        assert_eq!(
+            back_to_3["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
     }
 
     #[test]
