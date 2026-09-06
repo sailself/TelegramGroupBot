@@ -45,8 +45,11 @@ static AUTH_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// from, so per-request identity checks stop re-reading and re-decrypting.
 static AUTH_CACHE: LazyLock<parking_lot::Mutex<HashMap<PathBuf, CachedAuth>>> =
     LazyLock::new(Default::default);
-/// Set once a refresh is rejected with `invalid_grant`; only a new login clears it.
-static AUTH_INVALID_REASON: RwLock<Option<String>> = RwLock::new(None);
+/// Set once a refresh is rejected with `invalid_grant`, together with the
+/// auth file's fingerprint at that moment. Cleared by a login saved in this
+/// process, and lifted on its own once the file changes on disk (an operator
+/// repairing it by hand or through the external `codex` CLI).
+static AUTH_INVALID: RwLock<Option<AuthInvalid>> = RwLock::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexAuthStorageMode {
@@ -89,6 +92,12 @@ struct CachedAuth {
     /// `None` when the file was absent.
     fingerprint: Option<AuthFileFingerprint>,
     loaded: Option<LoadedAuthFile>,
+}
+
+struct AuthInvalid {
+    reason: String,
+    /// The auth file as it was when the refresh was rejected.
+    fingerprint: Option<AuthFileFingerprint>,
 }
 
 /// How a token refresh failed.
@@ -777,16 +786,38 @@ fn delete_auth_file(path: &Path) -> Result<bool> {
 }
 
 fn mark_auth_invalid(reason: &str) {
-    *AUTH_INVALID_REASON.write() = Some(reason.to_string());
+    mark_auth_invalid_at(auth_file_path(), reason);
+}
+
+fn mark_auth_invalid_at(path: &Path, reason: &str) {
+    let fingerprint = auth_file_fingerprint(path).ok().flatten();
+    *AUTH_INVALID.write() = Some(AuthInvalid {
+        reason: reason.to_string(),
+        fingerprint,
+    });
 }
 
 fn clear_auth_invalid() {
-    *AUTH_INVALID_REASON.write() = None;
+    *AUTH_INVALID.write() = None;
 }
 
 /// Why Codex auth is known to be unusable until the operator logs in again.
 pub fn auth_invalid_reason() -> Option<String> {
-    AUTH_INVALID_REASON.read().clone()
+    auth_invalid_reason_at(auth_file_path())
+}
+
+fn auth_invalid_reason_at(path: &Path) -> Option<String> {
+    let current = auth_file_fingerprint(path).ok().flatten();
+    let mut invalid = AUTH_INVALID.write();
+    match invalid.as_ref() {
+        Some(marker) if marker.fingerprint == current => Some(marker.reason.clone()),
+        Some(_) => {
+            info!("Codex auth file changed on disk; clearing the expired-login marker");
+            *invalid = None;
+            None
+        }
+        None => None,
+    }
 }
 
 fn ensure_auth_not_invalid() -> Result<()> {
@@ -1769,11 +1800,41 @@ mod tests {
         );
     }
 
+    /// The expired-login marker is process-global; tests that set it take
+    /// this lock so they do not observe each other's state.
+    static AUTH_MARKER_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[tokio::test]
+    async fn an_auth_file_repaired_out_of_process_clears_the_expired_login_marker() {
+        let _serial = AUTH_MARKER_TEST_LOCK.lock().await;
+        let path = temp_auth_path("invalid-marker");
+        save_auth_file_to_path(&path, &test_auth()).expect("save");
+
+        mark_auth_invalid_at(&path, "expired");
+        assert_eq!(auth_invalid_reason_at(&path).as_deref(), Some("expired"));
+
+        // Replacing the file by hand (portable/Docker workflow, external
+        // `codex login`) must lift the marker without a restart.
+        let mut repaired = test_auth();
+        repaired.tokens.as_mut().expect("tokens").refresh_token =
+            "refresh-token-after-relogin".to_string();
+        save_auth_file_to_path(&path, &repaired).expect("save repaired");
+
+        assert_eq!(auth_invalid_reason_at(&path), None);
+        assert_eq!(
+            auth_invalid_reason_at(&path),
+            None,
+            "the marker stays lifted"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn a_rejected_refresh_token_marks_the_login_expired_until_the_operator_logs_in_again() {
         use crate::tools::twitter_extractor::test_support::{
             response_with_headers, ExpectedRequest, TestServer,
         };
+        let _serial = AUTH_MARKER_TEST_LOCK.lock().await;
         let server = TestServer::new(vec![ExpectedRequest::new(
             "POST",
             "/oauth/token",
