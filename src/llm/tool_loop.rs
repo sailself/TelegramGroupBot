@@ -80,14 +80,16 @@ impl TurnDeadline {
         Self::new(per_request.saturating_mul(requests), per_request)
     }
 
-    /// The deadline for one tool-calling turn of `runtime`: every model turn
-    /// the loop may run, each at the provider's full request timeout. Tool
-    /// execution time eats into the same budget.
+    /// The deadline for one tool-calling turn of `runtime`: every model
+    /// request the loop may make (the budget's turns, the refusal turn, the
+    /// answer turn and a possible final pass), each at the provider's full
+    /// request timeout. Tool execution time eats into the same budget.
     pub fn for_runtime(per_request: Duration, runtime: &ToolRuntime) -> Self {
-        let turns = runtime
+        let requests = runtime
             .max_total_successful_calls()
-            .saturating_add(EXTRA_MODEL_TURNS);
-        Self::for_requests(per_request, u32::try_from(turns).unwrap_or(u32::MAX))
+            .saturating_add(EXTRA_MODEL_TURNS)
+            .saturating_add(1);
+        Self::for_requests(per_request, u32::try_from(requests).unwrap_or(u32::MAX))
     }
 
     pub fn total(&self) -> Duration {
@@ -106,6 +108,19 @@ impl TurnDeadline {
     /// turn is running out of time.
     pub fn request_timeout(&self) -> Duration {
         self.per_request.min(self.remaining())
+    }
+
+    /// Run `future` within the remaining time. A request's own retries and
+    /// Retry-After sleeps can outlive its nominal timeout, and a tool can
+    /// hang; either way an overrun is the deadline error.
+    async fn bound<T>(&self, what: &str, future: impl Future<Output = T>) -> Result<T> {
+        match tokio::time::timeout(self.remaining(), future).await {
+            Ok(value) => Ok(value),
+            Err(_) => Err(anyhow!(
+                "tool loop exceeded its {:?} deadline during {what}",
+                self.total
+            )),
+        }
     }
 }
 
@@ -173,13 +188,16 @@ pub async fn run_tool_loop<P: ToolProtocol>(
             tools_enabled,
             deadline.remaining()
         );
-        let model_turn = protocol
-            .complete(
-                &transcript,
-                tools_enabled.then_some(declarations.as_slice()),
-                deadline.request_timeout(),
+        let model_turn = deadline
+            .bound(
+                "a model request",
+                protocol.complete(
+                    &transcript,
+                    tools_enabled.then_some(declarations.as_slice()),
+                    deadline.request_timeout(),
+                ),
             )
-            .await?;
+            .await??;
         let tool_calls = if tools_enabled {
             model_turn.tool_calls
         } else {
@@ -194,10 +212,18 @@ pub async fn run_tool_loop<P: ToolProtocol>(
             break;
         }
 
+        // A turn that finished late must not spend more time on tools whose
+        // results could never be used.
+        ensure_time_remains(deadline)?;
         transcript.extend(model_turn.transcript);
         let mut results = Vec::with_capacity(tool_calls.len());
         for call in tool_calls {
-            let output = runtime.execute_tool(&call.name, &call.arguments).await;
+            let output = deadline
+                .bound(
+                    &format!("the {} tool", call.name),
+                    runtime.execute_tool(&call.name, &call.arguments),
+                )
+                .await?;
             results.push((call, output));
         }
         transcript.extend(protocol.tool_results(results));
@@ -220,9 +246,12 @@ pub async fn run_tool_loop<P: ToolProtocol>(
         final_pass_reason,
         deadline.remaining()
     );
-    let final_turn = protocol
-        .complete(&transcript, None, deadline.request_timeout())
-        .await?;
+    let final_turn = deadline
+        .bound(
+            "the final pass",
+            protocol.complete(&transcript, None, deadline.request_timeout()),
+        )
+        .await??;
     if !final_turn.tool_calls.is_empty() {
         warn!(
             "model returned {} tool call(s) in the final tool-less pass; using its text",
@@ -263,6 +292,8 @@ mod tests {
         requests: Arc<Mutex<Vec<Request>>>,
         needs_final_pass: bool,
         final_pass_started: bool,
+        /// Simulated request latency.
+        delay: Duration,
     }
 
     #[derive(Debug, Clone)]
@@ -279,6 +310,7 @@ mod tests {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 needs_final_pass: false,
                 final_pass_started: false,
+                delay: Duration::ZERO,
             }
         }
 
@@ -336,6 +368,9 @@ mod tests {
                     }),
                     timeout: request_timeout,
                 });
+                if !self.delay.is_zero() {
+                    tokio::time::sleep(self.delay).await;
+                }
                 self.turns
                     .pop_front()
                     .ok_or_else(|| anyhow!("the script ran out of turns"))
@@ -585,8 +620,34 @@ mod tests {
         let deadline = TurnDeadline::for_runtime(Duration::from_secs(30), &quick);
         assert_eq!(
             deadline.total(),
-            Duration::from_secs(90),
-            "budget 1 allows 3 model turns"
+            Duration::from_secs(120),
+            "budget 1 allows 3 model turns plus a final pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_request_that_outlives_the_deadline_is_cut_off_before_any_tool_runs() {
+        let db = init_test_db("loop-slow-model").await;
+        tokio::time::pause();
+        let mut runtime = ToolRuntime::for_quick(db, -100).with_web_search_available(true);
+        let mut protocol = FakeProtocol::scripted(vec![
+            tool_turn(&[("call_1", "web_search", json!({"query": ""}))]),
+            text_turn("never reached"),
+        ]);
+        // Retries and Retry-After sleeps inside one request can outlive the
+        // nominal request timeout; the loop must cut the request itself.
+        protocol.delay = Duration::from_secs(20);
+        let deadline = TurnDeadline::new(Duration::from_secs(10), Duration::from_secs(60));
+
+        let err = run_tool_loop(&mut protocol, &mut runtime, user_turn(), &deadline)
+            .await
+            .expect_err("the slow request is cut off at the deadline");
+
+        assert!(err.to_string().contains("deadline"), "{err}");
+        assert_eq!(protocol.requests().len(), 1);
+        assert!(
+            !runtime.web_search_attempted(),
+            "no tool runs for a turn that missed the deadline"
         );
     }
 
