@@ -20,7 +20,7 @@ use crate::llm::tool_loop::{
     TurnDeadline,
 };
 use crate::llm::tool_prompts::TOOL_LIMIT_SYSTEM_PROMPT;
-use crate::llm::tool_runtime::{ToolKind, ToolRuntime};
+use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::transport::sse::parse_sse_data_events;
 use crate::llm::transport::{
     call_with_retry, read_body_limited_or_partial, usage, BodyRead, LlmCall, ProviderError,
@@ -1228,12 +1228,10 @@ impl ToolProtocol for ResponsesProtocol<'_> {
     type Item = Value;
 
     fn tool_declarations(&self, runtime: &ToolRuntime) -> Vec<Value> {
+        // The runtime already withholds the function-call web_search when the
+        // model searches natively (see ToolRuntime::use_native_web_search).
         let mut tools = runtime.build_responses_tools();
         if let Some(native_tool) = &self.native_codex_web_search_tool {
-            // Codex's native web search supersedes the function-call variant.
-            tools.retain(|tool| {
-                tool.get("name").and_then(Value::as_str) != Some(ToolKind::WebSearch.name())
-            });
             tools.push(native_tool.clone());
         }
         tools
@@ -1384,13 +1382,6 @@ pub async fn call_responses_provider(
         )));
     };
 
-    let runtime_guidance = runtime.tool_limit_guidance();
-    let instructions = build_responses_system_prompt(
-        system_prompt,
-        model_config,
-        codex_prompt_style,
-        Some(&runtime_guidance),
-    );
     let native_codex_web_search_tool = if runtime.allows_native_web_search() {
         identity
             .as_ref()
@@ -1399,6 +1390,18 @@ pub async fn call_responses_provider(
     } else {
         None
     };
+    if native_codex_web_search_tool.is_some() {
+        // Decided before the guidance is rendered, so the prompt describes
+        // web_search while the function-call variant stays undeclared.
+        runtime.use_native_web_search();
+    }
+    let runtime_guidance = runtime.tool_limit_guidance();
+    let instructions = build_responses_system_prompt(
+        system_prompt,
+        model_config,
+        codex_prompt_style,
+        Some(&runtime_guidance),
+    );
     debug!(
         "Responses provider selected: provider={}, model={}, response_title={}, tools=true, native_codex_web_search={}, image_count={}",
         model_config.provider.as_str(),

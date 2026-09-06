@@ -240,6 +240,9 @@ pub struct ToolRuntime {
     // Whether a web-search provider is configured; decided once per request
     // so the offered tools, the guidance and the budget gate cannot disagree.
     web_search_available: bool,
+    // The model searches natively (Codex): web_search is offered and described,
+    // but no function declaration is emitted and a function call is refused.
+    native_web_search: bool,
     successful_calls: usize,
     calls: [usize; ToolKind::ALL.len()],
     force_final_answer: bool,
@@ -304,6 +307,7 @@ impl ToolRuntime {
             profile,
             budget,
             web_search_available: web_search::is_search_enabled(),
+            native_web_search: false,
             successful_calls: 0,
             calls: [0; ToolKind::ALL.len()],
             force_final_answer: false,
@@ -369,6 +373,14 @@ impl ToolRuntime {
             .ok_or_else(|| anyhow!("chat tools are unavailable for this request"))
     }
 
+    /// The provider answers web searches itself (Codex's native tool), so
+    /// `web_search` counts as offered for the guidance while the function
+    /// declaration is left to the provider.
+    pub fn use_native_web_search(&mut self) {
+        self.web_search_available = true;
+        self.native_web_search = true;
+    }
+
     #[cfg(test)]
     pub(crate) fn with_web_search_available(mut self, available: bool) -> Self {
         self.web_search_available = available;
@@ -398,6 +410,12 @@ impl ToolRuntime {
         ToolKind::ALL
             .into_iter()
             .filter(move |kind| self.offers(*kind))
+    }
+
+    /// Offered tools that need a function declaration from us.
+    fn declared_kinds(&self) -> impl Iterator<Item = ToolKind> + '_ {
+        self.offered_kinds()
+            .filter(move |kind| !(*kind == ToolKind::WebSearch && self.native_web_search))
     }
 
     /// Successful calls of `kind` so far.
@@ -467,14 +485,14 @@ impl ToolRuntime {
 
     /// Chat Completions `tools` array for the tools offered on this request.
     pub fn build_openai_function_tools(&self) -> Vec<Value> {
-        self.offered_kinds()
+        self.declared_kinds()
             .map(|kind| kind.spec().openai_function())
             .collect()
     }
 
     /// OpenAI Responses `tools` array for the tools offered on this request.
     pub fn build_responses_tools(&self) -> Vec<Value> {
-        self.offered_kinds()
+        self.declared_kinds()
             .map(|kind| kind.spec().responses_function())
             .collect()
     }
@@ -483,7 +501,7 @@ impl ToolRuntime {
     /// offered on this request; empty when nothing is offered.
     pub fn build_gemini_tools(&self) -> Vec<Value> {
         let declarations = self
-            .offered_kinds()
+            .declared_kinds()
             .map(|kind| kind.spec().gemini_declaration())
             .collect::<Vec<_>>();
         if declarations.is_empty() {
@@ -588,7 +606,7 @@ impl ToolRuntime {
                 kind: ToolBudgetErrorKind::Total,
             });
         }
-        if !self.offers(kind) {
+        if !self.offers(kind) || (kind == ToolKind::WebSearch && self.native_web_search) {
             self.force_final_answer = true;
             return Err(ToolBudgetError {
                 kind: ToolBudgetErrorKind::Disabled,
@@ -1202,6 +1220,34 @@ mod tests {
         assert!(offline.build_openai_function_tools().is_empty());
         assert!(offline.build_responses_tools().is_empty());
         assert!(offline.build_gemini_tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_web_search_is_described_in_the_guidance_but_never_declared_as_a_function() {
+        let mut runtime = ToolRuntime::for_web_search().with_web_search_available(false);
+        assert!(runtime.budget_guidance().contains("No tools are available"));
+
+        runtime.use_native_web_search();
+
+        assert!(runtime.offers(ToolKind::WebSearch));
+        let guidance = runtime.budget_guidance();
+        assert!(
+            guidance.contains("web_search at most 3 times"),
+            "{guidance}"
+        );
+        assert!(
+            runtime.build_responses_tools().is_empty(),
+            "the provider attaches its own native tool"
+        );
+        assert!(runtime.build_openai_function_tools().is_empty());
+        assert!(runtime.build_gemini_tools().is_empty());
+
+        // A function call for it can only be a hallucination.
+        let payload = runtime
+            .execute_tool_unfenced("web_search", &json!({"query": "x"}))
+            .await;
+        let payload: Value = serde_json::from_str(&payload).expect("JSON");
+        assert_eq!(payload["error_code"], "tool_disabled");
     }
 
     #[test]
