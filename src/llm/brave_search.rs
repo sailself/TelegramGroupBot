@@ -126,20 +126,32 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn brave_results_are_parsed_and_transient_failures_retried() {
+    async fn brave_results_are_parsed_and_a_failure_is_not_retried() {
         let body = br#"{"web":{"results":[{"title":"Rust","url":"https://www.rust-lang.org","description":"A language"},{"url":"https://no-title.example","extra_snippets":["fallback snippet"]}]}}"#;
         // The query string is part of the path the mock sees, so match any
         // path and pin the behaviour through the header check instead.
-        let server = TestServer::new(vec![
-            ExpectedRequest::any(response_with_headers(503, &[], b"busy".to_vec())),
-            ExpectedRequest::any(response_with_headers(200, &[], body.to_vec()))
-                .with_header("x-subscription-token", "brave-key"),
-        ]);
+        let server = TestServer::new(vec![ExpectedRequest::any(response_with_headers(
+            503,
+            &[],
+            b"busy".to_vec(),
+        ))]);
         let endpoint = server.url("/search").to_string();
+        // The next provider in the chain is the retry.
+        brave_search_at(&endpoint, "brave-key", "rust language", 5)
+            .await
+            .expect_err("a failing provider falls through without retrying");
+        server.join().expect("exactly one request was made");
 
+        let server = TestServer::new(vec![ExpectedRequest::any(response_with_headers(
+            200,
+            &[],
+            body.to_vec(),
+        ))
+        .with_header("x-subscription-token", "brave-key")]);
+        let endpoint = server.url("/search").to_string();
         let results = brave_search_at(&endpoint, "brave-key", "rust language", 5)
             .await
-            .expect("second attempt succeeds");
+            .expect("results parse");
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "Rust");
@@ -147,6 +159,6 @@ mod tests {
         assert_eq!(results[0].snippet, "A language");
         assert_eq!(results[1].title, "https://no-title.example");
         assert_eq!(results[1].snippet, "fallback snippet");
-        server.join().expect("both requests were served");
+        server.join().expect("one request was served");
     }
 }

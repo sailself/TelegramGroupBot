@@ -20,11 +20,15 @@ const MAX_RESULTS_LIMIT: usize = 10;
 const SNIPPET_LIMIT: usize = 240;
 /// Wall-clock budget for one `search_web` call across every provider tried.
 pub const WEB_SEARCH_TOTAL_DEADLINE: Duration = Duration::from_secs(45);
+/// The most of that budget any single provider may consume, so one hanging
+/// or rate-limited backend cannot starve the rest of the chain.
+pub(crate) const WEB_SEARCH_PROVIDER_DEADLINE: Duration = Duration::from_secs(15);
 /// Timeout for a single provider request.
-pub(crate) const WEB_SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Search APIs rate-limit aggressively: one retry that honours `Retry-After`.
-pub(crate) const WEB_SEARCH_RETRY_POLICY: RetryPolicy =
-    RetryPolicy::linear(2, Duration::from_millis(500));
+pub(crate) const WEB_SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// One attempt per provider: the next provider in the chain is the retry, so
+/// a failing or rate-limited backend falls through at once instead of
+/// sleeping on `Retry-After` inside its slice.
+pub(crate) const WEB_SEARCH_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(1, Duration::ZERO);
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -139,13 +143,15 @@ fn cache_search_results(query: &str, max_results: usize, results: &[SearchResult
 }
 
 /// Try `providers` in order until one returns results, within one overall
-/// `deadline`. A provider that exhausts the remaining time is abandoned and
-/// nothing further is tried: the deadline is total, not per provider.
+/// `deadline`. Each provider gets at most `provider_deadline` of what is left,
+/// so a hanging backend is abandoned while the next one still has a window;
+/// once the total is spent nothing further is tried.
 async fn search_web_with(
     providers: &[&dyn SearchProvider],
     query: &str,
     max_results: usize,
     deadline: Duration,
+    provider_deadline: Duration,
 ) -> Result<Vec<SearchResult>> {
     let deadline_at = tokio::time::Instant::now() + deadline;
     let mut last_error: Option<String> = None;
@@ -165,8 +171,9 @@ async fn search_web_with(
             break;
         }
 
+        let slice = remaining.min(provider_deadline);
         info!("Trying web search provider '{}'", provider.name());
-        match tokio::time::timeout(remaining, provider.search(query, max_results)).await {
+        match tokio::time::timeout(slice, provider.search(query, max_results)).await {
             Ok(Ok(results)) => {
                 had_success = true;
                 let mut normalized = results
@@ -183,7 +190,7 @@ async fn search_web_with(
             }
             Err(_) => {
                 last_error = Some(format!(
-                    "{}: timed out at the {deadline:?} web search deadline",
+                    "{}: timed out after its {slice:?} share of the {deadline:?} web search deadline",
                     provider.name()
                 ));
             }
@@ -223,8 +230,14 @@ pub async fn search_web(query: &str, max_results: Option<usize>) -> Result<Vec<S
         return Err(anyhow!("No web search providers are enabled"));
     }
 
-    let results =
-        search_web_with(&providers, query, max_results, WEB_SEARCH_TOTAL_DEADLINE).await?;
+    let results = search_web_with(
+        &providers,
+        query,
+        max_results,
+        WEB_SEARCH_TOTAL_DEADLINE,
+        WEB_SEARCH_PROVIDER_DEADLINE,
+    )
+    .await?;
     cache_search_results(query, max_results, &results);
     Ok(results)
 }
@@ -339,6 +352,7 @@ mod tests {
             "rust",
             2,
             Duration::from_secs(10),
+            Duration::from_secs(10),
         )
         .await
         .expect("a provider answered");
@@ -353,22 +367,64 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_hanging_provider_is_cut_off_at_the_total_deadline() {
+    async fn a_hanging_provider_spends_only_its_slice_and_the_next_provider_runs() {
         let slow = provider("slow", FakeOutcome::Hang);
         let fast = provider(
             "fast",
             FakeOutcome::Results(vec![result("https://fast.example")]),
         );
+        let started = tokio::time::Instant::now();
 
-        let err = search_web_with(&[&slow, &fast], "rust", 5, Duration::from_millis(200))
-            .await
-            .expect_err("the hanging provider spent the whole budget");
+        let results = search_web_with(
+            &[&slow, &fast],
+            "rust",
+            5,
+            Duration::from_secs(45),
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("the next provider answers after the slow one is cut off");
 
-        assert!(err.to_string().contains("slow: timed out"), "{err}");
+        assert_eq!(results[0].url, "https://fast.example");
+        assert_eq!(slow.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fast.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(15) && elapsed < Duration::from_secs(16),
+            "the slow provider was abandoned at its slice: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_total_deadline_still_caps_the_whole_chain() {
+        let first = provider("first", FakeOutcome::Hang);
+        let second = provider("second", FakeOutcome::Hang);
+        let third = provider(
+            "third",
+            FakeOutcome::Results(vec![result("https://third.example")]),
+        );
+        let started = tokio::time::Instant::now();
+
+        let err = search_web_with(
+            &[&first, &second, &third],
+            "rust",
+            5,
+            Duration::from_secs(20),
+            Duration::from_secs(15),
+        )
+        .await
+        .expect_err("the chain ran out of total time");
+
+        assert!(err.to_string().contains("second: timed out"), "{err}");
         assert_eq!(
-            fast.calls.load(std::sync::atomic::Ordering::SeqCst),
+            third.calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "the deadline is total: no fresh window for the next provider"
+            "no window is left for the third provider"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(20) && elapsed < Duration::from_secs(21),
+            "the second provider got only the remaining 5s: {elapsed:?}"
         );
     }
 
@@ -387,6 +443,7 @@ mod tests {
             "rust",
             5,
             Duration::from_millis(0),
+            Duration::from_secs(15),
         )
         .await
         .expect_err("no provider can run inside a zero deadline");
@@ -396,15 +453,27 @@ mod tests {
     #[tokio::test]
     async fn all_failures_surface_the_last_error_but_a_successful_empty_answer_does_not() {
         let broken = provider("broken", FakeOutcome::Failure("boom"));
-        let err = search_web_with(&[&broken], "rust", 5, Duration::from_secs(5))
-            .await
-            .expect_err("every provider failed");
+        let err = search_web_with(
+            &[&broken],
+            "rust",
+            5,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("every provider failed");
         assert!(err.to_string().contains("broken: boom"), "{err}");
 
         let empty = provider("empty", FakeOutcome::Results(Vec::new()));
-        let results = search_web_with(&[&broken, &empty], "rust", 5, Duration::from_secs(5))
-            .await
-            .expect("one provider answered, even if with nothing");
+        let results = search_web_with(
+            &[&broken, &empty],
+            "rust",
+            5,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("one provider answered, even if with nothing");
         assert!(results.is_empty());
     }
 
@@ -426,9 +495,15 @@ mod tests {
             ]),
         );
 
-        let results = search_web_with(&[&messy], "rust", 5, Duration::from_secs(5))
-            .await
-            .expect("results");
+        let results = search_web_with(
+            &[&messy],
+            "rust",
+            5,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("results");
 
         assert_eq!(results.len(), 1, "results without a URL are dropped");
         assert_eq!(results[0].title, "https://untitled.example");
