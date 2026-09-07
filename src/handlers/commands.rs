@@ -28,7 +28,7 @@ use crate::handlers::media::{
     collect_message_media, get_file_url, summarize_media_files, MediaCollectionOptions,
     MediaSummary,
 };
-use crate::handlers::qa::{resolve_default_text_model_for_request, MODEL_GEMINI};
+use crate::handlers::qa::MODEL_GEMINI;
 use crate::handlers::responses::send_response;
 use crate::llm::audit::LLM_TRIGGER_KIND_COMMAND;
 use crate::llm::gemini::ImageGenerationError;
@@ -38,6 +38,7 @@ use crate::llm::runtime_models::{
     codex_selected_model_label, runtime_model_config, runtime_model_count,
     selected_codex_model_record,
 };
+use crate::llm::text_model::resolve_default_text_model_for_request;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{

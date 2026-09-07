@@ -10,6 +10,7 @@ pub mod media;
 pub mod openai_codex;
 pub mod responses_provider;
 pub mod runtime_models;
+pub mod text_model;
 pub mod third_party;
 pub mod tool_loop;
 pub mod tool_prompts;

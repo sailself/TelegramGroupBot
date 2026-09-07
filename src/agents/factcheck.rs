@@ -18,9 +18,9 @@ use crate::config::{
 };
 use crate::handlers::media::MediaSummary;
 use crate::handlers::neutralize_closing_tag;
-use crate::handlers::qa::resolve_default_text_model_for_request;
 use crate::llm::media::MediaFile;
 use crate::llm::runtime_models::runtime_model_config;
+use crate::llm::text_model::resolve_default_text_model_for_request;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
