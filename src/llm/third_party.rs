@@ -10,19 +10,21 @@ use tracing::{debug, warn};
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
 use crate::llm::audit::LlmAuditContext;
 use crate::llm::media::{MediaFile, MediaKind};
-use crate::llm::responses_provider::{
-    call_responses_provider, call_responses_provider_with_tool_runtime, PinnedCodexRequestContract,
+use crate::llm::responses_provider::call_responses_provider;
+use crate::llm::runtime_models::{
+    is_runtime_provider_ready, runtime_model_config, ResolvedExplicitCodexModel,
 };
-use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config};
-use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
+use crate::llm::tool_loop::{
+    clamp_request_timeout_secs, run_tool_loop, BoxFuture, ModelTurn, ToolCall, ToolProtocol,
+    TurnDeadline,
+};
+use crate::llm::tool_prompts::TOOL_LIMIT_SYSTEM_PROMPT;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::transport::{call_with_retry, read_json, usage, LlmCall, RetryPolicy};
-use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::CodexPromptStyle;
 use crate::utils::http::get_http_client;
 use crate::utils::text::truncate_for_log;
 
-const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const THIRD_PARTY_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(3, Duration::from_millis(900));
 const OPENROUTER_REFERER: &str = "https://github.com/sailself/TelegramGroupHelperBot";
 const OPENROUTER_TITLE: &str = "TelegramGroupHelperBot";
@@ -31,7 +33,9 @@ const OPENROUTER_TITLE: &str = "TelegramGroupHelperBot";
 pub struct ThirdPartyCallOptions<'a> {
     audit_context: Option<&'a LlmAuditContext>,
     reasoning_override: Option<&'a str>,
-    pinned_codex: Option<&'a PinnedCodexRequestContract>,
+    /// An explicit Codex model (config plus catalog record) the caller already
+    /// resolved, so the call does not depend on the runtime catalog for it.
+    explicit_codex: Option<&'a ResolvedExplicitCodexModel>,
     codex_prompt_style: CodexPromptStyle,
 }
 
@@ -43,7 +47,7 @@ impl<'a> ThirdPartyCallOptions<'a> {
         Self {
             audit_context,
             reasoning_override: None,
-            pinned_codex: None,
+            explicit_codex: None,
             codex_prompt_style,
         }
     }
@@ -53,21 +57,24 @@ impl<'a> ThirdPartyCallOptions<'a> {
         self
     }
 
-    pub(crate) fn with_pinned_codex_request(
+    pub(crate) fn with_explicit_codex_model(
         mut self,
-        pinned_codex: Option<&'a PinnedCodexRequestContract>,
+        explicit_codex: Option<&'a ResolvedExplicitCodexModel>,
     ) -> Self {
-        self.pinned_codex = pinned_codex;
+        self.explicit_codex = explicit_codex;
         self
     }
 }
 
 fn model_config_for_call(
     model_id: &str,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
+    explicit_codex: Option<&ResolvedExplicitCodexModel>,
 ) -> Result<ThirdPartyModelConfig> {
-    if let Some(pinned) = pinned_codex {
-        return Ok(pinned.model_config_for_request(model_id)?.clone());
+    if let Some(explicit) = explicit_codex {
+        if explicit.config.id != model_id {
+            return Err(anyhow!("The explicit Codex model changed"));
+        }
+        return Ok(explicit.config.clone());
     }
 
     CONFIG
@@ -135,18 +142,6 @@ fn summarize_payload(payload: &Value) -> String {
         tool_choice,
         tool_names.join(",")
     )
-}
-
-fn build_third_party_system_prompt(
-    system_prompt: &str,
-    include_tool_limit_guidance: bool,
-) -> String {
-    if !include_tool_limit_guidance {
-        return system_prompt.to_string();
-    }
-
-    let guidance = tool_limit_guidance(MAX_TOOL_CALL_ITERATIONS);
-    format!("{system_prompt}\n\n{guidance}")
 }
 
 static HARMONY_TAG_REGEX: LazyLock<Regex> =
@@ -263,36 +258,6 @@ fn extract_message_content(message: &Value) -> String {
     }
 
     extract_reasoning_text(message).unwrap_or_default()
-}
-
-fn build_function_tools() -> Vec<Value> {
-    if !web_search::is_search_enabled() {
-        return Vec::new();
-    }
-
-    vec![json!({
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web using the configured providers (Brave, Exa, Jina) and return a concise Markdown summary of the results.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query to look up."
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default 5).",
-                        "minimum": 1,
-                        "maximum": 10
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    })]
 }
 
 fn image_data_list_from_media(media_files: &[MediaFile]) -> Vec<Vec<u8>> {
@@ -549,231 +514,114 @@ fn extract_tool_calls(message: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-async fn request_final_answer_after_tool_limit(
-    mut messages: Vec<Value>,
-    model_config: &ThirdPartyModelConfig,
-    audit_context: Option<&LlmAuditContext>,
-    operation: &str,
-) -> Result<String> {
-    messages.push(json!({
-        "role": "system",
-        "content": TOOL_LIMIT_SYSTEM_PROMPT
-    }));
-
-    debug!(
-        "{} tool limit reached; requesting final answer without tools",
-        model_config.provider.as_str()
-    );
-
-    let details = build_request_details(model_config, messages, None, None)?;
-    let response = call_provider_api(&details, audit_context, operation).await?;
-    let message = extract_response_message(&response);
-    let tool_calls = extract_tool_calls(&message);
-    if !tool_calls.is_empty() {
-        warn!(
-            "{} returned {} unexpected tool call(s) after tool limit; ignoring them and using available content",
-            details.display_name,
-            tool_calls.len()
-        );
-    }
-
-    let content = extract_message_content(&message);
-    if content.trim().is_empty() {
-        warn!(
-            "{} final response after tool limit had empty content: {}",
-            details.display_name,
-            truncate_for_log(&response.to_string(), 2000)
-        );
-    }
-
-    Ok(parse_third_party_response(model_config, &content))
+/// Chat Completions half of the shared tool loop.
+struct ChatCompletionsProtocol<'a> {
+    model_config: &'a ThirdPartyModelConfig,
+    audit_context: Option<&'a LlmAuditContext>,
+    operation: &'a str,
 }
 
-async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> {
-    match name {
-        "web_search" => {
-            let query = arguments
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let max_results = arguments
-                .get("max_results")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-            debug!(
-                "Executing tool call web_search: query='{}', max_results={:?}",
-                truncate_for_log(query, 200),
-                max_results
-            );
-            match web_search_tool(query, max_results).await {
-                Ok(result) => {
-                    debug!("web_search returned {} chars", result.chars().count());
-                    Ok(result)
-                }
-                Err(err) => {
-                    warn!("web_search tool failed: {}", err);
-                    Err(err)
-                }
-            }
-        }
-        _ => Ok(String::from("Unsupported tool call")),
+impl ToolProtocol for ChatCompletionsProtocol<'_> {
+    type Item = Value;
+
+    fn tool_declarations(&self, runtime: &ToolRuntime) -> Vec<Value> {
+        runtime.build_openai_function_tools()
     }
-}
 
-async fn chat_completion_with_tools(
-    mut messages: Vec<Value>,
-    model_config: &ThirdPartyModelConfig,
-    audit_context: Option<&LlmAuditContext>,
-    operation: &str,
-) -> Result<String> {
-    let tools = build_function_tools();
-
-    for iteration in 0..MAX_TOOL_CALL_ITERATIONS {
-        debug!(
-            "{} tool iteration {}/{}",
-            model_config.provider.as_str(),
-            iteration + 1,
-            MAX_TOOL_CALL_ITERATIONS
-        );
-        let details = build_request_details(
-            model_config,
-            messages.clone(),
-            Some(tools.clone()),
-            Some("auto"),
-        )?;
-        let response = call_provider_api(&details, audit_context, operation).await?;
-        let message = extract_response_message(&response);
-
-        let content = extract_message_content(&message);
-        let tool_calls = extract_tool_calls(&message);
-
-        if tool_calls.is_empty() {
-            if content.trim().is_empty() {
+    fn complete<'a>(
+        &'a mut self,
+        transcript: &'a [Value],
+        tools: Option<&'a [Value]>,
+        request_timeout: Duration,
+    ) -> BoxFuture<'a, Result<ModelTurn<Value>>> {
+        Box::pin(async move {
+            let mut details = build_request_details(
+                self.model_config,
+                transcript.to_vec(),
+                tools.map(<[Value]>::to_vec),
+                tools.is_some().then_some("auto"),
+            )?;
+            details.request_timeout_secs =
+                clamp_request_timeout_secs(details.request_timeout_secs, request_timeout);
+            let response = call_provider_api(&details, self.audit_context, self.operation).await?;
+            let message = extract_response_message(&response);
+            let content = extract_message_content(&message);
+            let tool_calls = extract_tool_calls(&message)
+                .iter()
+                .map(chat_tool_call)
+                .collect::<Vec<_>>();
+            if tool_calls.is_empty() && content.trim().is_empty() {
                 warn!(
                     "{} response had empty content and no tool calls: {}",
                     details.display_name,
                     truncate_for_log(&response.to_string(), 2000)
                 );
             }
-            return Ok(parse_third_party_response(model_config, &content));
-        }
-
-        messages.push(message.clone());
-
-        for tool_call in tool_calls {
-            let tool_name = tool_call
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let args_text = tool_call
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            let args_value: Value = serde_json::from_str(args_text).unwrap_or(Value::Null);
-            let result = execute_function_tool(tool_name, &args_value)
-                .await
-                .unwrap_or_else(|err| err.to_string());
-            if result.trim().is_empty() {
-                warn!("Tool call '{}' returned empty content", tool_name);
-            }
-
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": tool_call.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                "content": result
-            }));
-        }
-
-        if iteration + 1 == MAX_TOOL_CALL_ITERATIONS {
-            return request_final_answer_after_tool_limit(
-                messages,
-                model_config,
-                audit_context,
-                operation,
-            )
-            .await;
-        }
+            Ok(ModelTurn {
+                text: parse_third_party_response(self.model_config, &content),
+                tool_calls,
+                transcript: vec![message],
+            })
+        })
     }
 
-    unreachable!("third-party tool loop exhausted without returning")
+    fn tool_results(&self, results: Vec<(ToolCall, String)>) -> Vec<Value> {
+        results
+            .into_iter()
+            .map(|(call, output)| {
+                json!({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": output,
+                })
+            })
+            .collect()
+    }
+
+    fn budget_exhausted_notice(&self) -> Option<Value> {
+        Some(json!({
+            "role": "system",
+            "content": TOOL_LIMIT_SYSTEM_PROMPT,
+        }))
+    }
+}
+
+/// A Chat Completions `tool_calls[]` entry as a [`ToolCall`].
+fn chat_tool_call(tool_call: &Value) -> ToolCall {
+    let function = tool_call.get("function");
+    ToolCall::from_argument_text(
+        tool_call.get("id").and_then(Value::as_str).unwrap_or(""),
+        function
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        function
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("{}"),
+    )
 }
 
 async fn chat_completion_with_tool_runtime(
-    mut messages: Vec<Value>,
+    messages: Vec<Value>,
     model_config: &ThirdPartyModelConfig,
     runtime: &mut ToolRuntime,
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
 ) -> Result<String> {
-    let tools = runtime.build_openai_function_tools();
-    let mut tools_enabled = !tools.is_empty();
-    let mut final_answer_requested = false;
-
-    for _ in 0..runtime.max_total_successful_calls().saturating_add(2) {
-        let details = build_request_details(
-            model_config,
-            messages.clone(),
-            tools_enabled.then_some(tools.clone()),
-            Some("auto"),
-        )?;
-        let response = call_provider_api(&details, audit_context, operation).await?;
-        let message = extract_response_message(&response);
-        let content = extract_message_content(&message);
-        let tool_calls = if tools_enabled {
-            extract_tool_calls(&message)
-        } else {
-            Vec::new()
-        };
-
-        if tool_calls.is_empty() {
-            if content.trim().is_empty() {
-                warn!(
-                    "{} custom-tool response had empty content and no tool calls: {}",
-                    details.display_name,
-                    truncate_for_log(&response.to_string(), 2000)
-                );
-            }
-            return Ok(parse_third_party_response(model_config, &content));
-        }
-
-        messages.push(message.clone());
-
-        for tool_call in tool_calls {
-            let tool_name = tool_call
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let args_text = tool_call
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            let args_value: Value = serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
-            let result = runtime.execute_tool(tool_name, &args_value).await;
-
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": tool_call.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                "content": result,
-            }));
-        }
-
-        if runtime.force_final_answer() && !final_answer_requested {
-            messages.push(json!({
-                "role": "system",
-                "content": TOOL_LIMIT_SYSTEM_PROMPT,
-            }));
-            final_answer_requested = true;
-            tools_enabled = false;
-        }
-    }
-
-    request_final_answer_after_tool_limit(messages, model_config, audit_context, operation).await
+    let per_request =
+        Duration::from_secs(provider_runtime_config(model_config.provider)?.request_timeout_secs);
+    let deadline = TurnDeadline::for_runtime(per_request, runtime);
+    let mut protocol = ChatCompletionsProtocol {
+        model_config,
+        audit_context,
+        operation,
+    };
+    run_tool_loop(&mut protocol, runtime, messages, &deadline).await
 }
 
+/// [`call_third_party`] with a tool runtime, for the `/qc`, `/s` and
+/// quick-answer paths that manage their own runtime.
 pub async fn call_third_party_with_tool_runtime(
     system_prompt: &str,
     user_content: &str,
@@ -783,69 +631,41 @@ pub async fn call_third_party_with_tool_runtime(
     runtime: &mut ToolRuntime,
     options: ThirdPartyCallOptions<'_>,
 ) -> Result<String> {
-    let ThirdPartyCallOptions {
-        audit_context,
-        reasoning_override,
-        pinned_codex,
-        codex_prompt_style,
-    } = options;
-    if model_id.trim().is_empty() {
-        return Err(anyhow!("Model identifier is required"));
-    }
-
-    let model_config = model_config_for_call(model_id, pinned_codex)?;
-    if matches!(
-        model_config.provider,
-        ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
-    ) {
-        let image_data_list = image_data_list_from_media(media_files);
-        return call_responses_provider_with_tool_runtime(
-            system_prompt,
-            user_content,
-            &model_config,
-            response_title,
-            &image_data_list,
-            runtime,
-            audit_context,
-            reasoning_override,
-            pinned_codex,
-            codex_prompt_style,
-        )
-        .await;
-    }
-    let system_prompt = format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance());
-    let message_content = build_message_content(user_content, media_files);
-    let messages = vec![
-        json!({ "role": "system", "content": system_prompt }),
-        json!({ "role": "user", "content": message_content }),
-    ];
-    let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
-
-    chat_completion_with_tool_runtime(messages, &model_config, runtime, audit_context, &operation)
-        .await
+    call_third_party(
+        system_prompt,
+        user_content,
+        model_id,
+        response_title,
+        media_files,
+        Some(runtime),
+        options,
+    )
+    .await
 }
 
+/// Answer with a third-party model. `tools` runs the shared tool loop over
+/// that runtime's budget; `None` is a single request without tools.
 pub async fn call_third_party(
     system_prompt: &str,
     user_content: &str,
     model_id: &str,
     response_title: &str,
     media_files: &[MediaFile],
-    supports_tools: bool,
+    tools: Option<&mut ToolRuntime>,
     options: ThirdPartyCallOptions<'_>,
 ) -> Result<String> {
     if model_id.trim().is_empty() {
         return Err(anyhow!("Model identifier is required"));
     }
 
-    let model_config = model_config_for_call(model_id, options.pinned_codex)?;
+    let model_config = model_config_for_call(model_id, options.explicit_codex)?;
     call_third_party_with_reasoning_config(
         system_prompt,
         user_content,
         &model_config,
         response_title,
         media_files,
-        supports_tools,
+        tools,
         options,
     )
     .await
@@ -860,16 +680,15 @@ pub async fn call_third_party_with_reasoning_config(
     model_config: &ThirdPartyModelConfig,
     response_title: &str,
     media_files: &[MediaFile],
-    supports_tools: bool,
+    tools: Option<&mut ToolRuntime>,
     options: ThirdPartyCallOptions<'_>,
 ) -> Result<String> {
     let ThirdPartyCallOptions {
         audit_context,
         reasoning_override,
-        pinned_codex,
+        explicit_codex,
         codex_prompt_style,
     } = options;
-    let model_config = model_config.clone();
     if matches!(
         model_config.provider,
         ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
@@ -878,42 +697,43 @@ pub async fn call_third_party_with_reasoning_config(
         return call_responses_provider(
             system_prompt,
             user_content,
-            &model_config,
+            model_config,
             response_title,
             &image_data_list,
-            supports_tools,
+            tools,
             audit_context,
             reasoning_override,
-            pinned_codex,
+            explicit_codex,
             codex_prompt_style,
         )
         .await;
     }
-    let tools_enabled = supports_tools && web_search::is_search_enabled();
-    let system_prompt = build_third_party_system_prompt(system_prompt, tools_enabled);
-    let message_content = build_message_content(user_content, media_files);
 
+    let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
+    let message_content = build_message_content(user_content, media_files);
+    let Some(runtime) = tools else {
+        let messages = vec![
+            json!({ "role": "system", "content": system_prompt }),
+            json!({ "role": "user", "content": message_content }),
+        ];
+        let details = build_request_details(model_config, messages, None, None)?;
+        let response = call_provider_api(&details, audit_context, &operation).await?;
+        let content = response
+            .get("choices")
+            .and_then(|v| v.get(0))
+            .and_then(|v| v.get("message"))
+            .map(extract_message_content)
+            .unwrap_or_default();
+        return Ok(parse_third_party_response(model_config, &content));
+    };
+
+    let system_prompt = format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance());
     let messages = vec![
         json!({ "role": "system", "content": system_prompt }),
         json!({ "role": "user", "content": message_content }),
     ];
-
-    let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
-
-    if tools_enabled {
-        return chat_completion_with_tools(messages, &model_config, audit_context, &operation)
-            .await;
-    }
-
-    let details = build_request_details(&model_config, messages, None, None)?;
-    let response = call_provider_api(&details, audit_context, &operation).await?;
-    let content = response
-        .get("choices")
-        .and_then(|v| v.get(0))
-        .and_then(|v| v.get("message"))
-        .map(extract_message_content)
-        .unwrap_or_default();
-    Ok(parse_third_party_response(&model_config, &content))
+    chat_completion_with_tool_runtime(messages, model_config, runtime, audit_context, &operation)
+        .await
 }
 
 #[cfg(test)]
@@ -1235,22 +1055,6 @@ mod tests {
             Some("auto")
         );
         assert_eq!(details.request_timeout_secs, 90);
-    }
-
-    #[test]
-    fn system_prompt_includes_tool_limit_guidance_when_enabled() {
-        let prompt = build_third_party_system_prompt("Base prompt", true);
-        assert!(prompt.starts_with("Base prompt"));
-        assert!(prompt.contains("at most 3 rounds total"));
-        assert!(prompt.contains("without requesting more tool calls"));
-    }
-
-    #[test]
-    fn system_prompt_is_unchanged_when_tool_limit_guidance_disabled() {
-        assert_eq!(
-            build_third_party_system_prompt("Base prompt", false),
-            "Base prompt"
-        );
     }
 
     #[test]

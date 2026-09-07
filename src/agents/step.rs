@@ -234,7 +234,7 @@ pub async fn call_step_text(
                 config,
                 response_title,
                 media_files,
-                false,
+                None,
                 crate::llm::ThirdPartyCallOptions::new(
                     audit_context,
                     crate::llm::CodexPromptStyle::TaskSpecific,

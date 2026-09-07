@@ -38,6 +38,7 @@ use crate::llm::runtime_models::{
     codex_selected_model_label, runtime_model_config, runtime_model_count,
     selected_codex_model_record,
 };
+use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
     audit_context_from_id, call_gemini, call_third_party, create_audit_context_from_message,
@@ -222,13 +223,14 @@ pub(crate) async fn call_configured_text_model(
     }
 
     let media_files = media_files.unwrap_or_default();
+    let mut web_tools = tools_enabled.then(ToolRuntime::for_web_search);
     let response = call_third_party(
         system_prompt,
         user_content,
         &model_name,
         response_title,
         &media_files,
-        tools_enabled,
+        web_tools.as_mut(),
         crate::llm::ThirdPartyCallOptions::new(
             audit_context,
             crate::llm::CodexPromptStyle::TaskSpecific,

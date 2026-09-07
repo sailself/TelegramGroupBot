@@ -14,6 +14,9 @@ use tracing::{debug, info, warn};
 use crate::config::CONFIG;
 use crate::llm::audit::{LlmAuditContext, LlmUsageRecord};
 use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
+use crate::llm::tool_loop::{
+    run_tool_loop, BoxFuture, ModelTurn, ToolCall, ToolProtocol, TurnDeadline,
+};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::transport::retry::is_retryable_status;
 use crate::llm::transport::{
@@ -1216,27 +1219,121 @@ fn with_response_json_schema(config: Value, response_json_schema: Option<&Value>
     Value::Object(config_object)
 }
 
-fn build_function_response_part(function_call: &Value, result_json: &str) -> Value {
-    let name = function_call
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let id = function_call
-        .get("id")
-        .and_then(Value::as_str)
-        .map(|value| value.to_string());
-    let response_value = serde_json::from_str::<Value>(result_json)
-        .unwrap_or_else(|_| json!({ "result": result_json }));
-
+/// Gemini `functionResponse` part for one tool result. The fenced result is
+/// text, and Gemini wants an object, so it travels under `result`.
+fn build_function_response_part(call: &ToolCall, result: &str) -> Value {
     let mut function_response = json!({
-        "name": name,
-        "response": response_value,
+        "name": call.name,
+        "response": { "result": result },
     });
-    if let Some(id) = id {
-        function_response["id"] = Value::String(id);
+    if !call.id.is_empty() {
+        function_response["id"] = Value::String(call.id.clone());
+    }
+    json!({ "functionResponse": function_response })
+}
+
+/// A Gemini `functionCall` part as a [`ToolCall`].
+fn gemini_tool_call(function_call: &Value) -> ToolCall {
+    ToolCall {
+        id: function_call
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        name: function_call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        arguments: function_call
+            .get("args")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    }
+}
+
+/// Gemini half of the shared tool loop.
+struct GeminiProtocol<'a> {
+    model: &'a str,
+    system_prompt: &'a str,
+    system_prompt_label: Option<&'a str>,
+    /// Applied on the final pass only; its presence forces that pass.
+    final_response_json_schema: Option<Value>,
+    audit_context: Option<&'a LlmAuditContext>,
+    final_pass: bool,
+}
+
+impl ToolProtocol for GeminiProtocol<'_> {
+    type Item = Value;
+
+    fn tool_declarations(&self, runtime: &ToolRuntime) -> Vec<Value> {
+        runtime.build_gemini_tools()
     }
 
-    json!({ "functionResponse": function_response })
+    fn complete<'a>(
+        &'a mut self,
+        transcript: &'a [Value],
+        tools: Option<&'a [Value]>,
+        request_timeout: Duration,
+    ) -> BoxFuture<'a, Result<ModelTurn<Value>>> {
+        Box::pin(async move {
+            let mut generation_config =
+                generation_config_for(self.model, &CONFIG.gemini_thinking_level);
+            if self.final_pass {
+                generation_config = with_response_json_schema(
+                    generation_config,
+                    self.final_response_json_schema.as_ref(),
+                );
+            }
+            let mut payload = json!({
+                "systemInstruction": { "parts": [{ "text": self.system_prompt }] },
+                "contents": transcript,
+                "generationConfig": generation_config,
+                "safetySettings": build_safety_settings(),
+            });
+            if let Some(tools) = tools {
+                payload["tools"] = Value::Array(tools.to_vec());
+            }
+
+            let response = call_gemini_api_value_with_timeout(
+                self.model,
+                payload,
+                self.system_prompt_label,
+                request_timeout,
+                self.audit_context,
+                "call_gemini_with_tool_runtime",
+            )
+            .await?;
+            let content = extract_candidate_content(&response)
+                .ok_or_else(|| anyhow!("Gemini tool response did not include candidate content"))?;
+            let tool_calls = extract_function_calls(&content)
+                .iter()
+                .map(gemini_tool_call)
+                .collect();
+            Ok(ModelTurn {
+                text: extract_text_from_response_value(&response),
+                tool_calls,
+                transcript: vec![content],
+            })
+        })
+    }
+
+    fn tool_results(&self, results: Vec<(ToolCall, String)>) -> Vec<Value> {
+        // Gemini takes every functionResponse of a turn in one user content.
+        let parts = results
+            .iter()
+            .map(|(call, output)| build_function_response_part(call, output))
+            .collect::<Vec<_>>();
+        vec![json!({ "role": "user", "parts": parts })]
+    }
+
+    fn requires_final_pass(&self) -> bool {
+        self.final_response_json_schema.is_some()
+    }
+
+    fn begin_final_pass(&mut self) {
+        self.final_pass = true;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1252,7 +1349,6 @@ pub async fn call_gemini_with_tool_runtime(
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiCallResult> {
     ensure_gemini_api_available()?;
-    let content = user_content.to_string();
     let youtube_urls = youtube_urls.unwrap_or_default();
     let files = media_files.unwrap_or_default();
     let uploaded_files = if files.is_empty() {
@@ -1261,102 +1357,31 @@ pub async fn call_gemini_with_tool_runtime(
         upload_media_files(&files).await?
     };
     let text_after_media = !uploaded_files.is_empty() || !youtube_urls.is_empty();
-    let parts = build_gemini_file_parts(&content, &uploaded_files, &youtube_urls, text_after_media);
-    let mut contents = vec![json!({ "role": "user", "parts": parts })];
+    let parts = build_gemini_file_parts(
+        user_content,
+        &uploaded_files,
+        &youtube_urls,
+        text_after_media,
+    );
+    let contents = vec![json!({ "role": "user", "parts": parts })];
 
     let model = if use_pro_model {
         CONFIG.gemini_pro_model.as_str()
     } else {
         CONFIG.gemini_model.as_str()
     };
-    let tool_limit_turns = runtime.max_total_successful_calls().saturating_add(2);
-    let mut tools_enabled = true;
-
-    for _ in 0..tool_limit_turns {
-        let mut payload = json!({
-            "systemInstruction": { "parts": [{ "text": system_prompt }] },
-            "contents": contents.clone(),
-            "generationConfig": generation_config_for(model, &CONFIG.gemini_thinking_level),
-            "safetySettings": build_safety_settings(),
-        });
-        if tools_enabled {
-            payload["tools"] = Value::Array(runtime.build_gemini_tools());
-        }
-
-        let response = call_gemini_api_value(
-            model,
-            payload,
-            system_prompt_label,
-            audit_context,
-            "call_gemini_with_tool_runtime",
-        )
-        .await?;
-        let Some(content) = extract_candidate_content(&response) else {
-            return Err(anyhow!(
-                "Gemini tool response did not include candidate content"
-            ));
-        };
-        let function_calls = if tools_enabled {
-            extract_function_calls(&content)
-        } else {
-            Vec::new()
-        };
-
-        if function_calls.is_empty() {
-            if final_response_json_schema.is_none() {
-                return Ok(GeminiCallResult {
-                    text: extract_text_from_response_value(&response),
-                    model_used: model.to_string(),
-                });
-            }
-            break;
-        }
-
-        contents.push(content);
-
-        let mut response_parts = Vec::new();
-        for function_call in function_calls {
-            let tool_name = function_call
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let args = function_call
-                .get("args")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let result_json = runtime.execute_tool(tool_name, &args).await;
-            response_parts.push(build_function_response_part(&function_call, &result_json));
-        }
-
-        contents.push(json!({
-            "role": "user",
-            "parts": response_parts,
-        }));
-
-        if runtime.force_final_answer() {
-            tools_enabled = false;
-        }
-    }
-
-    let final_payload = json!({
-        "systemInstruction": { "parts": [{ "text": system_prompt }] },
-        "contents": contents.clone(),
-        "generationConfig": with_response_json_schema(
-            generation_config_for(model, &CONFIG.gemini_thinking_level),
-            final_response_json_schema.as_ref()
-        ),
-        "safetySettings": build_safety_settings(),
-    });
-    let final_response = call_gemini_api_value(
+    let deadline = TurnDeadline::for_runtime(gemini_generate_content_timeout(), runtime);
+    let mut protocol = GeminiProtocol {
         model,
-        final_payload,
+        system_prompt,
         system_prompt_label,
+        final_response_json_schema,
         audit_context,
-        "call_gemini_with_tool_runtime",
-    )
-    .await?;
+        final_pass: false,
+    };
+    let text = run_tool_loop(&mut protocol, runtime, contents, &deadline).await?;
     Ok(GeminiCallResult {
-        text: extract_text_from_response_value(&final_response),
+        text,
         model_used: model.to_string(),
     })
 }

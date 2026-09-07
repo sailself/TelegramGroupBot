@@ -211,7 +211,7 @@ pub(super) async fn compose_final_answer(
             model_name,
             "Answer about Chat",
             media_files,
-            false,
+            None,
             crate::llm::ThirdPartyCallOptions::new(
                 audit_context,
                 crate::llm::CodexPromptStyle::FreeformAnswer,

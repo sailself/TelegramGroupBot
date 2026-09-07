@@ -32,6 +32,20 @@ pub fn truncate_for_log(text: &str, max_chars: usize) -> String {
     truncate_with_suffix(text, max_chars, "... (truncated)")
 }
 
+/// Break any literal `</tag>` inside untrusted content with a zero-width space
+/// so a crafted message cannot close a fence early and smuggle out-of-band
+/// instructions past the data/instruction boundary.
+pub fn neutralize_closing_tag(content: &str, tag: &str) -> String {
+    content.replace(&format!("</{tag}>"), &format!("<\u{200b}/{tag}>"))
+}
+
+/// Like [`neutralize_closing_tag`] but also breaks the opening `<tag>`, for
+/// content that sits *outside* a fence (such as the user's question) and
+/// could otherwise forge a whole block.
+pub fn neutralize_tag(content: &str, tag: &str) -> String {
+    neutralize_closing_tag(content, tag).replace(&format!("<{tag}>"), &format!("<\u{200b}{tag}>"))
+}
+
 /// Escape the characters Telegram's HTML parse mode treats specially.
 pub fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());

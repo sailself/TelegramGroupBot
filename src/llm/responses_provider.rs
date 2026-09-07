@@ -9,27 +9,26 @@ use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use crate::config::{
-    parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
-};
+use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
 use crate::llm::audit::LlmAuditContext;
 use crate::llm::openai_codex;
 use crate::llm::runtime_models::{
-    codex_model_record_for_request, CodexSelectedModelRecord,
-    CODEX_SELECTED_MODEL_METADATA_VERSION, OPENAI_CODEX_SELECTED_MODEL_ID,
+    codex_model_record_for_request, CodexSelectedModelRecord, ResolvedExplicitCodexModel,
 };
-use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
+use crate::llm::tool_loop::{
+    clamp_request_timeout_secs, run_tool_loop, BoxFuture, ModelTurn, ToolCall, ToolProtocol,
+    TurnDeadline,
+};
+use crate::llm::tool_prompts::TOOL_LIMIT_SYSTEM_PROMPT;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::transport::sse::parse_sse_data_events;
 use crate::llm::transport::{
     call_with_retry, read_body_limited_or_partial, usage, BodyRead, LlmCall, ProviderError,
     RetryPolicy,
 };
-use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::{get_http_client, get_http_client_no_compression};
 use crate::utils::text::truncate_for_log;
 
-const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const RESPONSES_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(3, Duration::from_millis(900));
 const RESPONSES_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
@@ -40,7 +39,7 @@ const CODEX_FREEFORM_STYLE_GUIDANCE: &str = r#"Keep the answer substantive: reta
 Task-specific format and length requirements take precedence."#;
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ResponsesRequestDetails {
     provider: ThirdPartyProvider,
     display_name: &'static str,
@@ -53,75 +52,90 @@ struct ResponsesRequestDetails {
     request_timeout_secs: u64,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct PinnedCodexRequestContract {
-    model_config: ThirdPartyModelConfig,
-    pub(crate) record: CodexSelectedModelRecord,
-    account_id: String,
-    reasoning_effort: Option<String>,
+/// Who a Codex request is sent as and how it reasons, resolved once per turn
+/// from the active login and the catalog. Every request of the turn (tool-loop
+/// iterations, retries) reuses it; the only later check is that the login
+/// still belongs to `account_id` when the request headers are resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CodexRequestIdentity {
+    pub(crate) account_id: String,
+    /// Catalog record bound to this account for the requested model: the
+    /// selected alias's record, or the explicit record the caller resolved.
+    /// `None` for foreign slugs, which carry no metadata.
+    pub(crate) record: Option<CodexSelectedModelRecord>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) use_responses_lite: bool,
 }
 
-impl PinnedCodexRequestContract {
-    pub(crate) fn model_config(&self) -> &ThirdPartyModelConfig {
-        &self.model_config
-    }
-
-    pub(crate) fn model_config_for_request(
-        &self,
-        model_id: &str,
-    ) -> Result<&ThirdPartyModelConfig> {
-        if self.model_config.id != model_id {
-            return Err(anyhow!("The pinned Codex model changed"));
+impl CodexRequestIdentity {
+    /// Resolve against the active login. `explicit_record` is the catalog
+    /// record for an explicit Codex slug the caller already resolved (the
+    /// Quick path); it must name this model and belong to the active account.
+    /// Non-Codex providers have no identity.
+    pub(crate) fn resolve(
+        model_config: &ThirdPartyModelConfig,
+        explicit_record: Option<&CodexSelectedModelRecord>,
+        reasoning_override: Option<&str>,
+    ) -> Result<Option<Self>> {
+        if model_config.provider != ThirdPartyProvider::OpenAICodex {
+            return Ok(None);
         }
-        Ok(&self.model_config)
+        let account_id = crate::llm::runtime_models::current_codex_account_id()
+            .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+        let selected_record = codex_model_record_for_request(model_config)?;
+        Self::resolve_with(
+            model_config,
+            explicit_record,
+            selected_record.as_ref(),
+            &account_id,
+            reasoning_override,
+        )
+        .map(Some)
     }
 
-    pub(crate) fn result_label(&self) -> String {
-        self.reasoning_effort
-            .as_deref()
-            .map(|effort| format!("{} {effort}", self.record.slug))
-            .unwrap_or_else(|| self.record.slug.clone())
+    /// The pure half of [`Self::resolve`]: `selected_record` is the record
+    /// behind the `openai-codex:selected` alias when this request uses it.
+    fn resolve_with(
+        model_config: &ThirdPartyModelConfig,
+        explicit_record: Option<&CodexSelectedModelRecord>,
+        selected_record: Option<&CodexSelectedModelRecord>,
+        account_id: &str,
+        reasoning_override: Option<&str>,
+    ) -> Result<Self> {
+        let account_id = account_id.trim();
+        if account_id.is_empty() {
+            return Err(anyhow!(
+                "Codex auth token does not include a ChatGPT account id"
+            ));
+        }
+        let record = match explicit_record.or(selected_record) {
+            Some(record) => {
+                if record.slug != model_config.model {
+                    return Err(anyhow!(
+                        "The Codex model metadata does not match the requested model"
+                    ));
+                }
+                if record.account_id.as_deref().map(str::trim) != Some(account_id) {
+                    return Err(anyhow!(
+                        "The active ChatGPT account changed; retry the request"
+                    ));
+                }
+                Some(record.clone())
+            }
+            None => None,
+        };
+        let reasoning_effort =
+            effective_reasoning_effort(&model_config.model, record.as_ref(), reasoning_override);
+        let use_responses_lite = record
+            .as_ref()
+            .is_some_and(|record| record.use_responses_lite);
+        Ok(Self {
+            account_id: account_id.to_string(),
+            record,
+            reasoning_effort,
+            use_responses_lite,
+        })
     }
-}
-
-pub(crate) fn pin_quick_codex_request_contract(
-    model_config: &ThirdPartyModelConfig,
-    record: &CodexSelectedModelRecord,
-    current_account_id: Option<&str>,
-    requested_effort: Option<&str>,
-) -> Result<PinnedCodexRequestContract> {
-    let (provider, slug) = parse_third_party_model_id(&model_config.id)
-        .ok_or_else(|| anyhow!("Invalid explicit Codex model id"))?;
-    if provider != ThirdPartyProvider::OpenAICodex
-        || model_config.id == OPENAI_CODEX_SELECTED_MODEL_ID
-        || slug == "selected"
-        || model_config.model != slug
-        || record.slug != slug
-        || record.metadata_version < CODEX_SELECTED_MODEL_METADATA_VERSION
-    {
-        return Err(anyhow!(
-            "The explicit Codex model metadata is stale or mismatched"
-        ));
-    }
-    let account_id = current_account_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
-    if record.account_id.as_deref().map(str::trim) != Some(account_id) {
-        return Err(anyhow!("The explicit Codex model or account changed"));
-    }
-
-    Ok(PinnedCodexRequestContract {
-        model_config: model_config.clone(),
-        record: record.clone(),
-        account_id: account_id.to_string(),
-        reasoning_effort: quick_reasoning_effort_for_request(
-            model_config.provider,
-            &model_config.model,
-            requested_effort,
-            Some(record),
-        ),
-    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -465,10 +479,6 @@ fn responses_request_timeout_secs(provider: ThirdPartyProvider) -> u64 {
     }
 }
 
-fn responses_tool_limit_guidance() -> String {
-    tool_limit_guidance(MAX_TOOL_CALL_ITERATIONS)
-}
-
 fn build_responses_system_prompt(
     system_prompt: &str,
     model_config: &ThirdPartyModelConfig,
@@ -518,35 +528,6 @@ fn build_responses_user_input(user_content: &str, image_data_list: &[Vec<u8>]) -
     })]
 }
 
-fn build_responses_function_tools() -> Vec<Value> {
-    if !web_search::is_search_enabled() {
-        return Vec::new();
-    }
-
-    vec![json!({
-        "type": "function",
-        "name": "web_search",
-        "description": "Search the web using the configured providers (Brave, Exa, Jina) and return a concise Markdown summary of the results.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query to look up."
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return (default 5).",
-                    "minimum": 1,
-                    "maximum": 10
-                }
-            },
-            "required": ["query"]
-        },
-        "strict": false,
-    })]
-}
-
 fn build_native_codex_web_search_tool_from_record(
     model_config: &ThirdPartyModelConfig,
     record: &CodexSelectedModelRecord,
@@ -567,32 +548,6 @@ fn build_native_codex_web_search_tool_from_record(
     )
 }
 
-fn build_native_codex_web_search_tool(
-    model_config: &ThirdPartyModelConfig,
-) -> Result<Option<Value>> {
-    Ok(codex_model_record_for_request(model_config)?
-        .and_then(|record| build_native_codex_web_search_tool_from_record(model_config, &record)))
-}
-
-fn convert_openai_function_tools_to_responses(tools: Vec<Value>) -> Vec<Value> {
-    tools
-        .into_iter()
-        .filter_map(|tool| {
-            let function = tool.get("function")?;
-            Some(json!({
-                "type": "function",
-                "name": function.get("name")?.as_str()?,
-                "description": function
-                    .get("description")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(""),
-                "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({})),
-                "strict": false,
-            }))
-        })
-        .collect()
-}
-
 fn responses_base_url(base_url: &str) -> String {
     let normalized = base_url.trim().trim_end_matches('/');
     if normalized.ends_with("/responses") {
@@ -602,27 +557,16 @@ fn responses_base_url(base_url: &str) -> String {
     }
 }
 
-/// Decide the `reasoning.effort` value for a request, if any.
-///
-/// `reasoning_override` is a per-call request (e.g. cheap agent steps asking
-/// for "low"); it is validated against the exact Codex record's supported
-/// levels when that record matches the requested model, and passed through
-/// unvalidated for foreign slugs (the backend rejects unknown levels itself).
-/// With no override this reproduces the original behavior: the globally
-/// selected reasoning level of the matching Codex record.
-pub(crate) fn reasoning_effort_for_request(
-    provider: ThirdPartyProvider,
+/// The `reasoning.effort` to send for `model`: the caller's override when the
+/// catalog record supports it (or when no record is known, for foreign slugs),
+/// otherwise the operator's selected level, then the catalog default.
+pub(crate) fn effective_reasoning_effort(
     model: &str,
+    record: Option<&CodexSelectedModelRecord>,
     reasoning_override: Option<&str>,
-    selected_record: Option<&CodexSelectedModelRecord>,
 ) -> Option<String> {
-    if provider != ThirdPartyProvider::OpenAICodex {
-        return None;
-    }
-
-    let matching_record = selected_record.filter(|record| record.slug == model);
-    let recorded_level = matching_record.and_then(|record| record.selected_reasoning_level.clone());
-    let override_fallback = matching_record.and_then(|record| {
+    let record = record.filter(|record| record.slug == model);
+    let catalog_level = record.and_then(|record| {
         record
             .selected_reasoning_level
             .as_deref()
@@ -637,15 +581,14 @@ pub(crate) fn reasoning_effort_for_request(
             })
             .map(str::to_ascii_lowercase)
     });
-
     let Some(requested) = reasoning_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return recorded_level;
+        return catalog_level;
     };
 
-    if let Some(record) = matching_record {
+    if let Some(record) = record {
         let supported = record.supported_reasoning_levels.is_empty()
             || record
                 .supported_reasoning_levels
@@ -653,71 +596,14 @@ pub(crate) fn reasoning_effort_for_request(
                 .any(|option| option.effort.eq_ignore_ascii_case(requested));
         if !supported {
             warn!(
-                "Reasoning override '{}' is not supported by Codex model '{}'; keeping the selected level",
+                "Reasoning override '{}' is not supported by Codex model '{}'; using the catalog level",
                 requested, record.slug
             );
-            return override_fallback;
+            return catalog_level;
         }
     }
 
     Some(requested.to_ascii_lowercase())
-}
-
-pub(crate) fn quick_reasoning_effort_for_request(
-    provider: ThirdPartyProvider,
-    model: &str,
-    reasoning_override: Option<&str>,
-    record: Option<&CodexSelectedModelRecord>,
-) -> Option<String> {
-    if provider != ThirdPartyProvider::OpenAICodex {
-        return None;
-    }
-
-    let Some(record) = record.filter(|record| record.slug == model) else {
-        return reasoning_effort_for_request(provider, model, reasoning_override, None);
-    };
-    let catalog_fallback = record
-        .selected_reasoning_level
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            record
-                .default_reasoning_level
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
-        .map(str::to_ascii_lowercase);
-    let Some(requested) = reasoning_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return catalog_fallback;
-    };
-    let supported = record.supported_reasoning_levels.is_empty()
-        || record
-            .supported_reasoning_levels
-            .iter()
-            .any(|option| option.effort.eq_ignore_ascii_case(requested));
-    if supported {
-        Some(requested.to_ascii_lowercase())
-    } else {
-        warn!(
-            "Quick reasoning override '{}' is not supported by Codex model '{}'; using the catalog fallback",
-            requested, record.slug
-        );
-        catalog_fallback
-    }
-}
-
-fn selected_model_uses_responses_lite(
-    model_config: &ThirdPartyModelConfig,
-    selected_record: Option<&CodexSelectedModelRecord>,
-) -> bool {
-    model_config.provider == ThirdPartyProvider::OpenAICodex
-        && selected_record
-            .is_some_and(|record| record.slug == model_config.model && record.use_responses_lite)
 }
 
 fn add_codex_responses_lite_header(headers: &mut Vec<(String, String)>, use_responses_lite: bool) {
@@ -749,43 +635,13 @@ fn remove_input_image_details(value: &mut Value) {
 fn build_responses_payload(
     model_config: &ThirdPartyModelConfig,
     instructions: &str,
-    input_items: Vec<Value>,
-    tools: Option<Vec<Value>>,
-    session_id: &str,
-    reasoning_override: Option<&str>,
-    streaming_sse: bool,
-    selected_record: Option<&CodexSelectedModelRecord>,
-) -> (Value, bool) {
-    let effective_reasoning_effort = reasoning_effort_for_request(
-        model_config.provider,
-        &model_config.model,
-        reasoning_override,
-        selected_record,
-    );
-    build_responses_payload_with_effective_reasoning(
-        model_config,
-        instructions,
-        input_items,
-        tools,
-        session_id,
-        effective_reasoning_effort.as_deref(),
-        streaming_sse,
-        selected_record,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_responses_payload_with_effective_reasoning(
-    model_config: &ThirdPartyModelConfig,
-    instructions: &str,
     mut input_items: Vec<Value>,
     tools: Option<Vec<Value>>,
     session_id: &str,
-    effective_reasoning_effort: Option<&str>,
+    identity: Option<&CodexRequestIdentity>,
     streaming_sse: bool,
-    selected_record: Option<&CodexSelectedModelRecord>,
 ) -> (Value, bool) {
-    let use_lite = selected_model_uses_responses_lite(model_config, selected_record);
+    let use_lite = identity.is_some_and(|identity| identity.use_responses_lite);
     let mut payload = if use_lite {
         for input_item in &mut input_items {
             remove_input_image_details(input_item);
@@ -833,7 +689,7 @@ fn build_responses_payload_with_effective_reasoning(
         payload
     };
 
-    let effort = effective_reasoning_effort.map(str::to_string);
+    let effort = identity.and_then(|identity| identity.reasoning_effort.clone());
     if use_lite || effort.is_some() {
         let mut reasoning = json!({});
         if let Some(effort) = effort {
@@ -848,93 +704,14 @@ fn build_responses_payload_with_effective_reasoning(
     (payload, use_lite)
 }
 
-fn codex_account_id_for_request(
-    provider: ThirdPartyProvider,
-    codex_record: Option<&CodexSelectedModelRecord>,
-    current_account_id: Option<&str>,
-) -> Result<Option<String>> {
-    if provider != ThirdPartyProvider::OpenAICodex {
-        return Ok(None);
-    }
-
-    let current_account_id = current_account_id
-        .map(str::trim)
-        .filter(|account_id| !account_id.is_empty())
-        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
-    if let Some(record) = codex_record {
-        let record_account_id = record
-            .account_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|account_id| !account_id.is_empty())
-            .ok_or_else(|| anyhow!("The Codex model metadata is not bound to an account"))?;
-        if record_account_id != current_account_id {
-            return Err(anyhow!(
-                "The active ChatGPT account changed while constructing the Codex request"
-            ));
-        }
-    }
-
-    Ok(Some(current_account_id.to_string()))
-}
-
 fn build_request_details(
     model_config: &ThirdPartyModelConfig,
     instructions: &str,
     input_items: Vec<Value>,
     tools: Option<Vec<Value>>,
     session_id: &str,
-    reasoning_override: Option<&str>,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
+    identity: Option<&CodexRequestIdentity>,
 ) -> Result<ResponsesRequestDetails> {
-    let current_codex_account_id = if model_config.provider == ThirdPartyProvider::OpenAICodex {
-        crate::llm::runtime_models::current_codex_account_id()
-    } else {
-        None
-    };
-    build_request_details_with_current_codex_account(
-        model_config,
-        instructions,
-        input_items,
-        tools,
-        session_id,
-        reasoning_override,
-        pinned_codex,
-        current_codex_account_id.as_deref(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_request_details_with_current_codex_account(
-    model_config: &ThirdPartyModelConfig,
-    instructions: &str,
-    input_items: Vec<Value>,
-    tools: Option<Vec<Value>>,
-    session_id: &str,
-    reasoning_override: Option<&str>,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
-    current_codex_account_id: Option<&str>,
-) -> Result<ResponsesRequestDetails> {
-    let codex_record = if let Some(pinned) = pinned_codex {
-        if model_config.provider != ThirdPartyProvider::OpenAICodex
-            || pinned.model_config.id != model_config.id
-            || pinned.record.slug != model_config.model
-            || pinned.account_id != current_codex_account_id.map(str::trim).unwrap_or_default()
-        {
-            return Err(anyhow!(
-                "The pinned Codex model or active ChatGPT account changed"
-            ));
-        }
-        Some(pinned.record.clone())
-    } else {
-        codex_model_record_for_request(model_config)?
-    };
-    let codex_account_id = codex_account_id_for_request(
-        model_config.provider,
-        codex_record.as_ref(),
-        current_codex_account_id,
-    )?;
-
     let (display_name, url, mut headers, streaming_sse) = match model_config.provider {
         ThirdPartyProvider::OpenAI => (
             "OpenAI",
@@ -951,12 +728,17 @@ fn build_request_details_with_current_codex_account(
             ],
             false,
         ),
-        ThirdPartyProvider::OpenAICodex => (
-            "OpenAI Codex",
-            openai_codex::codex_response_url(),
-            Vec::new(),
-            true,
-        ),
+        ThirdPartyProvider::OpenAICodex => {
+            if identity.is_none() {
+                return Err(anyhow!("Codex requests need a resolved request identity"));
+            }
+            (
+                "OpenAI Codex",
+                openai_codex::codex_response_url(),
+                Vec::new(),
+                true,
+            )
+        }
         _ => {
             return Err(anyhow!(
                 "Unsupported responses provider {:?}",
@@ -969,29 +751,15 @@ fn build_request_details_with_current_codex_account(
         headers.push(("Accept".to_string(), "text/event-stream".to_string()));
     }
 
-    let (payload, use_responses_lite) = if let Some(pinned) = pinned_codex {
-        build_responses_payload_with_effective_reasoning(
-            model_config,
-            instructions,
-            input_items,
-            tools,
-            session_id,
-            pinned.reasoning_effort.as_deref(),
-            streaming_sse,
-            codex_record.as_ref(),
-        )
-    } else {
-        build_responses_payload(
-            model_config,
-            instructions,
-            input_items,
-            tools,
-            session_id,
-            reasoning_override,
-            streaming_sse,
-            codex_record.as_ref(),
-        )
-    };
+    let (payload, use_responses_lite) = build_responses_payload(
+        model_config,
+        instructions,
+        input_items,
+        tools,
+        session_id,
+        identity,
+        streaming_sse,
+    );
     add_codex_responses_lite_header(&mut headers, use_responses_lite);
 
     Ok(ResponsesRequestDetails {
@@ -1000,7 +768,7 @@ fn build_request_details_with_current_codex_account(
         url,
         headers,
         session_id: session_id.to_string(),
-        codex_account_id,
+        codex_account_id: identity.map(|identity| identity.account_id.clone()),
         payload,
         streaming_sse,
         request_timeout_secs: responses_request_timeout_secs(model_config.provider),
@@ -1444,252 +1212,124 @@ fn extract_response_tool_calls(output_items: &[Value]) -> Vec<ResponsesToolCall>
         .collect()
 }
 
-async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> {
-    let argument_keys = arguments
-        .as_object()
-        .map(|object| object.keys().map(String::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
-    debug!(
-        "Responses tool call requested: name={}, argument_keys={:?}, argument_bytes={}",
-        name,
-        argument_keys,
-        arguments.to_string().len()
-    );
-    match name {
-        "web_search" => {
-            let query = arguments
-                .get("query")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let max_results = arguments
-                .get("max_results")
-                .and_then(|value| value.as_u64())
-                .map(|value| value as usize);
-            match web_search_tool(query, max_results).await {
-                Ok(result) => {
-                    debug!(
-                        "Responses tool call web_search completed: chars={}",
-                        result.chars().count()
-                    );
-                    Ok(result)
-                }
-                Err(err) => Err(err),
-            }
-        }
-        _ => Ok(String::from("Unsupported tool call")),
-    }
+/// OpenAI Responses half of the shared tool loop.
+struct ResponsesProtocol<'a> {
+    model_config: &'a ThirdPartyModelConfig,
+    instructions: String,
+    session_id: String,
+    turn_state: CodexTurnState,
+    native_codex_web_search_tool: Option<Value>,
+    audit_context: Option<&'a LlmAuditContext>,
+    operation: &'a str,
+    identity: Option<CodexRequestIdentity>,
 }
 
-async fn responses_completion_with_tools(
-    instructions: &str,
-    mut input_items: Vec<Value>,
-    model_config: &ThirdPartyModelConfig,
-    audit_context: Option<&LlmAuditContext>,
-    operation: &str,
-    reasoning_override: Option<&str>,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
-) -> Result<String> {
-    let tools = build_responses_function_tools();
-    let session_id = generate_session_id();
-    let mut turn_state = CodexTurnState::default();
-    let model_label = debug_model_label(model_config);
-    debug!(
-        "Responses tool loop starting: model={}, session_id={}, tools_enabled={}",
-        model_label,
-        session_id,
-        !tools.is_empty()
-    );
+impl ToolProtocol for ResponsesProtocol<'_> {
+    type Item = Value;
 
-    for iteration in 0..MAX_TOOL_CALL_ITERATIONS {
-        debug!(
-            "Responses tool iteration {}/{} for model={} session_id={}",
-            iteration + 1,
-            MAX_TOOL_CALL_ITERATIONS,
-            model_label,
-            session_id
-        );
-        let details = build_request_details(
-            model_config,
-            instructions,
-            input_items.clone(),
-            Some(tools.clone()),
-            &session_id,
-            reasoning_override,
-            pinned_codex,
-        )?;
-        let ResponsesApiResult {
-            response,
-            metadata: _,
-        } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
-        let output_items = extract_response_output_items(&response);
-        let tool_calls = extract_response_tool_calls(&output_items);
-        let content = extract_response_text(&output_items);
-
-        if tool_calls.is_empty() {
-            return Ok(content);
+    fn tool_declarations(&self, runtime: &ToolRuntime) -> Vec<Value> {
+        // The runtime already withholds the function-call web_search when the
+        // model searches natively (see ToolRuntime::use_native_web_search).
+        let mut tools = runtime.build_responses_tools();
+        if let Some(native_tool) = &self.native_codex_web_search_tool {
+            tools.push(native_tool.clone());
         }
+        tools
+    }
 
-        debug!(
-            "Responses tool iteration {}/{} returned {} tool call(s) for model={} session_id={}",
-            iteration + 1,
-            MAX_TOOL_CALL_ITERATIONS,
-            tool_calls.len(),
-            model_label,
-            session_id
-        );
-
-        input_items.extend(output_items.clone());
-
-        for tool_call in tool_calls {
-            let args_value: Value =
-                serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
-            let result = execute_function_tool(&tool_call.name, &args_value)
-                .await
-                .unwrap_or_else(|err| err.to_string());
-            input_items.push(json!({
-                "type": "function_call_output",
-                "call_id": tool_call.call_id,
-                "output": result,
-            }));
-        }
-
-        if iteration + 1 == MAX_TOOL_CALL_ITERATIONS {
-            let final_instructions = format!("{instructions}\n\n{TOOL_LIMIT_SYSTEM_PROMPT}");
-            let details = build_request_details(
-                model_config,
-                &final_instructions,
-                input_items,
-                None,
-                &session_id,
-                reasoning_override,
-                pinned_codex,
+    fn complete<'a>(
+        &'a mut self,
+        transcript: &'a [Value],
+        tools: Option<&'a [Value]>,
+        request_timeout: Duration,
+    ) -> BoxFuture<'a, Result<ModelTurn<Value>>> {
+        Box::pin(async move {
+            let mut details = build_request_details(
+                self.model_config,
+                &self.instructions,
+                transcript.to_vec(),
+                tools.map(<[Value]>::to_vec),
+                &self.session_id,
+                self.identity.as_ref(),
             )?;
+            details.request_timeout_secs =
+                clamp_request_timeout_secs(details.request_timeout_secs, request_timeout);
             let ResponsesApiResult {
                 response,
                 metadata: _,
-            } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
-            return Ok(extract_response_text(&extract_response_output_items(
-                &response,
-            )));
-        }
+            } = call_provider_api(
+                &details,
+                self.audit_context,
+                self.operation,
+                &mut self.turn_state,
+            )
+            .await?;
+            let output_items = extract_response_output_items(&response);
+            let tool_calls = extract_response_tool_calls(&output_items)
+                .into_iter()
+                .map(|call| ToolCall::from_argument_text(call.call_id, call.name, &call.arguments))
+                .collect();
+            Ok(ModelTurn {
+                text: extract_response_text(&output_items),
+                tool_calls,
+                transcript: output_items,
+            })
+        })
     }
 
-    unreachable!("responses tool loop exhausted without returning")
+    fn tool_results(&self, results: Vec<(ToolCall, String)>) -> Vec<Value> {
+        results
+            .into_iter()
+            .map(|(call, output)| {
+                json!({
+                    "type": "function_call_output",
+                    "call_id": call.id,
+                    "output": output,
+                })
+            })
+            .collect()
+    }
+
+    fn begin_final_pass(&mut self) {
+        self.instructions = format!("{}\n\n{TOOL_LIMIT_SYSTEM_PROMPT}", self.instructions);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn responses_completion_with_tool_runtime(
     instructions: &str,
-    mut input_items: Vec<Value>,
+    input_items: Vec<Value>,
     model_config: &ThirdPartyModelConfig,
     runtime: &mut ToolRuntime,
     native_codex_web_search_tool: Option<Value>,
     audit_context: Option<&LlmAuditContext>,
     operation: &str,
-    reasoning_override: Option<&str>,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
+    identity: Option<CodexRequestIdentity>,
 ) -> Result<String> {
-    let mut tools =
-        convert_openai_function_tools_to_responses(runtime.build_openai_function_tools());
-    let has_native_codex_web_search = native_codex_web_search_tool.is_some();
-    let model_label = debug_model_label(model_config);
-    if has_native_codex_web_search {
-        tools
-            .retain(|tool| tool.get("name").and_then(|value| value.as_str()) != Some("web_search"));
-    }
-    if let Some(native_tool) = native_codex_web_search_tool {
-        tools.push(native_tool);
-    }
-    let mut tools_enabled = !tools.is_empty();
-    let session_id = generate_session_id();
-    let mut turn_state = CodexTurnState::default();
-    let mut final_answer_requested = false;
-    debug!(
-        "Responses runtime tool loop starting: model={}, session_id={}, tools_enabled={}, native_codex_web_search={}",
-        model_label,
-        session_id,
-        tools_enabled,
-        has_native_codex_web_search
-    );
-
-    for iteration in 0..runtime.max_total_successful_calls().saturating_add(2) {
-        debug!(
-            "Responses runtime iteration {} for model={} session_id={} tools_enabled={}",
-            iteration + 1,
-            model_label,
-            session_id,
-            tools_enabled
-        );
-        let details = build_request_details(
-            model_config,
-            instructions,
-            input_items.clone(),
-            tools_enabled.then_some(tools.clone()),
-            &session_id,
-            reasoning_override,
-            pinned_codex,
-        )?;
-        let ResponsesApiResult {
-            response,
-            metadata: _,
-        } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
-        let output_items = extract_response_output_items(&response);
-        let tool_calls = if tools_enabled {
-            extract_response_tool_calls(&output_items)
-        } else {
-            Vec::new()
-        };
-
-        if tool_calls.is_empty() {
-            return Ok(extract_response_text(&output_items));
-        }
-
-        debug!(
-            "Responses runtime iteration {} returned {} tool call(s) for model={} session_id={}",
-            iteration + 1,
-            tool_calls.len(),
-            model_label,
-            session_id
-        );
-
-        input_items.extend(output_items.clone());
-
-        for tool_call in tool_calls {
-            let args_value: Value =
-                serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
-            let result = runtime.execute_tool(&tool_call.name, &args_value).await;
-            input_items.push(json!({
-                "type": "function_call_output",
-                "call_id": tool_call.call_id,
-                "output": result,
-            }));
-        }
-
-        if runtime.force_final_answer() && !final_answer_requested {
-            final_answer_requested = true;
-            tools_enabled = false;
-        }
-    }
-
-    let final_instructions = format!("{instructions}\n\n{TOOL_LIMIT_SYSTEM_PROMPT}");
-    let details = build_request_details(
+    let per_request = Duration::from_secs(responses_request_timeout_secs(model_config.provider));
+    let deadline = TurnDeadline::for_runtime(per_request, runtime);
+    let mut protocol = ResponsesProtocol {
         model_config,
-        &final_instructions,
-        input_items,
-        None,
-        &session_id,
-        reasoning_override,
-        pinned_codex,
-    )?;
-    let ResponsesApiResult {
-        response,
-        metadata: _,
-    } = call_provider_api(&details, audit_context, operation, &mut turn_state).await?;
-    Ok(extract_response_text(&extract_response_output_items(
-        &response,
-    )))
+        instructions: instructions.to_string(),
+        session_id: generate_session_id(),
+        turn_state: CodexTurnState::default(),
+        native_codex_web_search_tool,
+        audit_context,
+        operation,
+        identity,
+    };
+    debug!(
+        "Responses runtime tool loop starting: model={}, session_id={}, native_codex_web_search={}",
+        debug_model_label(model_config),
+        protocol.session_id,
+        protocol.native_codex_web_search_tool.is_some()
+    );
+    run_tool_loop(&mut protocol, runtime, input_items, &deadline).await
 }
 
+/// Answer with an OpenAI Responses provider. `tools` runs the shared tool
+/// loop over that runtime's budget, letting Codex use its native web search
+/// where the profile allows; `None` is a single request without tools.
 #[allow(clippy::too_many_arguments)]
 pub async fn call_responses_provider(
     system_prompt: &str,
@@ -1697,87 +1337,64 @@ pub async fn call_responses_provider(
     model_config: &ThirdPartyModelConfig,
     response_title: &str,
     image_data_list: &[Vec<u8>],
-    supports_tools: bool,
+    tools: Option<&mut ToolRuntime>,
     audit_context: Option<&LlmAuditContext>,
     reasoning_override: Option<&str>,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
+    explicit_codex: Option<&ResolvedExplicitCodexModel>,
     codex_prompt_style: crate::llm::CodexPromptStyle,
 ) -> Result<String> {
     crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
-    let native_codex_web_search_tool = if supports_tools {
-        build_native_codex_web_search_tool(model_config)?
+    let identity = CodexRequestIdentity::resolve(
+        model_config,
+        explicit_codex.map(|explicit| &explicit.record),
+        reasoning_override,
+    )?;
+    let model_label = debug_model_label(model_config);
+    let input_items = build_responses_user_input(user_content, image_data_list);
+    let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
+
+    let Some(runtime) = tools else {
+        debug!(
+            "Responses provider selected: provider={}, model={}, response_title={}, tools=false, image_count={}",
+            model_config.provider.as_str(),
+            model_label,
+            response_title,
+            image_data_list.len()
+        );
+        let instructions =
+            build_responses_system_prompt(system_prompt, model_config, codex_prompt_style, None);
+        let session_id = generate_session_id();
+        let mut turn_state = CodexTurnState::default();
+        let details = build_request_details(
+            model_config,
+            &instructions,
+            input_items,
+            None,
+            &session_id,
+            identity.as_ref(),
+        )?;
+        let ResponsesApiResult {
+            response,
+            metadata: _,
+        } = call_provider_api(&details, audit_context, &operation, &mut turn_state).await?;
+        return Ok(extract_response_text(&extract_response_output_items(
+            &response,
+        )));
+    };
+
+    let native_codex_web_search_tool = if runtime.allows_native_web_search() {
+        identity
+            .as_ref()
+            .and_then(|identity| identity.record.as_ref())
+            .and_then(|record| build_native_codex_web_search_tool_from_record(model_config, record))
     } else {
         None
     };
-    let custom_tools_enabled =
-        supports_tools && native_codex_web_search_tool.is_none() && web_search::is_search_enabled();
-    let model_label = debug_model_label(model_config);
-    debug!(
-        "Responses provider selected: provider={}, model={}, response_title={}, supports_tools={}, custom_tools_enabled={}, native_codex_web_search={}, image_count={}",
-        model_config.provider.as_str(),
-        model_label,
-        response_title,
-        supports_tools,
-        custom_tools_enabled,
-        native_codex_web_search_tool.is_some(),
-        image_data_list.len()
-    );
-    let tool_limit_guidance = custom_tools_enabled.then(responses_tool_limit_guidance);
-    let instructions = build_responses_system_prompt(
-        system_prompt,
-        model_config,
-        codex_prompt_style,
-        tool_limit_guidance.as_deref(),
-    );
-    let input_items = build_responses_user_input(user_content, image_data_list);
-    let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
-    if custom_tools_enabled {
-        return responses_completion_with_tools(
-            &instructions,
-            input_items,
-            model_config,
-            audit_context,
-            &operation,
-            reasoning_override,
-            pinned_codex,
-        )
-        .await;
+    if native_codex_web_search_tool.is_some() {
+        // Decided before the guidance is rendered, so the prompt describes
+        // web_search while the function-call variant stays undeclared.
+        runtime.use_native_web_search();
     }
-
-    let session_id = generate_session_id();
-    let mut turn_state = CodexTurnState::default();
-    let details = build_request_details(
-        model_config,
-        &instructions,
-        input_items,
-        native_codex_web_search_tool.map(|tool| vec![tool]),
-        &session_id,
-        reasoning_override,
-        pinned_codex,
-    )?;
-    let ResponsesApiResult {
-        response,
-        metadata: _,
-    } = call_provider_api(&details, audit_context, &operation, &mut turn_state).await?;
-    Ok(extract_response_text(&extract_response_output_items(
-        &response,
-    )))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn call_responses_provider_with_tool_runtime(
-    system_prompt: &str,
-    user_content: &str,
-    model_config: &ThirdPartyModelConfig,
-    response_title: &str,
-    image_data_list: &[Vec<u8>],
-    runtime: &mut ToolRuntime,
-    audit_context: Option<&LlmAuditContext>,
-    reasoning_override: Option<&str>,
-    pinned_codex: Option<&PinnedCodexRequestContract>,
-    codex_prompt_style: crate::llm::CodexPromptStyle,
-) -> Result<String> {
-    crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
     let runtime_guidance = runtime.tool_limit_guidance();
     let instructions = build_responses_system_prompt(
         system_prompt,
@@ -1785,33 +1402,23 @@ pub async fn call_responses_provider_with_tool_runtime(
         codex_prompt_style,
         Some(&runtime_guidance),
     );
-    let input_items = build_responses_user_input(user_content, image_data_list);
-    let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
-    let native_codex_web_search_tool = if runtime.allows_native_web_search() {
-        build_native_codex_web_search_tool(model_config)?
-    } else {
-        None
-    };
-    let model_label = debug_model_label(model_config);
     debug!(
-        "Responses provider runtime selected: provider={}, model={}, response_title={}, native_codex_web_search={}, image_count={}",
+        "Responses provider selected: provider={}, model={}, response_title={}, tools=true, native_codex_web_search={}, image_count={}",
         model_config.provider.as_str(),
         model_label,
         response_title,
         native_codex_web_search_tool.is_some(),
         image_data_list.len()
     );
-
     responses_completion_with_tool_runtime(
         &instructions,
         input_items,
         model_config,
         runtime,
-        native_codex_web_search_tool.clone(),
+        native_codex_web_search_tool,
         audit_context,
         &operation,
-        reasoning_override,
-        pinned_codex,
+        identity,
     )
     .await
 }
@@ -1847,6 +1454,26 @@ mod tests {
             audio: false,
             tools: true,
         }
+    }
+
+    /// Identity for the fixture account, binding `record` (if any) to it.
+    fn test_identity(
+        config: &ThirdPartyModelConfig,
+        record: Option<&CodexSelectedModelRecord>,
+        reasoning_override: Option<&str>,
+    ) -> CodexRequestIdentity {
+        let record = record.cloned().map(|mut record| {
+            record.account_id = Some("acct-1".to_string());
+            record
+        });
+        CodexRequestIdentity::resolve_with(
+            config,
+            None,
+            record.as_ref(),
+            "acct-1",
+            reasoning_override,
+        )
+        .expect("the test identity resolves")
     }
 
     fn codex_record(
@@ -1898,9 +1525,8 @@ mod tests {
             vec![json!({"type": "message", "role": "user", "content": []})],
             Some(tools.clone()),
             "session-1",
-            None,
+            Some(&test_identity(&config, Some(&record), None)),
             true,
-            Some(&record),
         );
 
         assert!(use_lite);
@@ -1932,9 +1558,8 @@ mod tests {
                 vec![json!({"type": "message", "role": "user", "content": []})],
                 None,
                 "session-internal",
-                Some("low"),
+                Some(&test_identity(&config, Some(&record), Some("low"))),
                 false,
-                Some(&record),
             );
 
             assert_eq!(actual_use_lite, use_lite);
@@ -1957,9 +1582,12 @@ mod tests {
             vec![],
             None,
             "session-selected",
-            None,
+            Some(&test_identity(
+                &selected_luna_config,
+                Some(&selected_luna_record),
+                None,
+            )),
             true,
-            Some(&selected_luna_record),
         );
         let (_, explicit_actual_use_lite) = build_responses_payload(
             &explicit_terra_config,
@@ -1967,9 +1595,12 @@ mod tests {
             vec![],
             None,
             "session-explicit",
-            None,
+            Some(&test_identity(
+                &explicit_terra_config,
+                Some(&explicit_terra_record),
+                None,
+            )),
             true,
-            Some(&explicit_terra_record),
         );
 
         assert!(!selected_actual_use_lite);
@@ -1977,69 +1608,59 @@ mod tests {
     }
 
     #[test]
-    fn request_construction_rejects_fresh_account_mismatch_from_validated_metadata() {
+    fn request_identity_rejects_fresh_account_mismatch_from_validated_metadata() {
+        let config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-terra");
         let mut record = codex_record("gpt-5.6-terra", &[], None, true);
         record.account_id = Some("acct-1".to_string());
 
-        assert!(codex_account_id_for_request(
-            ThirdPartyProvider::OpenAICodex,
-            Some(&record),
-            Some("acct-2"),
-        )
-        .is_err());
+        assert!(
+            CodexRequestIdentity::resolve_with(&config, None, Some(&record), "acct-2", None)
+                .is_err()
+        );
+        assert!(
+            CodexRequestIdentity::resolve_with(&config, None, Some(&record), "  ", None).is_err(),
+            "an empty account id never resolves"
+        );
         assert_eq!(
-            codex_account_id_for_request(ThirdPartyProvider::OpenAI, None, None)
-                .expect("public OpenAI should not require Codex metadata"),
+            CodexRequestIdentity::resolve(
+                &model_config(ThirdPartyProvider::OpenAI, "gpt-5.4"),
+                None,
+                None
+            )
+            .expect("public OpenAI should not require Codex metadata"),
             None
         );
     }
 
     #[test]
-    fn pinned_quick_codex_turn_survives_runtime_metadata_loss_between_iterations() {
-        let mut source_config = Some(model_config(
-            ThirdPartyProvider::OpenAICodex,
-            "gpt-5.6-terra",
-        ));
-        source_config.as_mut().expect("config fixture").id =
-            "openai-codex:gpt-5.6-terra".to_string();
-        let mut source_record = Some(codex_record("gpt-5.6-terra", &["medium"], None, true));
-        let record = source_record.as_mut().expect("record fixture");
-        record.metadata_version = crate::llm::runtime_models::CODEX_SELECTED_MODEL_METADATA_VERSION;
+    fn an_explicit_quick_identity_is_resolved_once_and_reused_by_every_iteration() {
+        let mut config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-terra");
+        config.id = "openai-codex:gpt-5.6-terra".to_string();
+        let mut record = codex_record("gpt-5.6-terra", &["medium"], None, true);
         record.account_id = Some("acct-1".to_string());
         record.default_reasoning_level = Some("medium".to_string());
 
-        let pinned = pin_quick_codex_request_contract(
-            source_config.as_ref().expect("config fixture"),
-            record,
-            Some("acct-1"),
-            Some("low"),
-        )
-        .expect("the exact Quick record should pin");
-        source_config = None;
-        source_record = None;
-        assert!(
-            source_config.is_none(),
-            "simulated reload clears the config"
+        let identity =
+            CodexRequestIdentity::resolve_with(&config, Some(&record), None, "acct-1", Some("low"))
+                .expect("the explicit record resolves for its account");
+        assert_eq!(identity.account_id, "acct-1");
+        assert_eq!(
+            identity.reasoning_effort.as_deref(),
+            Some("medium"),
+            "an unsupported override falls back to the catalog level"
         );
-        assert!(
-            source_record.is_none(),
-            "simulated runtime reload clears metadata"
-        );
-        let config = pinned.model_config();
-        assert_eq!(config.id, "openai-codex:gpt-5.6-terra");
+        assert!(identity.use_responses_lite);
 
         for session_id in ["iteration-1", "iteration-2"] {
-            let details = build_request_details_with_current_codex_account(
-                config,
+            let details = build_request_details(
+                &config,
                 "instructions",
                 vec![json!({"type": "message", "role": "user", "content": []})],
                 Some(vec![json!({"type": "function", "name": "web_search"})]),
                 session_id,
-                Some("low"),
-                Some(&pinned),
-                Some("acct-1"),
+                Some(&identity),
             )
-            .expect("the pinned turn must not consult cleared runtime metadata");
+            .expect("details build from the identity alone");
 
             assert_eq!(details.codex_account_id.as_deref(), Some("acct-1"));
             assert_eq!(details.payload["model"], "gpt-5.6-terra");
@@ -2050,36 +1671,38 @@ mod tests {
                 .any(|(name, value)| { name == CODEX_RESPONSES_LITE_HEADER && value == "true" }));
         }
 
-        assert!(pin_quick_codex_request_contract(
-            config,
-            &pinned.record,
-            Some("acct-2"),
-            Some("low")
-        )
-        .is_err());
+        assert!(
+            CodexRequestIdentity::resolve_with(&config, Some(&record), None, "acct-2", Some("low"))
+                .is_err(),
+            "another account cannot use the record"
+        );
+        let mut other_model = config.clone();
+        other_model.model = "gpt-5.6-luna".to_string();
+        assert!(
+            CodexRequestIdentity::resolve_with(&other_model, Some(&record), None, "acct-1", None)
+                .is_err(),
+            "the record must name the requested model"
+        );
+        assert!(
+            build_request_details(&config, "", vec![], None, "no-identity", None).is_err(),
+            "Codex requests need an identity"
+        );
     }
 
     #[test]
-    fn quick_reasoning_catalog_fallback_shapes_payload_for_an_empty_override() {
+    fn an_empty_quick_override_uses_the_catalog_level() {
         let mut config = model_config(ThirdPartyProvider::OpenAICodex, "gpt-5.6-terra");
         config.id = "openai-codex:gpt-5.6-terra".to_string();
         let mut record = codex_record("gpt-5.6-terra", &["medium"], None, true);
         record.account_id = Some("acct-1".to_string());
         record.default_reasoning_level = Some("medium".to_string());
-        let pinned = pin_quick_codex_request_contract(&config, &record, Some("acct-1"), Some("  "))
-            .expect("the catalog default should produce a pinned contract");
+        let identity =
+            CodexRequestIdentity::resolve_with(&config, Some(&record), None, "acct-1", Some("  "))
+                .expect("the catalog default resolves");
 
-        let details = build_request_details_with_current_codex_account(
-            &config,
-            "",
-            vec![],
-            None,
-            "empty-override",
-            Some("  "),
-            Some(&pinned),
-            Some("acct-1"),
-        )
-        .expect("the empty Quick override should use the catalog fallback");
+        let details =
+            build_request_details(&config, "", vec![], None, "empty-override", Some(&identity))
+                .expect("details build");
 
         assert_eq!(details.payload["reasoning"]["effort"], "medium");
     }
@@ -2094,11 +1717,12 @@ mod tests {
             model_config(ThirdPartyProvider::OpenAICodex, "configured-q-model");
 
         for config in [&synthesized_agent_step, &configured_q_model] {
-            assert_eq!(
-                codex_account_id_for_request(config.provider, None, Some("acct-1"))
-                    .expect("foreign Codex requests should use the active account"),
-                Some("acct-1".to_string())
-            );
+            let identity =
+                CodexRequestIdentity::resolve_with(config, None, None, "acct-1", Some("low"))
+                    .expect("foreign Codex requests use the active account");
+            assert_eq!(identity.account_id, "acct-1");
+            assert!(identity.record.is_none());
+            assert!(!identity.use_responses_lite);
 
             let (payload, use_lite) = build_responses_payload(
                 config,
@@ -2106,9 +1730,8 @@ mod tests {
                 vec![],
                 None,
                 "foreign-session",
-                Some("low"),
+                Some(&identity),
                 true,
-                None,
             );
             assert_eq!(payload["model"], config.model);
             assert_eq!(payload["reasoning"]["effort"], "low");
@@ -2127,9 +1750,8 @@ mod tests {
             vec![json!({"type": "message", "role": "user", "content": []})],
             Some(Vec::new()),
             "session-1",
-            None,
+            Some(&test_identity(&config, Some(&record), None)),
             true,
-            Some(&record),
         );
 
         let input = payload["input"].as_array().expect("input array");
@@ -2150,15 +1772,23 @@ mod tests {
 
     #[test]
     fn responses_lite_requires_codex_provider_and_matching_slug() {
-        let record = codex_record("selected-model", &[], None, true);
+        let mut record = codex_record("selected-model", &[], None, true);
+        record.account_id = Some("acct-1".to_string());
         let mismatched = model_config(ThirdPartyProvider::OpenAICodex, "other-model");
         let public = model_config(ThirdPartyProvider::OpenAI, "selected-model");
 
-        assert!(!selected_model_uses_responses_lite(
-            &mismatched,
-            Some(&record)
-        ));
-        assert!(!selected_model_uses_responses_lite(&public, Some(&record)));
+        assert!(
+            CodexRequestIdentity::resolve_with(&mismatched, None, Some(&record), "acct-1", None)
+                .is_err(),
+            "a record for another slug cannot shape this request"
+        );
+        assert_eq!(
+            CodexRequestIdentity::resolve(&public, None, None).expect("non-Codex resolves"),
+            None,
+            "non-Codex providers carry no Codex identity"
+        );
+        let (_, use_lite) = build_responses_payload(&public, "", vec![], None, "s", None, false);
+        assert!(!use_lite);
     }
 
     #[test]
@@ -2173,9 +1803,8 @@ mod tests {
             history.clone(),
             Some(Vec::new()),
             "session-1",
-            None,
+            Some(&test_identity(&config, Some(&record), None)),
             true,
-            Some(&record),
         );
         history.push(json!({
             "type": "function_call_output",
@@ -2188,9 +1817,8 @@ mod tests {
             history,
             Some(Vec::new()),
             "session-1",
-            None,
+            Some(&test_identity(&config, Some(&record), None)),
             true,
-            Some(&record),
         );
 
         for payload in [&first, &second] {
@@ -2220,9 +1848,8 @@ mod tests {
             input,
             None,
             "session-1",
-            None,
+            Some(&test_identity(&config, Some(&record), None)),
             true,
-            Some(&record),
         );
 
         assert!(use_lite);
@@ -2252,9 +1879,8 @@ mod tests {
             input,
             None,
             "session-1",
-            None,
+            Some(&test_identity(&config, Some(&record), None)),
             true,
-            Some(&record),
         );
 
         let image = &payload["input"][1]["output"]["structured"][0];
@@ -2274,9 +1900,8 @@ mod tests {
             input,
             None,
             "session-1",
-            None,
+            Some(&test_identity(&config, Some(&record), None)),
             true,
-            Some(&record),
         );
 
         assert!(!use_lite);
@@ -2295,9 +1920,8 @@ mod tests {
             vec![json!({"type": "message", "role": "user", "content": []})],
             Some(tools.clone()),
             "session-1",
-            None,
+            Some(&test_identity(&config, Some(&record), None)),
             true,
-            Some(&record),
         );
 
         assert!(!use_lite);
@@ -2398,28 +2022,22 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_override_ignored_for_non_codex_providers() {
-        assert_eq!(
-            reasoning_effort_for_request(ThirdPartyProvider::OpenAI, "gpt-5.4", Some("low"), None),
-            None
-        );
-    }
-
-    #[test]
     fn reasoning_without_override_uses_selected_record_level() {
         let record = codex_record("gpt-5.5", &["low", "xhigh"], Some("xhigh"), false);
         assert_eq!(
-            reasoning_effort_for_request(
-                ThirdPartyProvider::OpenAICodex,
-                "gpt-5.5",
-                None,
-                Some(&record)
-            ),
+            effective_reasoning_effort("gpt-5.5", Some(&record), None),
             Some("xhigh".to_string())
         );
+        assert_eq!(effective_reasoning_effort("gpt-5.5", None, None), None);
+    }
+
+    #[test]
+    fn reasoning_without_override_or_selection_uses_the_catalog_default() {
+        let mut record = codex_record("gpt-5.5", &["medium"], None, false);
+        record.default_reasoning_level = Some("Medium".to_string());
         assert_eq!(
-            reasoning_effort_for_request(ThirdPartyProvider::OpenAICodex, "gpt-5.5", None, None),
-            None
+            effective_reasoning_effort("gpt-5.5", Some(&record), None),
+            Some("medium".to_string())
         );
     }
 
@@ -2427,12 +2045,7 @@ mod tests {
     fn reasoning_override_applies_when_supported() {
         let record = codex_record("gpt-5.5", &["low", "medium", "xhigh"], Some("xhigh"), false);
         assert_eq!(
-            reasoning_effort_for_request(
-                ThirdPartyProvider::OpenAICodex,
-                "gpt-5.5",
-                Some("Low"),
-                Some(&record)
-            ),
+            effective_reasoning_effort("gpt-5.5", Some(&record), Some("Low")),
             Some("low".to_string())
         );
     }
@@ -2441,12 +2054,7 @@ mod tests {
     fn unsupported_reasoning_override_falls_back_to_selected_level() {
         let record = codex_record("gpt-5.5", &["medium", "xhigh"], Some("xhigh"), false);
         assert_eq!(
-            reasoning_effort_for_request(
-                ThirdPartyProvider::OpenAICodex,
-                "gpt-5.5",
-                Some("low"),
-                Some(&record)
-            ),
+            effective_reasoning_effort("gpt-5.5", Some(&record), Some("low")),
             Some("xhigh".to_string())
         );
     }
@@ -2457,12 +2065,7 @@ mod tests {
         record.default_reasoning_level = Some("medium".to_string());
 
         assert_eq!(
-            reasoning_effort_for_request(
-                ThirdPartyProvider::OpenAICodex,
-                "gpt-5.5",
-                Some("low"),
-                Some(&record)
-            ),
+            effective_reasoning_effort("gpt-5.5", Some(&record), Some("low")),
             Some("medium".to_string())
         );
     }
@@ -2471,21 +2074,11 @@ mod tests {
     fn reasoning_override_passes_through_for_foreign_slugs() {
         let record = codex_record("gpt-5.5", &["medium"], Some("medium"), false);
         assert_eq!(
-            reasoning_effort_for_request(
-                ThirdPartyProvider::OpenAICodex,
-                "gpt-5.4-mini",
-                Some("low"),
-                Some(&record)
-            ),
+            effective_reasoning_effort("gpt-5.4-mini", Some(&record), Some("low")),
             Some("low".to_string())
         );
         assert_eq!(
-            reasoning_effort_for_request(
-                ThirdPartyProvider::OpenAICodex,
-                "gpt-5.4-mini",
-                Some("  "),
-                Some(&record)
-            ),
+            effective_reasoning_effort("gpt-5.4-mini", Some(&record), Some("  ")),
             None
         );
     }

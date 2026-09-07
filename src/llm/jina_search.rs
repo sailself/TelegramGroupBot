@@ -1,16 +1,20 @@
 use std::collections::HashMap;
-use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use tracing::info;
 
 use crate::config::CONFIG;
+use crate::llm::audit::LlmUsageRecord;
+use crate::llm::transport::{call_with_retry, read_body_limited, LlmCall};
+use crate::llm::web_search::{
+    BoxFuture, SearchProvider, SearchResult, WEB_SEARCH_REQUEST_TIMEOUT, WEB_SEARCH_RETRY_POLICY,
+};
 use crate::utils::http::get_http_client;
 
-const DEFAULT_READ_TIMEOUT: u64 = 30;
+/// Jina returns plain text; a few hundred KiB covers any sane result page.
+const JINA_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 static TITLE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[(\d+)\]\s+Title:\s*(.+)").expect("valid jina title regex"));
 static URL_REGEX: LazyLock<Regex> =
@@ -19,21 +23,40 @@ static SNIPPET_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[(\d+)\]\s+(Description|Snippet):\s*(.+)").expect("valid jina snippet regex")
 });
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JinaSearchResult {
-    pub title: String,
-    pub url: String,
-    pub snippet: String,
+/// Jina reader/search backend.
+pub struct JinaSearch;
+
+impl SearchProvider for JinaSearch {
+    fn name(&self) -> &'static str {
+        "jina"
+    }
+
+    fn is_enabled(&self) -> bool {
+        CONFIG.enable_jina_mcp
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        max_results: usize,
+    ) -> BoxFuture<'a, Result<Vec<SearchResult>>> {
+        Box::pin(async move {
+            if !self.is_enabled() {
+                return Err(anyhow!("Jina search is disabled."));
+            }
+            search_jina_web_at(
+                &CONFIG.jina_search_endpoint,
+                &CONFIG.jina_ai_api_key,
+                query,
+                max_results,
+            )
+            .await
+        })
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JinaSearchResponse {
-    pub query: String,
-    pub results: Vec<JinaSearchResult>,
-}
-
-fn parse_search_text(payload: &str, max_results: usize) -> Vec<JinaSearchResult> {
-    let mut results: HashMap<i32, JinaSearchResult> = HashMap::new();
+fn parse_search_text(payload: &str, max_results: usize) -> Vec<SearchResult> {
+    let mut results: HashMap<i32, SearchResult> = HashMap::new();
 
     for raw_line in payload.lines() {
         let line = raw_line.trim();
@@ -43,7 +66,7 @@ fn parse_search_text(payload: &str, max_results: usize) -> Vec<JinaSearchResult>
 
         if let Some(caps) = TITLE_REGEX.captures(line) {
             let idx = caps[1].parse::<i32>().unwrap_or_default();
-            let entry = results.entry(idx).or_insert_with(|| JinaSearchResult {
+            let entry = results.entry(idx).or_insert_with(|| SearchResult {
                 title: String::new(),
                 url: String::new(),
                 snippet: String::new(),
@@ -54,7 +77,7 @@ fn parse_search_text(payload: &str, max_results: usize) -> Vec<JinaSearchResult>
 
         if let Some(caps) = URL_REGEX.captures(line) {
             let idx = caps[1].parse::<i32>().unwrap_or_default();
-            let entry = results.entry(idx).or_insert_with(|| JinaSearchResult {
+            let entry = results.entry(idx).or_insert_with(|| SearchResult {
                 title: String::new(),
                 url: String::new(),
                 snippet: String::new(),
@@ -65,7 +88,7 @@ fn parse_search_text(payload: &str, max_results: usize) -> Vec<JinaSearchResult>
 
         if let Some(caps) = SNIPPET_REGEX.captures(line) {
             let idx = caps[1].parse::<i32>().unwrap_or_default();
-            let entry = results.entry(idx).or_insert_with(|| JinaSearchResult {
+            let entry = results.entry(idx).or_insert_with(|| SearchResult {
                 title: String::new(),
                 url: String::new(),
                 snippet: String::new(),
@@ -86,50 +109,44 @@ fn parse_search_text(payload: &str, max_results: usize) -> Vec<JinaSearchResult>
         .collect()
 }
 
-pub async fn search_jina_web(query: &str, max_results: usize) -> Result<JinaSearchResponse> {
-    search_jina_web_at(
-        &CONFIG.jina_search_endpoint,
-        &CONFIG.jina_ai_api_key,
-        query,
-        max_results,
-    )
-    .await
-}
-
 async fn search_jina_web_at(
     endpoint: &str,
     api_key: &str,
     query: &str,
     max_results: usize,
-) -> Result<JinaSearchResponse> {
+) -> Result<Vec<SearchResult>> {
     if query.trim().is_empty() {
-        anyhow::bail!("query must not be empty");
+        return Err(anyhow!("query must not be empty"));
     }
 
     let payload = serde_json::json!({ "q": query });
+    let payload = &payload;
     info!("Calling Jina search endpoint {endpoint} with query: {query}");
 
-    let client = get_http_client();
-    let mut request = client
-        .post(endpoint)
-        .timeout(Duration::from_secs(DEFAULT_READ_TIMEOUT))
-        .json(&payload);
+    let call = LlmCall::untracked("web-search", "jina");
+    let text = call_with_retry(
+        &call,
+        &WEB_SEARCH_RETRY_POLICY,
+        |_| async move {
+            let mut request = get_http_client()
+                .post(endpoint)
+                .timeout(WEB_SEARCH_REQUEST_TIMEOUT)
+                .json(payload);
+            if !api_key.trim().is_empty() {
+                request = request.bearer_auth(api_key);
+            }
+            Ok(request)
+        },
+        |_| {},
+        |response| async move {
+            let bytes = read_body_limited(response, "jina", JINA_MAX_BODY_BYTES).await?;
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        },
+        |_| LlmUsageRecord::default(),
+    )
+    .await?;
 
-    if !api_key.trim().is_empty() {
-        request = request.bearer_auth(api_key);
-    }
-
-    let response = request.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("Jina search request failed with status {status}");
-    }
-    let text = response.text().await?;
-    let parsed = parse_search_text(&text, max_results);
-    Ok(JinaSearchResponse {
-        query: query.to_string(),
-        results: parsed,
-    })
+    Ok(parse_search_text(&text, max_results))
 }
 
 #[cfg(test)]
@@ -157,12 +174,14 @@ mod tests {
         let server = TestServer::single(response_with_status(200, body));
         let endpoint = server.url("/search").to_string();
 
-        let response = search_jina_web_at(&endpoint, "", "rust language", 5)
+        let results = search_jina_web_at(&endpoint, "", "rust language", 5)
             .await
             .unwrap();
 
-        assert_eq!(response.results.len(), 1);
-        assert_eq!(response.results[0].url, "https://www.rust-lang.org");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://www.rust-lang.org");
+        assert_eq!(results[0].title, "Rust");
+        assert_eq!(results[0].snippet, "A language");
         server.join().unwrap();
     }
 }
