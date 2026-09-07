@@ -7,7 +7,6 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::sync::LazyLock;
 use tracing::{info, warn};
-use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub enum ThirdPartyProvider {
@@ -366,26 +365,8 @@ fn validate_twitter_fetch_limits(
 }
 
 fn validate_https_base(name: &str, value: String) -> Result<String> {
-    let parsed = Url::parse(value.trim())
-        .map_err(|err| anyhow::anyhow!("{name} must be a valid HTTPS URL: {err}"))?;
-    if parsed.scheme() != "https" {
-        return Err(anyhow::anyhow!("{name} must use HTTPS"));
-    }
-    if parsed.host_str().is_none() {
-        return Err(anyhow::anyhow!("{name} must contain a host"));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(anyhow::anyhow!("{name} must not contain credentials"));
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(anyhow::anyhow!(
-            "{name} must not contain a query or fragment"
-        ));
-    }
-    if parsed.port().is_some() && parsed.port_or_known_default() != Some(443) {
-        return Err(anyhow::anyhow!("{name} must not use a non-default port"));
-    }
-    Ok(parsed.to_string().trim_end_matches('/').to_string())
+    crate::utils::http::parse_https_allowlisted(name, &value, None)
+        .map(|url| url.as_str().trim_end_matches('/').to_string())
 }
 
 fn normalize_database_url(value: String) -> String {

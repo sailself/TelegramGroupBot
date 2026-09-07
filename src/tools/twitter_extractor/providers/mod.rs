@@ -223,40 +223,28 @@ impl TryFrom<&Config> for TwitterFetchConfig {
 
 pub(crate) async fn read_limited_body(
     provider: TwitterProvider,
-    mut response: Response,
+    response: Response,
     max_bytes: usize,
 ) -> std::result::Result<Vec<u8>, ProviderError> {
     let status = response.status();
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_bytes as u64)
-    {
-        return Err(ProviderError {
-            provider,
-            kind: ProviderErrorKind::BodyTooLarge,
-            status: Some(status),
-            detail: "provider response exceeds configured byte limit".to_string(),
-        });
-    }
-
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| ProviderError {
-        provider,
-        kind: ProviderErrorKind::Transport,
-        status: Some(status),
-        detail: "provider response body read failed".to_string(),
-    })? {
-        if body.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(ProviderError {
+    crate::utils::http::read_body_capped("twitter provider", response, max_bytes)
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|err| match err {
+            crate::utils::http::BodyCapError::DeclaredTooLarge { .. }
+            | crate::utils::http::BodyCapError::StreamedTooLarge { .. } => ProviderError {
                 provider,
                 kind: ProviderErrorKind::BodyTooLarge,
                 status: Some(status),
                 detail: "provider response exceeds configured byte limit".to_string(),
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+            },
+            crate::utils::http::BodyCapError::Read { .. } => ProviderError {
+                provider,
+                kind: ProviderErrorKind::Transport,
+                status: Some(status),
+                detail: "provider response body read failed".to_string(),
+            },
+        })
 }
 
 #[cfg(test)]
