@@ -11,7 +11,9 @@ use crate::agents::step::{call_step_text, resolve_step_model, StepModel, WallClo
 use crate::config::{CONFIG, TLDR_CHUNK_PROMPT, TLDR_MERGE_PROMPT};
 use crate::db::models::MessageRow;
 use crate::handlers::{format_tldr_chat_content, wrap_chat_history};
-use crate::llm::text_model::{call_configured_text_model, resolve_default_text_model_for_request};
+use crate::llm::text_model::{
+    call_configured_text_model, resolve_default_text_model_for_request, ModelRequestCapabilities,
+};
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
@@ -47,16 +49,18 @@ pub async fn summarize_messages_map_reduce(
 ) -> Result<TldrOutcome> {
     let wall_clock = WallClock::start();
 
-    let final_model_id =
-        match resolve_default_text_model_for_request(false, false, false, false, true) {
-            Ok(model) => model,
-            Err(err) => {
-                warn!("map-reduce /tldr could not resolve a model: {err}");
-                return Ok(TldrOutcome::UseLegacy {
-                    reason: "no model resolved",
-                });
-            }
-        };
+    let final_model_id = match resolve_default_text_model_for_request(ModelRequestCapabilities {
+        require_tools: true,
+        ..ModelRequestCapabilities::default()
+    }) {
+        Ok(model) => model,
+        Err(err) => {
+            warn!("map-reduce /tldr could not resolve a model: {err}");
+            return Ok(TldrOutcome::UseLegacy {
+                reason: "no model resolved",
+            });
+        }
+    };
     let step_model = match resolve_step_model(&final_model_id) {
         Ok(step_model) => step_model,
         Err(err) => {

@@ -3277,14 +3277,8 @@ async fn q_handler_internal(
                     )
                 })
         } else {
-            resolve_default_text_model_for_request(
-                has_images,
-                has_video,
-                has_audio,
-                has_documents,
-                require_tools,
-            )
-            .map(|model| (model, "default_text_model", None))
+            resolve_default_text_model_for_request(request_capabilities)
+                .map(|model| (model, "default_text_model", None))
         };
         match resolved {
             Ok(model) => Some(model),
@@ -3601,7 +3595,7 @@ pub async fn s_handler(
         false,
     );
     let direct_model = if must_use_default_model {
-        match resolve_default_text_model_for_request(false, false, false, false, true) {
+        match resolve_default_text_model_for_request(request_capabilities) {
             Ok(model) => Some((model, "default_text_model")),
             Err(err) => {
                 send_message_with_retry(
@@ -3725,13 +3719,13 @@ async fn process_timed_out_q_request_with_default_model(
     let has_video = summary.videos > 0;
     let has_audio = summary.audios > 0;
     let has_documents = summary.documents > 0;
-    let default_model = match resolve_default_text_model_for_request(
+    let default_model = match resolve_default_text_model_for_request(ModelRequestCapabilities {
         has_images,
         has_video,
         has_audio,
         has_documents,
-        request.mode.requires_custom_tools(),
-    ) {
+        require_tools: request.mode.requires_custom_tools(),
+    }) {
         Ok(model) => model,
         Err(err) => {
             let _ = bot

@@ -288,11 +288,7 @@ pub(crate) fn resolve_default_text_model_with_models(
 }
 
 pub(crate) fn resolve_default_text_model_for_request(
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> Result<String> {
     let models = runtime_models();
     let ready_providers = ready_runtime_providers(&models);
@@ -302,13 +298,7 @@ pub(crate) fn resolve_default_text_model_for_request(
         &models,
         &ready_providers,
         CONFIG.gemini_api_available(),
-        ModelRequestCapabilities {
-            has_images,
-            has_video,
-            has_audio,
-            has_documents,
-            require_tools,
-        },
+        request,
     )
     .map_err(|message| anyhow!(message))
 }
@@ -405,13 +395,13 @@ pub(crate) async fn call_configured_text_model(
         .as_ref()
         .map(|files| summarize_media_files(files))
         .unwrap_or_default();
-    let model_name = resolve_default_text_model_for_request(
-        media_summary.images > 0,
-        media_summary.videos > 0,
-        media_summary.audios > 0,
-        media_summary.documents > 0,
-        tools_enabled,
-    )?;
+    let model_name = resolve_default_text_model_for_request(ModelRequestCapabilities {
+        has_images: media_summary.images > 0,
+        has_video: media_summary.videos > 0,
+        has_audio: media_summary.audios > 0,
+        has_documents: media_summary.documents > 0,
+        require_tools: tools_enabled,
+    })?;
 
     if model_name == MODEL_GEMINI {
         let response = call_gemini(GeminiCallRequest {
