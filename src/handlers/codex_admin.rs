@@ -14,6 +14,7 @@ use crate::state::{
     ActiveCodexLogin, AppState, PendingCodexModelRequest, PendingCodexReasoningRequest,
 };
 use crate::utils::text::truncate_with_ellipsis;
+use crate::utils::timing::now_unix_seconds;
 use tracing::warn;
 
 pub const CODEX_MODEL_SELECT_CALLBACK_PREFIX: &str = "codex_model_select:";
@@ -22,10 +23,6 @@ pub const CODEX_REASONING_SELECT_CALLBACK_PREFIX: &str = "codex_reasoning_select
 const CODEX_MODEL_PAGE_SIZE: usize = 8;
 const CODEX_CALLBACK_INDEX_PREFIX: &str = "i:";
 const TELEGRAM_CALLBACK_DATA_LIMIT: usize = 64;
-
-fn now_unix_seconds() -> i64 {
-    chrono::Utc::now().timestamp()
-}
 
 fn request_key(chat_id: ChatId, message_id: MessageId) -> String {
     format!("{}_{}", chat_id.0, message_id.0)
@@ -395,7 +392,7 @@ pub async fn codex_login_handler(bot: Bot, state: AppState, message: Message) ->
             status_message_id: status_message.id.0 as i64,
             verification_url: start.verification_url.clone(),
             user_code: start.user_code.clone(),
-            started_at: now_unix_seconds(),
+            started_at: now_unix_seconds() as i64,
             cancel_flag: cancel_flag.clone(),
         });
     }
@@ -526,7 +523,7 @@ pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) ->
             account_id,
             chat_id: message.chat.id.0,
             selection_message_id: selection_message.id.0 as i64,
-            timestamp: now_unix_seconds(),
+            timestamp: now_unix_seconds() as i64,
             page,
             etag: list.etag,
             models,
@@ -655,7 +652,7 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
             model_slug: record.slug.clone(),
             chat_id: message.chat.id.0,
             selection_message_id: selection_message.id.0 as i64,
-            timestamp: now_unix_seconds(),
+            timestamp: now_unix_seconds() as i64,
             supported_levels: record.supported_reasoning_levels.clone(),
         },
         Duration::from_secs(crate::config::CONFIG.model_selection_timeout),
@@ -741,7 +738,7 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                     ReasoningAction::Expired
                 }
                 Some(pending)
-                    if now_unix_seconds() - pending.timestamp
+                    if (now_unix_seconds() as i64) - pending.timestamp
                         > crate::config::CONFIG.model_selection_timeout as i64 =>
                 {
                     pending_map.take();
@@ -867,7 +864,7 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                 if pending.admin_user_id != query_user_id {
                     CallbackAction::Ignore
                 } else if callback_account_id.as_deref() != Some(pending.account_id.as_str())
-                    || now_unix_seconds() - pending.timestamp
+                    || (now_unix_seconds() as i64) - pending.timestamp
                         > crate::config::CONFIG.model_selection_timeout as i64
                 {
                     pending_map.take();

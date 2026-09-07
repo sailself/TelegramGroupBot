@@ -10,7 +10,7 @@ use chrono::Utc;
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatAction, FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia,
-    InputMediaPhoto, MessageEntityRef, MessageId, ParseMode, ReplyParameters,
+    InputMediaPhoto, MessageId, ParseMode, ReplyParameters,
 };
 use teloxide::RequestError;
 
@@ -46,7 +46,11 @@ use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::logging::read_recent_log_lines;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::telegram::{retry_telegram, start_chat_action_heartbeat};
+use crate::utils::telegram::{
+    edit_message_text_with_retry, message_entities_for_text, retry_telegram,
+    send_message_with_retry, send_message_with_retry_parse_mode, start_chat_action_heartbeat,
+    strip_command_prefix,
+};
 use crate::utils::text::{
     escape_html, split_for_telegram, truncate_with_ellipsis, truncate_with_suffix,
 };
@@ -396,21 +400,6 @@ struct MysongLanguageSelection {
     fallback_notice: Option<String>,
 }
 
-fn strip_command_prefix(text: &str, command_prefix: &str) -> String {
-    let Some(stripped) = text.strip_prefix(command_prefix) else {
-        return text.to_string();
-    };
-    // Telegram appends `@botname` to the command when it is addressed to a
-    // specific bot (`/img@MyBot ...`); that mention is not part of the prompt.
-    let stripped = match stripped.strip_prefix('@') {
-        Some(after_at) => {
-            after_at.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
-        }
-        None => stripped,
-    };
-    stripped.trim().to_string()
-}
-
 fn format_user_history_for_persona(history: &[crate::db::models::MessageRow]) -> String {
     let mut lines = String::new();
     for msg in history {
@@ -580,14 +569,6 @@ async fn build_mysong_audio_caption(
         caption
     } else {
         base_caption
-    }
-}
-
-fn message_entities_for_text(message: &Message) -> Option<Vec<MessageEntityRef<'_>>> {
-    if message.text().is_some() {
-        message.parse_entities()
-    } else {
-        message.parse_caption_entities()
     }
 }
 
@@ -1143,49 +1124,6 @@ pub(crate) fn message_has_image(message: &Message) -> bool {
     }
 
     false
-}
-
-async fn send_message_with_retry(
-    bot: &Bot,
-    chat_id: ChatId,
-    text: &str,
-    reply_to: Option<MessageId>,
-) -> Result<Message> {
-    send_message_with_retry_parse_mode(bot, chat_id, text, reply_to, None).await
-}
-
-async fn send_message_with_retry_parse_mode(
-    bot: &Bot,
-    chat_id: ChatId,
-    text: &str,
-    reply_to: Option<MessageId>,
-    parse_mode: Option<ParseMode>,
-) -> Result<Message> {
-    retry_telegram("send_message", || {
-        let mut request = bot.send_message(chat_id, text.to_string());
-        if let Some(reply_to) = reply_to {
-            request = request.reply_parameters(ReplyParameters::new(reply_to));
-        }
-        if let Some(parse_mode) = parse_mode {
-            request = request.parse_mode(parse_mode);
-        }
-        request
-    })
-    .await
-    .map_err(Into::into)
-}
-
-async fn edit_message_text_with_retry(
-    bot: &Bot,
-    chat_id: ChatId,
-    message_id: MessageId,
-    text: &str,
-) -> Result<()> {
-    retry_telegram("edit_message_text", || {
-        bot.edit_message_text(chat_id, message_id, text.to_string())
-    })
-    .await?;
-    Ok(())
 }
 
 async fn send_video_with_retry(
@@ -4449,22 +4387,6 @@ external_media_total_max_bytes: 52428800\n"
         for expected in ["ollama-secret", "img2-secret", "bot-secret"] {
             assert!(secrets.iter().any(|s| s == expected), "missing {expected}");
         }
-    }
-
-    #[test]
-    fn strip_command_prefix_removes_command_and_attached_bot_mention() {
-        assert_eq!(strip_command_prefix("/img a cat", "/img"), "a cat");
-        assert_eq!(strip_command_prefix("/img@MyBot a cat", "/img"), "a cat");
-        assert_eq!(strip_command_prefix("/image@My_Bot2", "/image"), "");
-    }
-
-    #[test]
-    fn strip_command_prefix_keeps_mentions_inside_the_prompt() {
-        assert_eq!(
-            strip_command_prefix("/img @alice as a knight", "/img"),
-            "@alice as a knight"
-        );
-        assert_eq!(strip_command_prefix("draw a cat", "/img"), "draw a cat");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef,
-    MessageId, ParseMode, ReplyParameters,
+    MessageId, ParseMode,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -51,9 +51,14 @@ use crate::llm::{
 use crate::state::{AppState, PendingEntryGuard, PendingQRequest, QaCommandMode};
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::telegram::{build_message_link, retry_telegram, start_chat_action_heartbeat};
+use crate::utils::telegram::{
+    build_message_link, message_entities_for_text, message_text_or_caption, reply_with_retry,
+    start_chat_action_heartbeat,
+};
 use crate::utils::text::{escape_html, split_for_telegram, truncate_with_ellipsis};
-use crate::utils::timing::{complete_command_timer, start_command_timer, CommandTimer};
+use crate::utils::timing::{
+    complete_command_timer, now_unix_seconds, start_command_timer, CommandTimer,
+};
 use tracing::{error, info, warn};
 
 pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
@@ -79,25 +84,6 @@ const QC_SYSTEM_PROMPT: &str = r#"You are a helpful assistant in a Telegram grou
 "#;
 
 const CHAT_SEARCH_SYSTEM_PROMPT: &str = "You are helping search the current Telegram chat only. The search tool is keyword-based FTS retrieval, not semantic search. You must iteratively use chat_context_query to search this chat, inspect the returned messages, keep only clearly relevant messages, reformulate the query if needed, and continue until you have {result_target} relevant unique message IDs or you exhaust the 5 allowed chat_context_query calls. Never fabricate message IDs. Only choose message IDs that the tool actually returned. If fewer than {result_target} clearly relevant messages exist, return the best verified subset and explain that fewer relevant messages were found.";
-
-fn now_unix_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
-fn message_entities_for_text(message: &Message) -> Option<Vec<MessageEntityRef<'_>>> {
-    if message.text().is_some() {
-        message.parse_entities()
-    } else {
-        message.parse_caption_entities()
-    }
-}
-
-fn message_text_or_caption(message: &Message) -> Option<&str> {
-    message.text().or_else(|| message.caption())
-}
 
 fn is_bot_mention_entity(
     entity: &MessageEntityRef<'_>,
@@ -434,31 +420,6 @@ fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
 
     let detail = truncate_with_ellipsis(&err_text, USER_ERROR_DETAIL_LIMIT);
     format!("{friendly}\n\nError: {detail}")
-}
-
-async fn send_message_with_retry(
-    bot: &Bot,
-    chat_id: ChatId,
-    text: &str,
-    reply_to: Option<MessageId>,
-    parse_mode: Option<ParseMode>,
-    reply_markup: Option<InlineKeyboardMarkup>,
-) -> Result<Message> {
-    retry_telegram("send_message", || {
-        let mut request = bot.send_message(chat_id, text.to_string());
-        if let Some(reply_to) = reply_to {
-            request = request.reply_parameters(ReplyParameters::new(reply_to));
-        }
-        if let Some(mode) = parse_mode {
-            request = request.parse_mode(mode);
-        }
-        if let Some(markup) = reply_markup.clone() {
-            request = request.reply_markup(markup);
-        }
-        request
-    })
-    .await
-    .map_err(Into::into)
 }
 
 fn compact_model_callback_hash(model_identifier: &str) -> u64 {
@@ -1338,7 +1299,7 @@ fn build_chat_search_pending_request(
         selection_message_id,
         original_user_id: user_id,
         llm_invocation_id: audit_context.map(|context| context.invocation_id),
-        timestamp: now_unix_seconds(),
+        timestamp: now_unix_seconds() as i64,
         command_timer,
         mode: QaCommandMode::ChatSearch,
     }
@@ -3034,7 +2995,7 @@ async fn q_handler_internal(
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        send_message_with_retry(
+        reply_with_retry(
             &bot,
             message.chat.id,
             "You're sending commands too quickly. Please wait a moment before trying again.",
@@ -3095,7 +3056,7 @@ async fn q_handler_internal(
     };
 
     if original_query.trim().is_empty() {
-        send_message_with_retry(
+        reply_with_retry(
             &bot,
             message.chat.id,
             &format!(
@@ -3111,7 +3072,7 @@ async fn q_handler_internal(
     }
 
     if mode == QaCommandMode::ChatContext && !state.db.is_search_ready() {
-        send_message_with_retry(
+        reply_with_retry(
             &bot,
             message.chat.id,
             &chat_search_rebuilding_message("qc"),
@@ -3239,7 +3200,7 @@ async fn q_handler_internal(
             third_party_models_available_for_request,
         )
     {
-        send_message_with_retry(
+        reply_with_retry(
             &bot,
             message.chat.id,
             NO_VIDEO_CAPABLE_MODEL_MESSAGE,
@@ -3283,7 +3244,7 @@ async fn q_handler_internal(
         match resolved {
             Ok(model) => Some(model),
             Err(err) => {
-                send_message_with_retry(
+                reply_with_retry(
                     &bot,
                     message.chat.id,
                     &err.to_string(),
@@ -3361,7 +3322,7 @@ async fn q_handler_internal(
         } else {
             format!("Processing your question with {}...", display_name)
         };
-        let processing_message = send_message_with_retry(
+        let processing_message = reply_with_retry(
             &bot,
             message.chat.id,
             &processing_message_text,
@@ -3390,7 +3351,7 @@ async fn q_handler_internal(
             selection_message_id: processing_message.id.0 as i64,
             original_user_id: user_id,
             llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
-            timestamp: now_unix_seconds(),
+            timestamp: now_unix_seconds() as i64,
             command_timer: None,
             mode,
         };
@@ -3423,7 +3384,7 @@ async fn q_handler_internal(
         has_documents,
         require_tools,
     );
-    let selection_message = send_message_with_retry(
+    let selection_message = reply_with_retry(
         &bot,
         message.chat.id,
         &selection_text,
@@ -3455,7 +3416,7 @@ async fn q_handler_internal(
         selection_message_id: selection_message.id.0 as i64,
         original_user_id: user_id,
         llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
-        timestamp: now_unix_seconds(),
+        timestamp: now_unix_seconds() as i64,
         command_timer: Some(timer),
         mode,
     };
@@ -3518,7 +3479,7 @@ pub async fn s_handler(
         .and_then(|user| i64::try_from(user.id.0).ok())
         .unwrap_or_default();
     if is_rate_limited(user_id) {
-        send_message_with_retry(
+        reply_with_retry(
             &bot,
             message.chat.id,
             "You're sending commands too quickly. Please wait a moment before trying again.",
@@ -3542,7 +3503,7 @@ pub async fn s_handler(
         })
         .unwrap_or_default();
     if query_text.trim().is_empty() {
-        send_message_with_retry(
+        reply_with_retry(
             &bot,
             message.chat.id,
             "Please provide a search query or reply to a message with /s.",
@@ -3566,7 +3527,7 @@ pub async fn s_handler(
     }
 
     if !state.db.is_search_ready() {
-        send_message_with_retry(
+        reply_with_retry(
             &bot,
             message.chat.id,
             &chat_search_rebuilding_message("s"),
@@ -3598,7 +3559,7 @@ pub async fn s_handler(
         match resolve_default_text_model_for_request(request_capabilities) {
             Ok(model) => Some((model, "default_text_model")),
             Err(err) => {
-                send_message_with_retry(
+                reply_with_retry(
                     &bot,
                     message.chat.id,
                     &err.to_string(),
@@ -3614,7 +3575,7 @@ pub async fn s_handler(
         let selectable_model_ids =
             selectable_model_ids_for_request(false, false, false, false, true);
         if selectable_model_ids.is_empty() {
-            send_message_with_retry(
+            reply_with_retry(
                 &bot,
                 message.chat.id,
                 "No tool-capable AI model is available for /s. Enable Gemini or configure a ready third-party model with tools=true.",
@@ -3637,7 +3598,7 @@ pub async fn s_handler(
 
     if let Some((selected_model, timer_detail)) = direct_model {
         let display_name = configured_model_display_name(&selected_model);
-        let processing_message = send_message_with_retry(
+        let processing_message = reply_with_retry(
             &bot,
             message.chat.id,
             &format!("Searching this chat with {}...", display_name),
@@ -3665,7 +3626,7 @@ pub async fn s_handler(
     }
 
     let keyboard = create_model_selection_keyboard(false, false, false, false, true);
-    let selection_message = send_message_with_retry(
+    let selection_message = reply_with_retry(
         &bot,
         message.chat.id,
         "Please select which AI model to use for chat search:",
@@ -3810,7 +3771,7 @@ pub async fn model_selection_callback(
         take_pending_q_request_for_callback(
             &mut pending,
             query_user_id,
-            now_unix_seconds(),
+            now_unix_seconds() as i64,
             CONFIG.model_selection_timeout,
             |request| {
                 let summary = summarize_media_files(&request.media_files);
