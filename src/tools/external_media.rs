@@ -248,8 +248,23 @@ pub(crate) async fn read_external_media_response(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExternalMediaKind {
-    Image(&'static str),
+    Image,
     Video,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaSource {
+    Telegraph,
+    Twitter,
+}
+
+impl MediaSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Telegraph => "telegraph",
+            Self::Twitter => "twitter",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -257,7 +272,7 @@ pub(crate) struct ExternalMediaRequest {
     pub(crate) index: usize,
     pub(crate) url: String,
     pub(crate) kind: ExternalMediaKind,
-    source: &'static str,
+    source: MediaSource,
     thumbnail_url: Option<String>,
 }
 
@@ -266,7 +281,7 @@ impl ExternalMediaRequest {
         self.thumbnail_url.as_ref().map(|url| Self {
             index: self.index,
             url: url.clone(),
-            kind: ExternalMediaKind::Image(self.source),
+            kind: ExternalMediaKind::Image,
             source: self.source,
             thumbnail_url: None,
         })
@@ -282,7 +297,7 @@ pub(crate) fn twitter_video_request(
         index,
         url: video_url.to_string(),
         kind: ExternalMediaKind::Video,
-        source: "twitter",
+        source: MediaSource::Twitter,
         thumbnail_url: thumbnail_url.map(str::to_string),
     }
 }
@@ -305,11 +320,11 @@ fn telegraph_media_url(raw_url: &str) -> Result<Url> {
     Ok(parsed)
 }
 
-fn validate_media_url(url: &str, source: &str) -> Result<Url> {
-    if source == "twitter" {
-        return parse_allowed_media_url(url);
+fn validate_media_url(url: &str, source: MediaSource) -> Result<Url> {
+    match source {
+        MediaSource::Twitter => parse_allowed_media_url(url),
+        MediaSource::Telegraph => telegraph_media_url(url),
     }
-    telegraph_media_url(url)
 }
 
 fn display_name_from_url(url: &str) -> Option<String> {
@@ -372,7 +387,7 @@ async fn start_request(request: &ExternalMediaRequest) -> Option<Response> {
             return None;
         }
     };
-    if matches!(request.kind, ExternalMediaKind::Image(_))
+    if matches!(request.kind, ExternalMediaKind::Image)
         && request.url.to_ascii_lowercase().contains(".svg")
     {
         return None;
@@ -405,7 +420,8 @@ async fn process_response(
                 .trim()
                 .to_ascii_lowercase()
         });
-    if let ExternalMediaKind::Image(source) = request.kind {
+    if let ExternalMediaKind::Image = request.kind {
+        let source = request.source.as_str();
         let content_type =
             content_type.or_else(|| image_mime_from_url(&request.url).map(ToString::to_string));
         let Some(content_type) = content_type else {
@@ -580,8 +596,8 @@ pub async fn download_telegraph_media(
             requests.push(ExternalMediaRequest {
                 index,
                 url: url.clone(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             });
             index += 1;
@@ -594,7 +610,7 @@ pub async fn download_telegraph_media(
                 index,
                 url: url.clone(),
                 kind: ExternalMediaKind::Video,
-                source: "telegraph",
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             });
             index += 1;
@@ -631,8 +647,8 @@ fn twitter_media_requests(
                 TwitterAttachment::Image { url } => requests.push(ExternalMediaRequest {
                     index,
                     url: url.clone(),
-                    kind: ExternalMediaKind::Image("twitter"),
-                    source: "twitter",
+                    kind: ExternalMediaKind::Image,
+                    source: MediaSource::Twitter,
                     thumbnail_url: None,
                 }),
                 TwitterAttachment::Video { url, thumbnail_url } => {
@@ -866,7 +882,8 @@ mod tests {
         );
         let fallback = request.thumbnail_fallback().unwrap();
         assert_eq!(fallback.index, 3);
-        assert!(matches!(fallback.kind, ExternalMediaKind::Image("twitter")));
+        assert!(matches!(fallback.kind, ExternalMediaKind::Image));
+        assert_eq!(fallback.source, MediaSource::Twitter);
     }
 
     #[test]
@@ -1180,15 +1197,15 @@ mod tests {
             ExternalMediaRequest {
                 index: 0,
                 url: "https://telegra.ph/file/0.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             },
             ExternalMediaRequest {
                 index: 1,
                 url: "https://telegra.ph/file/1.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             },
         ];
@@ -1227,15 +1244,15 @@ mod tests {
             ExternalMediaRequest {
                 index: 0,
                 url: "https://telegra.ph/file/0.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             },
             ExternalMediaRequest {
                 index: 1,
                 url: "https://telegra.ph/file/1.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             },
         ];
@@ -1276,15 +1293,15 @@ mod tests {
             ExternalMediaRequest {
                 index: 0,
                 url: "https://telegra.ph/file/0.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             },
             ExternalMediaRequest {
                 index: 1,
                 url: "https://telegra.ph/file/1.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             },
         ];
@@ -1340,8 +1357,8 @@ mod tests {
                 ExternalMediaRequest {
                     index: 0,
                     url: "https://telegra.ph/file/0.jpg".to_string(),
-                    kind: ExternalMediaKind::Image("telegraph"),
-                    source: "telegraph",
+                    kind: ExternalMediaKind::Image,
+                    source: MediaSource::Telegraph,
                     thumbnail_url: None,
                 },
                 None,
@@ -1486,8 +1503,8 @@ mod tests {
             .map(|index| ExternalMediaRequest {
                 index,
                 url: format!("https://telegra.ph/file/{index}.jpg"),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             })
             .collect::<Vec<_>>();
@@ -1597,8 +1614,8 @@ mod tests {
             .map(|index| ExternalMediaRequest {
                 index,
                 url: format!("https://telegra.ph/file/{index}.jpg"),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             })
             .collect::<Vec<_>>();
@@ -1704,8 +1721,8 @@ mod tests {
             vec![ExternalMediaRequest {
                 index: 0,
                 url: "https://telegra.ph/file/stage.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             }],
             1,
@@ -1724,8 +1741,8 @@ mod tests {
             vec![ExternalMediaRequest {
                 index: 0,
                 url: "https://pbs.twimg.com/media/stage.jpg".to_string(),
-                kind: ExternalMediaKind::Image("twitter"),
-                source: "twitter",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Twitter,
                 thumbnail_url: None,
             }],
             1,
