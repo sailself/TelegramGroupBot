@@ -240,11 +240,37 @@ pub struct Config {
 pub static CONFIG: LazyLock<Config> =
     LazyLock::new(|| Config::load().expect("Failed to load configuration"));
 
+/// Parse an environment variable with `T::from_str`, warning once and
+/// falling back to `default` when the value is set but does not parse.
+fn env_parsed<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse::<T>().unwrap_or_else(|_| {
+            tracing::warn!(env = name, value = %raw, "unparsable value, using the default");
+            default
+        }),
+        _ => default,
+    }
+}
+
+/// Newtype so `env_parsed` can drive `env_bool`'s looser boolean grammar
+/// (`true`/`false`/`1`/`0`/`yes`/`no`) instead of `bool::from_str`'s
+/// case-sensitive `true`/`false` only.
+struct LooseBool(bool);
+
+impl std::str::FromStr for LooseBool {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(LooseBool(true)),
+            "false" | "0" | "no" => Ok(LooseBool(false)),
+            _ => Err(()),
+        }
+    }
+}
+
 fn env_bool(name: &str, default: bool) -> bool {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(default)
+    env_parsed(name, LooseBool(default)).0
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -252,24 +278,15 @@ fn env_string(name: &str, default: &str) -> String {
 }
 
 fn env_f32(name: &str, default: f32) -> f32 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<f32>().ok())
-        .unwrap_or(default)
+    env_parsed(name, default)
 }
 
 fn env_i32(name: &str, default: i32) -> i32 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(default)
+    env_parsed(name, default)
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(default)
+    env_parsed(name, default)
 }
 
 fn parse_optional_positive_u32(value: &str) -> Option<u32> {
@@ -287,10 +304,7 @@ fn env_optional_positive_u32(name: &str) -> Option<u32> {
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(default)
+    env_parsed(name, default)
 }
 
 fn env_timeout_secs(name: &str, default: u64) -> u64 {
@@ -298,10 +312,7 @@ fn env_timeout_secs(name: &str, default: u64) -> u64 {
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
+    env_parsed(name, default)
 }
 
 fn env_csv_lowercase(name: &str, default: &str) -> Vec<String> {
@@ -878,6 +889,29 @@ pub(crate) fn gemini_api_available_from(enable_gemini: bool, api_key: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Environment variables are process-wide; hold this lock for the whole
+    // span of any test that sets/removes one so tests can't race each other.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_f32_warns_once_and_returns_default_on_unparsable_value() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("GEMINI_TEMPERATURE", "warm");
+        }
+        let events = crate::utils::log_capture::capture_json_events(|| {
+            assert_eq!(env_f32("GEMINI_TEMPERATURE", 0.7), 0.7);
+        });
+        unsafe {
+            std::env::remove_var("GEMINI_TEMPERATURE");
+        }
+
+        assert_eq!(events.len(), 1, "{events:?}");
+        let fields = &events[0]["fields"];
+        assert_eq!(fields["env"], "GEMINI_TEMPERATURE");
+        assert_eq!(fields["value"], "warm");
+    }
 
     #[test]
     fn default_text_model_prefers_new_env_value_over_legacy_q_value() {
