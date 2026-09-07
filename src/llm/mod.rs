@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod audit;
 pub mod brave_search;
 pub mod codex_image;
+pub mod codex_selected_model;
 pub mod exa_search;
 pub mod gemini;
 pub mod img2_image;

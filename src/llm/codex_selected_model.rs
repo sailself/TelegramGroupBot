@@ -1,0 +1,1314 @@
+//! Codex selected-model persistence: account binding, atomic disk storage,
+//! etag-triggered metadata refresh, and the explicit-model resolution cache.
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::{info, warn};
+
+use crate::config::{
+    parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
+};
+use crate::llm::openai_codex::{
+    self, CodexInputModality, CodexReasoningEffortOption, CodexRemoteModel, CodexWebSearchToolType,
+};
+use crate::llm::runtime_models::{
+    build_runtime_models_state, reload_runtime_models, runtime_model_config,
+};
+
+pub const OPENAI_CODEX_SELECTED_MODEL_ID: &str = "openai-codex:selected";
+pub const CODEX_SELECTED_MODEL_METADATA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexSelectedModelRecord {
+    #[serde(default)]
+    pub metadata_version: u32,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub slug: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub default_reasoning_level: Option<String>,
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<CodexReasoningEffortOption>,
+    #[serde(default)]
+    pub selected_reasoning_level: Option<String>,
+    #[serde(default)]
+    pub web_search_tool_type: CodexWebSearchToolType,
+    #[serde(default)]
+    pub supports_search_tool: bool,
+    #[serde(default)]
+    pub use_responses_lite: bool,
+    pub fetched_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedExplicitCodexModel {
+    pub config: ThirdPartyModelConfig,
+    pub record: CodexSelectedModelRecord,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeModelsState {
+    pub(crate) models: Vec<ThirdPartyModelConfig>,
+    pub(crate) models_by_id: HashMap<String, ThirdPartyModelConfig>,
+    pub(crate) codex_selected_model: Option<CodexSelectedModelRecord>,
+    pub(crate) explicit_codex_configs_by_id: HashMap<String, ThirdPartyModelConfig>,
+    pub(crate) explicit_codex_records_by_id: HashMap<String, CodexSelectedModelRecord>,
+}
+
+static RUNTIME_MODELS: LazyLock<RwLock<RuntimeModelsState>> =
+    LazyLock::new(|| RwLock::new(build_runtime_models_state()));
+static CODEX_MODEL_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static CODEX_MODEL_REFRESH_STATE: LazyLock<AsyncMutex<CodexModelRefreshState>> =
+    LazyLock::new(|| AsyncMutex::new(CodexModelRefreshState::default()));
+static EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK: LazyLock<AsyncMutex<()>> =
+    LazyLock::new(|| AsyncMutex::new(()));
+static CODEX_MODEL_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const CODEX_MODEL_REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Read the current catalog+Codex snapshot without touching the lock directly.
+pub(crate) fn with_state<R>(f: impl FnOnce(&RuntimeModelsState) -> R) -> R {
+    f(&RUNTIME_MODELS.read())
+}
+
+/// Replace the current catalog+Codex snapshot without touching the lock directly.
+pub(crate) fn replace_state(state: RuntimeModelsState) {
+    *RUNTIME_MODELS.write() = state;
+}
+
+#[derive(Debug, Default)]
+struct CodexModelRefreshState {
+    last_failure: Option<CodexModelRefreshFailure>,
+}
+
+#[derive(Debug)]
+struct CodexModelRefreshFailure {
+    account_id: String,
+    etag: String,
+    attempted_at: Instant,
+}
+
+fn normalized_account_id(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+pub(super) fn selected_model_matches_account(
+    record: &CodexSelectedModelRecord,
+    account_id: Option<&str>,
+) -> bool {
+    normalized_account_id(record.account_id.as_deref()) == normalized_account_id(account_id)
+        && normalized_account_id(account_id).is_some()
+}
+
+fn selected_codex_model_needs_metadata_refresh(
+    record: &CodexSelectedModelRecord,
+    new_etag: Option<&str>,
+) -> bool {
+    if record.metadata_version < CODEX_SELECTED_MODEL_METADATA_VERSION {
+        return true;
+    }
+
+    new_etag
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|new_etag| record.etag.as_deref().map(str::trim) != Some(new_etag))
+}
+
+fn validate_selected_codex_model_for_request(
+    model_config: &ThirdPartyModelConfig,
+    selected_record: Option<&CodexSelectedModelRecord>,
+    current_account_id: Option<&str>,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex
+        || model_config.id != OPENAI_CODEX_SELECTED_MODEL_ID
+    {
+        return Ok(None);
+    }
+
+    let current_account_id = normalized_account_id(current_account_id)
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    let record = selected_record
+        .filter(|record| record.slug == model_config.model)
+        .filter(|record| selected_model_matches_account(record, Some(current_account_id)))
+        .ok_or_else(|| anyhow!("The selected Codex model or account changed"))?;
+    Ok(Some(record.clone()))
+}
+
+fn validate_explicit_codex_model_for_request(
+    model_config: &ThirdPartyModelConfig,
+    explicit_record: Option<&CodexSelectedModelRecord>,
+    current_account_id: Option<&str>,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex
+        || model_config.id == OPENAI_CODEX_SELECTED_MODEL_ID
+    {
+        return Ok(None);
+    }
+
+    let record = explicit_record
+        .ok_or_else(|| anyhow!("The explicit Codex model metadata is unavailable"))?;
+    if record.metadata_version < CODEX_SELECTED_MODEL_METADATA_VERSION {
+        return Err(anyhow!("The explicit Codex model metadata is stale"));
+    }
+    let current_account_id = normalized_account_id(current_account_id)
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if record.slug != model_config.model
+        || !selected_model_matches_account(record, Some(current_account_id))
+    {
+        return Err(anyhow!("The explicit Codex model or account changed"));
+    }
+    Ok(Some(record.clone()))
+}
+
+fn explicit_codex_model_record_from_state(
+    state: &RuntimeModelsState,
+    model_config: &ThirdPartyModelConfig,
+    current_account_id: Option<&str>,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    validate_explicit_codex_model_for_request(
+        model_config,
+        state.explicit_codex_records_by_id.get(&model_config.id),
+        current_account_id,
+    )
+}
+
+pub fn current_codex_account_id() -> Option<String> {
+    openai_codex::auth_summary()
+        .account_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn effective_codex_reasoning_level(record: &CodexSelectedModelRecord) -> Option<&str> {
+    record
+        .selected_reasoning_level
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            record
+                .default_reasoning_level
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+pub fn codex_selected_model_label(record: &CodexSelectedModelRecord) -> String {
+    let mut label = record.slug.trim().to_string();
+    if let Some(level) = effective_codex_reasoning_level(record) {
+        label.push(' ');
+        label.push_str(level.trim());
+    }
+    label
+}
+
+fn selected_model_path() -> &'static Path {
+    Path::new(&CONFIG.openai_codex_model_path)
+}
+
+pub(super) fn load_selected_codex_model_record() -> Option<CodexSelectedModelRecord> {
+    let path = selected_model_path();
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "Failed to read Codex selected model file {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+            return None;
+        }
+    };
+
+    match serde_json::from_str::<CodexSelectedModelRecord>(&raw) {
+        Ok(record) => Some(record),
+        Err(err) => {
+            warn!(
+                "Failed to parse Codex selected model file {}: {}",
+                path.display(),
+                err
+            );
+            None
+        }
+    }
+}
+
+pub(super) fn dynamic_codex_model_config(
+    record: &CodexSelectedModelRecord,
+) -> ThirdPartyModelConfig {
+    let supports_images = record
+        .input_modalities
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case("image"));
+
+    ThirdPartyModelConfig {
+        id: OPENAI_CODEX_SELECTED_MODEL_ID.to_string(),
+        provider: ThirdPartyProvider::OpenAICodex,
+        name: codex_selected_model_label(record),
+        model: record.slug.clone(),
+        image: supports_images,
+        video: false,
+        audio: false,
+        tools: true,
+    }
+}
+
+pub fn selected_codex_model_record() -> Option<CodexSelectedModelRecord> {
+    let record = RUNTIME_MODELS.read().codex_selected_model.clone()?;
+    selected_model_matches_account(&record, current_codex_account_id().as_deref()).then_some(record)
+}
+
+fn codex_model_record_for_request_with_state(
+    state: &RuntimeModelsState,
+    model_config: &ThirdPartyModelConfig,
+    current_account_id: Option<&str>,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex {
+        return Ok(None);
+    }
+
+    if model_config.id == OPENAI_CODEX_SELECTED_MODEL_ID {
+        return validate_selected_codex_model_for_request(
+            model_config,
+            state.codex_selected_model.as_ref(),
+            current_account_id,
+        );
+    }
+
+    // Non-selected Codex IDs are ordinary foreign/configured contracts unless
+    // the Quick resolver explicitly pins an account-bound catalog record for
+    // the call. Never infer Quick provenance from an ID or borrow cached
+    // metadata that may belong to a different request path.
+    Ok(None)
+}
+
+pub fn codex_model_record_for_request(
+    model_config: &ThirdPartyModelConfig,
+) -> Result<Option<CodexSelectedModelRecord>> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex {
+        return Ok(None);
+    }
+    let current_account_id = current_codex_account_id();
+    let state = RUNTIME_MODELS.read();
+    codex_model_record_for_request_with_state(&state, model_config, current_account_id.as_deref())
+}
+
+fn build_codex_selected_model_record(
+    model: &CodexRemoteModel,
+    etag: Option<String>,
+    account_id: &str,
+    previous: Option<&CodexSelectedModelRecord>,
+) -> CodexSelectedModelRecord {
+    let previous_selection = previous
+        .filter(|record| selected_model_matches_account(record, Some(account_id)))
+        .and_then(|record| record.selected_reasoning_level.clone())
+        .filter(|level| {
+            model
+                .supported_reasoning_levels
+                .iter()
+                .any(|option| option.effort == *level)
+        });
+
+    CodexSelectedModelRecord {
+        metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
+        account_id: Some(account_id.trim().to_string()),
+        slug: model.slug.clone(),
+        display_name: model.display_name.clone(),
+        description: model.description.clone(),
+        input_modalities: model
+            .input_modalities
+            .iter()
+            .map(|modality| match modality {
+                CodexInputModality::Text => "text".to_string(),
+                CodexInputModality::Image => "image".to_string(),
+            })
+            .collect(),
+        priority: model.priority,
+        etag,
+        default_reasoning_level: model.default_reasoning_level.clone(),
+        supported_reasoning_levels: model.supported_reasoning_levels.clone(),
+        selected_reasoning_level: previous_selection,
+        web_search_tool_type: model.web_search_tool_type,
+        supports_search_tool: model.supports_search_tool,
+        use_responses_lite: model.use_responses_lite,
+        fetched_at: Utc::now(),
+    }
+}
+
+fn build_explicit_codex_runtime_entry(
+    model_id: &str,
+    model: &CodexRemoteModel,
+    etag: Option<String>,
+    account_id: &str,
+) -> Result<(ThirdPartyModelConfig, CodexSelectedModelRecord)> {
+    let (provider, slug) = parse_third_party_model_id(model_id)
+        .ok_or_else(|| anyhow!("Invalid explicit Codex model id"))?;
+    if provider != ThirdPartyProvider::OpenAICodex || slug == "selected" {
+        return Err(anyhow!("Model is not an explicit Codex slug"));
+    }
+    if slug != model.slug || !model.supported_in_api {
+        return Err(anyhow!("Codex model '{}' is unavailable", slug));
+    }
+
+    let record = build_codex_selected_model_record(model, etag, account_id, None);
+    let config = ThirdPartyModelConfig {
+        id: model_id.to_string(),
+        provider: ThirdPartyProvider::OpenAICodex,
+        name: model.display_name.clone(),
+        model: model.slug.clone(),
+        image: model.input_modalities.contains(&CodexInputModality::Image),
+        video: false,
+        audio: false,
+        tools: true,
+    };
+    Ok((config, record))
+}
+
+fn insert_explicit_codex_runtime_entry(
+    state: &mut RuntimeModelsState,
+    config: ThirdPartyModelConfig,
+    record: CodexSelectedModelRecord,
+) {
+    let id = config.id.clone();
+    if !state.models.iter().any(|model| model.id == id) {
+        state.models_by_id.insert(id.clone(), config.clone());
+    }
+    state
+        .explicit_codex_configs_by_id
+        .insert(id.clone(), config);
+    state.explicit_codex_records_by_id.insert(id, record);
+}
+
+fn cached_explicit_codex_model_from_state(
+    state: &RuntimeModelsState,
+    model_id: &str,
+    current_account_id: Option<&str>,
+) -> Option<ResolvedExplicitCodexModel> {
+    let (provider, slug) = parse_third_party_model_id(model_id)?;
+    if provider != ThirdPartyProvider::OpenAICodex || slug == "selected" {
+        return None;
+    }
+
+    let config = state.explicit_codex_configs_by_id.get(model_id)?;
+    if config.id != model_id
+        || config.provider != ThirdPartyProvider::OpenAICodex
+        || config.model != slug
+    {
+        return None;
+    }
+    let record = explicit_codex_model_record_from_state(state, config, current_account_id)
+        .ok()
+        .flatten()?;
+    Some(ResolvedExplicitCodexModel {
+        config: config.clone(),
+        record,
+    })
+}
+
+pub async fn ensure_explicit_codex_model(model_id: &str) -> Result<ResolvedExplicitCodexModel> {
+    let (provider, slug) = parse_third_party_model_id(model_id)
+        .ok_or_else(|| anyhow!("Invalid explicit Codex model id"))?;
+    if provider != ThirdPartyProvider::OpenAICodex || slug == "selected" {
+        return Err(anyhow!("Model is not an explicit Codex slug"));
+    }
+
+    let active_account = current_codex_account_id()
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if let Some(cached) = cached_explicit_codex_model_from_state(
+        &RUNTIME_MODELS.read(),
+        model_id,
+        Some(&active_account),
+    ) {
+        return Ok(cached);
+    }
+
+    let _guard = EXPLICIT_CODEX_MODEL_RESOLUTION_LOCK.lock().await;
+    let active_account = current_codex_account_id()
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if let Some(cached) = cached_explicit_codex_model_from_state(
+        &RUNTIME_MODELS.read(),
+        model_id,
+        Some(&active_account),
+    ) {
+        return Ok(cached);
+    }
+
+    let list = openai_codex::fetch_models().await?;
+    let active_account = current_codex_account_id()
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if list.account_id != active_account {
+        return Err(anyhow!(
+            "The active ChatGPT account changed during model resolution"
+        ));
+    }
+    let model = list
+        .models
+        .iter()
+        .find(|model| model.slug == slug)
+        .ok_or_else(|| anyhow!("Codex model '{}' is unavailable", slug))?;
+    let (config, record) =
+        build_explicit_codex_runtime_entry(model_id, model, list.etag, &active_account)?;
+    let mut state = RUNTIME_MODELS.write();
+    insert_explicit_codex_runtime_entry(&mut state, config.clone(), record.clone());
+    Ok(ResolvedExplicitCodexModel { config, record })
+}
+
+fn write_selected_codex_model_file(record: &CodexSelectedModelRecord) -> Result<()> {
+    let path = selected_model_path();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_else(|| "codex-model".into());
+    let sequence = CODEX_MODEL_TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let contents = serde_json::to_vec_pretty(record)?;
+
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn save_selected_codex_model_locked(
+    record: &CodexSelectedModelRecord,
+) -> Result<ThirdPartyModelConfig> {
+    let path = selected_model_path();
+    write_selected_codex_model_file(record)?;
+    info!(
+        "Saved selected Codex model {} ({}) to {}",
+        record.display_name,
+        record.slug,
+        path.display()
+    );
+    reload_runtime_models();
+    runtime_model_config(OPENAI_CODEX_SELECTED_MODEL_ID)
+        .ok_or_else(|| anyhow::anyhow!("Selected Codex model did not load after save"))
+}
+
+fn validate_current_codex_account(expected_account_id: &str) -> Result<()> {
+    let expected_account_id = expected_account_id.trim();
+    if expected_account_id.is_empty() {
+        return Err(anyhow!("Expected Codex account id is empty"));
+    }
+    let current_account_id = current_codex_account_id()
+        .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+    if current_account_id != expected_account_id {
+        return Err(anyhow!("The active ChatGPT account changed"));
+    }
+    Ok(())
+}
+
+pub async fn save_codex_model_selection(
+    model: &CodexRemoteModel,
+    etag: Option<String>,
+    expected_account_id: &str,
+) -> Result<(CodexSelectedModelRecord, ThirdPartyModelConfig)> {
+    openai_codex::with_locked_auth_account(expected_account_id, || {
+        let _guard = CODEX_MODEL_STATE_LOCK.lock();
+        validate_current_codex_account(expected_account_id)?;
+        let previous = selected_codex_model_record();
+        let record =
+            build_codex_selected_model_record(model, etag, expected_account_id, previous.as_ref());
+        let config = save_selected_codex_model_locked(&record)?;
+        Ok((record, config))
+    })
+    .await
+}
+
+pub async fn refresh_selected_codex_model_metadata(
+    model: &CodexRemoteModel,
+    etag: Option<String>,
+    expected_account_id: &str,
+    expected_model_slug: &str,
+) -> Result<CodexSelectedModelRecord> {
+    openai_codex::with_locked_auth_account(expected_account_id, || {
+        let _guard = CODEX_MODEL_STATE_LOCK.lock();
+        validate_current_codex_account(expected_account_id)?;
+        let current = selected_codex_model_record()
+            .filter(|record| selected_model_matches_account(record, Some(expected_account_id)))
+            .filter(|record| record.slug == expected_model_slug)
+            .ok_or_else(|| anyhow!("The selected Codex model changed"))?;
+        if model.slug != current.slug {
+            return Err(anyhow!(
+                "The refreshed Codex model does not match the selection"
+            ));
+        }
+        let record =
+            build_codex_selected_model_record(model, etag, expected_account_id, Some(&current));
+        save_selected_codex_model_locked(&record)?;
+        Ok(record)
+    })
+    .await
+}
+
+async fn refresh_selected_codex_model_from_catalog(
+    expected_account_id: &str,
+    selected_slug: &str,
+    fallback_etag: Option<&str>,
+) -> Result<()> {
+    let list = openai_codex::fetch_models().await?;
+    if list.account_id != expected_account_id {
+        return Err(anyhow!(
+            "The active ChatGPT account changed during model refresh"
+        ));
+    }
+    let model = list
+        .models
+        .iter()
+        .find(|model| model.slug == selected_slug)
+        .ok_or_else(|| anyhow!("The selected Codex model is absent from the refreshed catalog"))?;
+    let refreshed_etag = list
+        .etag
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            fallback_etag
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    refresh_selected_codex_model_metadata(
+        model,
+        refreshed_etag,
+        expected_account_id,
+        selected_slug,
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn ensure_selected_codex_model_metadata_current(
+    model_config: &ThirdPartyModelConfig,
+) -> Result<()> {
+    let current_account_id = current_codex_account_id();
+    let Some(record) = validate_selected_codex_model_for_request(
+        model_config,
+        selected_codex_model_record().as_ref(),
+        current_account_id.as_deref(),
+    )?
+    else {
+        return Ok(());
+    };
+    if !selected_codex_model_needs_metadata_refresh(&record, None) {
+        return Ok(());
+    }
+
+    let _refresh_guard = CODEX_MODEL_REFRESH_STATE.lock().await;
+    let current_account_id = current_codex_account_id();
+    let Some(record) = validate_selected_codex_model_for_request(
+        model_config,
+        selected_codex_model_record().as_ref(),
+        current_account_id.as_deref(),
+    )?
+    else {
+        return Ok(());
+    };
+    if !selected_codex_model_needs_metadata_refresh(&record, None) {
+        return Ok(());
+    }
+
+    let account_id = record
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("The selected Codex model or account changed"))?;
+    refresh_selected_codex_model_from_catalog(account_id, &record.slug, record.etag.as_deref())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "Failed to refresh selected Codex model metadata; retry the request or reselect it with /codexmodel"
+            )
+        })
+}
+
+pub async fn save_selected_codex_reasoning_level(
+    level: Option<String>,
+    expected_account_id: &str,
+    expected_model_slug: &str,
+) -> Result<CodexSelectedModelRecord> {
+    openai_codex::with_locked_auth_account(expected_account_id, || {
+        let _guard = CODEX_MODEL_STATE_LOCK.lock();
+        validate_current_codex_account(expected_account_id)?;
+        let mut record = selected_codex_model_record()
+            .filter(|record| selected_model_matches_account(record, Some(expected_account_id)))
+            .filter(|record| record.slug == expected_model_slug)
+            .ok_or_else(|| anyhow!("The selected Codex model changed"))?;
+        if let Some(level) = level.as_deref() {
+            let supported = record
+                .supported_reasoning_levels
+                .iter()
+                .any(|option| option.effort == level);
+            if !supported {
+                return Err(anyhow!("The selected reasoning level is not supported"));
+            }
+        }
+        record.selected_reasoning_level = level;
+        save_selected_codex_model_locked(&record)?;
+        Ok(record)
+    })
+    .await
+}
+
+async fn refresh_selected_codex_model_for_etag_once(
+    new_etag: &str,
+    expected_account_id: &str,
+) -> Result<bool> {
+    let new_etag = new_etag.trim();
+    let Some(record) = selected_codex_model_record()
+        .filter(|record| selected_model_matches_account(record, Some(expected_account_id)))
+    else {
+        return Ok(false);
+    };
+    if !selected_codex_model_needs_metadata_refresh(&record, Some(new_etag)) {
+        return Ok(false);
+    }
+
+    let selected_slug = record.slug.clone();
+    refresh_selected_codex_model_from_catalog(expected_account_id, &selected_slug, Some(new_etag))
+        .await?;
+    Ok(true)
+}
+
+pub async fn refresh_selected_codex_model_for_etag(
+    new_etag: &str,
+    expected_account_id: &str,
+) -> Result<bool> {
+    let new_etag = new_etag.trim();
+    let expected_account_id = expected_account_id.trim();
+    if new_etag.is_empty() || expected_account_id.is_empty() {
+        return Ok(false);
+    }
+
+    let mut state = CODEX_MODEL_REFRESH_STATE.lock().await;
+    if state.last_failure.as_ref().is_some_and(|failure| {
+        failure.account_id == expected_account_id
+            && failure.etag == new_etag
+            && failure.attempted_at.elapsed() < CODEX_MODEL_REFRESH_FAILURE_BACKOFF
+    }) {
+        return Ok(false);
+    }
+
+    let result = refresh_selected_codex_model_for_etag_once(new_etag, expected_account_id).await;
+    match &result {
+        Ok(_) => state.last_failure = None,
+        Err(_) => {
+            state.last_failure = Some(CodexModelRefreshFailure {
+                account_id: expected_account_id.to_string(),
+                etag: new_etag.to_string(),
+                attempted_at: Instant::now(),
+            });
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_codex_catalog_entry_preserves_contract_metadata() {
+        let model = remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]);
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &model,
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+
+        assert_eq!(config.id, "openai-codex:gpt-5.6-terra");
+        assert_eq!(config.model, "gpt-5.6-terra");
+        assert_eq!(config.provider, ThirdPartyProvider::OpenAICodex);
+        assert!(config.tools);
+        assert!(!config.image);
+        assert!(record.use_responses_lite);
+        assert!(record.supports_search_tool);
+        assert_eq!(record.account_id.as_deref(), Some("acct-1"));
+    }
+
+    #[test]
+    fn explicit_codex_catalog_entry_rejects_non_api_model() {
+        let mut model = remote_model("gpt-5.6-terra", false, false, &[CodexInputModality::Text]);
+        model.supported_in_api = false;
+
+        assert!(build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &model,
+            None,
+            "acct-1",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_codex_cache_does_not_change_picker_or_selected_model() {
+        let selected_record = selected_model_record_for_test();
+        let selected_config = dynamic_codex_model_config(&selected_record);
+        let mut state = RuntimeModelsState {
+            models: vec![selected_config.clone()],
+            models_by_id: HashMap::from([(selected_config.id.clone(), selected_config)]),
+            codex_selected_model: Some(selected_record),
+            explicit_codex_configs_by_id: HashMap::new(),
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+
+        insert_explicit_codex_runtime_entry(&mut state, config, record);
+
+        assert!(state
+            .models_by_id
+            .contains_key("openai-codex:gpt-5.6-terra"));
+        assert!(state
+            .explicit_codex_configs_by_id
+            .contains_key("openai-codex:gpt-5.6-terra"));
+        assert_eq!(state.models.len(), 1);
+        assert_eq!(state.models[0].id, OPENAI_CODEX_SELECTED_MODEL_ID);
+        assert_eq!(
+            state
+                .codex_selected_model
+                .as_ref()
+                .map(|record| record.slug.as_str()),
+            Some("catalog-model")
+        );
+        assert!(state
+            .explicit_codex_records_by_id
+            .contains_key("openai-codex:gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn explicit_codex_cached_record_lookup_returns_the_matching_account_record() {
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let state = explicit_cache_state_for_test(&config, &record);
+
+        let returned = explicit_codex_model_record_from_state(&state, &config, Some("acct-1"))
+            .expect("matching cache entry should validate")
+            .expect("matching cache entry should be returned");
+
+        assert_eq!(returned.slug, "gpt-5.6-terra");
+        assert!(returned.supports_search_tool);
+        assert!(returned.use_responses_lite);
+    }
+
+    #[test]
+    fn explicit_codex_exact_cache_does_not_alias_the_selected_slug() {
+        let mut selected_record = selected_model_record_for_test();
+        selected_record.slug = "gpt-5.6-terra".to_string();
+        let selected_config = dynamic_codex_model_config(&selected_record);
+        let state = RuntimeModelsState {
+            models: vec![selected_config.clone()],
+            models_by_id: HashMap::from([(selected_config.id.clone(), selected_config)]),
+            codex_selected_model: Some(selected_record),
+            explicit_codex_configs_by_id: HashMap::new(),
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+
+        assert!(cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-1")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn explicit_codex_exact_cache_rejects_a_static_same_id_without_a_paired_record() {
+        let static_config = ThirdPartyModelConfig {
+            id: "openai-codex:gpt-5.6-terra".to_string(),
+            provider: ThirdPartyProvider::OpenAICodex,
+            name: "Static Terra".to_string(),
+            model: "gpt-5.6-terra".to_string(),
+            image: false,
+            video: false,
+            audio: false,
+            tools: true,
+        };
+        let state = RuntimeModelsState {
+            models: vec![static_config.clone()],
+            models_by_id: HashMap::from([(static_config.id.clone(), static_config)]),
+            codex_selected_model: None,
+            explicit_codex_configs_by_id: HashMap::new(),
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+
+        assert!(cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-1")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn explicit_codex_install_preserves_a_configured_same_id_contract() {
+        let static_config = ThirdPartyModelConfig {
+            id: "openai-codex:gpt-5.6-terra".to_string(),
+            provider: ThirdPartyProvider::OpenAICodex,
+            name: "Static Terra".to_string(),
+            model: "gpt-5.6-terra".to_string(),
+            image: false,
+            video: false,
+            audio: false,
+            tools: false,
+        };
+        let (catalog_config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model(
+                "gpt-5.6-terra",
+                true,
+                true,
+                &[CodexInputModality::Text, CodexInputModality::Image],
+            ),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let mut state = RuntimeModelsState {
+            models: vec![static_config.clone()],
+            models_by_id: HashMap::from([(static_config.id.clone(), static_config)]),
+            codex_selected_model: None,
+            explicit_codex_configs_by_id: HashMap::new(),
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+
+        insert_explicit_codex_runtime_entry(&mut state, catalog_config, record);
+
+        assert_eq!(
+            state
+                .models_by_id
+                .get("openai-codex:gpt-5.6-terra")
+                .map(|config| config.name.as_str()),
+            Some("Static Terra")
+        );
+        let cached = cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-1"),
+        )
+        .expect("the Quick cache should retain the separate catalog config");
+        assert_eq!(cached.config.name, "GPT 5.6 Terra");
+        assert!(cached.config.image);
+        assert!(cached.config.tools);
+    }
+
+    #[test]
+    fn explicit_codex_exact_cache_reuses_only_the_exact_account_bound_pair() {
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let state = explicit_cache_state_for_test(&config, &record);
+
+        let cached = cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-1"),
+        )
+        .expect("the exact config and record should be reusable");
+
+        assert_eq!(cached.config.id, "openai-codex:gpt-5.6-terra");
+        assert_eq!(cached.record.slug, "gpt-5.6-terra");
+        assert!(cached.record.use_responses_lite);
+        assert!(cached_explicit_codex_model_from_state(
+            &state,
+            "openai-codex:gpt-5.6-terra",
+            Some("acct-2")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn explicit_codex_cached_record_lookup_rejects_account_mismatch() {
+        let (config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let state = explicit_cache_state_for_test(&config, &record);
+
+        assert!(explicit_codex_model_record_from_state(&state, &config, Some("acct-2")).is_err());
+    }
+
+    #[test]
+    fn foreign_codex_requests_do_not_require_quick_catalog_metadata() {
+        let (config, _) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("explicit Terra entry should map");
+        let state = RuntimeModelsState {
+            models: vec![],
+            models_by_id: HashMap::from([(config.id.clone(), config.clone())]),
+            codex_selected_model: None,
+            explicit_codex_configs_by_id: HashMap::new(),
+            explicit_codex_records_by_id: HashMap::new(),
+        };
+
+        assert_eq!(
+            codex_model_record_for_request_with_state(&state, &config, Some("acct-1"))
+                .expect("ordinary foreign Codex configs keep their legacy request contract"),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_codex_cached_record_lookup_rejects_slug_mismatch() {
+        let (mut config, record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("catalog entry should map");
+        let state = explicit_cache_state_for_test(&config, &record);
+        config.model = "gpt-5.6-luna".to_string();
+
+        assert!(explicit_codex_model_record_from_state(&state, &config, Some("acct-1")).is_err());
+    }
+
+    #[test]
+    fn codex_model_record_for_request_with_state_uses_metadata_only_for_the_selected_alias(
+    ) -> Result<()> {
+        let mut selected_record = selected_model_record_for_test();
+        selected_record.slug = "gpt-5.6-luna".to_string();
+        selected_record.use_responses_lite = false;
+        let selected_config = dynamic_codex_model_config(&selected_record);
+        let (terra_config, terra_record) = build_explicit_codex_runtime_entry(
+            "openai-codex:gpt-5.6-terra",
+            &remote_model("gpt-5.6-terra", true, true, &[CodexInputModality::Text]),
+            Some("etag-1".to_string()),
+            "acct-1",
+        )
+        .expect("explicit Terra entry should map");
+        let state = RuntimeModelsState {
+            models: vec![selected_config.clone()],
+            models_by_id: HashMap::from([
+                (selected_config.id.clone(), selected_config.clone()),
+                (terra_config.id.clone(), terra_config.clone()),
+            ]),
+            codex_selected_model: Some(selected_record),
+            explicit_codex_configs_by_id: HashMap::from([(
+                terra_config.id.clone(),
+                terra_config.clone(),
+            )]),
+            explicit_codex_records_by_id: HashMap::from([(terra_config.id.clone(), terra_record)]),
+        };
+
+        assert_eq!(
+            codex_model_record_for_request_with_state(&state, &selected_config, Some("acct-1"))?
+                .unwrap()
+                .slug,
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            codex_model_record_for_request_with_state(&state, &terra_config, Some("acct-1"))?,
+            None
+        );
+        assert_eq!(
+            codex_model_record_for_request_with_state(&state, &terra_config, Some("acct-2"))?,
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn selected_model_config_maps_image_capability_from_modalities() {
+        let record = CodexSelectedModelRecord {
+            metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
+            account_id: Some("acct-1".to_string()),
+            slug: "gpt-5.4".to_string(),
+            display_name: "GPT-5.4".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![CodexReasoningEffortOption {
+                effort: "medium".to_string(),
+                description: "medium".to_string(),
+            }],
+            selected_reasoning_level: None,
+            web_search_tool_type: CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            use_responses_lite: false,
+            fetched_at: Utc::now(),
+        };
+
+        let config = dynamic_codex_model_config(&record);
+
+        assert_eq!(config.id, OPENAI_CODEX_SELECTED_MODEL_ID);
+        assert_eq!(config.provider, ThirdPartyProvider::OpenAICodex);
+        assert!(config.image);
+        assert!(!config.audio);
+        assert!(!config.video);
+        assert!(config.tools);
+        assert_eq!(config.name, "gpt-5.4 medium");
+    }
+
+    #[test]
+    fn codex_selected_model_label_prefers_selected_reasoning_level() {
+        let record = CodexSelectedModelRecord {
+            metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
+            account_id: Some("acct-1".to_string()),
+            slug: "gpt-5.4".to_string(),
+            display_name: "GPT-5.4".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![],
+            selected_reasoning_level: Some("high".to_string()),
+            web_search_tool_type: CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            use_responses_lite: false,
+            fetched_at: Utc::now(),
+        };
+
+        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 high");
+    }
+
+    #[test]
+    fn selected_model_account_binding_fails_closed() {
+        let record = CodexSelectedModelRecord {
+            metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
+            account_id: Some("acct-1".to_string()),
+            slug: "gpt-5.4".to_string(),
+            display_name: "GPT-5.4".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: vec![],
+            selected_reasoning_level: None,
+            web_search_tool_type: CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            use_responses_lite: false,
+            fetched_at: Utc::now(),
+        };
+
+        assert!(selected_model_matches_account(&record, Some("acct-1")));
+        assert!(!selected_model_matches_account(&record, Some("acct-2")));
+        assert!(!selected_model_matches_account(&record, None));
+    }
+
+    #[test]
+    fn legacy_selected_model_record_deserializes_but_remains_unbound() {
+        let raw = r#"{
+            "slug":"gpt-5.4",
+            "display_name":"GPT-5.4",
+            "fetched_at":"2026-07-09T00:00:00Z"
+        }"#;
+
+        let record: CodexSelectedModelRecord = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(record.account_id, None);
+        assert_eq!(record.metadata_version, 0);
+        assert!(!record.use_responses_lite);
+        assert!(!selected_model_matches_account(&record, Some("acct-1")));
+    }
+
+    #[test]
+    fn selected_model_record_copies_responses_lite_capability() {
+        let model = CodexRemoteModel {
+            slug: "gpt-5.6-luna".to_string(),
+            display_name: "GPT-5.6-Luna".to_string(),
+            description: None,
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![],
+            visibility: crate::llm::openai_codex::CodexModelVisibility::List,
+            supported_in_api: true,
+            priority: 3,
+            web_search_tool_type: CodexWebSearchToolType::TextAndImage,
+            input_modalities: vec![CodexInputModality::Text],
+            supports_search_tool: true,
+            use_responses_lite: true,
+        };
+
+        let record = build_codex_selected_model_record(&model, None, "acct-1", None);
+
+        assert_eq!(
+            record.metadata_version,
+            CODEX_SELECTED_MODEL_METADATA_VERSION
+        );
+        assert!(record.use_responses_lite);
+    }
+
+    #[test]
+    fn metadata_refresh_decision_rehydrates_legacy_record_even_when_etag_is_unchanged() {
+        let mut record = selected_model_record_for_test();
+        record.metadata_version = 0;
+        record.etag = Some("models-v1".to_string());
+
+        assert!(selected_codex_model_needs_metadata_refresh(
+            &record,
+            Some("models-v1")
+        ));
+    }
+
+    #[test]
+    fn metadata_refresh_decision_skips_current_record_when_etag_is_unchanged() {
+        let mut record = selected_model_record_for_test();
+        record.metadata_version = CODEX_SELECTED_MODEL_METADATA_VERSION;
+        record.etag = Some("models-v1".to_string());
+
+        assert!(!selected_codex_model_needs_metadata_refresh(
+            &record,
+            Some("models-v1")
+        ));
+    }
+
+    #[test]
+    fn selected_alias_rehydration_validation_fails_closed_for_slug_and_account_changes() {
+        let record = selected_model_record_for_test();
+        let mut config = dynamic_codex_model_config(&record);
+
+        assert!(
+            validate_selected_codex_model_for_request(&config, Some(&record), Some("acct-1"))
+                .unwrap()
+                .is_some()
+        );
+
+        config.model = "different-model".to_string();
+        assert!(
+            validate_selected_codex_model_for_request(&config, Some(&record), Some("acct-1"))
+                .is_err()
+        );
+
+        config.model = record.slug.clone();
+        assert!(
+            validate_selected_codex_model_for_request(&config, Some(&record), Some("acct-2"))
+                .is_err()
+        );
+        assert!(validate_selected_codex_model_for_request(&config, None, Some("acct-1")).is_err());
+    }
+
+    #[test]
+    fn selected_alias_rehydration_ignores_public_openai_provider() {
+        let record = selected_model_record_for_test();
+        let mut config = dynamic_codex_model_config(&record);
+        config.provider = ThirdPartyProvider::OpenAI;
+
+        assert!(
+            validate_selected_codex_model_for_request(&config, Some(&record), Some("acct-1"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    pub(super) fn selected_model_record_for_test() -> CodexSelectedModelRecord {
+        CodexSelectedModelRecord {
+            metadata_version: CODEX_SELECTED_MODEL_METADATA_VERSION,
+            account_id: Some("acct-1".to_string()),
+            slug: "catalog-model".to_string(),
+            display_name: "Catalog Model".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: vec![],
+            selected_reasoning_level: None,
+            web_search_tool_type: CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            use_responses_lite: true,
+            fetched_at: Utc::now(),
+        }
+    }
+
+    pub(super) fn remote_model(
+        slug: &str,
+        supports_search_tool: bool,
+        use_responses_lite: bool,
+        input_modalities: &[CodexInputModality],
+    ) -> CodexRemoteModel {
+        CodexRemoteModel {
+            slug: slug.to_string(),
+            display_name: "GPT 5.6 Terra".to_string(),
+            description: Some("Catalog model".to_string()),
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![CodexReasoningEffortOption {
+                effort: "medium".to_string(),
+                description: "Balanced".to_string(),
+            }],
+            visibility: crate::llm::openai_codex::CodexModelVisibility::List,
+            supported_in_api: true,
+            priority: 1,
+            web_search_tool_type: CodexWebSearchToolType::TextAndImage,
+            input_modalities: input_modalities.to_vec(),
+            supports_search_tool,
+            use_responses_lite,
+        }
+    }
+
+    pub(super) fn explicit_cache_state_for_test(
+        config: &ThirdPartyModelConfig,
+        record: &CodexSelectedModelRecord,
+    ) -> RuntimeModelsState {
+        RuntimeModelsState {
+            models: vec![],
+            models_by_id: HashMap::from([(config.id.clone(), config.clone())]),
+            codex_selected_model: None,
+            explicit_codex_configs_by_id: HashMap::from([(config.id.clone(), config.clone())]),
+            explicit_codex_records_by_id: HashMap::from([(config.id.clone(), record.clone())]),
+        }
+    }
+}
