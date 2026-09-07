@@ -47,7 +47,7 @@ pub(crate) fn resolve_exact_model_identifier_with_models(
     None
 }
 
-pub(crate) fn resolve_alias_to_model_id_with_models(
+fn resolve_alias_to_model_id_with_models(
     identifier: &str,
     models: &[ThirdPartyModelConfig],
     alias_map: &[(&str, &str)],
@@ -90,7 +90,7 @@ pub(crate) fn resolve_alias_to_model_id_with_models(
     None
 }
 
-pub(crate) fn resolve_keyword_alias_with_models(
+fn resolve_keyword_alias_with_models(
     identifier: &str,
     models: &[ThirdPartyModelConfig],
 ) -> Option<String> {
@@ -145,7 +145,7 @@ pub(crate) fn normalize_model_identifier(identifier: &str) -> String {
         .unwrap_or_else(|| normalize_model_identifier_with_models(identifier, &models, &[]))
 }
 
-pub(crate) fn is_third_party_model_available(config: &ThirdPartyModelConfig) -> bool {
+fn is_third_party_model_available(config: &ThirdPartyModelConfig) -> bool {
     is_runtime_provider_ready(config.provider)
 }
 
@@ -157,7 +157,7 @@ pub(crate) fn ready_runtime_providers(models: &[ThirdPartyModelConfig]) -> Vec<T
         .collect()
 }
 
-pub(crate) fn is_third_party_model_available_with_ready_providers(
+fn is_third_party_model_available_with_ready_providers(
     config: &ThirdPartyModelConfig,
     ready_providers: &[ThirdPartyProvider],
 ) -> bool {
@@ -303,7 +303,7 @@ pub(crate) fn resolve_default_text_model_for_request(
     .map_err(|message| anyhow!(message))
 }
 
-pub(crate) fn third_party_model_matches_request_capabilities(
+fn third_party_model_matches_request_capabilities(
     config: &ThirdPartyModelConfig,
     has_images: bool,
     has_video: bool,
