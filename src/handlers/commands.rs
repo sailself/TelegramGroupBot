@@ -2744,7 +2744,6 @@ Use the same language as the summary text for any labels.\
     Ok(())
 }
 
-#[allow(deprecated)]
 pub async fn factcheck_handler(
     bot: Bot,
     state: AppState,
@@ -2973,14 +2972,18 @@ pub async fn factcheck_handler(
                 text,
                 model_display,
             }) => {
-                let response_with_model = format!("{}\n\nModel: {}", text, model_display);
+                let response_with_model = format!(
+                    "{}\n\nModel: {}",
+                    markdown_to_telegram_html(&text),
+                    escape_html(&model_display)
+                );
                 send_response(
                     &bot,
                     processing_message.chat.id,
                     processing_message.id,
                     &response_with_model,
                     "Fact Check",
-                    ParseMode::Markdown,
+                    ParseMode::Html,
                 )
                 .await?;
                 return Ok(());
@@ -3028,7 +3031,11 @@ pub async fn factcheck_handler(
     };
 
     let (response_text, response_model) = response;
-    let response_with_model = format!("{}\n\nModel: {}", response_text, response_model);
+    let response_with_model = format!(
+        "{}\n\nModel: {}",
+        markdown_to_telegram_html(&response_text),
+        escape_html(&response_model)
+    );
 
     send_response(
         &bot,
@@ -3036,7 +3043,7 @@ pub async fn factcheck_handler(
         processing_message.id,
         &response_with_model,
         "Fact Check",
-        ParseMode::Markdown,
+        ParseMode::Html,
     )
     .await?;
 
