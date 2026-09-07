@@ -30,7 +30,7 @@ use handlers::commands::{
     IMAGE_MODEL_CALLBACK_PREFIX, IMAGE_RESOLUTION_CALLBACK_PREFIX,
 };
 use handlers::qa::MODEL_CALLBACK_PREFIX;
-use handlers::{commands, qa};
+use handlers::{commands, media, qa};
 use state::AppState;
 use utils::logging::init_logging;
 
@@ -450,7 +450,7 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
 }
 
 async fn handle_media_group(state: AppState, message: Message) -> HandlerResult {
-    commands::handle_media_group(state, message).await;
+    media::handle_media_group(state, message).await;
     Ok(())
 }
 

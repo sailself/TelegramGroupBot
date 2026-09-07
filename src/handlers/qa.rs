@@ -17,12 +17,11 @@ use crate::config::{
 use crate::db::database::build_message_insert;
 use crate::db::models::MessageInsert;
 use crate::handlers::access::{check_access_control, is_rate_limited};
-use crate::handlers::commands::message_has_image;
 use crate::handlers::content::{
     download_telegraph_media, download_twitter_media, extract_telegraph_urls_and_content,
     extract_twitter_urls_and_content, extract_youtube_urls,
 };
-use crate::handlers::media::{collect_message_media, MediaCollectionOptions};
+use crate::handlers::media::{collect_message_media, message_has_image, MediaCollectionOptions};
 use crate::handlers::responses::send_response;
 use crate::llm::audit::{
     audit_context_from_id, create_audit_context_from_message, LlmAuditContext,

@@ -24,9 +24,11 @@ use crate::handlers::access::{check_access_control, check_admin_access, is_rate_
 use crate::handlers::content::{
     create_telegraph_page, extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
 };
-use crate::handlers::media::{collect_message_media, get_file_url, MediaCollectionOptions};
+use crate::handlers::media::{
+    collect_message_media, get_file_url, message_has_image, MediaCollectionOptions,
+};
 use crate::handlers::responses::send_response;
-use crate::llm::audit::LLM_TRIGGER_KIND_COMMAND;
+use crate::llm::audit::create_command_audit_context;
 use crate::llm::gemini::ImageGenerationError;
 use crate::llm::media::{detect_mime_type, summarize_media_files, MediaSummary};
 use crate::llm::openai_codex;
@@ -34,14 +36,11 @@ use crate::llm::runtime_models::{runtime_model_count, selected_codex_model_recor
 use crate::llm::text_model::call_configured_text_model;
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
-    audit_context_from_id, call_gemini, create_audit_context_from_message,
-    generate_image_with_codex, generate_image_with_gemini, generate_image_with_img2,
-    generate_music_with_lyria, generate_video_with_veo, CodexImageConfig, GeminiCallRequest,
-    GeminiImageConfig, LlmAuditContext,
+    audit_context_from_id, call_gemini, generate_image_with_codex, generate_image_with_gemini,
+    generate_image_with_img2, generate_music_with_lyria, generate_video_with_veo, CodexImageConfig,
+    GeminiCallRequest, GeminiImageConfig, LlmAuditContext,
 };
-use crate::state::{
-    AppState, ImageGenerationModel, MediaGroupItem, PendingImageCommand, PendingImageRequest,
-};
+use crate::state::{AppState, ImageGenerationModel, PendingImageCommand, PendingImageRequest};
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::logging::read_recent_log_lines;
@@ -148,15 +147,6 @@ enum TokenStatsView {
     Total,
     Model,
     User,
-}
-
-async fn create_command_audit_context(
-    state: &AppState,
-    message: &Message,
-    trigger_name: &str,
-) -> Option<LlmAuditContext> {
-    create_audit_context_from_message(&state.db, LLM_TRIGGER_KIND_COMMAND, trigger_name, message)
-        .await
 }
 
 fn format_compact_token_count(tokens: i64) -> String {
@@ -1087,43 +1077,6 @@ fn build_img2_spoiler_photo_media(input_file: InputFile, caption: &str) -> Input
             .parse_mode(ParseMode::Html)
             .spoiler(),
     )
-}
-
-pub(crate) fn message_has_image(message: &Message) -> bool {
-    if message.photo().is_some() {
-        return true;
-    }
-
-    if let Some(document) = message.document() {
-        let mime_is_image = document
-            .mime_type
-            .as_ref()
-            .map(|mime| mime.essence_str().starts_with("image/"))
-            .unwrap_or(false);
-        let name_is_image = document
-            .file_name
-            .as_ref()
-            .map(|name| {
-                let lower = name.to_ascii_lowercase();
-                lower.ends_with(".png")
-                    || lower.ends_with(".jpg")
-                    || lower.ends_with(".jpeg")
-                    || lower.ends_with(".webp")
-                    || lower.ends_with(".gif")
-            })
-            .unwrap_or(false);
-        if mime_is_image || name_is_image {
-            return true;
-        }
-    }
-
-    if let Some(sticker) = message.sticker() {
-        if !sticker.flags.is_animated && !sticker.flags.is_video {
-            return true;
-        }
-    }
-
-    false
 }
 
 async fn send_video_with_retry(
@@ -3909,21 +3862,6 @@ pub async fn start_handler(bot: Bot, message: Message) -> Result<()> {
     .reply_parameters(ReplyParameters::new(message.id))
     .await?;
     Ok(())
-}
-
-pub async fn handle_media_group(state: AppState, message: Message) {
-    if let Some(media_group_id) = message.media_group_id() {
-        if let Some(photo_sizes) = message.photo() {
-            if let Some(photo) = photo_sizes.last() {
-                state.store_media_group_item(
-                    media_group_id,
-                    MediaGroupItem {
-                        file_id: photo.file.id.clone(),
-                    },
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]

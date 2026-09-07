@@ -26,7 +26,7 @@ pub(crate) enum CodexPromptStyle {
     FreeformAnswer,
 }
 
-pub use audit::{audit_context_from_id, create_audit_context_from_message, LlmAuditContext};
+pub use audit::{audit_context_from_id, LlmAuditContext};
 pub use codex_image::{generate_image_with_codex, CodexImageConfig};
 pub use gemini::{
     call_gemini, call_gemini_with_tool_runtime, generate_image_with_gemini,
