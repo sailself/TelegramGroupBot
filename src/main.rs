@@ -15,6 +15,7 @@ mod config;
 mod db;
 mod handlers;
 mod llm;
+mod prompts;
 mod state;
 mod tools;
 mod utils;
