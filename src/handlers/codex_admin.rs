@@ -392,7 +392,7 @@ pub async fn codex_login_handler(bot: Bot, state: AppState, message: Message) ->
             status_message_id: status_message.id.0 as i64,
             verification_url: start.verification_url.clone(),
             user_code: start.user_code.clone(),
-            started_at: now_unix_seconds() as i64,
+            started_at: now_unix_seconds(),
             cancel_flag: cancel_flag.clone(),
         });
     }
@@ -523,7 +523,7 @@ pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) ->
             account_id,
             chat_id: message.chat.id.0,
             selection_message_id: selection_message.id.0 as i64,
-            timestamp: now_unix_seconds() as i64,
+            timestamp: now_unix_seconds(),
             page,
             etag: list.etag,
             models,
@@ -652,7 +652,7 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
             model_slug: record.slug.clone(),
             chat_id: message.chat.id.0,
             selection_message_id: selection_message.id.0 as i64,
-            timestamp: now_unix_seconds() as i64,
+            timestamp: now_unix_seconds(),
             supported_levels: record.supported_reasoning_levels.clone(),
         },
         Duration::from_secs(crate::config::CONFIG.model_selection_timeout),
@@ -738,7 +738,7 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                     ReasoningAction::Expired
                 }
                 Some(pending)
-                    if (now_unix_seconds() as i64) - pending.timestamp
+                    if now_unix_seconds() - pending.timestamp
                         > crate::config::CONFIG.model_selection_timeout as i64 =>
                 {
                     pending_map.take();
@@ -864,7 +864,7 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                 if pending.admin_user_id != query_user_id {
                     CallbackAction::Ignore
                 } else if callback_account_id.as_deref() != Some(pending.account_id.as_str())
-                    || (now_unix_seconds() as i64) - pending.timestamp
+                    || now_unix_seconds() - pending.timestamp
                         > crate::config::CONFIG.model_selection_timeout as i64
                 {
                     pending_map.take();

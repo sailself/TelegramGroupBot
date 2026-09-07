@@ -1298,7 +1298,7 @@ fn build_chat_search_pending_request(
         selection_message_id,
         original_user_id: user_id,
         llm_invocation_id: audit_context.map(|context| context.invocation_id),
-        timestamp: now_unix_seconds() as i64,
+        timestamp: now_unix_seconds(),
         command_timer,
         mode: QaCommandMode::ChatSearch,
     }
@@ -3350,7 +3350,7 @@ async fn q_handler_internal(
             selection_message_id: processing_message.id.0 as i64,
             original_user_id: user_id,
             llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
-            timestamp: now_unix_seconds() as i64,
+            timestamp: now_unix_seconds(),
             command_timer: None,
             mode,
         };
@@ -3415,7 +3415,7 @@ async fn q_handler_internal(
         selection_message_id: selection_message.id.0 as i64,
         original_user_id: user_id,
         llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
-        timestamp: now_unix_seconds() as i64,
+        timestamp: now_unix_seconds(),
         command_timer: Some(timer),
         mode,
     };
@@ -3770,7 +3770,7 @@ pub async fn model_selection_callback(
         take_pending_q_request_for_callback(
             &mut pending,
             query_user_id,
-            now_unix_seconds() as i64,
+            now_unix_seconds(),
             CONFIG.model_selection_timeout,
             |request| {
                 let summary = summarize_media_files(&request.media_files);
