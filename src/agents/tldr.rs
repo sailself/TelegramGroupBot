@@ -10,11 +10,11 @@ use tracing::{info, warn};
 use crate::agents::step::{call_step_text, resolve_step_model, StepModel, WallClock};
 use crate::config::{CONFIG, TLDR_CHUNK_PROMPT, TLDR_MERGE_PROMPT};
 use crate::db::models::MessageRow;
-use crate::handlers::{format_tldr_chat_content, neutralize_closing_tag, wrap_chat_history};
+use crate::handlers::{format_tldr_chat_content, wrap_chat_history};
 use crate::llm::text_model::{call_configured_text_model, resolve_default_text_model_for_request};
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::text::truncate_for_log;
+use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 
 const CHUNK_SUMMARY_MAX_CHARS: usize = 4_000;
 const DEGRADED_TAIL_MESSAGES: usize = 30;

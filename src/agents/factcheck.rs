@@ -17,14 +17,13 @@ use crate::config::{
     LANGUAGE_POLICY,
 };
 use crate::handlers::media::MediaSummary;
-use crate::handlers::neutralize_closing_tag;
 use crate::llm::media::MediaFile;
 use crate::llm::runtime_models::runtime_model_config;
 use crate::llm::text_model::{call_configured_text_model, resolve_default_text_model_for_request};
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::text::truncate_for_log;
+use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 
 const EVIDENCE_BLOCK_MAX_CHARS: usize = 2_000;
 const EXTRACTION_INPUT_MAX_CHARS: usize = 24_000;
