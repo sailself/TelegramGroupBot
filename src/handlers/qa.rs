@@ -49,6 +49,7 @@ use crate::llm::{
 };
 use crate::state::{AppState, PendingEntryGuard, PendingQRequest, QaCommandMode};
 use crate::tools::external_media::ExternalMediaBudget;
+use crate::utils::markdown::markdown_to_telegram_html;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::{
     build_message_link, message_entities_for_text, message_text_or_caption, reply_with_retry,
@@ -1304,7 +1305,6 @@ fn build_chat_search_pending_request(
     }
 }
 
-#[allow(deprecated)]
 /// Run a prepared request against `model_name`. `heavy_permit` is the permit a
 /// caller already holds (the direct `/q` path throttles its own preparation);
 /// passing it through avoids taking a second slot from the same semaphore,
@@ -1664,8 +1664,8 @@ async fn process_request(
         );
     }
 
-    let mut response_text =
-        append_quick_search_footer(response, request.mode, quick_search_attempted);
+    let response_text = append_quick_search_footer(response, request.mode, quick_search_attempted);
+    let mut rendered_response = markdown_to_telegram_html(&response_text);
     if !model_name.is_empty() {
         let display_model = result_model_display_name(
             model_name,
@@ -1673,20 +1673,20 @@ async fn process_request(
             request.mode,
             explicit_codex,
         );
-        response_text.push_str(&format!("\n\nModel: {}", display_model));
+        rendered_response.push_str(&format!("\n\nModel: {}", escape_html(&display_model)));
     }
 
     send_response(
         bot,
         ChatId(request.chat_id),
         MessageId(request.selection_message_id as i32),
-        &response_text,
+        &rendered_response,
         if request.mode == QaCommandMode::ChatContext {
             "Answer about Chat"
         } else {
             "Answer to Your Question"
         },
-        ParseMode::Markdown,
+        ParseMode::Html,
     )
     .await?;
 
@@ -2975,7 +2975,6 @@ fn build_q_command_insert(
     )
 }
 
-#[allow(deprecated)]
 async fn q_handler_internal(
     bot: Bot,
     state: AppState,
@@ -3373,7 +3372,7 @@ async fn q_handler_internal(
     let has_media = has_images || has_video || has_audio || has_documents;
     let mut selection_text = "Please select which AI model to use for your question:".to_string();
     if has_media {
-        selection_text.push_str("\n\n*Note: Only models that support media are shown.*");
+        selection_text.push_str("\n\n<i>Note: Only models that support media are shown.</i>");
     }
 
     let keyboard = create_model_selection_keyboard(
@@ -3388,7 +3387,7 @@ async fn q_handler_internal(
         message.chat.id,
         &selection_text,
         Some(message.id),
-        Some(ParseMode::Markdown),
+        Some(ParseMode::Html),
         Some(keyboard),
     )
     .await?;
