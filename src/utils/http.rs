@@ -73,6 +73,27 @@ pub fn parse_https_allowlisted(
     value: &str,
     allowed_hosts: Option<&[&str]>,
 ) -> anyhow::Result<url::Url> {
+    parse_https_allowlisted_inner(name, value, allowed_hosts, false)
+}
+
+/// Same as [`parse_https_allowlisted`], but permits a query string. Some
+/// allowlisted CDNs attach one to every real URL (Twitter's media hosts
+/// serve `?format=jpg&name=orig`-style query strings), so a media-URL
+/// validator needs this instead of the stricter default.
+pub fn parse_https_allowlisted_with_query(
+    name: &str,
+    value: &str,
+    allowed_hosts: Option<&[&str]>,
+) -> anyhow::Result<url::Url> {
+    parse_https_allowlisted_inner(name, value, allowed_hosts, true)
+}
+
+fn parse_https_allowlisted_inner(
+    name: &str,
+    value: &str,
+    allowed_hosts: Option<&[&str]>,
+    allow_query: bool,
+) -> anyhow::Result<url::Url> {
     let parsed = url::Url::parse(value.trim())
         .map_err(|err| anyhow::anyhow!("{name} must be a valid HTTPS URL: {err}"))?;
     if parsed.scheme() != "https" {
@@ -85,7 +106,7 @@ pub fn parse_https_allowlisted(
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(anyhow::anyhow!("{name} must not contain credentials"));
     }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
+    if (!allow_query && parsed.query().is_some()) || parsed.fragment().is_some() {
         return Err(anyhow::anyhow!(
             "{name} must not contain a query or fragment"
         ));
@@ -175,6 +196,30 @@ mod tests {
         ] {
             assert!(parse_https_allowlisted("x", bad, None).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn https_allowlist_with_query_accepts_a_query_but_still_rejects_fragment_and_bad_host() {
+        let hosts = ["pbs.twimg.com", "video.twimg.com"];
+        let ok = parse_https_allowlisted_with_query(
+            "m",
+            "https://pbs.twimg.com/media/a.jpg?format=jpg&name=orig",
+            Some(&hosts),
+        )
+        .unwrap();
+        assert_eq!(ok.query(), Some("format=jpg&name=orig"));
+        assert!(parse_https_allowlisted_with_query(
+            "m",
+            "https://pbs.twimg.com/media/a.jpg#frag",
+            Some(&hosts)
+        )
+        .is_err());
+        assert!(parse_https_allowlisted_with_query(
+            "m",
+            "https://evil.pbs.twimg.com/media/a.jpg?format=jpg",
+            Some(&hosts)
+        )
+        .is_err());
     }
 
     #[test]

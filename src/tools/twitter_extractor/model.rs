@@ -4,6 +4,7 @@ use ::url::Url;
 use anyhow::{anyhow, Result};
 
 use super::url::XStatusIdentity;
+use crate::utils::http::parse_https_allowlisted_with_query;
 
 #[derive(Debug, Clone)]
 pub struct TwitterContent {
@@ -56,25 +57,14 @@ pub(crate) enum XMedia {
 }
 
 pub(crate) fn parse_allowed_media_url(raw_url: &str) -> Result<Url> {
-    let parsed =
-        Url::parse(raw_url.trim()).map_err(|error| anyhow!("invalid media URL: {error}"))?;
-    if parsed.scheme() != "https" {
-        return Err(anyhow!("media URL must use HTTPS"));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(anyhow!("media URL must not contain credentials"));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow!("media URL has no host"))?
-        .to_ascii_lowercase();
-    if host != "pbs.twimg.com" && host != "video.twimg.com" {
-        return Err(anyhow!("media URL host is not allowlisted"));
-    }
-    if parsed.port().is_some_and(|port| port != 443) {
-        return Err(anyhow!("media URL has a non-default port"));
-    }
-    Ok(parsed)
+    // Twitter's CDN attaches a query string to real media URLs
+    // (`?format=jpg&name=orig`), so this allows one; `parse_https_allowlisted`
+    // stays the stricter default other callers use.
+    parse_https_allowlisted_with_query(
+        "twitter media",
+        raw_url,
+        Some(&["pbs.twimg.com", "video.twimg.com"]),
+    )
 }
 
 pub(crate) fn validate_complete_post(post: &XPost) -> Result<()> {

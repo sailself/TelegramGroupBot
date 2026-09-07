@@ -15,7 +15,7 @@ use crate::config::CONFIG;
 use crate::llm::media::{detect_mime_type, MediaFile, MediaKind};
 use crate::tools::telegraph_extractor::TelegraphContent;
 use crate::tools::twitter_extractor::{parse_allowed_media_url, TwitterAttachment, TwitterContent};
-use crate::utils::http::get_http_client_no_redirect;
+use crate::utils::http::{get_http_client_no_redirect, parse_https_allowlisted};
 
 #[derive(Clone, Debug)]
 pub struct ExternalMediaBudget {
@@ -303,21 +303,11 @@ pub(crate) fn twitter_video_request(
 }
 
 fn telegraph_media_url(raw_url: &str) -> Result<Url> {
-    let parsed = Url::parse(raw_url.trim())?;
-    if parsed.scheme() != "https" {
-        bail!("Telegraph media must use HTTPS")
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        bail!("Telegraph media must not contain credentials")
-    }
-    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    if host != "telegra.ph" && host != "graph.org" {
-        bail!("Telegraph media host is not allowlisted")
-    }
-    if parsed.port().is_some_and(|port| port != 443) {
-        bail!("Telegraph media has a non-default port")
-    }
-    Ok(parsed)
+    parse_https_allowlisted(
+        "telegraph media",
+        raw_url,
+        Some(&["telegra.ph", "graph.org"]),
+    )
 }
 
 fn validate_media_url(url: &str, source: MediaSource) -> Result<Url> {
