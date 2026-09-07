@@ -3573,7 +3573,6 @@ pub async fn paintme_handler(
     Ok(())
 }
 
-#[allow(deprecated)]
 fn filter_gemini_help_text(help_text: &str, gemini_available: bool) -> String {
     let mut text = help_text.to_string();
     if gemini_available {
@@ -3839,18 +3838,19 @@ pub async fn token_stats_handler(
     Ok(())
 }
 
-#[allow(deprecated)]
 pub async fn support_handler(bot: Bot, message: Message) -> Result<()> {
     if !check_access_control(&bot, &message, "support").await {
         return Ok(());
     }
 
+    let support_message = escape_html(&CONFIG.support_message);
+
     let support_url = match reqwest::Url::parse(CONFIG.support_link.trim()) {
         Ok(url) => url,
         Err(_) => {
-            bot.send_message(message.chat.id, CONFIG.support_message.clone())
+            bot.send_message(message.chat.id, support_message)
                 .reply_parameters(ReplyParameters::new(message.id))
-                .parse_mode(ParseMode::Markdown)
+                .parse_mode(ParseMode::Html)
                 .await?;
             return Ok(());
         }
@@ -3861,10 +3861,10 @@ pub async fn support_handler(bot: Bot, message: Message) -> Result<()> {
         support_url,
     )]]);
 
-    bot.send_message(message.chat.id, CONFIG.support_message.clone())
+    bot.send_message(message.chat.id, support_message)
         .reply_parameters(ReplyParameters::new(message.id))
         .reply_markup(keyboard)
-        .parse_mode(ParseMode::Markdown)
+        .parse_mode(ParseMode::Html)
         .await?;
     Ok(())
 }
