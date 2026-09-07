@@ -3,10 +3,15 @@ use anyhow::{anyhow, Result};
 use crate::config::{
     parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
 };
+use crate::handlers::media::summarize_media_files;
+use crate::llm::audit::LlmAuditContext;
 use crate::llm::runtime_models::{
-    is_runtime_provider_ready, resolve_runtime_model_identifier, runtime_model_config,
-    runtime_models, OPENAI_CODEX_SELECTED_MODEL_ID,
+    codex_selected_model_label, is_runtime_provider_ready, resolve_runtime_model_identifier,
+    runtime_model_config, runtime_models, selected_codex_model_record,
+    OPENAI_CODEX_SELECTED_MODEL_ID,
 };
+use crate::llm::tool_runtime::ToolRuntime;
+use crate::llm::{call_gemini, call_third_party, GeminiCallRequest};
 
 pub const MODEL_GEMINI: &str = "gemini";
 
@@ -359,6 +364,89 @@ pub(crate) fn available_third_party_models_for_request<'a>(
             )
         })
         .collect()
+}
+
+pub(crate) fn default_text_model_display_name(
+    model_name: &str,
+    gemini_model_used: Option<&str>,
+) -> String {
+    if model_name == MODEL_GEMINI {
+        return gemini_model_used
+            .unwrap_or(CONFIG.gemini_model.as_str())
+            .to_string();
+    }
+
+    if let Some(config) = runtime_model_config(model_name) {
+        if config.provider == ThirdPartyProvider::OpenAICodex {
+            if let Some(record) = selected_codex_model_record() {
+                if record.slug == config.model {
+                    return codex_selected_model_label(&record);
+                }
+            }
+        }
+        return config.model;
+    }
+
+    model_name.to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_configured_text_model(
+    system_prompt: &str,
+    user_content: &str,
+    response_title: &str,
+    tools_enabled: bool,
+    use_pro: bool,
+    media_files: Option<Vec<crate::llm::media::MediaFile>>,
+    prompt_name: Option<&str>,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<(String, String)> {
+    let media_summary = media_files
+        .as_ref()
+        .map(|files| summarize_media_files(files))
+        .unwrap_or_default();
+    let model_name = resolve_default_text_model_for_request(
+        media_summary.images > 0,
+        media_summary.videos > 0,
+        media_summary.audios > 0,
+        media_summary.documents > 0,
+        tools_enabled,
+    )?;
+
+    if model_name == MODEL_GEMINI {
+        let response = call_gemini(GeminiCallRequest {
+            system_prompt,
+            user_content,
+            use_search_grounding: tools_enabled,
+            use_pro_model: use_pro,
+            media_files: media_files.unwrap_or_default(),
+            youtube_urls: Vec::new(),
+            system_prompt_label: prompt_name,
+            audit_context,
+        })
+        .await?;
+        let model_used = response.model_used;
+        return Ok((response.text, model_used));
+    }
+
+    let media_files = media_files.unwrap_or_default();
+    let mut web_tools = tools_enabled.then(ToolRuntime::for_web_search);
+    let response = call_third_party(
+        system_prompt,
+        user_content,
+        &model_name,
+        response_title,
+        &media_files,
+        web_tools.as_mut(),
+        crate::llm::ThirdPartyCallOptions::new(
+            audit_context,
+            crate::llm::CodexPromptStyle::TaskSpecific,
+        ),
+    )
+    .await?;
+    let model_used = default_text_model_display_name(&model_name, None);
+
+    Ok((response, model_used))
 }
 
 #[cfg(test)]

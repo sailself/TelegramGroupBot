@@ -16,8 +16,8 @@ use teloxide::RequestError;
 
 use crate::agents::factcheck::{run_factcheck_pipeline, FactcheckOutcome};
 use crate::config::{
-    Config, ThirdPartyProvider, CONFIG, FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY,
-    PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
+    Config, CONFIG, FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY, PAINTME_SYSTEM_PROMPT,
+    PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT, TLDR_SYSTEM_PROMPT,
 };
 use crate::db::models::{ModelTokenStat, TokenUserStat};
 use crate::handlers::access::{check_access_control, check_admin_access, is_rate_limited};
@@ -28,21 +28,16 @@ use crate::handlers::media::{
     collect_message_media, get_file_url, summarize_media_files, MediaCollectionOptions,
     MediaSummary,
 };
-use crate::handlers::qa::MODEL_GEMINI;
 use crate::handlers::responses::send_response;
 use crate::llm::audit::LLM_TRIGGER_KIND_COMMAND;
 use crate::llm::gemini::ImageGenerationError;
 use crate::llm::media::detect_mime_type;
 use crate::llm::openai_codex;
-use crate::llm::runtime_models::{
-    codex_selected_model_label, runtime_model_config, runtime_model_count,
-    selected_codex_model_record,
-};
-use crate::llm::text_model::resolve_default_text_model_for_request;
-use crate::llm::tool_runtime::ToolRuntime;
+use crate::llm::runtime_models::{runtime_model_count, selected_codex_model_record};
+use crate::llm::text_model::call_configured_text_model;
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
-    audit_context_from_id, call_gemini, call_third_party, create_audit_context_from_message,
+    audit_context_from_id, call_gemini, create_audit_context_from_message,
     generate_image_with_codex, generate_image_with_gemini, generate_image_with_img2,
     generate_music_with_lyria, generate_video_with_veo, CodexImageConfig, GeminiCallRequest,
     GeminiImageConfig, LlmAuditContext,
@@ -161,86 +156,6 @@ async fn create_command_audit_context(
 ) -> Option<LlmAuditContext> {
     create_audit_context_from_message(&state.db, LLM_TRIGGER_KIND_COMMAND, trigger_name, message)
         .await
-}
-
-fn default_text_model_display_name(model_name: &str, gemini_model_used: Option<&str>) -> String {
-    if model_name == MODEL_GEMINI {
-        return gemini_model_used
-            .unwrap_or(CONFIG.gemini_model.as_str())
-            .to_string();
-    }
-
-    if let Some(config) = runtime_model_config(model_name) {
-        if config.provider == ThirdPartyProvider::OpenAICodex {
-            if let Some(record) = selected_codex_model_record() {
-                if record.slug == config.model {
-                    return codex_selected_model_label(&record);
-                }
-            }
-        }
-        return config.model;
-    }
-
-    model_name.to_string()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_configured_text_model(
-    system_prompt: &str,
-    user_content: &str,
-    response_title: &str,
-    tools_enabled: bool,
-    use_pro: bool,
-    media_files: Option<Vec<crate::llm::media::MediaFile>>,
-    prompt_name: Option<&str>,
-    audit_context: Option<&LlmAuditContext>,
-) -> Result<(String, String)> {
-    let media_summary = media_files
-        .as_ref()
-        .map(|files| summarize_media_files(files))
-        .unwrap_or_default();
-    let model_name = resolve_default_text_model_for_request(
-        media_summary.images > 0,
-        media_summary.videos > 0,
-        media_summary.audios > 0,
-        media_summary.documents > 0,
-        tools_enabled,
-    )?;
-
-    if model_name == MODEL_GEMINI {
-        let response = call_gemini(GeminiCallRequest {
-            system_prompt,
-            user_content,
-            use_search_grounding: tools_enabled,
-            use_pro_model: use_pro,
-            media_files: media_files.unwrap_or_default(),
-            youtube_urls: Vec::new(),
-            system_prompt_label: prompt_name,
-            audit_context,
-        })
-        .await?;
-        let model_used = response.model_used;
-        return Ok((response.text, model_used));
-    }
-
-    let media_files = media_files.unwrap_or_default();
-    let mut web_tools = tools_enabled.then(ToolRuntime::for_web_search);
-    let response = call_third_party(
-        system_prompt,
-        user_content,
-        &model_name,
-        response_title,
-        &media_files,
-        web_tools.as_mut(),
-        crate::llm::ThirdPartyCallOptions::new(
-            audit_context,
-            crate::llm::CodexPromptStyle::TaskSpecific,
-        ),
-    )
-    .await?;
-    let model_used = default_text_model_display_name(&model_name, None);
-
-    Ok((response, model_used))
 }
 
 fn format_compact_token_count(tokens: i64) -> String {
