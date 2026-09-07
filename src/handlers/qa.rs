@@ -1115,10 +1115,11 @@ fn format_chat_search_results_html(
     if hits.is_empty() {
         lines.push("No clearly relevant messages were found.".to_string());
     } else {
-        let label_map = super::build_display_label_map(hits.iter().filter_map(|h| {
-            h.user_id
-                .map(|uid| (uid, h.username.as_deref().unwrap_or("Anonymous")))
-        }));
+        let label_map =
+            crate::llm::prompting::build_display_label_map(hits.iter().filter_map(|h| {
+                h.user_id
+                    .map(|uid| (uid, h.username.as_deref().unwrap_or("Anonymous")))
+            }));
         for (index, hit) in hits.iter().enumerate() {
             let raw_label = hit
                 .user_id

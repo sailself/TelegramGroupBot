@@ -8,6 +8,7 @@ pub mod img2_image;
 pub mod jina_search;
 pub mod media;
 pub mod openai_codex;
+pub mod prompting;
 pub mod responses_provider;
 pub mod runtime_models;
 pub mod text_model;

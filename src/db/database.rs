@@ -3192,7 +3192,7 @@ mod tests {
 
     #[tokio::test]
     async fn display_labels_disambiguate_same_name_users_in_chat() {
-        use crate::handlers::{build_display_label_map, format_tldr_chat_content};
+        use crate::llm::prompting::{build_display_label_map, format_tldr_chat_content};
 
         let db = init_test_db("disambiguate-names").await;
         let chat = -1001374348669_i64;

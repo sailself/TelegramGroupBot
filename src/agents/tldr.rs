@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use crate::agents::step::{call_step_text, resolve_step_model, StepModel, WallClock};
 use crate::config::{CONFIG, TLDR_CHUNK_PROMPT, TLDR_MERGE_PROMPT};
 use crate::db::models::MessageRow;
-use crate::handlers::{format_tldr_chat_content, wrap_chat_history};
+use crate::llm::prompting::{format_tldr_chat_content, wrap_chat_history};
 use crate::llm::text_model::{
     call_configured_text_model, resolve_default_text_model_for_request, ModelRequestCapabilities,
 };
