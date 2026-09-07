@@ -24,14 +24,11 @@ use crate::handlers::access::{check_access_control, check_admin_access, is_rate_
 use crate::handlers::content::{
     create_telegraph_page, extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
 };
-use crate::handlers::media::{
-    collect_message_media, get_file_url, summarize_media_files, MediaCollectionOptions,
-    MediaSummary,
-};
+use crate::handlers::media::{collect_message_media, get_file_url, MediaCollectionOptions};
 use crate::handlers::responses::send_response;
 use crate::llm::audit::LLM_TRIGGER_KIND_COMMAND;
 use crate::llm::gemini::ImageGenerationError;
-use crate::llm::media::detect_mime_type;
+use crate::llm::media::{detect_mime_type, summarize_media_files, MediaSummary};
 use crate::llm::openai_codex;
 use crate::llm::runtime_models::{runtime_model_count, selected_codex_model_record};
 use crate::llm::text_model::call_configured_text_model;

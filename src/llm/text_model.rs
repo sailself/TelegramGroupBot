@@ -3,8 +3,8 @@ use anyhow::{anyhow, Result};
 use crate::config::{
     parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
 };
-use crate::handlers::media::summarize_media_files;
 use crate::llm::audit::LlmAuditContext;
+use crate::llm::media::summarize_media_files;
 use crate::llm::runtime_models::{
     codex_selected_model_label, is_runtime_provider_ready, resolve_runtime_model_identifier,
     runtime_model_config, runtime_models, selected_codex_model_record,

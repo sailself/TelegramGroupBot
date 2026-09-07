@@ -22,14 +22,13 @@ use crate::handlers::content::{
     download_telegraph_media, download_twitter_media, extract_telegraph_urls_and_content,
     extract_twitter_urls_and_content, extract_youtube_urls,
 };
-use crate::handlers::media::{
-    collect_message_media, summarize_media_files, MediaCollectionOptions, MediaSummary,
-};
+use crate::handlers::media::{collect_message_media, MediaCollectionOptions};
 use crate::handlers::responses::send_response;
 use crate::llm::audit::{
     audit_context_from_id, create_audit_context_from_message, LlmAuditContext,
     LLM_TRIGGER_KIND_AUTO_Q, LLM_TRIGGER_KIND_COMMAND,
 };
+use crate::llm::media::{summarize_media_files, MediaSummary};
 use crate::llm::responses_provider::effective_reasoning_effort;
 use crate::llm::runtime_models::{
     codex_model_record_for_request, codex_selected_model_label, ensure_explicit_codex_model,
@@ -1738,7 +1737,7 @@ async fn process_request(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::handlers::media::MediaSummary;
+    use crate::llm::media::MediaSummary;
     use crate::state::PendingRequests;
     use serde_json::json;
     use teloxide::types::InlineKeyboardButtonKind;

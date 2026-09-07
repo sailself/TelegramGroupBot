@@ -16,8 +16,7 @@ use crate::config::{
     ThirdPartyProvider, CONFIG, FACTCHECK_CLAIM_EXTRACTION_PROMPT, FACTCHECK_SYNTHESIS_PROMPT,
     LANGUAGE_POLICY,
 };
-use crate::handlers::media::MediaSummary;
-use crate::llm::media::MediaFile;
+use crate::llm::media::{MediaFile, MediaSummary};
 use crate::llm::runtime_models::runtime_model_config;
 use crate::llm::text_model::{
     call_configured_text_model, resolve_default_text_model_for_request, ModelRequestCapabilities,
