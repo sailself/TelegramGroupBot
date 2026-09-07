@@ -3,15 +3,12 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use regex::Regex;
-use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 use tracing::{debug, warn};
 
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
-use crate::llm::audit::{
-    log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
-};
+use crate::llm::audit::LlmAuditContext;
 use crate::llm::media::{MediaFile, MediaKind};
 use crate::llm::responses_provider::{
     call_responses_provider, call_responses_provider_with_tool_runtime, PinnedCodexRequestContract,
@@ -19,14 +16,14 @@ use crate::llm::responses_provider::{
 use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config};
 use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
+use crate::llm::transport::{call_with_retry, read_json, usage, LlmCall, RetryPolicy};
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::CodexPromptStyle;
 use crate::utils::http::get_http_client;
 use crate::utils::text::truncate_for_log;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
-const THIRD_PARTY_MAX_ATTEMPTS: usize = 3;
-const THIRD_PARTY_RETRY_BASE_DELAY_MS: u64 = 900;
+const THIRD_PARTY_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(3, Duration::from_millis(900));
 const OPENROUTER_REFERER: &str = "https://github.com/sailself/TelegramGroupHelperBot";
 const OPENROUTER_TITLE: &str = "TelegramGroupHelperBot";
 
@@ -138,44 +135,6 @@ fn summarize_payload(payload: &Value) -> String {
         tool_choice,
         tool_names.join(",")
     )
-}
-
-fn summarize_error_body(body: &str) -> (Option<String>, String) {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return (None, "empty response body".to_string());
-    }
-
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        let message = value
-            .pointer("/error/message")
-            .and_then(|v| v.as_str())
-            .map(|v| v.to_string())
-            .or_else(|| {
-                value
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string())
-            });
-        return (message, truncate_for_log(&value.to_string(), 2000));
-    }
-
-    (None, truncate_for_log(trimmed, 2000))
-}
-
-fn third_party_should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
-}
-
-fn third_party_should_retry_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status.is_server_error()
-}
-
-fn third_party_retry_delay(attempt: usize) -> Duration {
-    let attempt = attempt.max(1) as u64;
-    Duration::from_millis(THIRD_PARTY_RETRY_BASE_DELAY_MS.saturating_mul(attempt))
 }
 
 fn build_third_party_system_prompt(
@@ -529,107 +488,48 @@ async fn call_provider_api(
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let started_at = chrono::Utc::now();
     let metadata = json!({
         "request_summary": summarize_payload(&details.payload),
         "timeout_secs": details.request_timeout_secs
     });
-    log_llm_request_started(
+    let call = LlmCall::begin(
         details.display_name,
         model,
         operation,
-        started_at,
+        audit_context,
         Some(&metadata),
     );
+    let timeout = Duration::from_secs(details.request_timeout_secs);
 
-    let client = get_http_client();
-    for attempt in 1..=THIRD_PARTY_MAX_ATTEMPTS {
-        let mut request = client
-            .post(&details.url)
-            .timeout(Duration::from_secs(details.request_timeout_secs));
-        for (name, value) in &details.headers {
-            request = request.header(name, value);
-        }
-        debug!(
-            "{} request timeout configured: model={}, timeout_secs={}, attempt={}/{}",
-            details.display_name,
-            model,
-            details.request_timeout_secs,
-            attempt,
-            THIRD_PARTY_MAX_ATTEMPTS
-        );
-        let response = match request.json(&details.payload).send().await {
-            Ok(response) => response,
-            Err(err) => {
-                let should_retry =
-                    third_party_should_retry_error(&err) && attempt < THIRD_PARTY_MAX_ATTEMPTS;
-                warn!(
-                    "{} request failed to send: {} (timeout={}, connect={}, status={:?}, attempt={}/{}, retrying={})",
-                    details.display_name,
-                    err,
-                    err.is_timeout(),
-                    err.is_connect(),
-                    err.status(),
-                    attempt,
-                    THIRD_PARTY_MAX_ATTEMPTS,
-                    should_retry
-                );
-                if should_retry {
-                    tokio::time::sleep(third_party_retry_delay(attempt)).await;
-                    continue;
-                }
-                return Err(anyhow!("{} request failed: {}", details.display_name, err));
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let (message, body_summary) = summarize_error_body(&body);
-            let should_retry =
-                third_party_should_retry_status(status) && attempt < THIRD_PARTY_MAX_ATTEMPTS;
-            warn!(
-                "{} API error: status={}, body={}, attempt={}/{}, retrying={}",
+    let value = call_with_retry(
+        &call,
+        &THIRD_PARTY_RETRY_POLICY,
+        |attempt| async move {
+            debug!(
+                "{} request timeout configured: model={}, timeout_secs={}, attempt={}/{}",
                 details.display_name,
-                status,
-                body_summary,
-                attempt,
-                THIRD_PARTY_MAX_ATTEMPTS,
-                should_retry
+                model,
+                details.request_timeout_secs,
+                attempt.number,
+                attempt.max_attempts
             );
-            if should_retry {
-                tokio::time::sleep(third_party_retry_delay(attempt)).await;
-                continue;
+            let mut request = get_http_client().post(&details.url).timeout(timeout);
+            for (name, value) in &details.headers {
+                request = request.header(name, value);
             }
-            let detail = message.unwrap_or(body_summary);
-            return Err(anyhow!(
-                "{} request failed with status {}: {}",
-                details.display_name,
-                status,
-                detail
-            ));
-        }
+            Ok(request.json(&details.payload))
+        },
+        |_| {},
+        |response| read_json::<Value>(response, details.display_name),
+        usage::from_chat_completions,
+    )
+    .await?;
 
-        let value = response.json::<Value>().await?;
-        debug!(
-            "{} response received for model={}",
-            details.display_name, model
-        );
-        let usage = extract_openai_compatible_usage(&value);
-        record_llm_request_success(
-            audit_context,
-            details.display_name,
-            model,
-            operation,
-            started_at,
-            chrono::Utc::now(),
-            usage,
-        )
-        .await;
-        return Ok(value);
-    }
-
-    unreachable!("third-party provider retry loop exhausted")
+    debug!(
+        "{} response received for model={}",
+        details.display_name, model
+    );
+    Ok(value)
 }
 
 fn extract_response_message(response: &Value) -> Value {
@@ -647,44 +547,6 @@ fn extract_tool_calls(message: &Value) -> Vec<Value> {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default()
-}
-
-fn extract_openai_compatible_usage(response: &Value) -> LlmUsageRecord {
-    let usage_value = response.get("usage").cloned();
-    let input_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.get("prompt_tokens"))
-        .and_then(|value| value.as_i64());
-    let output_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.get("completion_tokens"))
-        .and_then(|value| value.as_i64());
-    let total_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.get("total_tokens"))
-        .and_then(|value| value.as_i64());
-    let reasoning_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.pointer("/completion_tokens_details/reasoning_tokens"))
-        .and_then(|value| value.as_i64());
-    let cached_input_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.pointer("/prompt_tokens_details/cached_tokens"))
-        .and_then(|value| value.as_i64());
-
-    LlmUsageRecord {
-        response_id: response
-            .get("id")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string()),
-        input_tokens,
-        output_tokens,
-        total_tokens,
-        reasoning_tokens,
-        cached_input_tokens,
-        cache_write_tokens: None,
-        raw_usage_json: usage_value.map(|usage| usage.to_string()),
-    }
 }
 
 async fn request_final_answer_after_tool_limit(
@@ -1071,6 +933,92 @@ mod tests {
         }
     }
 
+    fn mock_runtime(base_url: &str) -> ProviderRuntimeConfig {
+        ProviderRuntimeConfig {
+            provider: ThirdPartyProvider::OpenRouter,
+            display_name: "OpenRouter",
+            base_url: base_url.to_string(),
+            api_key: "test-openrouter".to_string(),
+            temperature: 0.7,
+            top_p: 0.95,
+            top_k: Some(40),
+            request_timeout_secs: 5,
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_api_retries_transient_failures_and_sends_provider_headers() {
+        use crate::tools::twitter_extractor::test_support::{
+            response_with_headers, ExpectedRequest, TestServer,
+        };
+        let server = TestServer::new(vec![
+            ExpectedRequest::new(
+                "POST",
+                "/chat/completions",
+                response_with_headers(503, &[], b"busy".to_vec()),
+            ),
+            ExpectedRequest::new(
+                "POST",
+                "/chat/completions",
+                response_with_headers(
+                    200,
+                    &[("content-type", "application/json")],
+                    br#"{"id":"chatcmpl_1","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#.to_vec(),
+                ),
+            )
+            .with_header("authorization", "Bearer test-openrouter")
+            .with_header("http-referer", OPENROUTER_REFERER),
+        ]);
+        let runtime = mock_runtime(server.base_url().to_string().trim_end_matches('/'));
+        let details = build_request_details_for_runtime(
+            &model(ThirdPartyProvider::OpenRouter, "Test", "vendor/model"),
+            &runtime,
+            vec![json!({ "role": "user", "content": "hello" })],
+            None,
+            None,
+        );
+
+        let value = call_provider_api(&details, None, "test")
+            .await
+            .expect("second attempt succeeds");
+
+        assert_eq!(value["choices"][0]["message"]["content"], "hi");
+        server.join().expect("both requests were served");
+    }
+
+    #[tokio::test]
+    async fn provider_api_decode_failures_name_the_content_type_and_body() {
+        use crate::tools::twitter_extractor::test_support::{
+            response_with_headers, ExpectedRequest, TestServer,
+        };
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "POST",
+            "/chat/completions",
+            response_with_headers(
+                200,
+                &[("content-type", "text/html")],
+                b"<html>upstream oops</html>".to_vec(),
+            ),
+        )]);
+        let runtime = mock_runtime(server.base_url().to_string().trim_end_matches('/'));
+        let details = build_request_details_for_runtime(
+            &model(ThirdPartyProvider::OpenRouter, "Test", "vendor/model"),
+            &runtime,
+            vec![json!({ "role": "user", "content": "hello" })],
+            None,
+            None,
+        );
+
+        let err = call_provider_api(&details, None, "test")
+            .await
+            .expect_err("html is not a chat completion");
+
+        let text = err.to_string();
+        assert!(text.contains("text/html"), "{text}");
+        assert!(text.contains("upstream oops"), "{text}");
+        server.join().expect("one request was served");
+    }
+
     #[test]
     fn openrouter_request_details_keep_headers_and_top_k() {
         let runtime = ProviderRuntimeConfig {
@@ -1287,55 +1235,6 @@ mod tests {
             Some("auto")
         );
         assert_eq!(details.request_timeout_secs, 90);
-    }
-
-    #[test]
-    fn retryable_statuses_match_expected_provider_failures() {
-        assert!(third_party_should_retry_status(StatusCode::REQUEST_TIMEOUT));
-        assert!(third_party_should_retry_status(
-            StatusCode::TOO_MANY_REQUESTS
-        ));
-        assert!(third_party_should_retry_status(StatusCode::BAD_GATEWAY));
-        assert!(third_party_should_retry_status(
-            StatusCode::SERVICE_UNAVAILABLE
-        ));
-        assert!(!third_party_should_retry_status(StatusCode::BAD_REQUEST));
-        assert!(!third_party_should_retry_status(StatusCode::UNAUTHORIZED));
-        assert!(!third_party_should_retry_status(StatusCode::NOT_FOUND));
-    }
-
-    #[test]
-    fn retry_delay_grows_by_attempt() {
-        assert_eq!(third_party_retry_delay(1), Duration::from_millis(900));
-        assert_eq!(third_party_retry_delay(2), Duration::from_millis(1800));
-        assert_eq!(third_party_retry_delay(3), Duration::from_millis(2700));
-    }
-
-    #[test]
-    fn extract_openai_compatible_usage_reads_prompt_completion_and_total_tokens() {
-        let response = json!({
-            "id": "chatcmpl_123",
-            "usage": {
-                "prompt_tokens": 21,
-                "completion_tokens": 34,
-                "total_tokens": 55,
-                "prompt_tokens_details": {
-                    "cached_tokens": 8
-                },
-                "completion_tokens_details": {
-                    "reasoning_tokens": 5
-                }
-            }
-        });
-
-        let usage = extract_openai_compatible_usage(&response);
-
-        assert_eq!(usage.response_id.as_deref(), Some("chatcmpl_123"));
-        assert_eq!(usage.input_tokens, Some(21));
-        assert_eq!(usage.output_tokens, Some(34));
-        assert_eq!(usage.total_tokens, Some(55));
-        assert_eq!(usage.reasoning_tokens, Some(5));
-        assert_eq!(usage.cached_input_tokens, Some(8));
     }
 
     #[test]

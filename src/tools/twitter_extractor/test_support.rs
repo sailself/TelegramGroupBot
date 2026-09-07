@@ -426,6 +426,25 @@ pub(crate) fn response_with_content_length(declared_length: usize, body: Vec<u8>
     response
 }
 
+/// Raw HTTP/1.1 response with arbitrary extra headers (e.g. `Retry-After`).
+pub(crate) fn response_with_headers(
+    status: u16,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str("\r\n");
+    let mut bytes = response.into_bytes();
+    bytes.extend_from_slice(&body);
+    bytes
+}
+
 pub(crate) fn response_with_status(status: u16, body: Vec<u8>) -> Vec<u8> {
     let reason = match status {
         200 => "OK",

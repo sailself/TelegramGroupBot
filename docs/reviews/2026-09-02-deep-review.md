@@ -400,14 +400,21 @@ Top refactors: R1 (M) shared pipeline primitives in `agents/step.rs`/`common.rs`
 
 ### Phase 2: LLM layer
 
-- [ ] `llm/transport`: `RetryPolicy` (jitter, `Retry-After`, rate-limit headers), `ProviderError`, `send_json_with_retry`, `decode_json_response`, `read_body_limited`, `SseEvents`, usage extractors; port gemini, third_party, responses, codex_image, img2, media
-- [ ] `record_llm_request_failure` in the shared wrapper
+Part A — shared transport (`refactor/phase2-llm-transport`, 2026-09-05):
+
+- [x] `llm/transport`: `RetryPolicy` (jitter, `Retry-After` + `x-ratelimit-reset-*`/`ratelimit-reset`, optional 401 refresh), `ProviderError`, `call_with_retry` (per-attempt builder, response observer, pluggable reader), `read_json`, `read_body_limited[_or_partial]`, `parse_sse_data_events`, `usage::{from_gemini, from_chat_completions, from_responses[_usage_object]}`; ported gemini (generateContent, file upload/metadata, Veo), third_party, responses, codex_image, img2, media
+- [x] `record_llm_request_failure` in the shared wrapper (`LlmCall::fail`; `llm_requests.status`/`error_summary` columns)
+- [x] `GeminiCallRequest` struct; `GEMINI_THINKING_LEVEL` wired as `thinkingConfig.thinkingLevel` for Gemini 3 models; `GeminiPart::Other` catch-all; explicit upload/metadata/Veo timeouts and a 256 MiB video cap
+- [x] `download_media` capped (32 MiB) and token-redacted error text
+- [x] Codex: observe model metadata only on success (rest of the identity item is Part B)
+
+Part B — tool loop, search, Codex identity (next):
+
 - [ ] `ToolSpec` registry + `HashMap<ToolKind, Budget>`; single `run_tool_loop` over a provider trait; delete legacy loops and schemas in `third_party.rs` / `responses_provider.rs`; `tool_limit_guidance` from budget
 - [ ] `SearchProvider` trait; overall deadline in `search_web`
-- [ ] `CodexRequestIdentity` once per turn; in-memory auth cache; one `effective_reasoning_effort`; delete `PinnedCodexRequestContract` and wrapper pairs; refresh-token `invalid_grant` handling; observe metadata only on success
-- [ ] `GeminiCallRequest` struct; wire or delete `GEMINI_THINKING_LEVEL`; typed response with catch-all; explicit Veo/upload timeouts
+- [ ] `CodexRequestIdentity` once per turn; in-memory auth cache; one `effective_reasoning_effort`; delete `PinnedCodexRequestContract` and wrapper pairs; refresh-token `invalid_grant` handling
 - [ ] Overall turn deadline derived from remaining budget
-- [ ] Tool results wrapped in an untrusted-data block; `download_media` capped
+- [ ] Tool results wrapped in an untrusted-data block
 
 ### Phase 3: structure
 

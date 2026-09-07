@@ -5,7 +5,6 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::StatusCode;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio::sync::Semaphore;
@@ -13,11 +12,13 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::config::CONFIG;
-use crate::llm::audit::{
-    log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
-};
-use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
+use crate::llm::audit::{LlmAuditContext, LlmUsageRecord};
+use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
 use crate::llm::tool_runtime::ToolRuntime;
+use crate::llm::transport::retry::is_retryable_status;
+use crate::llm::transport::{
+    call_with_retry, read_body_limited, read_json, usage, LlmCall, ProviderError, RetryPolicy,
+};
 use crate::utils::http::get_http_client;
 use crate::utils::text::truncate_for_log;
 
@@ -50,7 +51,7 @@ pub struct GeminiMusicGenerationResult {
 struct GeminiResponse {
     candidates: Option<Vec<GeminiCandidate>>,
     #[serde(rename = "usageMetadata")]
-    usage_metadata: Option<GeminiUsageMetadata>,
+    usage_metadata: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +82,9 @@ enum GeminiPart {
         #[serde(rename = "codeExecutionResult")]
         code_execution_result: GeminiCodeExecutionResult,
     },
+    /// Anything else the API may add (function calls, thought signatures,
+    /// file data). Kept so one unfamiliar part never fails the whole response.
+    Other(Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,25 +122,25 @@ struct GeminiFileResponse {
     file: GeminiFileInfo,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GeminiUsageMetadata {
-    prompt_token_count: Option<i64>,
-    candidates_token_count: Option<i64>,
-    total_token_count: Option<i64>,
-    thoughts_token_count: Option<i64>,
-    cached_content_token_count: Option<i64>,
-}
-
 #[derive(Debug, Clone)]
 struct UploadedFileRef {
     uri: String,
 }
 
-const GEMINI_MAX_RETRY_ATTEMPTS: usize = 2;
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
+/// generateContent: two attempts, 900ms apart (plus jitter / Retry-After).
+const GEMINI_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(2, Duration::from_millis(900));
+/// File API, operation polls and video download: cheap to repeat.
+const GEMINI_FILE_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(2, Duration::from_millis(500));
+const GEMINI_FILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Uploading a Telegram video or audio attachment can take a while.
+const GEMINI_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 const GEMINI_LITE_FALLBACK_MAX_ATTEMPTS: usize = 3;
-const GEMINI_RETRY_BASE_DELAY_MS: u64 = 900;
 const LYRIA_GENERATION_TIMEOUT_SECS: u64 = 240;
+const VEO_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const VEO_VIDEO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Eight seconds of 1080p video is tens of MiB; refuse runaway bodies.
+const VEO_VIDEO_MAX_BYTES: usize = 256 * 1024 * 1024;
 const VEO_DEFAULT_RESOLUTION: &str = "1080p";
 const VEO_DEFAULT_DURATION_SECONDS: u32 = 8;
 const VEO_DEFAULT_ASPECT_RATIO: &str = "16:9";
@@ -151,25 +155,15 @@ fn redact_gemini_api_key(text: &str) -> String {
     text.replace(key, "[redacted]")
 }
 
-/// Typed failure from the Gemini generateContent transport, so callers can
-/// decide whether another model is worth trying.
-#[derive(Debug, thiserror::Error)]
-pub enum GeminiApiError {
-    #[error("Gemini request failed: {message}")]
-    Transport { message: String, retryable: bool },
-    #[error("Gemini request failed with status {status}: {detail}")]
-    Http { status: StatusCode, detail: String },
-}
-
 /// Whether an error from one Gemini model justifies retrying the same
 /// payload on a fallback model. Only capacity/availability failures do;
 /// a 400/401/403 or a decode failure will fail identically elsewhere.
 fn gemini_error_allows_model_fallback(err: &anyhow::Error) -> bool {
-    match err.downcast_ref::<GeminiApiError>() {
-        Some(GeminiApiError::Transport { retryable, .. }) => *retryable,
-        Some(GeminiApiError::Http { status, .. }) => {
-            gemini_should_retry_status(*status) || *status == StatusCode::NOT_FOUND
+    match err.downcast_ref::<ProviderError>() {
+        Some(ProviderError::Http { status, .. }) => {
+            is_retryable_status(*status) || *status == StatusCode::NOT_FOUND
         }
+        Some(other) => other.is_retryable(),
         None => false,
     }
 }
@@ -179,27 +173,12 @@ fn gemini_fallback_budget() -> Duration {
     gemini_generate_content_timeout()
 }
 
-fn gemini_should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
-}
-
-fn gemini_should_retry_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status.is_server_error()
-}
-
-fn gemini_retry_delay(attempt: usize) -> Duration {
-    let attempt = attempt.max(1) as u64;
-    Duration::from_millis(GEMINI_RETRY_BASE_DELAY_MS.saturating_mul(attempt))
-}
-
 fn gemini_generate_content_timeout() -> Duration {
     Duration::from_secs(CONFIG.gemini_request_timeout_secs)
 }
 
 fn gemini_generate_content_url(model: &str) -> String {
-    format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent")
+    format!("{GEMINI_API_BASE}/v1beta/models/{model}:generateContent")
 }
 
 fn ensure_gemini_api_available() -> Result<()> {
@@ -261,44 +240,6 @@ fn build_image_config(config: Option<&GeminiImageConfig>) -> Option<Value> {
         None
     } else {
         Some(Value::Object(map))
-    }
-}
-
-async fn decode_json_response<T: DeserializeOwned>(
-    response: reqwest::Response,
-    context: &str,
-) -> Result<T> {
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    let bytes = response.bytes().await?;
-    if bytes.is_empty() {
-        return Err(anyhow!(
-            "{} returned empty response body (status {}, content-type {})",
-            context,
-            status,
-            content_type
-        ));
-    }
-
-    match serde_json::from_slice::<T>(&bytes) {
-        Ok(value) => Ok(value),
-        Err(err) => {
-            let body = String::from_utf8_lossy(&bytes);
-            let body_summary = truncate_for_log(&body, 4000);
-            Err(anyhow!(
-                "{} failed to decode JSON (status {}, content-type {}): {} | body={}",
-                context,
-                status,
-                content_type,
-                err,
-                body_summary
-            ))
-        }
     }
 }
 
@@ -400,6 +341,7 @@ fn summarize_gemini_payload(payload: &Value, system_prompt_label: Option<&str>) 
 fn summarize_gemini_response(response: &GeminiResponse) -> Value {
     let mut text_parts = 0usize;
     let mut image_parts = 0usize;
+    let mut other_parts: Vec<String> = Vec::new();
     let mut text_preview = None;
 
     let candidates = response.candidates.as_deref().unwrap_or(&[]);
@@ -439,6 +381,15 @@ fn summarize_gemini_response(response: &GeminiResponse) -> Value {
                                 }
                             }
                         }
+                        GeminiPart::Other(part) => {
+                            // Record which unfamiliar keys the API sent (e.g.
+                            // "functionCall", "thoughtSignature") without the payload.
+                            let keys = part
+                                .as_object()
+                                .map(|object| object.keys().cloned().collect::<Vec<_>>())
+                                .unwrap_or_default();
+                            other_parts.push(keys.join("+"));
+                        }
                     }
                 }
             }
@@ -449,54 +400,10 @@ fn summarize_gemini_response(response: &GeminiResponse) -> Value {
         "candidates": response.candidates.as_ref().map(|candidates| candidates.len()).unwrap_or(0),
         "textParts": text_parts,
         "imageParts": image_parts,
+        "otherParts": other_parts,
         "textPreview": text_preview,
         "hasUsageMetadata": response.usage_metadata.is_some()
     })
-}
-
-fn extract_gemini_usage(value: &Value) -> LlmUsageRecord {
-    let usage_value = value.get("usageMetadata").cloned();
-    let usage = usage_value
-        .as_ref()
-        .and_then(|usage| serde_json::from_value::<GeminiUsageMetadata>(usage.clone()).ok());
-
-    LlmUsageRecord {
-        response_id: None,
-        input_tokens: usage.as_ref().and_then(|usage| usage.prompt_token_count),
-        output_tokens: usage
-            .as_ref()
-            .and_then(|usage| usage.candidates_token_count),
-        total_tokens: usage.as_ref().and_then(|usage| usage.total_token_count),
-        reasoning_tokens: usage.as_ref().and_then(|usage| usage.thoughts_token_count),
-        cached_input_tokens: usage
-            .as_ref()
-            .and_then(|usage| usage.cached_content_token_count),
-        cache_write_tokens: None,
-        raw_usage_json: usage_value.map(|usage| usage.to_string()),
-    }
-}
-
-fn summarize_error_body(body: &str) -> (Option<String>, String) {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return (None, "empty response body".to_string());
-    }
-
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        let message = value
-            .pointer("/error/message")
-            .and_then(|v| v.as_str())
-            .map(|v| v.to_string())
-            .or_else(|| {
-                value
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string())
-            });
-        return (message, truncate_for_log(&value.to_string(), 2000));
-    }
-
-    (None, truncate_for_log(trimmed, 2000))
 }
 
 fn kind_label(kind: MediaKind) -> &'static str {
@@ -572,92 +479,134 @@ async fn upload_file_bytes(
     bytes: &[u8],
 ) -> Result<GeminiFileInfo> {
     ensure_gemini_api_available()?;
-    let client = get_http_client();
-    let start_response = client
-        .post("https://generativelanguage.googleapis.com/upload/v1beta/files")
-        .header("x-goog-api-key", &CONFIG.gemini_api_key)
-        .header("X-Goog-Upload-Protocol", "resumable")
-        .header("X-Goog-Upload-Command", "start")
-        .header(
-            "X-Goog-Upload-Header-Content-Length",
-            bytes.len().to_string(),
-        )
-        .header("X-Goog-Upload-Header-Content-Type", mime_type)
-        .json(&json!({ "file": { "display_name": display_name } }))
-        .send()
-        .await?;
+    upload_file_bytes_at(
+        GEMINI_API_BASE,
+        &CONFIG.gemini_api_key,
+        display_name,
+        mime_type,
+        bytes,
+    )
+    .await
+}
 
-    if !start_response.status().is_success() {
-        let status = start_response.status();
-        let body = start_response.text().await.unwrap_or_default();
-        let (message, body_summary) = summarize_error_body(&body);
-        let detail = message.unwrap_or(body_summary);
-        return Err(anyhow!(
-            "Gemini file upload start failed with status {}: {}",
-            status,
-            detail
-        ));
-    }
+/// Resumable upload in two steps: `start` yields the upload URL, `finalize`
+/// sends the bytes. Both run on the shared transport with explicit timeouts.
+async fn upload_file_bytes_at(
+    base: &str,
+    api_key: &str,
+    display_name: &str,
+    mime_type: &str,
+    bytes: &[u8],
+) -> Result<GeminiFileInfo> {
+    let start_url = format!("{base}/upload/v1beta/files");
+    let start_url = start_url.as_str();
+    let content_length = bytes.len().to_string();
+    let content_length = content_length.as_str();
+    let start_call =
+        LlmCall::untracked("gemini", "file-upload-start").with_redaction(redact_gemini_api_key);
+    let upload_url: String = call_with_retry(
+        &start_call,
+        &GEMINI_FILE_RETRY_POLICY,
+        |_| async move {
+            Ok(get_http_client()
+                .post(start_url)
+                .header("x-goog-api-key", api_key)
+                .header("X-Goog-Upload-Protocol", "resumable")
+                .header("X-Goog-Upload-Command", "start")
+                .header("X-Goog-Upload-Header-Content-Length", content_length)
+                .header("X-Goog-Upload-Header-Content-Type", mime_type)
+                .timeout(GEMINI_FILE_REQUEST_TIMEOUT)
+                .json(&json!({ "file": { "display_name": display_name } })))
+        },
+        |_| {},
+        |response| async move {
+            let upload_url = response
+                .headers()
+                .get("x-goog-upload-url")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            // Drain the (normally empty) body so the connection can be reused.
+            let _ = read_body_limited(response, "gemini", 64 * 1024).await;
+            upload_url.ok_or_else(|| {
+                ProviderError::decode(
+                    "gemini",
+                    "file upload start did not return an upload URL",
+                    false,
+                )
+            })
+        },
+        |_| LlmUsageRecord::default(),
+    )
+    .await?;
 
-    let upload_url = start_response
-        .headers()
-        .get("x-goog-upload-url")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| anyhow!("Gemini file upload did not return an upload URL"))?;
-
-    let finalize_response = client
-        .post(upload_url)
-        .header("X-Goog-Upload-Command", "upload, finalize")
-        .header("X-Goog-Upload-Offset", "0")
-        .header("Content-Length", bytes.len().to_string())
-        .body(bytes.to_vec())
-        .send()
-        .await?;
-
-    if !finalize_response.status().is_success() {
-        let status = finalize_response.status();
-        let body = finalize_response.text().await.unwrap_or_default();
-        let (message, body_summary) = summarize_error_body(&body);
-        let detail = message.unwrap_or(body_summary);
-        return Err(anyhow!(
-            "Gemini file upload failed with status {}: {}",
-            status,
-            detail
-        ));
-    }
-
-    let payload =
-        decode_json_response::<GeminiFileResponse>(finalize_response, "Gemini file upload").await?;
+    let upload_url = upload_url.as_str();
+    let finalize_call =
+        LlmCall::untracked("gemini", "file-upload-finalize").with_redaction(redact_gemini_api_key);
+    let payload: GeminiFileResponse = call_with_retry(
+        &finalize_call,
+        &GEMINI_FILE_RETRY_POLICY,
+        |_| async move {
+            Ok(get_http_client()
+                .post(upload_url)
+                .header("X-Goog-Upload-Command", "upload, finalize")
+                .header("X-Goog-Upload-Offset", "0")
+                .header("Content-Length", content_length)
+                .timeout(GEMINI_UPLOAD_TIMEOUT)
+                .body(bytes.to_vec()))
+        },
+        |_| {},
+        |response| read_json::<GeminiFileResponse>(response, "gemini"),
+        |_| LlmUsageRecord::default(),
+    )
+    .await?;
     Ok(payload.file)
 }
 
+/// Authenticated GET returning JSON (file metadata, Veo operation polls).
+async fn gemini_get_json(
+    url: &str,
+    api_key: &str,
+    label: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let call = LlmCall::untracked("gemini", label).with_redaction(redact_gemini_api_key);
+    let value = call_with_retry(
+        &call,
+        &GEMINI_FILE_RETRY_POLICY,
+        |_| async move {
+            Ok(get_http_client()
+                .get(url)
+                .header("x-goog-api-key", api_key)
+                .timeout(timeout))
+        },
+        |_| {},
+        |response| read_json::<Value>(response, "gemini"),
+        |_| LlmUsageRecord::default(),
+    )
+    .await?;
+    Ok(value)
+}
+
 async fn get_file_metadata(name: &str) -> Result<GeminiFileInfo> {
+    get_file_metadata_at(
+        GEMINI_API_BASE,
+        &CONFIG.gemini_api_key,
+        name,
+        GEMINI_FILE_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+async fn get_file_metadata_at(
+    base: &str,
+    api_key: &str,
+    name: &str,
+    timeout: Duration,
+) -> Result<GeminiFileInfo> {
     let name = name.trim();
     let name = name.strip_prefix("files/").unwrap_or(name);
-    let client = get_http_client();
-    let response = client
-        .get(format!(
-            "https://generativelanguage.googleapis.com/v1beta/files/{}",
-            name
-        ))
-        .header("x-goog-api-key", &CONFIG.gemini_api_key)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let (message, body_summary) = summarize_error_body(&body);
-        let detail = message.unwrap_or(body_summary);
-        return Err(anyhow!(
-            "Gemini file metadata fetch failed with status {}: {}",
-            status,
-            detail
-        ));
-    }
-
-    let payload =
-        decode_json_response::<serde_json::Value>(response, "Gemini file metadata").await?;
+    let url = format!("{base}/v1beta/files/{name}");
+    let payload = gemini_get_json(&url, api_key, "file-metadata", timeout).await?;
     decode_file_info_from_value(payload, "Gemini file metadata")
 }
 
@@ -998,110 +947,51 @@ async fn call_gemini_api_value_with_timeout(
     operation: &str,
 ) -> Result<Value> {
     ensure_gemini_api_available()?;
-    let client = get_http_client();
     let url = gemini_generate_content_url(model);
-    let started_at = chrono::Utc::now();
+    let url = url.as_str();
     let metadata = json!({
         "system_prompt_label": system_prompt_label.unwrap_or(""),
         "timeout_secs": timeout.as_secs()
     });
-    log_llm_request_started("gemini", model, operation, started_at, Some(&metadata));
+    let call = LlmCall::begin("gemini", model, operation, audit_context, Some(&metadata))
+        .with_redaction(redact_gemini_api_key);
 
     if tracing::enabled!(tracing::Level::DEBUG) {
         let payload_summary = summarize_gemini_payload(&payload, system_prompt_label);
         debug!(target: "llm.gemini", model = model, payload = %payload_summary);
     }
 
-    let mut attempt = 0usize;
-    loop {
-        attempt += 1;
-        let response = match client
-            .post(&url)
-            .header("x-goog-api-key", &CONFIG.gemini_api_key)
-            .timeout(timeout)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                let err_text = redact_gemini_api_key(&err.to_string());
-                let url = err.url().map(|url| redact_gemini_api_key(url.as_str()));
-                let should_retry =
-                    gemini_should_retry_error(&err) && attempt < GEMINI_MAX_RETRY_ATTEMPTS;
-                warn!(
-                    "Gemini request failed to send: {} (timeout={}, connect={}, status={:?}, url={:?}, retrying={})",
-                    err_text,
-                    err.is_timeout(),
-                    err.is_connect(),
-                    err.status(),
-                    url,
-                    should_retry
-                );
-                if should_retry {
-                    tokio::time::sleep(gemini_retry_delay(attempt)).await;
-                    continue;
-                }
-                return Err(GeminiApiError::Transport {
-                    message: err_text,
-                    retryable: gemini_should_retry_error(&err),
-                }
-                .into());
-            }
-        };
+    let payload = &payload;
+    let value = call_with_retry(
+        &call,
+        &GEMINI_RETRY_POLICY,
+        |_| async move {
+            Ok(get_http_client()
+                .post(url)
+                .header("x-goog-api-key", CONFIG.gemini_api_key.as_str())
+                .timeout(timeout)
+                .json(payload))
+        },
+        |_| {},
+        |response| read_json::<Value>(response, "gemini"),
+        usage::from_gemini,
+    )
+    .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let (message, body_summary) = summarize_error_body(&body);
-            let should_retry =
-                gemini_should_retry_status(status) && attempt < GEMINI_MAX_RETRY_ATTEMPTS;
-            warn!(
-                "Gemini API error: status={}, body={}, retrying={}",
-                status, body_summary, should_retry
-            );
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(
-                    target: "llm.gemini",
-                    status = %status,
-                    body = %truncate_for_log(&body, 4000)
-                );
-            }
-            if should_retry {
-                tokio::time::sleep(gemini_retry_delay(attempt)).await;
-                continue;
-            }
-            let detail = message.unwrap_or(body_summary);
-            return Err(GeminiApiError::Http { status, detail }.into());
-        }
-
-        let value = decode_json_response::<Value>(response, "Gemini generateContent").await?;
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let parsed = serde_json::from_value::<GeminiResponse>(value.clone()).ok();
-            let response_summary = parsed
-                .as_ref()
-                .map(summarize_gemini_response)
-                .unwrap_or_else(|| {
-                    json!({
-                        "rawResponsePreview": truncate_for_log(&value.to_string(), 400)
-                    })
-                });
-            debug!(target: "llm.gemini", model = model, response = %response_summary);
-        }
-
-        let usage = extract_gemini_usage(&value);
-        record_llm_request_success(
-            audit_context,
-            "gemini",
-            model,
-            operation,
-            started_at,
-            chrono::Utc::now(),
-            usage,
-        )
-        .await;
-        return Ok(value);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let parsed = serde_json::from_value::<GeminiResponse>(value.clone()).ok();
+        let response_summary = parsed
+            .as_ref()
+            .map(summarize_gemini_response)
+            .unwrap_or_else(|| {
+                json!({
+                    "rawResponsePreview": truncate_for_log(&value.to_string(), 400)
+                })
+            });
+        debug!(target: "llm.gemini", model = model, response = %response_summary);
     }
+
+    Ok(value)
 }
 
 fn text_part_looks_like_music_metadata(text: &str) -> bool {
@@ -1272,6 +1162,46 @@ fn base_generation_config() -> Value {
     })
 }
 
+/// `thinkingConfig` for `GEMINI_THINKING_LEVEL`. Only Gemini 3 models accept
+/// `thinkingLevel`; the 2.5 generation uses token budgets and rejects it, so
+/// the setting is ignored there.
+fn thinking_config_for(model: &str, level: &str) -> Option<Value> {
+    let level = level.trim();
+    if level.is_empty() || !model.trim().to_ascii_lowercase().starts_with("gemini-3") {
+        return None;
+    }
+    Some(json!({ "thinkingLevel": level }))
+}
+
+/// Sampling config for text calls, with the thinking level when `model`
+/// supports it.
+fn generation_config_for(model: &str, thinking_level: &str) -> Value {
+    let mut config = base_generation_config();
+    if let Some(thinking) = thinking_config_for(model, thinking_level) {
+        if let Some(object) = config.as_object_mut() {
+            object.insert("thinkingConfig".to_string(), thinking);
+        }
+    }
+    config
+}
+
+/// The same request retargeted at `model`, with `thinkingConfig` re-derived
+/// for that model: a fallback chain may cross generations, and Gemini 2.5
+/// rejects the `thinkingLevel` that Gemini 3 accepts.
+fn payload_for_model(payload: &Value, model: &str, thinking_level: &str) -> Value {
+    let mut payload = payload.clone();
+    if let Some(config) = payload
+        .get_mut("generationConfig")
+        .and_then(Value::as_object_mut)
+    {
+        config.remove("thinkingConfig");
+        if let Some(thinking) = thinking_config_for(model, thinking_level) {
+            config.insert("thinkingConfig".to_string(), thinking);
+        }
+    }
+    payload
+}
+
 fn with_response_json_schema(config: Value, response_json_schema: Option<&Value>) -> Value {
     let Some(schema) = response_json_schema else {
         return config;
@@ -1346,7 +1276,7 @@ pub async fn call_gemini_with_tool_runtime(
         let mut payload = json!({
             "systemInstruction": { "parts": [{ "text": system_prompt }] },
             "contents": contents.clone(),
-            "generationConfig": base_generation_config(),
+            "generationConfig": generation_config_for(model, &CONFIG.gemini_thinking_level),
             "safetySettings": build_safety_settings(),
         });
         if tools_enabled {
@@ -1412,7 +1342,7 @@ pub async fn call_gemini_with_tool_runtime(
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": contents.clone(),
         "generationConfig": with_response_json_schema(
-            base_generation_config(),
+            generation_config_for(model, &CONFIG.gemini_thinking_level),
             final_response_json_schema.as_ref()
         ),
         "safetySettings": build_safety_settings(),
@@ -1460,7 +1390,7 @@ pub async fn call_gemini_model_simple(
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": [json!({ "role": "user", "parts": parts })],
         "generationConfig": with_response_json_schema(
-            base_generation_config(),
+            generation_config_for(model, &CONFIG.gemini_thinking_level),
             response_json_schema
         ),
         "safetySettings": build_safety_settings(),
@@ -1517,7 +1447,7 @@ async fn call_gemini_lite_fallback(
         let result = async {
             let response = call_gemini_api(
                 lite_model,
-                payload.clone(),
+                payload_for_model(payload, lite_model, &CONFIG.gemini_thinking_level),
                 system_prompt_label,
                 audit_context,
                 "call_gemini_lite_fallback",
@@ -1559,39 +1489,34 @@ async fn call_gemini_lite_fallback(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn call_gemini(
-    system_prompt: &str,
-    user_content: &str,
-    use_search_grounding: bool,
-    _use_url_context: bool,
-    _thinking_level: Option<&str>,
-    image_url: Option<&str>,
-    use_pro_model: bool,
-    media_files: Option<Vec<MediaFile>>,
-    youtube_urls: Option<Vec<String>>,
-    system_prompt_label: Option<&str>,
-    audit_context: Option<&LlmAuditContext>,
-) -> Result<GeminiCallResult> {
+/// One Gemini text call (default or pro model, with the lite fallback chain).
+#[derive(Default)]
+pub struct GeminiCallRequest<'a> {
+    pub system_prompt: &'a str,
+    pub user_content: &'a str,
+    /// Attach the `google_search` grounding tool.
+    pub use_search_grounding: bool,
+    pub use_pro_model: bool,
+    pub media_files: Vec<MediaFile>,
+    pub youtube_urls: Vec<String>,
+    /// Name used in place of the system prompt text in logs.
+    pub system_prompt_label: Option<&'a str>,
+    pub audit_context: Option<&'a LlmAuditContext>,
+}
+
+pub async fn call_gemini(request: GeminiCallRequest<'_>) -> Result<GeminiCallResult> {
     ensure_gemini_api_available()?;
+    let GeminiCallRequest {
+        system_prompt,
+        user_content,
+        use_search_grounding,
+        use_pro_model,
+        media_files: files,
+        youtube_urls,
+        system_prompt_label,
+        audit_context,
+    } = request;
     let content = user_content.to_string();
-
-    let youtube_urls = youtube_urls.unwrap_or_default();
-
-    let mut files = media_files.unwrap_or_default();
-    if files.is_empty() {
-        if let Some(url) = image_url {
-            if let Some(data) = download_media(url).await {
-                let mime_type = detect_mime_type(&data).unwrap_or_else(|| "image/png".to_string());
-                files.push(MediaFile::new(
-                    data,
-                    mime_type.clone(),
-                    kind_for_mime(&mime_type),
-                    None,
-                ));
-            }
-        }
-    }
 
     let has_video_or_audio = files
         .iter()
@@ -1616,24 +1541,20 @@ pub async fn call_gemini(
         tools
     };
 
-    let payload = json!({
-        "systemInstruction": { "parts": [{ "text": system_prompt }] },
-        "contents": [{ "role": "user", "parts": parts }],
-        "generationConfig": {
-            "temperature": CONFIG.gemini_temperature,
-            "topK": CONFIG.gemini_top_k,
-            "topP": CONFIG.gemini_top_p,
-            "maxOutputTokens": CONFIG.gemini_max_output_tokens,
-        },
-        "safetySettings": build_safety_settings(),
-        "tools": tools,
-    });
-
     let primary_model = if use_pro_model {
         &CONFIG.gemini_pro_model
     } else {
         &CONFIG.gemini_model
     };
+    // Fallback models reuse this payload with thinkingConfig re-derived per
+    // model (payload_for_model): the chain may cross generations.
+    let payload = json!({
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "contents": [{ "role": "user", "parts": parts }],
+        "generationConfig": generation_config_for(primary_model, &CONFIG.gemini_thinking_level),
+        "safetySettings": build_safety_settings(),
+        "tools": tools,
+    });
     let primary_operation = if use_pro_model {
         "call_gemini_pro"
     } else {
@@ -1719,7 +1640,7 @@ async fn run_gemini_model_fallbacks(
     let fallback_text = async {
         let response = call_gemini_api(
             fallback_model,
-            payload.clone(),
+            payload_for_model(payload, fallback_model, &CONFIG.gemini_thinking_level),
             system_prompt_label,
             audit_context,
             "call_gemini_fallback",
@@ -1917,71 +1838,19 @@ pub async fn generate_video_with_veo(
         "parameters": Value::Object(parameters),
     });
 
-    let client = get_http_client();
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:predictLongRunning",
-        model
-    );
+    let url = format!("{GEMINI_API_BASE}/v1beta/models/{model}:predictLongRunning");
     let metadata = json!({
         "resolution": VEO_DEFAULT_RESOLUTION,
         "duration_seconds": VEO_DEFAULT_DURATION_SECONDS,
     });
-    let started_at = chrono::Utc::now();
-    log_llm_request_started(
-        "gemini",
-        model,
-        "veo_predict_long_running",
-        started_at,
-        Some(&metadata),
-    );
-
-    let response = client
-        .post(&url)
-        .header("x-goog-api-key", &CONFIG.gemini_api_key)
-        .json(&payload)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let (message, body_summary) = summarize_error_body(&body);
-        let detail = message.unwrap_or(body_summary);
-        return Err(anyhow!(
-            "Veo predictLongRunning failed with status {}: {}",
-            status,
-            detail
-        ));
-    }
-
-    let operation = decode_json_response::<Value>(response, "Veo predictLongRunning").await?;
-    record_llm_request_success(
-        audit_context,
-        "gemini",
-        model,
-        "veo_predict_long_running",
-        started_at,
-        chrono::Utc::now(),
-        LlmUsageRecord {
-            response_id: operation
-                .get("name")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string()),
-            ..LlmUsageRecord::default()
-        },
-    )
-    .await;
+    let operation = veo_start_operation(&url, &payload, model, &metadata, audit_context).await?;
 
     let operation_name = operation
         .get("name")
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow!("Veo operation response missing name"))?
         .to_string();
-
-    let operation_url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/{}",
-        operation_name
-    );
+    let operation_url = format!("{GEMINI_API_BASE}/v1beta/{operation_name}");
 
     let mut current_operation = operation;
     for attempt in 0..VEO_MAX_POLL_ATTEMPTS {
@@ -2004,7 +1873,7 @@ pub async fn generate_video_with_veo(
             let video_uri = video
                 .and_then(|value| value.get("uri"))
                 .and_then(|value| value.as_str());
-            let mut mime_type = video
+            let declared_mime_type = video
                 .and_then(|value| value.get("mimeType"))
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
@@ -2014,38 +1883,13 @@ pub async fn generate_video_with_veo(
                 return Ok((None, None));
             };
 
-            let response = client
-                .get(video_uri)
-                .header("x-goog-api-key", &CONFIG.gemini_api_key)
-                .send()
-                .await?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let (message, body_summary) = summarize_error_body(&body);
-                let detail = message.unwrap_or(body_summary);
-                return Err(anyhow!(
-                    "Veo video download failed with status {}: {}",
-                    status,
-                    detail
-                ));
-            }
-
-            if mime_type.is_none() {
-                mime_type = response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .map(|value| value.to_string());
-            }
-
-            let bytes = response.bytes().await?;
+            let (bytes, mime_type) = veo_download_video(video_uri, declared_mime_type).await?;
             info!(
                 "Veo video download completed (bytes={}, mime={:?})",
                 bytes.len(),
                 mime_type
             );
-            return Ok((Some(bytes.to_vec()), mime_type));
+            return Ok((Some(bytes), mime_type));
         }
 
         if attempt + 1 < VEO_MAX_POLL_ATTEMPTS {
@@ -2055,24 +1899,13 @@ pub async fn generate_video_with_veo(
                 VEO_MAX_POLL_ATTEMPTS
             );
             tokio::time::sleep(Duration::from_secs(VEO_POLL_INTERVAL_SECS)).await;
-            let response = client
-                .get(&operation_url)
-                .header("x-goog-api-key", &CONFIG.gemini_api_key)
-                .send()
-                .await?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let (message, body_summary) = summarize_error_body(&body);
-                let detail = message.unwrap_or(body_summary);
-                return Err(anyhow!(
-                    "Veo operation poll failed with status {}: {}",
-                    status,
-                    detail
-                ));
-            }
-            current_operation =
-                decode_json_response::<Value>(response, "Veo operation poll").await?;
+            current_operation = gemini_get_json(
+                &operation_url,
+                &CONFIG.gemini_api_key,
+                "veo-operation-poll",
+                VEO_REQUEST_TIMEOUT,
+            )
+            .await?;
         }
     }
 
@@ -2080,24 +1913,239 @@ pub async fn generate_video_with_veo(
     Ok((None, None))
 }
 
+/// Start the long-running Veo generation. The audit row records the
+/// operation name as its response id.
+async fn veo_start_operation(
+    url: &str,
+    payload: &Value,
+    model: &str,
+    metadata: &Value,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<Value> {
+    let call = LlmCall::begin(
+        "gemini",
+        model,
+        "veo_predict_long_running",
+        audit_context,
+        Some(metadata),
+    )
+    .with_redaction(redact_gemini_api_key);
+    let operation = call_with_retry(
+        &call,
+        &GEMINI_RETRY_POLICY,
+        |_| async move {
+            Ok(get_http_client()
+                .post(url)
+                .header("x-goog-api-key", CONFIG.gemini_api_key.as_str())
+                .timeout(VEO_REQUEST_TIMEOUT)
+                .json(payload))
+        },
+        |_| {},
+        |response| read_json::<Value>(response, "gemini"),
+        |operation: &Value| LlmUsageRecord {
+            response_id: operation
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ..LlmUsageRecord::default()
+        },
+    )
+    .await?;
+    Ok(operation)
+}
+
+/// Fetch the finished video, preferring the operation's declared MIME type
+/// over the download's `Content-Type`.
+async fn veo_download_video(
+    video_uri: &str,
+    declared_mime_type: Option<String>,
+) -> Result<(Vec<u8>, Option<String>)> {
+    let call =
+        LlmCall::untracked("gemini", "veo-video-download").with_redaction(redact_gemini_api_key);
+    let (bytes, header_mime_type) = call_with_retry(
+        &call,
+        &GEMINI_FILE_RETRY_POLICY,
+        |_| async move {
+            Ok(get_http_client()
+                .get(video_uri)
+                .header("x-goog-api-key", CONFIG.gemini_api_key.as_str())
+                .timeout(VEO_VIDEO_DOWNLOAD_TIMEOUT))
+        },
+        |_| {},
+        |response| async move {
+            let mime_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let bytes = read_body_limited(response, "gemini", VEO_VIDEO_MAX_BYTES).await?;
+            Ok((bytes, mime_type))
+        },
+        |_| LlmUsageRecord::default(),
+    )
+    .await?;
+    Ok((bytes, declared_mime_type.or(header_mime_type)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::tools::twitter_extractor::test_support::{
+        response_with_headers, ExpectedRequest, TestServer,
+    };
+
     fn http_error(status: u16) -> anyhow::Error {
-        GeminiApiError::Http {
-            status: StatusCode::from_u16(status).unwrap(),
-            detail: "detail".to_string(),
-        }
+        ProviderError::http(
+            "gemini",
+            StatusCode::from_u16(status).unwrap(),
+            None,
+            "detail".to_string(),
+            None,
+        )
         .into()
     }
 
     fn transport_error(retryable: bool) -> anyhow::Error {
-        GeminiApiError::Transport {
+        ProviderError::Transport {
+            provider: "gemini".to_string(),
             message: "boom".to_string(),
             retryable,
         }
         .into()
+    }
+
+    #[tokio::test]
+    async fn file_metadata_fetch_decodes_the_wrapped_file_object() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/v1beta/files/abc123",
+            response_with_headers(
+                200,
+                &[],
+                br#"{"file":{"name":"files/abc123","uri":"https://files/abc123","state":"ACTIVE"}}"#
+                    .to_vec(),
+            ),
+        )
+        .with_header("x-goog-api-key", "test-key")]);
+        let base = server.base_url().to_string();
+
+        let info = get_file_metadata_at(
+            base.trim_end_matches('/'),
+            "test-key",
+            "files/abc123",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("metadata decodes");
+
+        assert_eq!(info.name, "files/abc123");
+        assert_eq!(info.state.as_deref(), Some("ACTIVE"));
+        server.join().expect("one request was served");
+    }
+
+    #[tokio::test]
+    async fn file_metadata_fetch_applies_its_explicit_timeout_and_retries() {
+        // Without the explicit timeout the first (400ms-delayed) response
+        // would be awaited and the second expectation would go unmet.
+        let body = br#"{"name":"files/slow","uri":"u","state":"ACTIVE"}"#.to_vec();
+        let server = TestServer::new(vec![
+            ExpectedRequest::new(
+                "GET",
+                "/v1beta/files/slow",
+                response_with_headers(200, &[], body.clone()),
+            )
+            .delayed(Duration::from_millis(400)),
+            ExpectedRequest::new(
+                "GET",
+                "/v1beta/files/slow",
+                response_with_headers(200, &[], body),
+            ),
+        ]);
+        let base = server.base_url().to_string();
+
+        let info = get_file_metadata_at(
+            base.trim_end_matches('/'),
+            "test-key",
+            "slow",
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("the retry after the timed-out attempt succeeds");
+
+        assert_eq!(info.name, "files/slow");
+        server
+            .join_allowing_client_disconnect()
+            .expect("both requests were served; the first client gave up");
+    }
+
+    #[test]
+    fn unknown_response_parts_do_not_break_text_extraction() {
+        let response: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [
+                { "functionCall": { "name": "web_search", "args": {} } },
+                { "text": "visible answer" }
+            ] } }]
+        }))
+        .expect("unknown part kinds must deserialize");
+
+        assert_eq!(extract_text_from_response(response), "visible answer");
+    }
+
+    #[test]
+    fn fallback_payloads_carry_the_thinking_config_of_their_own_model() {
+        let mut primary = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generationConfig": generation_config_for("gemini-3-pro-preview", "high"),
+        });
+        primary["generationConfig"]["temperature"] = json!(0.25);
+        assert_eq!(
+            primary["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+
+        let for_flash_25 = payload_for_model(&primary, "gemini-2.5-flash", "high");
+        assert!(
+            for_flash_25["generationConfig"]
+                .get("thinkingConfig")
+                .is_none(),
+            "2.5 models reject thinkingLevel: {for_flash_25}"
+        );
+        assert_eq!(
+            for_flash_25["generationConfig"]["temperature"], 0.25,
+            "other generation settings survive"
+        );
+        assert_eq!(for_flash_25["contents"], primary["contents"]);
+
+        let back_to_3 = payload_for_model(&for_flash_25, "gemini-3-flash", "high");
+        assert_eq!(
+            back_to_3["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn thinking_level_is_only_sent_to_gemini_3_models() {
+        assert_eq!(
+            thinking_config_for("gemini-3-pro-preview", "high"),
+            Some(json!({ "thinkingLevel": "high" }))
+        );
+        assert_eq!(
+            thinking_config_for("gemini-3-flash", "low"),
+            Some(json!({ "thinkingLevel": "low" }))
+        );
+        assert_eq!(thinking_config_for("gemini-2.5-flash", "high"), None);
+        assert_eq!(thinking_config_for("gemini-3-pro", "  "), None);
+    }
+
+    #[test]
+    fn generation_config_carries_the_thinking_level_for_gemini_3() {
+        let config = generation_config_for("gemini-3-pro", "high");
+        assert_eq!(config["thinkingConfig"]["thinkingLevel"], "high");
+        assert_eq!(config["temperature"], json!(CONFIG.gemini_temperature));
+        assert!(generation_config_for("gemini-2.5-flash", "high")
+            .get("thinkingConfig")
+            .is_none());
     }
 
     #[test]
@@ -2139,32 +2187,6 @@ mod tests {
         if !CONFIG.gemini_api_key.is_empty() {
             assert!(!url.contains(&CONFIG.gemini_api_key));
         }
-    }
-
-    #[test]
-    fn extract_gemini_usage_reads_usage_metadata() {
-        let response = json!({
-            "usageMetadata": {
-                "promptTokenCount": 12,
-                "candidatesTokenCount": 34,
-                "totalTokenCount": 46,
-                "thoughtsTokenCount": 5,
-                "cachedContentTokenCount": 3
-            }
-        });
-
-        let usage = extract_gemini_usage(&response);
-
-        assert_eq!(usage.input_tokens, Some(12));
-        assert_eq!(usage.output_tokens, Some(34));
-        assert_eq!(usage.total_tokens, Some(46));
-        assert_eq!(usage.reasoning_tokens, Some(5));
-        assert_eq!(usage.cached_input_tokens, Some(3));
-        assert!(usage
-            .raw_usage_json
-            .as_deref()
-            .expect("usage json")
-            .contains("\"promptTokenCount\":12"));
     }
 
     #[test]

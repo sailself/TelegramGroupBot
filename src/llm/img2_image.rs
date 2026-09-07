@@ -3,23 +3,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::multipart::{Form, Part};
-use reqwest::StatusCode;
-use serde_json::json;
+use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::config::CONFIG;
-use crate::llm::audit::{
-    log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
-};
+use crate::llm::audit::{LlmAuditContext, LlmUsageRecord};
 use crate::llm::gemini::ImageGenerationError;
 use crate::llm::media::{detect_mime_type, download_media};
+use crate::llm::transport::{
+    call_with_retry, read_body_limited, LlmCall, ProviderError, RetryPolicy,
+};
 use crate::utils::http::get_http_client;
-use crate::utils::text::truncate_for_log;
 
 const IMG2_PROVIDER: &str = "img2";
 const IMG2_MODEL: &str = "img2";
 const IMG2_OPERATION: &str = "generate_image_with_img2";
-const IMG2_ERROR_BODY_LIMIT: usize = 1200;
+const IMG2_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(2, Duration::from_millis(500));
+/// Generated PNGs are a few MiB at most; anything larger is a misbehaving endpoint.
+const IMG2_MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 static IMG2_SAVE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -163,15 +164,17 @@ async fn first_source_image(image_urls: &[String]) -> Option<SourceImage> {
     Some(SourceImage { bytes, mime_type })
 }
 
+/// Build the multipart body. Called once per attempt, so the source image is
+/// borrowed and its bytes copied into the part.
 fn build_form(
     prompt: &str,
-    source_image: Option<SourceImage>,
+    source_image: Option<&SourceImage>,
     options: &Img2RequestOptions,
 ) -> Result<Form, ImageGenerationError> {
     let mut form = Form::new().text("prompt", prompt.to_string());
     if let Some(source_image) = source_image {
         let file_name = file_name_for_mime(&source_image.mime_type);
-        let part = Part::bytes(source_image.bytes)
+        let part = Part::bytes(source_image.bytes.clone())
             .file_name(file_name.to_string())
             .mime_str(&source_image.mime_type)
             .map_err(|err| {
@@ -219,10 +222,117 @@ fn header_string(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Str
         .map(|value| value.to_string())
 }
 
-fn status_retryable(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status.is_server_error()
+/// Raw result of one Img2 generation request, before it is written to disk.
+#[derive(Debug)]
+pub(crate) struct Img2FetchedImage {
+    pub bytes: Vec<u8>,
+    pub request_id: Option<String>,
+    pub content_type: Option<String>,
+}
+
+/// Send the multipart generation request, rebuilding the form for each
+/// attempt, and return the PNG bytes. Transient failures are retried by the
+/// shared transport, which also writes the audit row.
+async fn fetch_img2_image<F>(
+    url: &str,
+    api_key: &str,
+    timeout: Duration,
+    build_form: F,
+    audit_context: Option<&LlmAuditContext>,
+    metadata: &Value,
+) -> Result<Img2FetchedImage, ImageGenerationError>
+where
+    F: Fn() -> Result<Form, ImageGenerationError>,
+{
+    let call = LlmCall::begin(
+        IMG2_PROVIDER,
+        IMG2_MODEL,
+        IMG2_OPERATION,
+        audit_context,
+        Some(metadata),
+    );
+    let last_request_id = parking_lot::Mutex::new(None::<String>);
+
+    let result = call_with_retry(
+        &call,
+        &IMG2_RETRY_POLICY,
+        |attempt| {
+            let form = build_form().map_err(|err| ProviderError::rejected(err.0));
+            async move {
+                debug!(
+                    "Img2 image request attempt {}/{}: timeout_secs={}",
+                    attempt.number,
+                    attempt.max_attempts,
+                    timeout.as_secs()
+                );
+                Ok(get_http_client()
+                    .post(url)
+                    .timeout(timeout)
+                    .header("X-API-Key", api_key)
+                    .multipart(form?))
+            }
+        },
+        |response| {
+            *last_request_id.lock() = header_string(response.headers(), "x-request-id");
+        },
+        |response| async move {
+            let request_id = header_string(response.headers(), "x-request-id");
+            let content_type = header_string(response.headers(), "content-type");
+            if !content_type
+                .as_deref()
+                .map(|value| value.to_ascii_lowercase().contains("image/png"))
+                .unwrap_or(false)
+            {
+                warn!(
+                    "Img2 image response content type was not image/png: request_id={:?}, content_type={:?}",
+                    request_id, content_type
+                );
+            }
+            let bytes = read_body_limited(response, IMG2_PROVIDER, IMG2_MAX_IMAGE_BYTES).await?;
+            if bytes.is_empty() {
+                return Err(ProviderError::decode(
+                    IMG2_PROVIDER,
+                    format!(
+                        "Img2 image response was empty (request_id={})",
+                        request_id.as_deref().unwrap_or("unknown")
+                    ),
+                    false,
+                ));
+            }
+            Ok(Img2FetchedImage {
+                bytes,
+                request_id,
+                content_type,
+            })
+        },
+        |fetched| LlmUsageRecord {
+            response_id: fetched.request_id.clone(),
+            raw_usage_json: Some(
+                json!({
+                    "request_id": fetched.request_id,
+                    "bytes": fetched.bytes.len(),
+                    "content_type": fetched.content_type,
+                })
+                .to_string(),
+            ),
+            ..LlmUsageRecord::default()
+        },
+    )
+    .await;
+
+    result.map_err(|err| img2_error(err, last_request_id.lock().clone()))
+}
+
+/// Keep the user-facing message free of provider error bodies; the transport
+/// already logged the details.
+fn img2_error(err: ProviderError, request_id: Option<String>) -> ImageGenerationError {
+    match err.status() {
+        Some(status) => ImageGenerationError(format!(
+            "Img2 image request failed with status {status} (request_id={})",
+            request_id.as_deref().unwrap_or("unknown")
+        )),
+        None => ImageGenerationError(err.to_string()),
+    }
 }
 
 pub async fn generate_image_with_img2(
@@ -253,9 +363,8 @@ pub async fn generate_image_with_img2(
     let options = Img2RequestOptions::from_config();
     let source_image = first_source_image(image_urls).await;
     let source_image_present = source_image.is_some();
-    let form = build_form(prompt, source_image, &options)?;
     let url = img2_generate_url();
-    let started_at = chrono::Utc::now();
+    let timeout = Duration::from_secs(CONFIG.img2_request_timeout_secs);
     let metadata = json!({
         "url": url,
         "timeout_secs": CONFIG.img2_request_timeout_secs,
@@ -265,13 +374,6 @@ pub async fn generate_image_with_img2(
         "steps": options.steps,
         "media_dir": CONFIG.img2_media_dir,
     });
-    log_llm_request_started(
-        IMG2_PROVIDER,
-        IMG2_MODEL,
-        IMG2_OPERATION,
-        started_at,
-        Some(&metadata),
-    );
 
     debug!(
         "Img2 image request starting: source_image={}, width={:?}, height={:?}, steps={:?}, timeout_secs={}, url={}",
@@ -283,108 +385,36 @@ pub async fn generate_image_with_img2(
         url
     );
 
-    let client = get_http_client();
-    let response = client
-        .post(&url)
-        .timeout(Duration::from_secs(CONFIG.img2_request_timeout_secs))
-        .header("X-API-Key", api_key)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|err| {
-            ImageGenerationError(format!(
-                "Img2 image request failed to send: {err} (timeout={}, connect={}, status={:?})",
-                err.is_timeout(),
-                err.is_connect(),
-                err.status()
-            ))
-        })?;
+    let fetched = fetch_img2_image(
+        &url,
+        api_key,
+        timeout,
+        || build_form(prompt, source_image.as_ref(), &options),
+        audit_context,
+        &metadata,
+    )
+    .await?;
 
-    let status = response.status();
-    let headers = response.headers().clone();
-    let request_id = header_string(&headers, "x-request-id");
-    let content_type = header_string(&headers, "content-type");
-
-    if !status.is_success() {
-        let retryable = status_retryable(status);
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|err| format!("<failed to read error body: {err}>"));
-        warn!(
-            "Img2 image request failed: status={}, request_id={:?}, retryable={}, body={}",
-            status,
-            request_id,
-            retryable,
-            truncate_for_log(&body, IMG2_ERROR_BODY_LIMIT)
-        );
-        return Err(ImageGenerationError(format!(
-            "Img2 image request failed with status {} (request_id={})",
-            status,
-            request_id.as_deref().unwrap_or("unknown")
-        )));
-    }
-
-    if !content_type
-        .as_deref()
-        .map(|value| value.to_ascii_lowercase().contains("image/png"))
-        .unwrap_or(false)
-    {
-        warn!(
-            "Img2 image response content type was not image/png: request_id={:?}, content_type={:?}",
-            request_id, content_type
-        );
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| ImageGenerationError(format!("Failed to read Img2 image bytes: {err}")))?;
-    if bytes.is_empty() {
-        return Err(ImageGenerationError(format!(
-            "Img2 image response was empty (request_id={})",
-            request_id.as_deref().unwrap_or("unknown")
-        )));
-    }
-
-    let path = save_image_bytes(&bytes, request_id.as_deref(), chat_id, message_id).await?;
-    let completed_at = chrono::Utc::now();
-    let byte_len = bytes.len();
+    let path = save_image_bytes(
+        &fetched.bytes,
+        fetched.request_id.as_deref(),
+        chat_id,
+        message_id,
+    )
+    .await?;
+    let byte_len = fetched.bytes.len();
     info!(
         "Img2 image request completed: request_id={:?}, bytes={}, content_type={:?}, saved_path={}",
-        request_id,
+        fetched.request_id,
         byte_len,
-        content_type,
+        fetched.content_type,
         path.display()
     );
 
-    record_llm_request_success(
-        audit_context,
-        IMG2_PROVIDER,
-        IMG2_MODEL,
-        IMG2_OPERATION,
-        started_at,
-        completed_at,
-        LlmUsageRecord {
-            response_id: request_id.clone(),
-            raw_usage_json: Some(
-                json!({
-                    "request_id": request_id.clone(),
-                    "bytes": byte_len,
-                    "content_type": content_type.clone(),
-                    "path": path.to_string_lossy(),
-                })
-                .to_string(),
-            ),
-            ..LlmUsageRecord::default()
-        },
-    )
-    .await;
-
     Ok(Img2GeneratedImage {
         path,
-        request_id,
-        content_type,
+        request_id: fetched.request_id,
+        content_type: fetched.content_type,
         byte_len,
     })
 }
@@ -392,6 +422,73 @@ pub async fn generate_image_with_img2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::twitter_extractor::test_support::{
+        response_with_headers, ExpectedRequest, TestServer,
+    };
+
+    #[tokio::test]
+    async fn fetch_img2_image_retries_a_transient_failure_and_returns_the_png() {
+        let server = TestServer::new(vec![
+            ExpectedRequest::new(
+                "POST",
+                "/generate",
+                response_with_headers(503, &[], b"busy".to_vec()),
+            ),
+            ExpectedRequest::new(
+                "POST",
+                "/generate",
+                response_with_headers(
+                    200,
+                    &[("content-type", "image/png"), ("x-request-id", "req_1")],
+                    b"PNGDATA".to_vec(),
+                ),
+            )
+            .with_header("x-api-key", "k"),
+        ]);
+        let url = server.url("/generate").to_string();
+
+        let fetched = fetch_img2_image(
+            &url,
+            "k",
+            Duration::from_secs(5),
+            || build_form("a cat", None, &Img2RequestOptions::default()),
+            None,
+            &json!({}),
+        )
+        .await
+        .expect("second attempt succeeds");
+
+        assert_eq!(fetched.bytes, b"PNGDATA");
+        assert_eq!(fetched.request_id.as_deref(), Some("req_1"));
+        assert_eq!(fetched.content_type.as_deref(), Some("image/png"));
+        server.join().expect("both requests were served");
+    }
+
+    #[tokio::test]
+    async fn fetch_img2_image_reports_permanent_failures_without_echoing_the_body() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "POST",
+            "/generate",
+            response_with_headers(400, &[("x-request-id", "req_2")], b"secret detail".to_vec()),
+        )]);
+        let url = server.url("/generate").to_string();
+
+        let err = fetch_img2_image(
+            &url,
+            "k",
+            Duration::from_secs(5),
+            || build_form("a cat", None, &Img2RequestOptions::default()),
+            None,
+            &json!({}),
+        )
+        .await
+        .expect_err("400 is permanent");
+
+        assert!(err.0.contains("status 400"), "{}", err.0);
+        assert!(err.0.contains("req_2"), "{}", err.0);
+        assert!(!err.0.contains("secret detail"), "{}", err.0);
+        server.join().expect("exactly one request was served");
+    }
 
     #[test]
     fn optional_form_fields_omit_unset_values() {

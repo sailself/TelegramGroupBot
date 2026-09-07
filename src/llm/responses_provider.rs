@@ -6,16 +6,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
-use reqwest::StatusCode;
 use serde_json::{json, Value};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{
     parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
 };
-use crate::llm::audit::{
-    log_llm_request_started, record_llm_request_success, LlmAuditContext, LlmUsageRecord,
-};
+use crate::llm::audit::LlmAuditContext;
 use crate::llm::openai_codex;
 use crate::llm::runtime_models::{
     codex_model_record_for_request, CodexSelectedModelRecord,
@@ -23,13 +20,17 @@ use crate::llm::runtime_models::{
 };
 use crate::llm::tool_prompts::{tool_limit_guidance, TOOL_LIMIT_SYSTEM_PROMPT};
 use crate::llm::tool_runtime::ToolRuntime;
+use crate::llm::transport::sse::parse_sse_data_events;
+use crate::llm::transport::{
+    call_with_retry, read_body_limited_or_partial, usage, BodyRead, LlmCall, ProviderError,
+    RetryPolicy,
+};
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::{get_http_client, get_http_client_no_compression};
 use crate::utils::text::truncate_for_log;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
-const RESPONSES_MAX_ATTEMPTS: usize = 3;
-const RESPONSES_RETRY_BASE_DELAY_MS: u64 = 900;
+const RESPONSES_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(3, Duration::from_millis(900));
 const RESPONSES_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
@@ -206,31 +207,6 @@ impl CodexTurnState {
         }
     }
 }
-
-#[derive(Debug)]
-enum ResponseBodyReadError {
-    Transport(reqwest::Error),
-    TooLarge { limit: usize },
-}
-
-impl ResponseBodyReadError {
-    fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transport(_))
-    }
-}
-
-impl fmt::Display for ResponseBodyReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transport(err) => write!(formatter, "response body decode failed: {err}"),
-            Self::TooLarge { limit } => {
-                write!(formatter, "response body exceeded the {limit}-byte limit")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ResponseBodyReadError {}
 
 #[derive(Debug)]
 enum SseParseError {
@@ -470,140 +446,13 @@ fn capture_response_metadata(
     }
 }
 
-async fn read_response_body_bytes(
-    response: reqwest::Response,
-    display_name: &str,
-    model: &str,
-    attempt: usize,
-    streaming_sse: bool,
-) -> std::result::Result<(Vec<u8>, String), ResponseBodyReadError> {
-    read_response_body_bytes_with_limit(
-        response,
-        display_name,
-        model,
-        attempt,
-        streaming_sse,
-        RESPONSES_MAX_BODY_BYTES,
-    )
-    .await
-}
-
-async fn read_response_body_bytes_with_limit(
-    mut response: reqwest::Response,
-    display_name: &str,
-    model: &str,
-    attempt: usize,
-    streaming_sse: bool,
-    max_body_bytes: usize,
-) -> std::result::Result<(Vec<u8>, String), ResponseBodyReadError> {
-    let header_summary = summarize_response_headers(response.headers());
-    let mut body = Vec::new();
-
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_body_bytes as u64)
-    {
-        error!(
-            "{} response body rejected: model={}, attempt={}/{}, streaming_sse={}, headers=[{}], limit_bytes={}",
-            display_name,
-            model,
-            attempt,
-            RESPONSES_MAX_ATTEMPTS,
-            streaming_sse,
-            header_summary,
-            max_body_bytes
-        );
-        return Err(ResponseBodyReadError::TooLarge {
-            limit: max_body_bytes,
-        });
-    }
-
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                if body.len().saturating_add(chunk.len()) > max_body_bytes {
-                    error!(
-                        "{} response body rejected: model={}, attempt={}/{}, streaming_sse={}, headers=[{}], received_bytes={}, next_chunk_bytes={}, limit_bytes={}",
-                        display_name,
-                        model,
-                        attempt,
-                        RESPONSES_MAX_ATTEMPTS,
-                        streaming_sse,
-                        header_summary,
-                        body.len(),
-                        chunk.len(),
-                        max_body_bytes
-                    );
-                    return Err(ResponseBodyReadError::TooLarge {
-                        limit: max_body_bytes,
-                    });
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(None) => {
-                return Ok((body, header_summary));
-            }
-            Err(err) => {
-                if streaming_sse
-                    && std::str::from_utf8(&body)
-                        .ok()
-                        .is_some_and(|partial| parse_sse_responses_body(partial).is_ok())
-                {
-                    warn!(
-                        "{} response framing ended after a valid response.completed event: model={}, attempt={}/{}, headers=[{}], bytes={}, error={}",
-                        display_name,
-                        model,
-                        attempt,
-                        RESPONSES_MAX_ATTEMPTS,
-                        header_summary,
-                        body.len(),
-                        err
-                    );
-                    return Ok((body, header_summary));
-                }
-                // A failure while streaming the body (e.g. an intermediary closing an
-                // idle chunked connection mid-reasoning) is transient and safe to retry,
-                // so log it as a warning while attempts remain and reserve `error!` for
-                // the final, give-up attempt.
-                let will_retry = attempt < RESPONSES_MAX_ATTEMPTS;
-                let log_message = format!(
-                    "{} response body decode failed: model={}, attempt={}/{}, streaming_sse={}, timeout={}, connect={}, headers=[{}], partial_bytes={}, retrying={}, error={}",
-                    display_name,
-                    model,
-                    attempt,
-                    RESPONSES_MAX_ATTEMPTS,
-                    streaming_sse,
-                    err.is_timeout(),
-                    err.is_connect(),
-                    header_summary,
-                    body.len(),
-                    will_retry,
-                    err
-                );
-                if will_retry {
-                    warn!("{log_message}");
-                } else {
-                    error!("{log_message}");
-                }
-                return Err(ResponseBodyReadError::Transport(err));
-            }
-        }
-    }
-}
-
-fn responses_should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
-}
-
-fn responses_should_retry_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status.is_server_error()
-}
-
-fn responses_retry_delay(attempt: usize) -> Duration {
-    let attempt = attempt.max(1) as u64;
-    Duration::from_millis(RESPONSES_RETRY_BASE_DELAY_MS.saturating_mul(attempt))
+/// A chunked SSE stream whose terminator was cut after a full
+/// `response.completed` event is semantically complete; retrying it would
+/// only repeat the turn.
+fn interrupted_body_is_complete_sse(partial: &[u8]) -> bool {
+    std::str::from_utf8(partial)
+        .ok()
+        .is_some_and(|body| parse_sse_responses_body(body).is_ok())
 }
 
 fn responses_request_timeout_secs(provider: ThirdPartyProvider) -> u64 {
@@ -1186,34 +1035,19 @@ async fn resolve_request_headers_for_attempt(
 }
 
 fn parse_sse_responses_body(body: &str) -> std::result::Result<Value, SseParseError> {
+    let events = parse_sse_data_events(body).map_err(|err| SseParseError::InvalidPayload {
+        bytes: err.bytes,
+        source: err.source,
+    })?;
+
     let mut output_items: Vec<Value> = Vec::new();
-    let mut current_data_lines: Vec<String> = Vec::new();
     let mut response_id: Option<String> = None;
     let mut usage: Option<Value> = None;
     let mut completed = false;
 
-    let flush_event = |lines: &mut Vec<String>,
-                       output_items: &mut Vec<Value>,
-                       response_id: &mut Option<String>,
-                       usage: &mut Option<Value>,
-                       completed: &mut bool|
-     -> std::result::Result<(), SseParseError> {
-        if lines.is_empty() {
-            return Ok(());
-        }
-        let payload = lines.join("\n");
-        lines.clear();
-        if payload.trim().is_empty() || payload.trim() == "[DONE]" {
-            return Ok(());
-        }
-
-        let value: Value =
-            serde_json::from_str(&payload).map_err(|source| SseParseError::InvalidPayload {
-                bytes: payload.len(),
-                source,
-            })?;
+    for value in events {
         if response_id.is_none() {
-            *response_id = value
+            response_id = value
                 .pointer("/response/id")
                 .and_then(|value| value.as_str())
                 .map(str::to_string);
@@ -1225,9 +1059,9 @@ fn parse_sse_responses_body(body: &str) -> std::result::Result<Value, SseParseEr
                 }
             }
             Some("response.completed") => {
-                *completed = true;
+                completed = true;
                 if usage.is_none() {
-                    *usage = value.pointer("/response/usage").cloned();
+                    usage = value.pointer("/response/usage").cloned();
                 }
                 if output_items.is_empty() {
                     if let Some(items) = value
@@ -1273,32 +1107,7 @@ fn parse_sse_responses_body(body: &str) -> std::result::Result<Value, SseParseEr
             }
             _ => {}
         }
-
-        Ok(())
-    };
-
-    for line in body.lines() {
-        if line.trim().is_empty() {
-            flush_event(
-                &mut current_data_lines,
-                &mut output_items,
-                &mut response_id,
-                &mut usage,
-                &mut completed,
-            )?;
-            continue;
-        }
-        if let Some(data) = line.strip_prefix("data:") {
-            current_data_lines.push(data.trim_start().to_string());
-        }
     }
-    flush_event(
-        &mut current_data_lines,
-        &mut output_items,
-        &mut response_id,
-        &mut usage,
-        &mut completed,
-    )?;
 
     if !completed {
         return Err(SseParseError::MissingCompletion);
@@ -1366,300 +1175,198 @@ where
         .get("model")
         .and_then(|value| value.as_str())
         .unwrap_or("unknown");
-    let started_at = chrono::Utc::now();
     let audit_metadata = json!({
         "request_summary": summarize_responses_payload(&details.payload),
         "streaming_sse": details.streaming_sse,
         "timeout_secs": details.request_timeout_secs
     });
-    log_llm_request_started(
+    let call = LlmCall::begin(
         details.provider.as_str(),
         model,
         operation,
-        started_at,
+        audit_context,
         Some(&audit_metadata),
-    );
+    )
+    .with_label(details.display_name);
     info!(
         "{} responses request starting: {}",
         details.display_name,
         summarize_responses_payload(&details.payload)
     );
+
     let client = if details.streaming_sse {
         get_http_client_no_compression()
     } else {
         get_http_client()
     };
-    for attempt in 1..=RESPONSES_MAX_ATTEMPTS {
-        let mut attempt_headers = resolve_headers().await?;
-        if details.provider == ThirdPartyProvider::OpenAICodex {
-            turn_state.apply(&mut attempt_headers);
-        }
-        let mut request = client
-            .post(&details.url)
-            .timeout(Duration::from_secs(details.request_timeout_secs));
-        for (name, value) in &attempt_headers {
-            request = request.header(name, value);
-        }
-        if details.streaming_sse {
-            request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
-        }
-        debug!(
-            "{} request timeout configured: model={}, timeout_secs={}, streaming_sse={}, attempt={}/{}",
-            details.display_name,
-            model,
-            details.request_timeout_secs,
-            details.streaming_sse,
-            attempt,
-            RESPONSES_MAX_ATTEMPTS
-        );
+    let timeout = Duration::from_secs(details.request_timeout_secs);
+    let is_codex = details.provider == ThirdPartyProvider::OpenAICodex;
+    // Only Codex credentials can be refreshed; for OpenAI a 401 is final.
+    let policy = RetryPolicy {
+        refresh_auth_on_unauthorized: is_codex,
+        ..RESPONSES_RETRY_POLICY
+    };
+    let display_name = details.display_name;
+    let streaming_sse = details.streaming_sse;
+    let turn_state = parking_lot::Mutex::new(turn_state);
+    let last_metadata = parking_lot::Mutex::new(None::<ResponsesResponseMetadata>);
 
-        let response = match request.json(&details.payload).send().await {
-            Ok(response) => response,
-            Err(err) => {
-                let should_retry =
-                    responses_should_retry_error(&err) && attempt < RESPONSES_MAX_ATTEMPTS;
-                let log_message = format!(
-                    "{} responses request failed to send: model={}, error={}, timeout={}, connect={}, status={:?}, attempt={}/{}, retrying={}",
-                    details.display_name,
-                    model,
-                    err,
-                    err.is_timeout(),
-                    err.is_connect(),
-                    err.status(),
-                    attempt,
-                    RESPONSES_MAX_ATTEMPTS,
-                    should_retry
-                );
-                if should_retry {
-                    warn!("{log_message}");
-                } else {
-                    error!("{log_message}");
-                }
-                if should_retry {
-                    tokio::time::sleep(responses_retry_delay(attempt)).await;
-                    continue;
-                }
-                return Err(anyhow!("{} request failed: {}", details.display_name, err));
-            }
-        };
-
-        let status = response.status();
-        if details.provider == ThirdPartyProvider::OpenAICodex {
-            turn_state.capture(response.headers());
-        }
-        let response_metadata =
-            capture_response_metadata(response.headers(), details.codex_account_id.as_deref());
-        observe_response_metadata(details.provider, &response_metadata);
-
-        if !status.is_success() {
-            if status == StatusCode::UNAUTHORIZED
-                && details.provider == ThirdPartyProvider::OpenAICodex
-                && attempt < RESPONSES_MAX_ATTEMPTS
-            {
-                warn!(
-                    "{} responses request unauthorized for model={}; refreshing Codex auth and retrying (attempt={}/{})",
-                    details.display_name,
-                    model,
-                    attempt,
-                    RESPONSES_MAX_ATTEMPTS
-                );
-                refresh_auth().await?;
-                continue;
-            }
-            let body = match read_response_body_bytes(
-                response,
-                details.display_name,
-                model,
-                attempt,
-                details.streaming_sse,
-            )
-            .await
-            {
-                Ok((bytes, _)) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(err) => {
-                    let should_retry = responses_should_retry_status(status)
-                        && err.is_retryable()
-                        && attempt < RESPONSES_MAX_ATTEMPTS;
-                    if should_retry {
-                        tokio::time::sleep(responses_retry_delay(attempt)).await;
-                        continue;
-                    }
-                    return Err(anyhow!(
-                        "{} request failed with status {} and its error body could not be read: {}",
-                        details.display_name,
-                        status,
-                        err
-                    ));
-                }
-            };
-            let body_summary = summarize_error_body(&body);
-            let should_retry =
-                responses_should_retry_status(status) && attempt < RESPONSES_MAX_ATTEMPTS;
-            let log_message = format!(
-                "{} responses API error: model={}, status={}, error_summary={}, attempt={}/{}, retrying={}",
-                details.display_name,
-                model,
-                status,
-                body_summary,
-                attempt,
-                RESPONSES_MAX_ATTEMPTS,
-                should_retry
-            );
-            if should_retry {
-                warn!("{log_message}");
+    let result = call_with_retry(
+        &call,
+        &policy,
+        |attempt| {
+            // Refresh first (when the previous attempt was rejected with 401),
+            // then resolve the per-attempt headers so they see the new tokens.
+            let refresh = if attempt.previous_unauthorized {
+                Some(refresh_auth())
             } else {
-                error!("{log_message}");
-            }
-            if should_retry {
-                tokio::time::sleep(responses_retry_delay(attempt)).await;
-                continue;
-            }
-            return Err(anyhow!(
-                "{} request failed with status {}: {}",
-                details.display_name,
-                status,
-                body_summary
-            ));
-        }
-
-        debug!(
-            "{} response metadata: model={}, request_id={:?}, models_etag={:?}, rate_limit_headers={:?}",
-            details.display_name,
-            model,
-            response_metadata.request_id,
-            response_metadata.models_etag,
-            response_metadata.rate_limit_headers
-        );
-
-        let (body_bytes, header_summary) = match read_response_body_bytes(
-            response,
-            details.display_name,
-            model,
-            attempt,
-            details.streaming_sse,
-        )
-        .await
-        {
-            Ok(result) => result,
-            // The body stream was interrupted (e.g. a Cloudflare-fronted chunked SSE
-            // connection dropped while the model was reasoning and emitting no events).
-            // Re-issuing is safe: the payload is unchanged across attempts, and
-            // `store=false` means the failed attempt left no server-side state behind.
-            // So retry with the same backoff used for send-phase failures instead of
-            // surfacing the failure to the user. `read_response_body_bytes` already
-            // logged the diagnostics, including whether a retry would follow.
-            Err(err) => {
-                if err.is_retryable() && attempt < RESPONSES_MAX_ATTEMPTS {
-                    tokio::time::sleep(responses_retry_delay(attempt)).await;
-                    continue;
+                None
+            };
+            let headers = resolve_headers();
+            let turn_state = &turn_state;
+            async move {
+                if let Some(refresh) = refresh {
+                    refresh
+                        .await
+                        .map_err(|err| ProviderError::rejected(err.to_string()))?;
                 }
-                return Err(err.into());
-            }
-        };
-        debug!(
-            "{} response headers for model={}: [{}]",
-            details.display_name, model, header_summary
-        );
-        let body = match String::from_utf8(body_bytes) {
-            Ok(body) => body,
-            Err(err) => {
-                let bytes = err.into_bytes();
-                let should_retry = details.streaming_sse && attempt < RESPONSES_MAX_ATTEMPTS;
-                let log_message = format!(
-                    "{} response body was not valid UTF-8: model={}, attempt={}/{}, headers=[{}], bytes={}, retrying={}",
-                    details.display_name,
+                let mut attempt_headers = headers
+                    .await
+                    .map_err(|err| ProviderError::rejected(err.to_string()))?;
+                if is_codex {
+                    turn_state.lock().apply(&mut attempt_headers);
+                }
+                let mut request = client.post(&details.url).timeout(timeout);
+                for (name, value) in &attempt_headers {
+                    request = request.header(name, value);
+                }
+                if streaming_sse {
+                    request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+                }
+                debug!(
+                    "{} request timeout configured: model={}, timeout_secs={}, streaming_sse={}, attempt={}/{}",
+                    display_name,
                     model,
-                    attempt,
-                    RESPONSES_MAX_ATTEMPTS,
-                    header_summary,
-                    bytes.len(),
-                    should_retry
+                    details.request_timeout_secs,
+                    streaming_sse,
+                    attempt.number,
+                    attempt.max_attempts
                 );
-                if should_retry {
-                    warn!("{log_message}");
-                    tokio::time::sleep(responses_retry_delay(attempt)).await;
-                    continue;
-                }
-                error!("{log_message}");
-                return Err(anyhow!(
-                    "{} response body was not valid UTF-8",
-                    details.display_name
-                ));
+                Ok(request.json(&details.payload))
             }
-        };
-
-        let value = if details.streaming_sse {
-            match parse_sse_responses_body(&body) {
-                Ok(value) => value,
-                Err(err) => {
-                    let should_retry = err.is_retryable() && attempt < RESPONSES_MAX_ATTEMPTS;
-                    let log_message = format!(
-                        "{} SSE response rejected: model={}, attempt={}/{}, headers=[{}], retrying={}, error={}",
-                        details.display_name,
-                        model,
-                        attempt,
-                        RESPONSES_MAX_ATTEMPTS,
-                        header_summary,
-                        should_retry,
-                        err
-                    );
-                    if should_retry {
-                        warn!("{log_message}");
-                        tokio::time::sleep(responses_retry_delay(attempt)).await;
-                        continue;
+        },
+        |response| {
+            // Every response (including a 401) may carry the sticky turn state
+            // and rate-limit metadata.
+            if is_codex {
+                turn_state.lock().capture(response.headers());
+            }
+            *last_metadata.lock() = Some(capture_response_metadata(
+                response.headers(),
+                details.codex_account_id.as_deref(),
+            ));
+        },
+        |response| async move {
+            let header_summary = summarize_response_headers(response.headers());
+            debug!(
+                "{} response headers for model={}: [{}]",
+                display_name, model, header_summary
+            );
+            let body_bytes =
+                match read_body_limited_or_partial(response, display_name, RESPONSES_MAX_BODY_BYTES)
+                    .await?
+                {
+                    BodyRead::Complete(bytes) => bytes,
+                    BodyRead::Interrupted { partial, error } => {
+                        if streaming_sse && interrupted_body_is_complete_sse(&partial) {
+                            warn!(
+                                "{} response framing ended after a valid response.completed event: model={}, headers=[{}], bytes={}, error={}",
+                                display_name,
+                                model,
+                                header_summary,
+                                partial.len(),
+                                error
+                            );
+                            partial
+                        } else {
+                            // An intermediary closing an idle chunked connection
+                            // mid-reasoning is transient. Re-issuing is safe: the
+                            // payload is unchanged and `store=false` left no
+                            // server-side state behind.
+                            return Err(error);
+                        }
                     }
-                    error!("{log_message}");
-                    return Err(err.into());
-                }
+                };
+            let body = String::from_utf8(body_bytes).map_err(|err| {
+                ProviderError::decode(
+                    display_name,
+                    format!(
+                        "response body was not valid UTF-8 ({} bytes, headers=[{header_summary}])",
+                        err.as_bytes().len()
+                    ),
+                    streaming_sse,
+                )
+            })?;
+            if streaming_sse {
+                parse_sse_responses_body(&body).map_err(|err| {
+                    ProviderError::decode(
+                        display_name,
+                        format!("SSE response rejected (headers=[{header_summary}]): {err}"),
+                        err.is_retryable(),
+                    )
+                })
+            } else {
+                serde_json::from_str::<Value>(&body).map_err(|err| {
+                    ProviderError::decode(
+                        display_name,
+                        format!(
+                            "response JSON parse failed ({} bytes, headers=[{header_summary}]): {err}",
+                            body.len()
+                        ),
+                        false,
+                    )
+                })
             }
-        } else {
-            match serde_json::from_str::<Value>(&body) {
-                Ok(value) => value,
-                Err(err) => {
-                    error!(
-                        "{} JSON parse failed: model={}, attempt={}/{}, headers=[{}], bytes={}, error={}",
-                        details.display_name,
-                        model,
-                        attempt,
-                        RESPONSES_MAX_ATTEMPTS,
-                        header_summary,
-                        body.len(),
-                        err
-                    );
-                    return Err(anyhow!(
-                        "{} response JSON parse failed: {}",
-                        details.display_name,
-                        err
-                    ));
-                }
-            }
-        };
-        let output_items = extract_response_output_items(&value);
-        info!(
-            "{} responses request completed: model={}, output_items={}, output_summary=[{}]",
-            details.display_name,
-            model,
-            output_items.len(),
-            summarize_output_items(&output_items)
-        );
-        let usage = extract_responses_usage(&value);
-        record_llm_request_success(
-            audit_context,
-            details.provider.as_str(),
-            model,
-            operation,
-            started_at,
-            chrono::Utc::now(),
-            usage,
-        )
-        .await;
-        return Ok(ResponsesApiResult {
-            response: value,
-            metadata: response_metadata,
-        });
-    }
+        },
+        usage::from_responses,
+    )
+    .await;
 
-    unreachable!("responses provider retry loop exhausted")
+    let value = result.map_err(|err| responses_provider_error(display_name, err))?;
+    // Only a successful response carries model metadata worth acting on.
+    let metadata = last_metadata.into_inner().unwrap_or_default();
+    observe_response_metadata(details.provider, &metadata);
+    let output_items = extract_response_output_items(&value);
+    info!(
+        "{} responses request completed: model={}, output_items={}, output_summary=[{}]",
+        display_name,
+        model,
+        output_items.len(),
+        summarize_output_items(&output_items)
+    );
+    Ok(ResponsesApiResult {
+        response: value,
+        metadata,
+    })
+}
+
+/// Keep remote error text out of user-facing messages: HTTP failures are
+/// summarised structurally and decode failures carry only our own wording.
+fn responses_provider_error(display_name: &str, err: ProviderError) -> anyhow::Error {
+    match err {
+        ProviderError::Http {
+            status,
+            body_snippet,
+            ..
+        } => anyhow!(
+            "{} request failed with status {}: {}",
+            display_name,
+            status,
+            summarize_error_body(&body_snippet)
+        ),
+        ProviderError::Decode { detail, .. } => anyhow!("{detail}"),
+        other => anyhow!("{other}"),
+    }
 }
 
 fn extract_response_output_items(response: &Value) -> Vec<Value> {
@@ -1668,52 +1375,6 @@ fn extract_response_output_items(response: &Value) -> Vec<Value> {
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default()
-}
-
-fn extract_responses_usage(response: &Value) -> LlmUsageRecord {
-    let usage_value = response.get("usage").cloned();
-    let input_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.get("input_tokens"))
-        .and_then(|value| value.as_i64());
-    let output_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.get("output_tokens"))
-        .and_then(|value| value.as_i64());
-    let total_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.get("total_tokens"))
-        .and_then(|value| value.as_i64())
-        .or_else(|| match (input_tokens, output_tokens) {
-            (Some(input_tokens), Some(output_tokens)) => Some(input_tokens + output_tokens),
-            _ => None,
-        });
-    let reasoning_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.pointer("/output_tokens_details/reasoning_tokens"))
-        .and_then(|value| value.as_i64());
-    let cached_input_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.pointer("/input_tokens_details/cached_tokens"))
-        .and_then(|value| value.as_i64());
-    let cache_write_tokens = usage_value
-        .as_ref()
-        .and_then(|usage| usage.pointer("/input_tokens_details/cache_write_tokens"))
-        .and_then(|value| value.as_i64());
-
-    LlmUsageRecord {
-        response_id: response
-            .get("id")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string()),
-        input_tokens,
-        output_tokens,
-        total_tokens,
-        reasoning_tokens,
-        cached_input_tokens,
-        cache_write_tokens,
-        raw_usage_json: usage_value.map(|usage| usage.to_string()),
-    }
 }
 
 fn extract_response_text(output_items: &[Value]) -> String {
@@ -2924,47 +2585,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_responses_usage_reads_token_counts_and_reasoning_details() {
-        let response = json!({
-            "id": "resp_123",
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": 20,
-                "input_tokens_details": {
-                    "cached_tokens": 3,
-                    "cache_write_tokens": 4
-                },
-                "output_tokens_details": {
-                    "reasoning_tokens": 7
-                }
-            }
-        });
-
-        let usage = extract_responses_usage(&response);
-
-        assert_eq!(usage.response_id.as_deref(), Some("resp_123"));
-        assert_eq!(usage.input_tokens, Some(10));
-        assert_eq!(usage.output_tokens, Some(20));
-        assert_eq!(usage.total_tokens, Some(30));
-        assert_eq!(usage.reasoning_tokens, Some(7));
-        assert_eq!(usage.cached_input_tokens, Some(3));
-        assert_eq!(usage.cache_write_tokens, Some(4));
-    }
-
-    #[test]
-    fn extract_responses_usage_leaves_cache_write_tokens_none_when_absent() {
-        let usage = extract_responses_usage(&json!({
-            "usage": {
-                "input_tokens": 2,
-                "output_tokens": 1,
-                "input_tokens_details": {"cached_tokens": 0}
-            }
-        }));
-
-        assert_eq!(usage.cache_write_tokens, None);
-    }
-
-    #[test]
     fn parse_sse_responses_body_collects_output_items() {
         let body = r#"event: response.created
 data: {"type":"response.created","response":{"id":"resp1"}}
@@ -3147,11 +2767,15 @@ data: {"type":"response.failed","response":{"id":"resp1","error":{"message":"bac
             .send()
             .await
             .expect("request headers should arrive");
-        let result = read_response_body_bytes(response, "Test", "test-model", 1, true).await;
-        assert!(
-            result.is_err(),
-            "a truncated chunked body must surface as an error so the loop can retry"
-        );
+        let read = read_body_limited_or_partial(response, "Test", RESPONSES_MAX_BODY_BYTES)
+            .await
+            .expect("only the size limit is a hard error");
+        let BodyRead::Interrupted { partial, error } = read else {
+            panic!("a truncated chunked body must surface as interrupted so the loop can retry");
+        };
+        assert_eq!(partial, b"hello");
+        assert!(error.is_retryable());
+        assert!(!interrupted_body_is_complete_sse(&partial));
         handle.join().unwrap();
     }
 
@@ -3176,9 +2800,12 @@ data: {"type":"response.failed","response":{"id":"resp1","error":{"message":"bac
             .send()
             .await
             .expect("request headers should arrive");
-        let (body, _headers) = read_response_body_bytes(response, "Test", "test-model", 1, true)
+        let read = read_body_limited_or_partial(response, "Test", RESPONSES_MAX_BODY_BYTES)
             .await
             .expect("a complete chunked body should read cleanly");
+        let BodyRead::Complete(body) = read else {
+            panic!("a complete chunked body must not be reported as interrupted");
+        };
         assert_eq!(String::from_utf8(body).unwrap(), "hello");
         handle.join().unwrap();
     }
@@ -3208,10 +2835,17 @@ data: {"type":"response.failed","response":{"id":"resp1","error":{"message":"bac
             .send()
             .await
             .expect("request headers should arrive");
-        let (body, _) = read_response_body_bytes(response, "Test", "test-model", 1, true)
+        let read = read_body_limited_or_partial(response, "Test", RESPONSES_MAX_BODY_BYTES)
             .await
-            .expect("a semantically complete SSE body must not be retried");
-        let parsed = parse_sse_responses_body(std::str::from_utf8(&body).unwrap())
+            .expect("only the size limit is a hard error");
+        let BodyRead::Interrupted { partial, .. } = read else {
+            panic!("the missing chunk terminator must be reported as an interruption");
+        };
+        assert!(
+            interrupted_body_is_complete_sse(&partial),
+            "a semantically complete SSE body must be accepted instead of retried"
+        );
+        let parsed = parse_sse_responses_body(std::str::from_utf8(&partial).unwrap())
             .expect("the buffered SSE body should be complete");
         assert_eq!(parsed["id"], "resp-complete");
         handle.join().unwrap();
@@ -3238,11 +2872,11 @@ data: {"type":"response.failed","response":{"id":"resp1","error":{"message":"bac
             .send()
             .await
             .expect("request headers should arrive");
-        let err = read_response_body_bytes_with_limit(response, "Test", "test-model", 1, true, 4)
+        let err = read_body_limited_or_partial(response, "Test", 4)
             .await
             .expect_err("the configured body limit must be enforced");
 
-        assert!(matches!(err, ResponseBodyReadError::TooLarge { limit: 4 }));
+        assert!(matches!(err, ProviderError::BodyTooLarge { limit: 4, .. }));
         handle.join().unwrap();
     }
 

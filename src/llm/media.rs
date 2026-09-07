@@ -2,12 +2,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use regex::Regex;
-use reqwest::StatusCode;
 use std::sync::LazyLock;
-use tracing::{error, warn};
+use tracing::error;
 
+use crate::llm::audit::LlmUsageRecord;
+use crate::llm::transport::{call_with_retry, read_body_limited, LlmCall, RetryPolicy};
 use crate::utils::http::get_http_client;
-use crate::utils::text::truncate_for_log;
 
 pub fn detect_mime_type(data: &[u8]) -> Option<String> {
     if data.len() > 12 {
@@ -23,10 +23,6 @@ pub fn detect_mime_type(data: &[u8]) -> Option<String> {
     infer::get(data).map(|kind| kind.mime_type().to_string())
 }
 
-const MEDIA_DOWNLOAD_MAX_ATTEMPTS: usize = 3;
-const MEDIA_DOWNLOAD_BASE_DELAY_MS: u64 = 400;
-const MEDIA_DOWNLOAD_ERROR_BODY_LIMIT: usize = 800;
-
 /// Mask the bot token embedded in Telegram file-download URLs so the URL can
 /// be logged safely. Other URLs pass through unchanged.
 pub fn redact_url_for_log(url: &str) -> String {
@@ -39,77 +35,40 @@ pub fn redact_url_for_log(url: &str) -> String {
         .into_owned()
 }
 
-fn should_retry_status(status: StatusCode) -> bool {
-    status.is_server_error()
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
-}
-
-fn should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
-}
+/// Largest media payload accepted from Telegram or an external host. Telegram's
+/// bot API caps file downloads at 20 MiB; the headroom covers external images.
+pub const MEDIA_DOWNLOAD_MAX_BYTES: usize = 32 * 1024 * 1024;
+const MEDIA_DOWNLOAD_POLICY: RetryPolicy = RetryPolicy::exponential(3, Duration::from_millis(400));
 
 pub async fn download_media(url: &str) -> Option<Vec<u8>> {
-    let client = get_http_client();
-    // Telegram file URLs embed the bot token; never log the raw URL.
+    download_media_limited(url, MEDIA_DOWNLOAD_MAX_BYTES).await
+}
+
+/// Download `url`, retrying transient failures and refusing bodies above
+/// `max_bytes`. Returns `None` after logging the cause; callers treat a
+/// missing download as "skip this attachment".
+pub async fn download_media_limited(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    // Telegram file URLs embed the bot token; never log the raw URL (reqwest
+    // error text repeats it, hence the redaction on the call).
     let log_url = redact_url_for_log(url);
-    for attempt in 0..MEDIA_DOWNLOAD_MAX_ATTEMPTS {
-        let response = match client.get(url).send().await {
-            Ok(resp) => resp,
-            Err(err) => {
-                warn!(
-                    "Failed to fetch media {log_url}: {err} (timeout={}, connect={}, status={:?}, attempt={}/{})",
-                    err.is_timeout(),
-                    err.is_connect(),
-                    err.status(),
-                    attempt + 1,
-                    MEDIA_DOWNLOAD_MAX_ATTEMPTS
-                );
-                if !should_retry_error(&err) || attempt + 1 == MEDIA_DOWNLOAD_MAX_ATTEMPTS {
-                    return None;
-                }
-                let delay = Duration::from_millis(MEDIA_DOWNLOAD_BASE_DELAY_MS << attempt);
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-        };
+    let call = LlmCall::untracked("media", &log_url).with_redaction(redact_url_for_log);
+    let result = call_with_retry(
+        &call,
+        &MEDIA_DOWNLOAD_POLICY,
+        |_| async move { Ok(get_http_client().get(url)) },
+        |_| {},
+        |response| read_body_limited(response, "media", max_bytes),
+        |_| LlmUsageRecord::default(),
+    )
+    .await;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            warn!(
-                "Media download failed for {log_url} with status {}: {}",
-                status,
-                truncate_for_log(&body, MEDIA_DOWNLOAD_ERROR_BODY_LIMIT)
-            );
-            if !should_retry_status(status) || attempt + 1 == MEDIA_DOWNLOAD_MAX_ATTEMPTS {
-                return None;
-            }
-            let delay = Duration::from_millis(MEDIA_DOWNLOAD_BASE_DELAY_MS << attempt);
-            tokio::time::sleep(delay).await;
-            continue;
+    match result {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            error!("Media download failed for {log_url}: {err}");
+            None
         }
-
-        return match response.bytes().await {
-            Ok(bytes) => Some(bytes.to_vec()),
-            Err(err) => {
-                error!(
-                    "Failed to read media bytes {log_url}: {err} (attempt={}/{})",
-                    attempt + 1,
-                    MEDIA_DOWNLOAD_MAX_ATTEMPTS
-                );
-                if attempt + 1 == MEDIA_DOWNLOAD_MAX_ATTEMPTS {
-                    None
-                } else {
-                    let delay = Duration::from_millis(MEDIA_DOWNLOAD_BASE_DELAY_MS << attempt);
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-            }
-        };
     }
-
-    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +122,50 @@ pub fn kind_for_mime(mime_type: &str) -> MediaKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::twitter_extractor::test_support::{
+        response_with_status, ExpectedRequest, TestServer,
+    };
+
+    #[tokio::test]
+    async fn download_media_limited_refuses_bodies_over_the_cap() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/f",
+            response_with_status(200, vec![b'x'; 100]),
+        )]);
+        let url = server.url("/f").to_string();
+
+        assert!(download_media_limited(&url, 10).await.is_none());
+        server.join().expect("one request was served");
+    }
+
+    #[tokio::test]
+    async fn download_media_retries_transient_server_errors() {
+        let server = TestServer::new(vec![
+            ExpectedRequest::new("GET", "/f", response_with_status(503, b"busy".to_vec())),
+            ExpectedRequest::new("GET", "/f", response_with_status(200, b"bytes".to_vec())),
+        ]);
+        let url = server.url("/f").to_string();
+
+        assert_eq!(
+            download_media_limited(&url, 1024).await.as_deref(),
+            Some(b"bytes".as_slice())
+        );
+        server.join().expect("both requests were served");
+    }
+
+    #[tokio::test]
+    async fn download_media_gives_up_on_permanent_errors_without_retrying() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/f",
+            response_with_status(404, b"gone".to_vec()),
+        )]);
+        let url = server.url("/f").to_string();
+
+        assert!(download_media_limited(&url, 1024).await.is_none());
+        server.join().expect("exactly one request was served");
+    }
 
     #[test]
     fn redacts_bot_token_in_telegram_file_urls() {
