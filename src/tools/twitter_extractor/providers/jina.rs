@@ -373,15 +373,8 @@ mod tests {
     use super::*;
     use crate::tools::twitter_extractor::model::XMedia;
     use crate::tools::twitter_extractor::test_support::{
-        response_with_content_length, ExpectedRequest, TestServer,
+        identity, response_with_content_length, ExpectedRequest, TestServer,
     };
-
-    fn identity(id: &str) -> XStatusIdentity {
-        XStatusIdentity {
-            id: id.to_owned(),
-            canonical_url: url::Url::parse(&format!("https://x.com/i/status/{id}")).unwrap(),
-        }
-    }
 
     #[test]
     fn parses_jina_photo_fixture_into_normalized_post() {

@@ -308,18 +308,10 @@ mod tests {
     use super::*;
     use crate::tools::twitter_extractor::model::XMedia;
     use crate::tools::twitter_extractor::test_support::{
-        response_with_content_length, ExpectedRequest, TestServer,
+        identity, response_with_content_length, ExpectedRequest, TestServer,
     };
-    use crate::tools::twitter_extractor::url::XStatusIdentity;
     use std::time::Duration;
     use url::Url;
-
-    fn identity(id: &str) -> XStatusIdentity {
-        XStatusIdentity {
-            id: id.to_owned(),
-            canonical_url: Url::parse(&format!("https://x.com/i/status/{id}")).unwrap(),
-        }
-    }
 
     fn test_config_with_vx_base(base: Url) -> TwitterFetchConfig {
         TwitterFetchConfig {

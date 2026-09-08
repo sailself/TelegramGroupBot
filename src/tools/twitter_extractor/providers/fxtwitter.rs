@@ -329,16 +329,8 @@ mod tests {
     use super::*;
     use crate::tools::twitter_extractor::model::XMedia;
     use crate::tools::twitter_extractor::test_support::{
-        redirect_response, response_with_content_length, ExpectedRequest, TestServer,
+        identity, redirect_response, response_with_content_length, ExpectedRequest, TestServer,
     };
-    use crate::tools::twitter_extractor::url::XStatusIdentity;
-
-    fn identity(id: &str) -> XStatusIdentity {
-        XStatusIdentity {
-            id: id.to_owned(),
-            canonical_url: url::Url::parse(&format!("https://x.com/i/status/{id}")).unwrap(),
-        }
-    }
 
     #[test]
     fn parses_fxtwitter_photo_quote_fixture() {
