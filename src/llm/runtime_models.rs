@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tracing::warn;
 
 use crate::config::{
-    qualify_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
+    qualify_third_party_model_id, Config, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
 };
 use crate::llm::codex_selected_model::{
     self, dynamic_codex_model_config, load_selected_codex_model_record,
@@ -19,7 +19,7 @@ pub use crate::llm::codex_selected_model::{
     OPENAI_CODEX_SELECTED_MODEL_ID,
 };
 
-pub(crate) fn build_runtime_models_state() -> RuntimeModelsState {
+pub(super) fn build_runtime_models_state() -> RuntimeModelsState {
     let mut models = CONFIG.third_party_models.clone();
     let stored_codex_selected_model = load_selected_codex_model_record();
     let current_account_id = current_codex_account_id();
@@ -114,15 +114,30 @@ pub fn resolve_runtime_model_identifier(identifier: &str) -> Option<String> {
     None
 }
 
-pub fn is_runtime_provider_ready(provider: ThirdPartyProvider) -> bool {
+fn is_runtime_provider_ready_with(config: &Config, provider: ThirdPartyProvider) -> bool {
     match provider {
+        ThirdPartyProvider::OpenRouter => {
+            config.enable_openrouter && !config.openrouter_api_key.trim().is_empty()
+        }
+        ThirdPartyProvider::Nvidia => {
+            config.enable_nvidia && !config.nvidia_api_key.trim().is_empty()
+        }
+        ThirdPartyProvider::Ollama => {
+            config.enable_ollama && !config.ollama_api_key.trim().is_empty()
+        }
+        ThirdPartyProvider::OpenAI => {
+            config.enable_openai && !config.openai_api_key.trim().is_empty()
+        }
         ThirdPartyProvider::OpenAICodex => {
-            CONFIG.enable_openai_codex
+            config.enable_openai_codex
                 && crate::llm::openai_codex::is_auth_ready()
                 && selected_codex_model_record().is_some()
         }
-        other => CONFIG.is_third_party_provider_ready(other),
     }
+}
+
+pub fn is_runtime_provider_ready(provider: ThirdPartyProvider) -> bool {
+    is_runtime_provider_ready_with(&CONFIG, provider)
 }
 
 #[cfg(test)]
@@ -130,21 +145,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_runtime_provider_ready_agrees_with_config_for_api_key_providers() {
+    fn is_runtime_provider_ready_with_matches_the_historical_formula_for_api_key_providers() {
         let providers = [
             ThirdPartyProvider::OpenRouter,
             ThirdPartyProvider::Nvidia,
             ThirdPartyProvider::Ollama,
             ThirdPartyProvider::OpenAI,
         ];
-
-        for provider in providers {
-            assert_eq!(
-                is_runtime_provider_ready(provider),
-                CONFIG.is_third_party_provider_ready(provider),
-                "{provider:?} should delegate to Config::is_third_party_provider_ready for the real environment"
-            );
-        }
 
         for provider in providers {
             for enabled in [true, false] {
@@ -170,12 +177,14 @@ mod tests {
                         ThirdPartyProvider::OpenAICodex => unreachable!(),
                     }
 
-                    // This is the exact formula is_runtime_provider_ready's arms used to
-                    // hardcode per-provider before delegating; lock it in here so deleting
-                    // those arms can't silently change behaviour.
+                    // This is the exact formula is_runtime_provider_ready_with's arms used to
+                    // hardcode per-provider before delegating to Config; lock it in here so
+                    // deleting those arms can't silently change behaviour. Exercising the seam
+                    // (not the global-CONFIG-reading public wrapper) means mutating `config`
+                    // above actually changes the outcome asserted below.
                     let historical_arm_result = enabled && !key.trim().is_empty();
                     assert_eq!(
-                        config.is_third_party_provider_ready(provider),
+                        is_runtime_provider_ready_with(&config, provider),
                         historical_arm_result,
                         "provider={provider:?} enabled={enabled} key={key:?}"
                     );
