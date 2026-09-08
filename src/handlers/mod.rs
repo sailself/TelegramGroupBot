@@ -1,4 +1,5 @@
 pub mod access;
+pub mod admin;
 pub mod codex_admin;
 pub mod commands;
 pub mod content;
