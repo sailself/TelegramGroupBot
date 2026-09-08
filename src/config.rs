@@ -417,13 +417,6 @@ fn validate_http_base_allowing_loopback(name: &str, value: String) -> Result<Str
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
-fn normalize_database_url(value: String) -> String {
-    if value.starts_with("sqlite+aiosqlite://") {
-        return value.replacen("sqlite+aiosqlite://", "sqlite://", 1);
-    }
-    value
-}
-
 fn normalize_gemini_safety_settings(value: String) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -459,7 +452,6 @@ fn resolve_third_party_models_path() -> PathBuf {
         }
     }
     candidates.push(PathBuf::from("third_party_models.json"));
-    candidates.push(PathBuf::from("bot").join("third_party_models.json"));
 
     for candidate in &candidates {
         if candidate.exists() {
@@ -562,46 +554,11 @@ fn load_third_party_models(path: &Path) -> Vec<ThirdPartyModelConfig> {
     models
 }
 
-#[cfg(test)]
-fn resolve_exact_model_identifier(value: &str, models: &[ThirdPartyModelConfig]) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    if trimmed.eq_ignore_ascii_case("gemini") {
-        return "gemini".to_string();
-    }
-
-    if let Some((provider, model)) = parse_third_party_model_id(trimmed) {
-        return qualify_third_party_model_id(provider, model);
-    }
-
-    let exact_matches = models
-        .iter()
-        .filter(|config_entry| config_entry.model == trimmed)
-        .collect::<Vec<_>>();
-    if exact_matches.len() == 1 {
-        return exact_matches[0].id.clone();
-    }
-
-    trimmed.to_string()
-}
-
-fn resolve_default_text_model_value(
-    default_text_model: Option<&str>,
-    default_q_model: Option<&str>,
-) -> String {
+fn resolve_default_text_model_value(default_text_model: Option<&str>) -> String {
     default_text_model
         .and_then(|value| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .or_else(|| {
-            default_q_model.and_then(|value| {
-                let trimmed = value.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            })
         })
         .unwrap_or_else(|| "gemini".to_string())
 }
@@ -663,10 +620,8 @@ impl Config {
         if web_search_providers.is_empty() {
             web_search_providers = vec!["brave".to_string(), "exa".to_string(), "jina".to_string()];
         }
-        let default_text_model = resolve_default_text_model_value(
-            env::var("DEFAULT_TEXT_MODEL").ok().as_deref(),
-            env::var("DEFAULT_Q_MODEL").ok().as_deref(),
-        );
+        let default_text_model =
+            resolve_default_text_model_value(env::var("DEFAULT_TEXT_MODEL").ok().as_deref());
         let default_quick_text_model = resolve_default_quick_text_model_value(
             env::var("DEFAULT_QUICK_TEXT_MODEL").ok().as_deref(),
             &default_text_model,
@@ -754,10 +709,7 @@ impl Config {
         Ok(Config {
             bot_token,
             log_level: env_string("LOG_LEVEL", "info").to_lowercase(),
-            database_url: normalize_database_url(env_string(
-                "DATABASE_URL",
-                "sqlite+aiosqlite:///bot.db",
-            )),
+            database_url: env_string("DATABASE_URL", "sqlite://bot.db"),
             publish_bot_commands: env_bool("PUBLISH_BOT_COMMANDS", false),
             enable_bot_to_bot_auto_q: env_bool("ENABLE_BOT_TO_BOT_AUTO_Q", false),
             enable_gemini: env_bool("ENABLE_GEMINI", true),
@@ -811,7 +763,10 @@ impl Config {
             enable_openai_codex: env_bool("ENABLE_OPENAI_CODEX", true),
             openai_codex_base_url,
             openai_codex_originator: env_string("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs"),
-            openai_codex_client_version: env_string("OPENAI_CODEX_CLIENT_VERSION", "0.144.0"),
+            openai_codex_client_version: env_string(
+                "OPENAI_CODEX_CLIENT_VERSION",
+                crate::llm::openai_codex::CODEX_CLIENT_VERSION,
+            ),
             openai_codex_web_search_mode: env_string("OPENAI_CODEX_WEB_SEARCH_MODE", "live")
                 .to_lowercase(),
             openai_codex_web_search_context_size: env_string(
@@ -953,7 +908,9 @@ impl Config {
     }
 
     pub fn img2_api_available(&self) -> bool {
-        self.enable_img2 && !self.img2_api_key.trim().is_empty()
+        self.enable_img2
+            && !self.img2_api_key.trim().is_empty()
+            && !self.img2_base_url.trim().is_empty()
     }
 }
 
@@ -968,6 +925,31 @@ mod tests {
     // Environment variables are process-wide; hold this lock for the whole
     // span of any test that sets/removes one so tests can't race each other.
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn resolve_exact_model_identifier(value: &str, models: &[ThirdPartyModelConfig]) -> String {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        if trimmed.eq_ignore_ascii_case("gemini") {
+            return "gemini".to_string();
+        }
+
+        if let Some((provider, model)) = parse_third_party_model_id(trimmed) {
+            return qualify_third_party_model_id(provider, model);
+        }
+
+        let exact_matches = models
+            .iter()
+            .filter(|config_entry| config_entry.model == trimmed)
+            .collect::<Vec<_>>();
+        if exact_matches.len() == 1 {
+            return exact_matches[0].id.clone();
+        }
+
+        trimmed.to_string()
+    }
 
     #[test]
     fn env_f32_warns_once_and_returns_default_on_unparsable_value() {
@@ -989,24 +971,17 @@ mod tests {
     }
 
     #[test]
-    fn default_text_model_prefers_new_env_value_over_legacy_q_value() {
+    fn default_text_model_uses_configured_value_when_present() {
         assert_eq!(
-            resolve_default_text_model_value(Some("openai-codex"), Some("gemini")),
+            resolve_default_text_model_value(Some("openai-codex")),
             "openai-codex"
         );
     }
 
     #[test]
-    fn default_text_model_uses_legacy_q_value_when_new_value_missing() {
-        assert_eq!(
-            resolve_default_text_model_value(None, Some("openai-codex:selected")),
-            "openai-codex:selected"
-        );
-    }
-
-    #[test]
-    fn default_text_model_defaults_to_gemini_when_both_values_missing() {
-        assert_eq!(resolve_default_text_model_value(None, None), "gemini");
+    fn default_text_model_defaults_to_gemini_when_unset_or_blank() {
+        assert_eq!(resolve_default_text_model_value(None), "gemini");
+        assert_eq!(resolve_default_text_model_value(Some("   ")), "gemini");
     }
 
     #[test]
