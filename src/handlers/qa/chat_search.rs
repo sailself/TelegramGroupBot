@@ -17,7 +17,7 @@ use crate::utils::text::{escape_html, split_for_telegram, truncate_with_ellipsis
 use crate::utils::timing::{now_unix_seconds, CommandTimer};
 use tracing::warn;
 
-use super::{format_llm_error_message, result_model_display_name};
+use super::model_resolution::{format_llm_error_message, result_model_display_name};
 
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
 const CHAT_SEARCH_JSON_OUTPUT_PROMPT: &str = "Final response format: return only valid JSON with this shape: {\"selected_message_ids\":[123],\"note\":\"optional short note\"}. Do not wrap the JSON in Markdown. Do not include message IDs that were not returned by chat_context_query.";
