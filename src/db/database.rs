@@ -7,9 +7,8 @@ use std::time::Duration;
 
 use crate::config::CONFIG;
 use crate::db::schema::{
-    count_messages, current_search_schema_version, ensure_llm_audit_schema, ensure_messages_schema,
-    ensure_search_fts_exists, ensure_search_support_schema, recreate_search_fts,
-    reset_search_versions, set_search_schema_version,
+    self, count_messages, current_search_schema_version, ensure_search_fts_exists,
+    recreate_search_fts, reset_search_versions, set_search_schema_version,
 };
 use crate::db::search::CURRENT_SEARCH_SCHEMA_VERSION;
 use crate::db::search_index::{count_pending_search_rows, spawn_search_rebuild};
@@ -48,9 +47,7 @@ impl Database {
             .await?;
         let search_ready = Arc::new(AtomicBool::new(false));
 
-        ensure_messages_schema(&pool).await?;
-        ensure_search_support_schema(&pool).await?;
-        ensure_llm_audit_schema(&pool).await?;
+        schema::migrate(&pool).await?;
         sqlx::query("PRAGMA optimize").execute(&pool).await?;
 
         let schema_version = current_search_schema_version(&pool).await?;

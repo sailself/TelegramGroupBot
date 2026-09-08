@@ -1,6 +1,7 @@
-//! Schema creation, column backfills, and FTS bootstrapping for the SQLite database.
+//! Schema creation, column backfills, FTS bootstrapping, and versioned
+//! migrations for the SQLite database.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::{FromRow, SqlitePool};
 
 #[derive(Debug, Clone, FromRow)]
@@ -8,7 +9,48 @@ struct TableInfoRow {
     name: String,
 }
 
-pub(super) async fn ensure_messages_schema(pool: &SqlitePool) -> Result<()> {
+pub(super) const LATEST_SCHEMA_VERSION: i32 = 1;
+
+/// Bring `pool`'s schema up to [`LATEST_SCHEMA_VERSION`], applying any
+/// migrations in order. Refuses to run against a database stamped with a
+/// version newer than this binary understands.
+pub(super) async fn migrate(pool: &SqlitePool) -> Result<()> {
+    let mut version: i32 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await?;
+    if version > LATEST_SCHEMA_VERSION {
+        anyhow::bail!(
+            "database schema version {version} is newer than this binary supports ({LATEST_SCHEMA_VERSION})"
+        );
+    }
+    while version < LATEST_SCHEMA_VERSION {
+        let next = version + 1;
+        apply_migration(pool, next)
+            .await
+            .with_context(|| format!("applying schema migration {next}"))?;
+        sqlx::query(&format!("PRAGMA user_version = {next}"))
+            .execute(pool)
+            .await?;
+        version = next;
+    }
+    Ok(())
+}
+
+async fn apply_migration(pool: &SqlitePool, version: i32) -> Result<()> {
+    match version {
+        // v1 = today's idempotent schema (CREATE IF NOT EXISTS + column backfills),
+        // so a legacy database at user_version 0 is brought to v1 without data loss.
+        1 => {
+            ensure_messages_schema(pool).await?;
+            ensure_search_support_schema(pool).await?;
+            ensure_llm_audit_schema(pool).await?;
+            Ok(())
+        }
+        other => anyhow::bail!("unknown schema migration {other}"),
+    }
+}
+
+async fn ensure_messages_schema(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS messages (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -69,7 +111,7 @@ pub(super) async fn ensure_messages_schema(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn ensure_search_support_schema(pool: &SqlitePool) -> Result<()> {
+async fn ensure_search_support_schema(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS app_meta (\
             key TEXT PRIMARY KEY,\
@@ -81,7 +123,7 @@ pub(super) async fn ensure_search_support_schema(pool: &SqlitePool) -> Result<()
     Ok(())
 }
 
-pub(super) async fn ensure_llm_audit_schema(pool: &SqlitePool) -> Result<()> {
+async fn ensure_llm_audit_schema(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS llm_invocations (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -305,7 +347,8 @@ pub(super) async fn count_messages(pool: &SqlitePool) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_support::init_test_db;
+    use crate::db::test_support::{init_test_db, sqlite_url_for_path, test_db_path};
+    use sqlx::sqlite::SqlitePoolOptions;
 
     #[tokio::test]
     async fn llm_audit_schema_restores_cache_write_tokens_on_existing_table() {
@@ -335,5 +378,130 @@ mod tests {
         assert!(columns
             .iter()
             .any(|column| column.name == "cache_write_tokens"));
+    }
+
+    #[tokio::test]
+    async fn fresh_database_is_stamped_with_the_latest_schema_version() {
+        let db = init_test_db("fresh-schema-version").await;
+
+        let version: i32 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(db.pool())
+            .await
+            .expect("user_version should be readable");
+
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn legacy_database_without_user_version_is_migrated_in_place() {
+        let path = test_db_path("legacy-schema-migration");
+        let url = sqlite_url_for_path(&path);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("raw pool should initialize");
+
+        // Old column set: no search_text/search_tags/search_version/is_command/
+        // asks_ai/ai_command/is_synthetic_record, and no PRAGMA user_version stamp.
+        sqlx::query(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                message_id INTEGER NOT NULL,\
+                chat_id INTEGER NOT NULL,\
+                user_id INTEGER,\
+                username TEXT,\
+                text TEXT,\
+                language TEXT,\
+                date TEXT NOT NULL,\
+                reply_to_message_id INTEGER,\
+                UNIQUE(chat_id, message_id)\
+            );",
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy messages table should be creatable");
+
+        sqlx::query(
+            "INSERT INTO messages (message_id, chat_id, user_id, username, text, language, date, reply_to_message_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(1_i64)
+        .bind(-1001374348669_i64)
+        .bind(123_i64)
+        .bind("alice")
+        .bind("legacy row survives migration")
+        .bind("en")
+        .bind(chrono::Utc::now())
+        .bind(None::<i64>)
+        .execute(&pool)
+        .await
+        .expect("legacy row should insert");
+
+        migrate(&pool).await.expect("migration should succeed");
+
+        let columns = sqlx::query_as::<_, TableInfoRow>("PRAGMA table_info(messages)")
+            .fetch_all(&pool)
+            .await
+            .expect("migrated messages columns should load");
+        assert!(columns.iter().any(|column| column.name == "search_version"));
+
+        let text: String = sqlx::query_scalar("SELECT text FROM messages WHERE message_id = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("legacy row should still exist after migration");
+        assert_eq!(text, "legacy row survives migration");
+
+        let version: i32 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("user_version should be readable");
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn migrate_is_idempotent() {
+        let path = test_db_path("migrate-idempotent");
+        let url = sqlite_url_for_path(&path);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("raw pool should initialize");
+
+        migrate(&pool)
+            .await
+            .expect("first migration should succeed");
+        migrate(&pool)
+            .await
+            .expect("second migration should be a no-op");
+
+        let version: i32 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .expect("user_version should be readable");
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn newer_database_is_refused() {
+        let path = test_db_path("migrate-newer-refused");
+        let url = sqlite_url_for_path(&path);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("raw pool should initialize");
+
+        sqlx::query("PRAGMA user_version = 99")
+            .execute(&pool)
+            .await
+            .expect("setting user_version should succeed");
+
+        let err = migrate(&pool)
+            .await
+            .expect_err("a newer schema version must be refused");
+
+        assert!(err.to_string().contains("newer than this binary supports"));
     }
 }
