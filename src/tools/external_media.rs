@@ -427,11 +427,14 @@ where
         let start = start.clone();
         let budget = budget.clone();
         workers.spawn(async move {
-            let permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("external media semaphore is never closed");
             let index = request.index;
+            let permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                // The semaphore is only ever closed if it were `close()`d,
+                // which nothing here does; treat it as "this request did
+                // not produce a file" rather than panicking a worker task.
+                Err(_) => return (index, None),
+            };
             let response = start_logged(start.clone(), request.clone()).await;
             let fallback_start = {
                 let start = start.clone();
@@ -1087,6 +1090,83 @@ mod tests {
             "more requests than permits should saturate the fanout"
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn collector_holds_permit_until_body_is_consumed() {
+        // With fanout 1, the second request must not be able to start
+        // while the first is still streaming its body: the fanout permit
+        // is only released after process_response_with_fallback (which
+        // reads the whole body) returns, not as soon as the response
+        // headers arrive.
+        let (slow_url, mut body_ready, release_body, slow_worker) =
+            controlled_thirty_chunk_server();
+        let fast = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                1,
+                b"1".to_vec(),
+            ),
+        );
+        let fast_url = fast.url("/media");
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_for_start = started.clone();
+        let requests = vec![
+            ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file/0.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+            ExternalMediaRequest {
+                index: 1,
+                url: "https://telegra.ph/file/1.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+        ];
+        let budget = ExternalMediaBudget::new(200);
+        let collection = collect_external_media(requests, &budget, 1, move |request| {
+            started_for_start.fetch_add(1, Ordering::SeqCst);
+            let slow_url = slow_url.clone();
+            let fast_url = fast_url.clone();
+            async move {
+                let url = if request.index == 0 {
+                    slow_url
+                } else {
+                    fast_url
+                };
+                Ok(get_http_client_no_redirect().get(url).send().await?)
+            }
+        });
+        tokio::pin!(collection);
+
+        // The slow leg's first chunk has landed, but its body is not yet
+        // fully read (the second chunk is still gated on `release_body`).
+        // Only one worker may have started at this point.
+        tokio::time::timeout(SIGNAL_TIMEOUT, async {
+            tokio::select! {
+                result = &mut body_ready => result.expect("controlled first chunk should become ready"),
+                _ = &mut collection => panic!("collection completed before the controlled body was released"),
+            }
+        })
+        .await
+        .expect("controlled body should become ready");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the second request must not start while the first body is still streaming"
+        );
+
+        release_body.send(()).unwrap();
+        let files = tokio::time::timeout(std::time::Duration::from_secs(2), collection)
+            .await
+            .expect("collection should finish once the body is released");
+        assert_eq!(files.len(), 2);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        slow_worker.join().unwrap();
+        fast.join().unwrap();
     }
 
     #[tokio::test]
