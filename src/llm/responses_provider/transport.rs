@@ -48,17 +48,17 @@ pub(super) struct ResponsesRequestDetails {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ResponsesResponseMetadata {
-    pub(crate) request_id: Option<String>,
-    pub(crate) models_etag: Option<String>,
-    pub(crate) codex_account_id: Option<String>,
-    pub(crate) rate_limit_headers: BTreeMap<String, String>,
+pub(super) struct ResponsesResponseMetadata {
+    pub(super) request_id: Option<String>,
+    pub(super) models_etag: Option<String>,
+    pub(super) codex_account_id: Option<String>,
+    pub(super) rate_limit_headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
-pub(crate) struct ResponsesApiResult {
-    pub(crate) response: Value,
-    pub(crate) metadata: ResponsesResponseMetadata,
+pub(super) struct ResponsesApiResult {
+    pub(super) response: Value,
+    pub(super) metadata: ResponsesResponseMetadata,
 }
 
 #[derive(Debug, Default)]
