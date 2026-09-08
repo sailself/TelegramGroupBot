@@ -28,6 +28,11 @@ struct Renderer {
     buffer_stack: Vec<String>,
     link_url_stack: Vec<String>,
     table: Option<TableAccumulator>,
+    /// True from `Tag::Table`'s start to its end. Telegram's `<pre>` (which
+    /// a table renders inside) cannot itself contain nested entities, so
+    /// while this is set every inline construct degrades to plain escaped
+    /// text instead of emitting `<b>`/`<i>`/`<s>`/`<code>`/`<a>`.
+    in_table: bool,
 }
 
 impl Renderer {
@@ -38,6 +43,7 @@ impl Renderer {
             buffer_stack: Vec::new(),
             link_url_stack: Vec::new(),
             table: None,
+            in_table: false,
         }
     }
 
@@ -77,8 +83,12 @@ impl Renderer {
             // other text node instead of passing it through.
             Event::Html(text) => self.push_text(&text),
             Event::Code(text) => {
-                let wrapped = format!("<code>{}</code>", escape_html(&text));
-                self.sink().push_str(&wrapped);
+                if self.in_table {
+                    self.push_text(&text);
+                } else {
+                    let wrapped = format!("<code>{}</code>", escape_html(&text));
+                    self.sink().push_str(&wrapped);
+                }
             }
             Event::SoftBreak | Event::HardBreak => self.push_raw("\n"),
             Event::Rule => {
@@ -119,15 +129,30 @@ impl Renderer {
                 };
                 self.push_raw(&format!("{indent}{marker}"));
             }
-            Tag::Emphasis => self.push_raw("<i>"),
-            Tag::Strong => self.push_raw("<b>"),
-            Tag::Strikethrough => self.push_raw("<s>"),
+            Tag::Emphasis => {
+                if !self.in_table {
+                    self.push_raw("<i>");
+                }
+            }
+            Tag::Strong => {
+                if !self.in_table {
+                    self.push_raw("<b>");
+                }
+            }
+            Tag::Strikethrough => {
+                if !self.in_table {
+                    self.push_raw("<s>");
+                }
+            }
             Tag::Link(_, dest_url, _) => {
                 self.link_url_stack.push(dest_url.to_string());
                 self.buffer_stack.push(String::new());
             }
             Tag::Image(..) => self.buffer_stack.push(String::new()),
-            Tag::Table(_) => self.table = Some(TableAccumulator::default()),
+            Tag::Table(_) => {
+                self.table = Some(TableAccumulator::default());
+                self.in_table = true;
+            }
             Tag::TableHead | Tag::TableRow => {}
             Tag::TableCell => self.buffer_stack.push(String::new()),
             _ => {}
@@ -148,16 +173,37 @@ impl Renderer {
                 }
             }
             Tag::Item => self.ensure_newline(),
-            Tag::Emphasis => self.push_raw("</i>"),
-            Tag::Strong => self.push_raw("</b>"),
-            Tag::Strikethrough => self.push_raw("</s>"),
+            Tag::Emphasis => {
+                if !self.in_table {
+                    self.push_raw("</i>");
+                }
+            }
+            Tag::Strong => {
+                if !self.in_table {
+                    self.push_raw("</b>");
+                }
+            }
+            Tag::Strikethrough => {
+                if !self.in_table {
+                    self.push_raw("</s>");
+                }
+            }
             Tag::Link(..) => {
                 let text = self.buffer_stack.pop().unwrap_or_default();
                 let url = self.link_url_stack.pop().unwrap_or_default();
-                let rendered = if allowed_link_scheme(&url) {
-                    format!("<a href=\"{}\">{}</a>", escape_html(&url), text)
+                let escaped_url = escape_html(&url);
+                let rendered = if self.in_table {
+                    // <pre> cannot contain a nested <a>, so every link
+                    // (regardless of scheme) flattens to plain text here.
+                    if text == escaped_url {
+                        text
+                    } else {
+                        format!("{} ({})", text, escaped_url)
+                    }
+                } else if allowed_link_scheme(&url) {
+                    format!("<a href=\"{}\">{}</a>", escaped_url, text)
                 } else {
-                    format!("{} ({})", text, escape_html(&url))
+                    format!("{} ({})", text, escaped_url)
                 };
                 self.push_raw(&rendered);
             }
@@ -171,6 +217,7 @@ impl Renderer {
                     let wrapped = format!("<pre>{grid}</pre>\n\n");
                     self.push_raw(&wrapped);
                 }
+                self.in_table = false;
             }
             Tag::TableHead | Tag::TableRow => {
                 if let Some(table) = self.table.as_mut() {
@@ -311,5 +358,20 @@ mod tests {
     #[test]
     fn plain_text_round_trips_without_extra_tags() {
         assert_eq!(markdown_to_telegram_html("hello world"), "hello world");
+    }
+
+    #[test]
+    fn table_cells_render_as_plain_text_inside_pre() {
+        let html =
+            markdown_to_telegram_html("| **Alice** | [link](https://x.y) |\n|---|---|\n| a | b |");
+        let pre_start = html
+            .find("<pre>")
+            .expect("table should render inside <pre>");
+        let pre_end = html.find("</pre>").expect("table's <pre> should close");
+        let pre_body = &html[pre_start..pre_end];
+        assert!(pre_body.contains("Alice"));
+        assert!(pre_body.contains("link (https://x.y)"));
+        assert!(!pre_body.contains("<b>"));
+        assert!(!pre_body.contains("<a "));
     }
 }
