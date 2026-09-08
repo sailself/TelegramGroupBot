@@ -44,6 +44,7 @@ use crate::state::{AppState, ImageGenerationModel, PendingImageCommand, PendingI
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::logging::read_recent_log_lines;
+use crate::utils::markdown::markdown_to_telegram_html;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::{
     edit_message_text_with_retry, message_entities_for_text, retry_telegram,
@@ -2490,7 +2491,6 @@ fn resolve_tldr_count(arg: Option<&str>, max_messages: usize) -> i64 {
         .clamp(1, max)
 }
 
-#[allow(deprecated)]
 pub async fn tldr_handler(
     bot: Bot,
     state: AppState,
@@ -2619,7 +2619,12 @@ pub async fn tldr_handler(
         return Ok(());
     }
 
-    let summary_with_model = format!("{}\n\nModel: {}", summary_text, summary_model);
+    let model_line = format!("Model: {}", escape_html(&summary_model));
+    let summary_with_model = format!(
+        "{}\n\n{}",
+        markdown_to_telegram_html(&summary_text),
+        model_line
+    );
     let infographic_enabled = CONFIG.enable_tldr_infographic;
 
     let _ = bot
@@ -2699,11 +2704,16 @@ Use the same language as the summary text for any labels.\
 
     let final_message = if let Some(url) = telegraph_url {
         format!(
-            "Chat summary with infographic: [View it here]({})\n\nModel: {}",
-            url, summary_model
+            "Chat summary with infographic: <a href=\"{}\">View it here</a>\n\n{}",
+            escape_html(&url),
+            model_line
         )
     } else if let Some(url) = infographic_url {
-        format!("{}\n\nInfographic: {}", summary_with_model, url)
+        format!(
+            "{}\n\nInfographic: <a href=\"{}\">View it here</a>",
+            summary_with_model,
+            escape_html(&url)
+        )
     } else {
         summary_with_model
     };
@@ -2726,7 +2736,7 @@ Use the same language as the summary text for any labels.\
         processing_message.id,
         &final_message,
         "Message Summary",
-        ParseMode::Markdown,
+        ParseMode::Html,
     )
     .await?;
     complete_command_timer(&mut timer, "success", None);
