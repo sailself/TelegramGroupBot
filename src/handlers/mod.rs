@@ -3,6 +3,7 @@ pub mod admin;
 pub mod codex_admin;
 pub mod commands;
 pub mod content;
+pub mod factcheck;
 pub mod help;
 pub mod media;
 pub mod mysong;
