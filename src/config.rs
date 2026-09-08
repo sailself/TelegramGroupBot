@@ -382,6 +382,41 @@ fn validate_https_base(name: &str, value: String) -> Result<String> {
         .map(|url| url.as_str().trim_end_matches('/').to_string())
 }
 
+/// Validate `value` as an absolute HTTPS URL via [`validate_https_base`], or,
+/// failing that, as a plain `http` URL whose host is loopback (`localhost`,
+/// `127.0.0.1`, or `::1`) — the common local Ollama setup.
+fn validate_http_base_allowing_loopback(name: &str, value: String) -> Result<String> {
+    let https_err = match validate_https_base(name, value.clone()) {
+        Ok(validated) => return Ok(validated),
+        Err(err) => err,
+    };
+
+    let Ok(parsed) = url::Url::parse(value.trim()) else {
+        return Err(https_err);
+    };
+    if parsed.scheme() != "http" {
+        return Err(https_err);
+    }
+    let is_loopback = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    };
+    if !is_loopback {
+        return Err(https_err);
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(anyhow::anyhow!("{name} must not contain credentials"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(anyhow::anyhow!(
+            "{name} must not contain a query or fragment"
+        ));
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
 fn normalize_database_url(value: String) -> String {
     if value.starts_with("sqlite+aiosqlite://") {
         return value.replacen("sqlite+aiosqlite://", "sqlite://", 1);
@@ -655,6 +690,52 @@ impl Config {
             "JINA_READER_ENDPOINT",
             env_string("JINA_READER_ENDPOINT", "https://r.jina.ai/"),
         )?;
+        let openrouter_base_url = validate_https_base(
+            "OPENROUTER_BASE_URL",
+            env_string("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        )?;
+        let nvidia_base_url = validate_https_base(
+            "NVIDIA_BASE_URL",
+            env_string("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+        )?;
+        let ollama_base_url = validate_http_base_allowing_loopback(
+            "OLLAMA_BASE_URL",
+            env_string("OLLAMA_BASE_URL", "https://ollama.com/v1"),
+        )?;
+        let openai_base_url = validate_https_base(
+            "OPENAI_BASE_URL",
+            env_string("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        )?;
+        let openai_codex_base_url = validate_https_base(
+            "OPENAI_CODEX_BASE_URL",
+            env_string(
+                "OPENAI_CODEX_BASE_URL",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+        )?;
+        let brave_search_endpoint = validate_https_base(
+            "BRAVE_SEARCH_ENDPOINT",
+            env_string(
+                "BRAVE_SEARCH_ENDPOINT",
+                "https://api.search.brave.com/res/v1/web/search",
+            ),
+        )?;
+        let exa_search_endpoint = validate_https_base(
+            "EXA_SEARCH_ENDPOINT",
+            env_string("EXA_SEARCH_ENDPOINT", "https://api.exa.ai/search"),
+        )?;
+        let jina_search_endpoint = validate_https_base(
+            "JINA_SEARCH_ENDPOINT",
+            env_string("JINA_SEARCH_ENDPOINT", "https://s.jina.ai/search"),
+        )?;
+        // No personal default: img2 is opt-in, and any non-empty value must
+        // pass the same https validation as every other provider endpoint.
+        let img2_base_url_raw = env_string("IMG2_BASE_URL", "");
+        let img2_base_url = if img2_base_url_raw.trim().is_empty() {
+            String::new()
+        } else {
+            validate_https_base("IMG2_BASE_URL", img2_base_url_raw)?
+        };
         let twitter_fetch_total_timeout_secs =
             env_timeout_secs("TWITTER_FETCH_TOTAL_TIMEOUT_SECS", 20);
         let twitter_provider_timeout_secs = env_timeout_secs("TWITTER_PROVIDER_TIMEOUT_SECS", 8);
@@ -703,7 +784,7 @@ impl Config {
             ),
             enable_openrouter: env_bool("ENABLE_OPENROUTER", true),
             openrouter_api_key: env_string("OPENROUTER_API_KEY", ""),
-            openrouter_base_url: env_string("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            openrouter_base_url,
             openrouter_temperature: env_f32("OPENROUTER_TEMPERATURE", 0.7),
             openrouter_top_k: env_i32("OPENROUTER_TOP_K", 40),
             openrouter_top_p: env_f32("OPENROUTER_TOP_P", 0.95),
@@ -713,25 +794,22 @@ impl Config {
             ),
             enable_nvidia: env_bool("ENABLE_NVIDIA", true),
             nvidia_api_key: env_string("NVIDIA_API_KEY", ""),
-            nvidia_base_url: env_string("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+            nvidia_base_url,
             nvidia_temperature: env_f32("NVIDIA_TEMPERATURE", 0.7),
             nvidia_top_p: env_f32("NVIDIA_TOP_P", 0.95),
             nvidia_request_timeout_secs: env_timeout_secs("NVIDIA_REQUEST_TIMEOUT_SECS", 60),
             enable_ollama: env_bool("ENABLE_OLLAMA", true),
             ollama_api_key: env_string("OLLAMA_API_KEY", ""),
-            ollama_base_url: env_string("OLLAMA_BASE_URL", "https://ollama.com/v1"),
+            ollama_base_url,
             ollama_temperature: env_f32("OLLAMA_TEMPERATURE", 0.7),
             ollama_top_p: env_f32("OLLAMA_TOP_P", 0.95),
             ollama_request_timeout_secs: env_timeout_secs("OLLAMA_REQUEST_TIMEOUT_SECS", 60),
             enable_openai: env_bool("ENABLE_OPENAI", false),
             openai_api_key: env_string("OPENAI_API_KEY", ""),
-            openai_base_url: env_string("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            openai_base_url,
             openai_request_timeout_secs: env_timeout_secs("OPENAI_REQUEST_TIMEOUT_SECS", 60),
             enable_openai_codex: env_bool("ENABLE_OPENAI_CODEX", true),
-            openai_codex_base_url: env_string(
-                "OPENAI_CODEX_BASE_URL",
-                "https://chatgpt.com/backend-api/codex",
-            ),
+            openai_codex_base_url,
             openai_codex_originator: env_string("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs"),
             openai_codex_client_version: env_string("OPENAI_CODEX_CLIENT_VERSION", "0.144.0"),
             openai_codex_web_search_mode: env_string("OPENAI_CODEX_WEB_SEARCH_MODE", "live")
@@ -765,7 +843,7 @@ impl Config {
             ),
             openai_codex_image_model: env_string("OPENAI_CODEX_IMAGE_MODEL", "gpt-image-2"),
             enable_img2: env_bool("ENABLE_IMG2", false),
-            img2_base_url: env_string("IMG2_BASE_URL", "https://wspark.taild6a660.ts.net:8443"),
+            img2_base_url,
             img2_api_key: env_string("IMG2_API_KEY", ""),
             img2_generate_path: env_string("IMG2_GENERATE_PATH", "/v1/images/generate"),
             img2_health_path: env_string("IMG2_HEALTH_PATH", "/v1/health"),
@@ -776,7 +854,7 @@ impl Config {
             img2_steps: env_optional_positive_u32("IMG2_STEPS"),
             enable_jina_mcp: env_bool("ENABLE_JINA_MCP", false),
             jina_ai_api_key: env_string("JINA_AI_API_KEY", ""),
-            jina_search_endpoint: env_string("JINA_SEARCH_ENDPOINT", "https://s.jina.ai/search"),
+            jina_search_endpoint,
             jina_reader_endpoint,
             twitter_fetch_providers,
             fxtwitter_api_base,
@@ -788,13 +866,10 @@ impl Config {
             external_media_total_max_bytes,
             enable_brave_search: env_bool("ENABLE_BRAVE_SEARCH", true),
             brave_search_api_key: env_string("BRAVE_SEARCH_API_KEY", ""),
-            brave_search_endpoint: env_string(
-                "BRAVE_SEARCH_ENDPOINT",
-                "https://api.search.brave.com/res/v1/web/search",
-            ),
+            brave_search_endpoint,
             enable_exa_search: env_bool("ENABLE_EXA_SEARCH", true),
             exa_api_key: env_string("EXA_API_KEY", ""),
-            exa_search_endpoint: env_string("EXA_SEARCH_ENDPOINT", "https://api.exa.ai/search"),
+            exa_search_endpoint,
             web_search_cache_ttl_seconds: env_u64("WEB_SEARCH_CACHE_TTL_SECONDS", 900),
             web_search_cache_max_entries: env_usize("WEB_SEARCH_CACHE_MAX_ENTRIES", 256),
             web_search_providers,
@@ -1151,5 +1226,88 @@ mod tests {
         ] {
             assert!(validate_https_base("TEST_ENDPOINT", value.into()).is_err());
         }
+    }
+
+    #[test]
+    fn loopback_http_base_accepts_https_and_loopback_http_but_rejects_other_http_hosts() {
+        // A valid https URL still goes through the same rules as validate_https_base.
+        assert_eq!(
+            validate_http_base_allowing_loopback("OLLAMA_BASE_URL", "https://ollama.com/v1".into())
+                .unwrap(),
+            "https://ollama.com/v1"
+        );
+        // The common local-Ollama case: plain http on a loopback host/port.
+        for value in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:11434/v1",
+        ] {
+            assert_eq!(
+                validate_http_base_allowing_loopback("OLLAMA_BASE_URL", value.into()).unwrap(),
+                value
+            );
+        }
+        // Non-loopback http, and loopback URLs with credentials/query/fragment, are rejected.
+        for value in [
+            "http://example.com",
+            "http://user@localhost:11434/v1",
+            "http://localhost:11434/v1?debug=1",
+            "http://localhost:11434/v1#fragment",
+        ] {
+            assert!(validate_http_base_allowing_loopback("OLLAMA_BASE_URL", value.into()).is_err());
+        }
+    }
+
+    #[test]
+    fn config_load_rejects_plain_http_provider_endpoints() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        for name in [
+            "OPENROUTER_BASE_URL",
+            "NVIDIA_BASE_URL",
+            "OPENAI_BASE_URL",
+            "OPENAI_CODEX_BASE_URL",
+            "BRAVE_SEARCH_ENDPOINT",
+            "EXA_SEARCH_ENDPOINT",
+            "JINA_SEARCH_ENDPOINT",
+            "IMG2_BASE_URL",
+        ] {
+            unsafe {
+                std::env::set_var(name, "http://example.com");
+            }
+            let result = Config::load();
+            unsafe {
+                std::env::remove_var(name);
+            }
+            let err = result.expect_err(&format!("{name} must reject a plain-http endpoint"));
+            assert!(err.to_string().contains(name), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn config_load_rejects_non_loopback_http_ollama_endpoint() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("OLLAMA_BASE_URL", "http://example.com");
+        }
+        let result = Config::load();
+        unsafe {
+            std::env::remove_var("OLLAMA_BASE_URL");
+        }
+        let err = result.expect_err("non-loopback http Ollama endpoint must be rejected");
+        assert!(err.to_string().contains("OLLAMA_BASE_URL"), "{err}");
+    }
+
+    #[test]
+    fn config_load_accepts_ollama_over_loopback_http() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("OLLAMA_BASE_URL", "http://localhost:11434/v1");
+        }
+        let result = Config::load();
+        unsafe {
+            std::env::remove_var("OLLAMA_BASE_URL");
+        }
+        let config = result.expect("loopback Ollama endpoint should be accepted");
+        assert_eq!(config.ollama_base_url, "http://localhost:11434/v1");
     }
 }
