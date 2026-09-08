@@ -73,7 +73,7 @@ struct MysongLanguageSelection {
     fallback_notice: Option<String>,
 }
 
-fn format_user_history_for_persona(history: &[crate::db::models::MessageRow]) -> String {
+fn format_user_history_for_mysong(history: &[crate::db::models::MessageRow]) -> String {
     let mut lines = String::new();
     for msg in history {
         let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
@@ -406,7 +406,7 @@ pub async fn mysong_handler(
         }
         let audit_context = create_command_audit_context(&state, &message, "mysong").await;
 
-        let formatted_history = format_user_history_for_persona(&history);
+        let formatted_history = format_user_history_for_mysong(&history);
         let language_selection = resolve_mysong_language(note.as_deref());
 
         let persona_summary = retry_mysong_llm_step(
