@@ -1,80 +1,18 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use reqwest::Response;
-use std::sync::LazyLock;
-use tokio::sync::Semaphore;
-use tokio::task::{JoinError, JoinHandle};
 use url::Url;
 
 use crate::config::Config;
+use crate::tools::twitter_extractor::model::XPost;
+use crate::utils::http::NoRedirectClient;
 
 pub(crate) mod fxtwitter;
 pub(crate) mod jina;
 pub(crate) mod vxtwitter;
 
-static BLOCKING_PARSER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(4)));
-
 const TWITTER_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-
-struct AbortOnDropParser<T> {
-    handle: Option<JoinHandle<T>>,
-}
-
-impl<T> AbortOnDropParser<T> {
-    fn new(handle: JoinHandle<T>) -> Self {
-        Self {
-            handle: Some(handle),
-        }
-    }
-
-    async fn join(mut self) -> Result<T, JoinError> {
-        let result = self
-            .handle
-            .as_mut()
-            .expect("parser handle should remain owned until join")
-            .await;
-        self.handle.take();
-        result
-    }
-}
-
-impl<T> Drop for AbortOnDropParser<T> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-    }
-}
-
-async fn run_blocking_parser<F, T>(parser: F) -> Result<T, JoinError>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    run_blocking_parser_with_semaphore(BLOCKING_PARSER_SEMAPHORE.clone(), parser).await
-}
-
-async fn run_blocking_parser_with_semaphore<F, T>(
-    semaphore: Arc<Semaphore>,
-    parser: F,
-) -> Result<T, JoinError>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    let permit = semaphore
-        .acquire_owned()
-        .await
-        .expect("static parser semaphore must remain open");
-    AbortOnDropParser::new(tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        parser()
-    }))
-    .join()
-    .await
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TwitterProvider {
@@ -225,11 +163,10 @@ pub(crate) async fn read_limited_body(
     provider: TwitterProvider,
     response: Response,
     max_bytes: usize,
-) -> std::result::Result<Vec<u8>, ProviderError> {
+) -> std::result::Result<bytes::Bytes, ProviderError> {
     let status = response.status();
     crate::utils::http::read_body_capped("twitter provider", response, max_bytes)
         .await
-        .map(|bytes| bytes.to_vec())
         .map_err(|err| match err {
             crate::utils::http::BodyCapError::DeclaredTooLarge { .. }
             | crate::utils::http::BodyCapError::StreamedTooLarge { .. } => ProviderError {
@@ -245,6 +182,85 @@ pub(crate) async fn read_limited_body(
                 detail: "provider response body read failed".to_string(),
             },
         })
+}
+
+/// Everything a provider's HTTP request needs beyond the endpoint URL: the
+/// client to send it with (each provider is invoked with the same shared,
+/// no-redirect client the extractor holds), an optional bearer token (jina
+/// only), and an optional `User-Agent` override (fx/vx only).
+pub(super) struct ProviderFetch<'a> {
+    pub(super) url: Url,
+    pub(super) bearer: Option<&'a str>,
+    pub(super) user_agent: Option<&'static str>,
+    pub(super) client: &'a NoRedirectClient,
+    pub(super) provider: TwitterProvider,
+}
+
+/// One GET with the shared no-redirect client, bounded by `timeout` and
+/// `max_bytes`; returns the status and body so the caller's `parse` can
+/// back-fill the status on error.
+pub(super) async fn fetch_provider_body(
+    fetch: ProviderFetch<'_>,
+    max_bytes: usize,
+    timeout: Duration,
+) -> std::result::Result<(reqwest::StatusCode, bytes::Bytes), ProviderError> {
+    let provider = fetch.provider;
+    let future = async {
+        let mut request = fetch.client.get(fetch.url);
+        if let Some(agent) = fetch.user_agent {
+            request = request.header(reqwest::header::USER_AGENT, agent);
+        }
+        if let Some(token) = fetch.bearer {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|_| ProviderError {
+            provider,
+            kind: ProviderErrorKind::Transport,
+            status: None,
+            detail: "provider request failed".to_string(),
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProviderError {
+                provider,
+                kind: ProviderErrorKind::HttpStatus,
+                status: Some(status),
+                detail: "provider returned a non-success status".to_string(),
+            });
+        }
+        let body = read_limited_body(provider, response, max_bytes).await?;
+        Ok((status, body))
+    };
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| ProviderError {
+            provider,
+            kind: ProviderErrorKind::Timeout,
+            status: None,
+            detail: "provider request timed out".to_string(),
+        })?
+}
+
+/// Fetches the provider's response then hands the body to `parse`; if
+/// `parse` fails without a status, back-fills the HTTP status observed on
+/// the wire (every provider gets this uniformly now, closing a gap where
+/// jina previously did not).
+pub(super) async fn fetch_and_parse<P>(
+    fetch: ProviderFetch<'_>,
+    max_bytes: usize,
+    timeout: Duration,
+    parse: P,
+) -> std::result::Result<XPost, ProviderError>
+where
+    P: FnOnce(&[u8]) -> std::result::Result<XPost, ProviderError>,
+{
+    let (status, body) = fetch_provider_body(fetch, max_bytes, timeout).await?;
+    parse(&body).map_err(|mut error| {
+        if error.status.is_none() {
+            error.status = Some(status);
+        }
+        error
+    })
 }
 
 #[cfg(test)]

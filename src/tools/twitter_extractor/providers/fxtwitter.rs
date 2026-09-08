@@ -5,7 +5,7 @@ use serde::Deserialize;
 use url::Url;
 
 use super::{
-    read_limited_body, run_blocking_parser, ProviderError, ProviderErrorKind, TwitterFetchConfig,
+    fetch_and_parse, ProviderError, ProviderErrorKind, ProviderFetch, TwitterFetchConfig,
     TwitterProvider, TWITTER_USER_AGENT,
 };
 use crate::tools::twitter_extractor::model::{
@@ -294,89 +294,34 @@ pub(crate) async fn fetch(
     identity: &XStatusIdentity,
     timeout: Duration,
 ) -> Result<XPost, ProviderError> {
-    fetch_with_parser(client, config, identity, timeout, |body, identity| {
-        parse(&body, &identity)
-    })
-    .await
-}
-
-async fn fetch_with_parser<F>(
-    client: &NoRedirectClient,
-    config: &TwitterFetchConfig,
-    identity: &XStatusIdentity,
-    timeout: Duration,
-    parser: F,
-) -> Result<XPost, ProviderError>
-where
-    F: FnOnce(Vec<u8>, XStatusIdentity) -> Result<XPost, ProviderError> + Send + 'static,
-{
-    let identity = identity.clone();
-    let future = async {
-        if identity.id.is_empty() || !identity.id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(error(
-                ProviderErrorKind::Incomplete,
-                "requested status ID was invalid",
-                None,
-            ));
-        }
-        let mut endpoint = config.fxtwitter_api_base.clone();
-        let mut path = endpoint.path().trim_end_matches('/').to_owned();
-        path.push_str("/i/status/");
-        path.push_str(&identity.id);
-        endpoint.set_path(&path);
-        endpoint.set_query(None);
-        endpoint.set_fragment(None);
-        let response = client
-            .get(endpoint)
-            .header(reqwest::header::USER_AGENT, TWITTER_USER_AGENT)
-            .send()
-            .await
-            .map_err(|_| {
-                error(
-                    ProviderErrorKind::Transport,
-                    "provider request failed",
-                    None,
-                )
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(error(
-                ProviderErrorKind::HttpStatus,
-                "provider returned a non-success status",
-                Some(status),
-            ));
-        }
-        let body = read_limited_body(
-            TwitterProvider::FxTwitter,
-            response,
-            config.response_max_bytes,
-        )
-        .await?;
-        run_blocking_parser(move || match parser(body, identity) {
-            Ok(post) => Ok(post),
-            Err(mut error) => {
-                if error.status.is_none() {
-                    error.status = Some(status);
-                }
-                Err(error)
-            }
-        })
-        .await
-        .map_err(|_| {
-            error(
-                ProviderErrorKind::Incomplete,
-                "provider parser failed",
-                None,
-            )
-        })?
-    };
-    tokio::time::timeout(timeout, future).await.map_err(|_| {
-        error(
-            ProviderErrorKind::Timeout,
-            "provider request timed out",
+    if identity.id.is_empty() || !identity.id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(error(
+            ProviderErrorKind::Incomplete,
+            "requested status ID was invalid",
             None,
-        )
-    })?
+        ));
+    }
+    let mut endpoint = config.fxtwitter_api_base.clone();
+    let mut path = endpoint.path().trim_end_matches('/').to_owned();
+    path.push_str("/i/status/");
+    path.push_str(&identity.id);
+    endpoint.set_path(&path);
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    let identity = identity.clone();
+    fetch_and_parse(
+        ProviderFetch {
+            url: endpoint,
+            bearer: None,
+            user_agent: Some(TWITTER_USER_AGENT),
+            client,
+            provider: TwitterProvider::FxTwitter,
+        },
+        config.response_max_bytes,
+        timeout,
+        move |body| parse(body, &identity),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -569,51 +514,6 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[test]
-    fn timed_out_parser_waiter_never_starts_after_running_parser_releases_capacity() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-            let (first_started_sender, first_started_receiver) = tokio::sync::oneshot::channel();
-            let (release_sender, release_receiver) = std::sync::mpsc::channel();
-            let second_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-            let first_semaphore = semaphore.clone();
-            let first = tokio::spawn(async move {
-                super::super::run_blocking_parser_with_semaphore(first_semaphore, move || {
-                    let _ = first_started_sender.send(());
-                    let _ = release_receiver.recv_timeout(Duration::from_secs(1));
-                    "first"
-                })
-                .await
-            });
-            tokio::time::timeout(Duration::from_secs(1), first_started_receiver)
-                .await
-                .expect("first parser should start")
-                .unwrap();
-
-            let second_started_in_parser = second_started.clone();
-            let second = tokio::time::timeout(
-                Duration::from_millis(30),
-                super::super::run_blocking_parser_with_semaphore(semaphore, move || {
-                    second_started_in_parser.store(true, std::sync::atomic::Ordering::SeqCst);
-                }),
-            )
-            .await;
-            assert!(second.is_err());
-            assert!(!second_started.load(std::sync::atomic::Ordering::SeqCst));
-
-            release_sender.send(()).unwrap();
-            assert_eq!(first.await.unwrap().unwrap(), "first");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert!(!second_started.load(std::sync::atomic::Ordering::SeqCst));
-        });
-    }
-
     #[tokio::test]
     async fn fxtwitter_fetch_rejects_redirect_without_following_location() {
         let server = TestServer::new(vec![ExpectedRequest::new(
@@ -632,36 +532,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::HttpStatus);
         assert_eq!(error.status, Some(reqwest::StatusCode::FOUND));
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn fxtwitter_fetch_times_out_while_blocking_parser_is_running() {
-        let server = TestServer::single_json(
-            "GET",
-            "/i/status/123",
-            include_bytes!("../fixtures/fxtwitter_photo_quote.json"),
-        );
-        let config = test_config_with_fx_base(server.base_url());
-        // The parser blocks until the test releases it, so only the timeout
-        // path can make fetch_with_parser return early.
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let started = std::time::Instant::now();
-        let error = fetch_with_parser(
-            crate::utils::http::get_http_client_no_redirect(),
-            &config,
-            &identity("123"),
-            Duration::from_millis(20),
-            move |_body, _identity| {
-                let _ = release_rx.recv_timeout(Duration::from_secs(5));
-                Err(error(ProviderErrorKind::Incomplete, "slow parser", None))
-            },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.kind, ProviderErrorKind::Timeout);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        let _ = release_tx.send(());
         server.join().unwrap();
     }
 
