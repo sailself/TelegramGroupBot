@@ -401,11 +401,11 @@ pub(super) async fn count_pending_search_rows(pool: &SqlitePool) -> Result<i64> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::database::tests::{
+    use crate::db::schema::reset_search_versions;
+    use crate::db::test_support::{
         init_test_db, insert_legacy_message, queue_ai_request, queue_message, sqlite_url_for_path,
         test_db_path, wait_for_search_ready,
     };
-    use crate::db::schema::reset_search_versions;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::atomic::Ordering;
 

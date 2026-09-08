@@ -305,7 +305,7 @@ pub(super) async fn count_messages(pool: &SqlitePool) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::database::tests::init_test_db;
+    use crate::db::test_support::init_test_db;
 
     #[tokio::test]
     async fn llm_audit_schema_restores_cache_write_tokens_on_existing_table() {

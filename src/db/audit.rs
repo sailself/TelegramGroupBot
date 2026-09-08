@@ -237,7 +237,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::database::tests::{
+    use crate::db::test_support::{
         init_test_db, insert_invocation_with_usage, queue_message_with_user,
     };
     use chrono::Utc;

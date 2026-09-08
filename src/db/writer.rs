@@ -288,7 +288,7 @@ async fn write_message_batch(pool: &SqlitePool, batch: &[MessageInsert]) -> Resu
 mod tests {
     use super::*;
     use crate::db::database::build_message_insert;
-    use crate::db::database::tests::{sqlite_url_for_path, test_db_path, wait_for_search_ready};
+    use crate::db::test_support::{sqlite_url_for_path, test_db_path, wait_for_search_ready};
     use chrono::Utc;
     use sqlx::sqlite::SqlitePoolOptions;
 

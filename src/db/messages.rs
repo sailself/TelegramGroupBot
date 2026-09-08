@@ -301,10 +301,10 @@ pub fn build_message_insert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::database::tests::{
+    use crate::db::models::TopicWindowSpec;
+    use crate::db::test_support::{
         at, init_test_db, insert_count_message, queue_message, queue_message_with_user,
     };
-    use crate::db::models::TopicWindowSpec;
 
     #[tokio::test]
     async fn get_message_window_rejects_cross_chat_requests() {
