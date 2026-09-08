@@ -116,23 +116,12 @@ pub fn resolve_runtime_model_identifier(identifier: &str) -> Option<String> {
 
 fn is_runtime_provider_ready_with(config: &Config, provider: ThirdPartyProvider) -> bool {
     match provider {
-        ThirdPartyProvider::OpenRouter => {
-            config.enable_openrouter && !config.openrouter_api_key.trim().is_empty()
-        }
-        ThirdPartyProvider::Nvidia => {
-            config.enable_nvidia && !config.nvidia_api_key.trim().is_empty()
-        }
-        ThirdPartyProvider::Ollama => {
-            config.enable_ollama && !config.ollama_api_key.trim().is_empty()
-        }
-        ThirdPartyProvider::OpenAI => {
-            config.enable_openai && !config.openai_api_key.trim().is_empty()
-        }
         ThirdPartyProvider::OpenAICodex => {
             config.enable_openai_codex
                 && crate::llm::openai_codex::is_auth_ready()
                 && selected_codex_model_record().is_some()
         }
+        other => config.is_third_party_provider_ready(other),
     }
 }
 
