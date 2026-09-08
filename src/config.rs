@@ -926,6 +926,43 @@ mod tests {
     // span of any test that sets/removes one so tests can't race each other.
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Acquire `ENV_TEST_LOCK` for a test that is about to mutate the
+    /// environment. `CONFIG` is a process-wide `LazyLock`: if some other
+    /// test is the first to dereference it while our temporary env vars are
+    /// set, `Config::load()` runs (and can panic) against our dirty
+    /// environment, poisoning the static for every later test in the
+    /// binary. Force it here, while still holding the lock and before any
+    /// `set_var`, so it is always initialised from the clean environment.
+    fn lock_env_and_force_config() -> std::sync::MutexGuard<'static, ()> {
+        let guard = ENV_TEST_LOCK.lock().unwrap();
+        // initialise CONFIG from the clean environment so no other test's
+        // first access can observe our temporary values
+        std::sync::LazyLock::force(&CONFIG);
+        guard
+    }
+
+    /// RAII guard that removes an env var when dropped (including while a
+    /// panic unwinds), so a test that sets one and then fails an assertion
+    /// never leaves it behind for whichever test the runtime schedules
+    /// next. Declare the `ENV_TEST_LOCK` guard first so this one, declared
+    /// after, drops (and clears the var) before the lock is released.
+    struct EnvVarGuard(&'static str);
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(self.0);
+            }
+        }
+    }
+
+    fn set_env_var_for_test(name: &'static str, value: &str) -> EnvVarGuard {
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        EnvVarGuard(name)
+    }
+
     fn resolve_exact_model_identifier(value: &str, models: &[ThirdPartyModelConfig]) -> String {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -953,16 +990,11 @@ mod tests {
 
     #[test]
     fn env_f32_warns_once_and_returns_default_on_unparsable_value() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("GEMINI_TEMPERATURE", "warm");
-        }
+        let _lock = lock_env_and_force_config();
+        let _env = set_env_var_for_test("GEMINI_TEMPERATURE", "warm");
         let events = crate::utils::log_capture::capture_json_events(|| {
             assert_eq!(env_f32("GEMINI_TEMPERATURE", 0.7), 0.7);
         });
-        unsafe {
-            std::env::remove_var("GEMINI_TEMPERATURE");
-        }
 
         assert_eq!(events.len(), 1, "{events:?}");
         let fields = &events[0]["fields"];
@@ -1235,7 +1267,7 @@ mod tests {
 
     #[test]
     fn config_load_rejects_plain_http_provider_endpoints() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let _lock = lock_env_and_force_config();
         for name in [
             "OPENROUTER_BASE_URL",
             "NVIDIA_BASE_URL",
@@ -1246,13 +1278,8 @@ mod tests {
             "JINA_SEARCH_ENDPOINT",
             "IMG2_BASE_URL",
         ] {
-            unsafe {
-                std::env::set_var(name, "http://example.com");
-            }
+            let _env = set_env_var_for_test(name, "http://example.com");
             let result = Config::load();
-            unsafe {
-                std::env::remove_var(name);
-            }
             let err = result.expect_err(&format!("{name} must reject a plain-http endpoint"));
             assert!(err.to_string().contains(name), "{name}: {err}");
         }
@@ -1260,28 +1287,18 @@ mod tests {
 
     #[test]
     fn config_load_rejects_non_loopback_http_ollama_endpoint() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("OLLAMA_BASE_URL", "http://example.com");
-        }
+        let _lock = lock_env_and_force_config();
+        let _env = set_env_var_for_test("OLLAMA_BASE_URL", "http://example.com");
         let result = Config::load();
-        unsafe {
-            std::env::remove_var("OLLAMA_BASE_URL");
-        }
         let err = result.expect_err("non-loopback http Ollama endpoint must be rejected");
         assert!(err.to_string().contains("OLLAMA_BASE_URL"), "{err}");
     }
 
     #[test]
     fn config_load_accepts_ollama_over_loopback_http() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("OLLAMA_BASE_URL", "http://localhost:11434/v1");
-        }
+        let _lock = lock_env_and_force_config();
+        let _env = set_env_var_for_test("OLLAMA_BASE_URL", "http://localhost:11434/v1");
         let result = Config::load();
-        unsafe {
-            std::env::remove_var("OLLAMA_BASE_URL");
-        }
         let config = result.expect("loopback Ollama endpoint should be accepted");
         assert_eq!(config.ollama_base_url, "http://localhost:11434/v1");
     }
