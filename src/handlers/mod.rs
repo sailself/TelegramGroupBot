@@ -5,6 +5,7 @@ pub mod commands;
 pub mod content;
 pub mod help;
 pub mod media;
+pub mod mysong;
 pub mod qa;
 pub mod responses;
 pub mod token_stats;
