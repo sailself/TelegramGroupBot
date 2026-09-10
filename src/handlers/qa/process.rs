@@ -333,14 +333,16 @@ pub(super) async fn process_request(
                     MessageId(request.selection_message_id as i32),
                 );
                 match crate::agents::qc::run_qc_pipeline(
-                    &state.db,
-                    request.chat_id,
-                    &query,
-                    model_name,
-                    &system_prompt,
-                    &request.media_files,
-                    &request.youtube_urls,
-                    audit_context.as_ref(),
+                    crate::agents::qc::QcRequest {
+                        db: &state.db,
+                        chat_id: request.chat_id,
+                        query: &query,
+                        model_name,
+                        system_prompt: &system_prompt,
+                        media_files: &request.media_files,
+                        youtube_urls: &request.youtube_urls,
+                        audit_context: audit_context.as_ref(),
+                    },
                     &mut progress_reporter,
                 )
                 .await

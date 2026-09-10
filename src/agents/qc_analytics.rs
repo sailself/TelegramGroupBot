@@ -7,15 +7,12 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::agents::qc::{
-    compose_final_answer, fence_user_question, QcAgentOutcome, QcPipelineResult,
+    compose_final_answer, fence_user_question, QcAgentOutcome, QcPipelineResult, QcRequest,
 };
 use crate::config::CONFIG;
-use crate::db::database::Database;
 use crate::llm::gemini::call_gemini_with_tool_runtime;
-use crate::llm::media::MediaFile;
 use crate::llm::third_party::call_third_party_with_tool_runtime;
 use crate::llm::tool_runtime::ToolRuntime;
-use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 
@@ -110,20 +107,20 @@ fn build_analytics_gather_system_prompt(
 }
 
 /// Run the analytics lane: model-driven gather loop then Rust-authoritative compose.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_analytics_lane(
-    db: &Database,
-    chat_id: i64,
-    query: &str,
-    model_name: &str,
-    system_prompt: &str,
-    _media_files: &[MediaFile],
-    _youtube_urls: &[String],
-    audit_context: Option<&LlmAuditContext>,
+    request: &QcRequest<'_>,
     progress: &mut ProgressReporter,
 ) -> Result<QcPipelineResult> {
+    let (chat_id, query, model_name, system_prompt, audit_context) = (
+        request.chat_id,
+        request.query,
+        request.model_name,
+        request.system_prompt,
+        request.audit_context,
+    );
+
     progress.update_now("Analyzing chat...").await;
-    let mut runtime = ToolRuntime::for_analytics(db.clone(), chat_id);
+    let mut runtime = ToolRuntime::for_analytics(request.db.clone(), chat_id);
     let runtime_guidance =
         (model_name == crate::llm::text_model::MODEL_GEMINI).then(|| runtime.tool_limit_guidance());
     let gather_sys =

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::agents::common::{call_step_json, map_bounded};
-use crate::agents::qc::{compose_final_answer, QcAgentOutcome, QcPipelineResult};
+use crate::agents::qc::{compose_final_answer, QcAgentOutcome, QcPipelineResult, QcRequest};
 use crate::agents::step::{StepModel, WallClock};
 use crate::config::CONFIG;
 use crate::db::database::Database;
@@ -631,6 +631,7 @@ async fn map_topic_chunks(
     messages: &[MessageRow],
     audit_context: Option<&LlmAuditContext>,
     progress: &mut ProgressReporter,
+    clock: &WallClock,
 ) -> TopicMapAggregation {
     let chunks: Vec<Vec<MessageRow>> = messages
         .chunks(CONFIG.tldr_chunk_size.max(1))
@@ -643,15 +644,12 @@ async fn map_topic_chunks(
         .update(&format!("Analyzing {total} topic chunk(s)..."))
         .await;
 
-    // Bounded by a fresh clock scoped to this phase; Step 4 threads the
-    // pipeline's own wall clock through instead.
-    let clock = WallClock::start();
     let step_model = step_model.clone();
     let audit_context = audit_context.cloned();
     let results = map_bounded(
         chunks,
         MAX_TOPIC_MAP_CONCURRENCY,
-        &clock,
+        clock,
         move |chunk_index, chunk| {
             let step_model = step_model.clone();
             let audit_context = audit_context.clone();
@@ -797,25 +795,39 @@ fn outcome_when_no_candidates(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_topic_discovery_lane(
-    db: &Database,
-    chat_id: i64,
-    query: &str,
-    model_name: &str,
-    system_prompt: &str,
+    request: &QcRequest<'_>,
     step_model: &StepModel,
-    audit_context: Option<&LlmAuditContext>,
     progress: &mut ProgressReporter,
+    clock: &WallClock,
 ) -> Result<QcPipelineResult> {
+    let (chat_id, query, model_name, system_prompt, audit_context) = (
+        request.chat_id,
+        request.query,
+        request.model_name,
+        request.system_prompt,
+        request.audit_context,
+    );
+
     progress.update("Planning topic analysis...").await;
     let plan = plan_topic_request(step_model, query, audit_context).await?;
 
+    if clock.exceeded() {
+        warn!("/qc topic discovery: wall-clock budget exhausted before message selection; using legacy loop");
+        return Ok(QcPipelineResult::UseLegacy(
+            "wall-clock budget exhausted before message selection",
+        ));
+    }
+
     progress.update("Selecting chat messages...").await;
-    let window = db.select_topic_window(chat_id, &plan.window).await?;
+    let window = request
+        .db
+        .select_topic_window(chat_id, &plan.window)
+        .await?;
     let selected_messages = window.messages.len();
 
-    let mapped = map_topic_chunks(step_model, &window.messages, audit_context, progress).await;
+    let mapped =
+        map_topic_chunks(step_model, &window.messages, audit_context, progress, clock).await;
     for (chunk_index, error) in &mapped.failures {
         warn!("/qc topic map chunk {chunk_index} failed: {error}");
     }
@@ -848,7 +860,8 @@ pub async fn run_topic_discovery_lane(
         .await?
     };
 
-    let literal_substring_results = run_literal_substring_analytics(db, chat_id, &plan).await;
+    let literal_substring_results =
+        run_literal_substring_analytics(request.db, chat_id, &plan).await;
     let evidence = build_topic_evidence(
         query,
         &plan,

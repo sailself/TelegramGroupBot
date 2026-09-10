@@ -210,23 +210,29 @@ pub(super) async fn compose_final_answer(
     }
 }
 
-/// Run the multi-phase /qc flow. `system_prompt` is the already-built QC
-/// system prompt; `model_name` is the user-selected final model.
-#[allow(clippy::too_many_arguments)]
+/// Everything the `/qc` pipeline (and its analytics/topic-discovery lanes)
+/// needs to answer one request, bundled so the entry points take one
+/// argument instead of positional soup.
+pub struct QcRequest<'a> {
+    pub db: &'a Database,
+    pub chat_id: i64,
+    pub query: &'a str,
+    pub model_name: &'a str,
+    pub system_prompt: &'a str,
+    pub media_files: &'a [MediaFile],
+    pub youtube_urls: &'a [String],
+    pub audit_context: Option<&'a LlmAuditContext>,
+}
+
+/// Run the multi-phase /qc flow. `request.system_prompt` is the already-built
+/// QC system prompt; `request.model_name` is the user-selected final model.
 pub async fn run_qc_pipeline(
-    db: &Database,
-    chat_id: i64,
-    query: &str,
-    model_name: &str,
-    system_prompt: &str,
-    media_files: &[MediaFile],
-    youtube_urls: &[String],
-    audit_context: Option<&LlmAuditContext>,
+    request: QcRequest<'_>,
     progress: &mut ProgressReporter,
 ) -> Result<QcPipelineResult> {
     let wall_clock = WallClock::start();
 
-    let step_model = match resolve_step_model(model_name) {
+    let step_model = match resolve_step_model(request.model_name) {
         Ok(step_model) => step_model,
         Err(err) => {
             warn!("agentic /qc has no step model: {err}");
@@ -236,36 +242,19 @@ pub async fn run_qc_pipeline(
 
     // Phase 0: classify text-only questions. Media stays on the recall path so
     // the selected answer model receives the attachments unchanged.
-    let lane = if should_classify_qc_request(!media_files.is_empty()) {
-        classify_lane(&step_model, query, audit_context).await
+    let lane = if should_classify_qc_request(!request.media_files.is_empty()) {
+        classify_lane(&step_model, request.query, request.audit_context).await
     } else {
         QcLane::Recall
     };
     match lane {
-        QcLane::Analytics => {
-            return run_analytics_lane(
-                db,
-                chat_id,
-                query,
-                model_name,
-                system_prompt,
-                media_files,
-                youtube_urls,
-                audit_context,
-                progress,
-            )
-            .await;
-        }
+        QcLane::Analytics => return run_analytics_lane(&request, progress).await,
         QcLane::TopicDiscovery if CONFIG.enable_qc_topic_discovery => {
             return crate::agents::qc_topics::run_topic_discovery_lane(
-                db,
-                chat_id,
-                query,
-                model_name,
-                system_prompt,
+                &request,
                 &step_model,
-                audit_context,
                 progress,
+                &wall_clock,
             )
             .await;
         }
@@ -281,20 +270,21 @@ pub async fn run_qc_pipeline(
 
     // Phase A: plan keyword queries.
     progress.update("Planning chat search...").await;
-    let planned_queries = match plan_queries(&step_model, query, audit_context).await {
-        Ok(queries) if !queries.is_empty() => queries,
-        Ok(_) => {
-            info!("agentic /qc planner returned no queries; using legacy loop");
-            return Ok(QcPipelineResult::UseLegacy("planner returned no queries"));
-        }
-        Err(err) => {
-            warn!("agentic /qc planning failed; using legacy loop: {err}");
-            return Ok(QcPipelineResult::UseLegacy("planner failed"));
-        }
-    };
+    let planned_queries =
+        match plan_queries(&step_model, request.query, request.audit_context).await {
+            Ok(queries) if !queries.is_empty() => queries,
+            Ok(_) => {
+                info!("agentic /qc planner returned no queries; using legacy loop");
+                return Ok(QcPipelineResult::UseLegacy("planner returned no queries"));
+            }
+            Err(err) => {
+                warn!("agentic /qc planning failed; using legacy loop: {err}");
+                return Ok(QcPipelineResult::UseLegacy("planner failed"));
+            }
+        };
 
     // Phase B: execute the searches from Rust through the budgeted runtime.
-    let mut runtime = ToolRuntime::for_qc(db.clone(), chat_id);
+    let mut runtime = ToolRuntime::for_qc(request.db.clone(), request.chat_id);
     let mut executed_queries: Vec<String> = Vec::new();
     let mut hits: Vec<EvidenceHit> = Vec::new();
     let total = planned_queries.len();
@@ -319,11 +309,11 @@ pub async fn run_qc_pipeline(
         }
         let reflection = match reflect(
             &step_model,
-            query,
+            request.query,
             &executed_queries,
             &hits,
             &web_evidence,
-            audit_context,
+            request.audit_context,
         )
         .await
         {
@@ -366,16 +356,16 @@ pub async fn run_qc_pipeline(
 
     // Phase D: final answer over curated evidence with the selected model.
     progress.update_now("Composing answer...").await;
-    let final_system_prompt = format!("{system_prompt}\n\n{QC_EVIDENCE_ADDENDUM}");
-    let user_content = build_final_input(query, &hits, &web_evidence);
+    let final_system_prompt = format!("{}\n\n{QC_EVIDENCE_ADDENDUM}", request.system_prompt);
+    let user_content = build_final_input(request.query, &hits, &web_evidence);
 
     let (answer, gemini_model_used) = compose_final_answer(
-        model_name,
+        request.model_name,
         &final_system_prompt,
         &user_content,
-        media_files,
-        youtube_urls,
-        audit_context,
+        request.media_files,
+        request.youtube_urls,
+        request.audit_context,
     )
     .await?;
 
