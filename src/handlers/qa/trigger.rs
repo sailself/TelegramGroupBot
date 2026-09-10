@@ -56,7 +56,7 @@ fn strip_bot_mentions_from_query(
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn is_reply_to_this_bot(message: &Message, bot_user_id: i64) -> bool {
+fn is_reply_to_this_bot(message: &Message, bot_user_id: i64) -> bool {
     let Some(reply) = message.reply_to_message() else {
         return false;
     };
@@ -82,11 +82,7 @@ fn reply_target_has_image(message: &Message) -> bool {
         .unwrap_or(false)
 }
 
-pub fn is_mentioning_this_bot(
-    message: &Message,
-    bot_user_id: i64,
-    bot_username_lower: &str,
-) -> bool {
+fn is_mentioning_this_bot(message: &Message, bot_user_id: i64, bot_username_lower: &str) -> bool {
     let Some(entities) = message_entities_for_text(message) else {
         return false;
     };

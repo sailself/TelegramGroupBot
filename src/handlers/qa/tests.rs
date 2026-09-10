@@ -8,7 +8,7 @@ use super::{
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider};
 use crate::llm::media::MediaSummary;
 use crate::llm::runtime_models::{codex_selected_model_label, ResolvedExplicitCodexModel};
-use crate::llm::text_model::ModelRequestCapabilities;
+use crate::llm::text_model::{ModelRequestCapabilities, MODEL_GEMINI};
 use crate::state::{PendingQRequest, PendingRequests, QaCommandMode};
 use serde_json::json;
 use teloxide::prelude::*;
