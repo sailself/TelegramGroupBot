@@ -6,6 +6,7 @@ use super::{
     trigger::*,
 };
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider};
+use crate::handlers::enrichment::Enrichment;
 use crate::llm::media::MediaSummary;
 use crate::llm::runtime_models::{codex_selected_model_label, ResolvedExplicitCodexModel};
 use crate::llm::text_model::{ModelRequestCapabilities, MODEL_GEMINI};
@@ -110,10 +111,7 @@ fn pending_q_request(original_user_id: i64, timestamp: i64) -> PendingQRequest {
         user_id: original_user_id,
         query: "question".to_string(),
         telegram_language_code: None,
-        media_files: Vec::new(),
-        youtube_urls: Vec::new(),
-        telegraph_contents: Vec::new(),
-        twitter_contents: Vec::new(),
+        enrichment: Enrichment::default(),
         chat_id: 123,
         message_id: 456,
         selection_message_id: 789,

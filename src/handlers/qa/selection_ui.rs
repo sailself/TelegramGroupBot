@@ -198,7 +198,7 @@ pub(super) async fn process_timed_out_q_request_with_default_model(
     state: &AppState,
     mut request: PendingQRequest,
 ) {
-    let summary = summarize_media_files(&request.media_files);
+    let summary = summarize_media_files(&request.enrichment.media_files);
     let has_images = summary.images > 0;
     let has_video = summary.videos > 0;
     let has_audio = summary.audios > 0;
@@ -297,7 +297,7 @@ pub async fn model_selection_callback(
             now_unix_seconds(),
             CONFIG.model_selection_timeout,
             |request| {
-                let summary = summarize_media_files(&request.media_files);
+                let summary = summarize_media_files(&request.enrichment.media_files);
                 let has_images = summary.images > 0;
                 let has_video = summary.videos > 0;
                 let has_audio = summary.audios > 0;
@@ -325,7 +325,7 @@ pub async fn model_selection_callback(
         | PendingQRequestCallbackAction::InvalidSelection => return Ok(()),
     };
 
-    let summary = summarize_media_files(&request.media_files);
+    let summary = summarize_media_files(&request.enrichment.media_files);
 
     let display_name = configured_model_display_name(&selected_model);
 

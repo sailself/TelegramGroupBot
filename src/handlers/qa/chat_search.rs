@@ -7,6 +7,7 @@ use teloxide::prelude::*;
 use teloxide::types::{MessageId, ParseMode};
 
 use crate::config::CONFIG;
+use crate::handlers::enrichment::Enrichment;
 use crate::llm::audit::LlmAuditContext;
 use crate::llm::text_model::MODEL_GEMINI;
 use crate::llm::tool_runtime::ToolRuntime;
@@ -338,10 +339,7 @@ pub(super) fn build_chat_search_pending_request(
             .as_ref()
             .and_then(|user| user.language_code.as_deref())
             .map(str::to_string),
-        media_files: Vec::new(),
-        youtube_urls: Vec::new(),
-        telegraph_contents: Vec::new(),
-        twitter_contents: Vec::new(),
+        enrichment: Enrichment::default(),
         chat_id: message.chat.id.0,
         message_id: message.id.0 as i64,
         selection_message_id,

@@ -10,6 +10,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tracing::{error, info};
 
 use crate::config::{ThirdPartyProvider, CONFIG};
+use crate::handlers::enrichment::{render_sources, EnrichmentBudget};
 use crate::handlers::responses::send_response;
 use crate::llm::audit::audit_context_from_id;
 use crate::llm::media::summarize_media_files;
@@ -150,14 +151,16 @@ pub(super) async fn process_request(
         QaCommandMode::ChatSearch => String::new(),
     };
 
+    // Fetched link content is quoted after the question, fenced and budgeted,
+    // so remote text is data the model may cite and never instructions.
     let mut query = request.query.clone();
-    for content in &request.telegraph_contents {
+    let rendered_sources = render_sources(
+        &request.enrichment.sources,
+        &EnrichmentBudget::for_question(),
+    );
+    if !rendered_sources.is_empty() {
         query.push_str("\n\n");
-        query.push_str(content);
-    }
-    for content in &request.twitter_contents {
-        query.push_str("\n\n");
-        query.push_str(content);
+        query.push_str(&rendered_sources);
     }
 
     let supports_tools = if model_name == MODEL_GEMINI {
@@ -165,7 +168,7 @@ pub(super) async fn process_request(
     } else {
         request_model_config.is_some_and(|config| config.tools)
     };
-    let media_summary = summarize_media_files(&request.media_files);
+    let media_summary = summarize_media_files(&request.enrichment.media_files);
     let provider_label = if model_name == MODEL_GEMINI {
         "Gemini".to_string()
     } else {
@@ -197,7 +200,7 @@ pub(super) async fn process_request(
         media_summary.videos,
         media_summary.audios,
         media_summary.documents,
-        request.youtube_urls.len(),
+        request.enrichment.youtube_urls.len(),
         query.chars().count()
     );
 
@@ -220,14 +223,15 @@ pub(super) async fn process_request(
         }
         QaCommandMode::Standard => {
             if model_name == MODEL_GEMINI {
-                let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
+                let use_pro = !request.enrichment.media_files.is_empty()
+                    || !request.enrichment.youtube_urls.is_empty();
                 call_gemini(GeminiCallRequest {
                     system_prompt: &system_prompt,
                     user_content: &query,
                     use_search_grounding: true,
                     use_pro_model: use_pro,
-                    media_files: request.media_files.clone(),
-                    youtube_urls: request.youtube_urls.clone(),
+                    media_files: request.enrichment.media_files.clone(),
+                    youtube_urls: request.enrichment.youtube_urls.clone(),
                     system_prompt_label: Some("Q_SYSTEM_PROMPT"),
                     audit_context: audit_context.as_ref(),
                 })
@@ -240,7 +244,7 @@ pub(super) async fn process_request(
                     &query,
                     model_name,
                     "Answer to Your Question",
-                    &request.media_files,
+                    &request.enrichment.media_files,
                     web_tools.as_mut(),
                     crate::llm::ThirdPartyCallOptions::new(
                         audit_context.as_ref(),
@@ -252,7 +256,8 @@ pub(super) async fn process_request(
             }
         }
         QaCommandMode::Quick => {
-            let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
+            let use_pro = !request.enrichment.media_files.is_empty()
+                || !request.enrichment.youtube_urls.is_empty();
             if uses_quick_tool_runtime(request.mode, supports_tools) {
                 let mut runtime = ToolRuntime::for_quick(state.db.clone(), request.chat_id);
                 let result = if model_name == MODEL_GEMINI {
@@ -261,8 +266,8 @@ pub(super) async fn process_request(
                         &query,
                         &mut runtime,
                         use_pro,
-                        Some(request.media_files.clone()),
-                        Some(request.youtube_urls.clone()),
+                        Some(request.enrichment.media_files.clone()),
+                        Some(request.enrichment.youtube_urls.clone()),
                         Some("QUICK_Q_SYSTEM_PROMPT"),
                         None,
                         audit_context.as_ref(),
@@ -283,7 +288,7 @@ pub(super) async fn process_request(
                         &query,
                         model_name,
                         "Quick Answer",
-                        &request.media_files,
+                        &request.enrichment.media_files,
                         &mut runtime,
                         crate::llm::ThirdPartyCallOptions::new(
                             audit_context.as_ref(),
@@ -311,7 +316,7 @@ pub(super) async fn process_request(
                     &query,
                     model_name,
                     "Quick Answer",
-                    &request.media_files,
+                    &request.enrichment.media_files,
                     None,
                     crate::llm::ThirdPartyCallOptions::new(
                         audit_context.as_ref(),
@@ -339,8 +344,8 @@ pub(super) async fn process_request(
                         query: &query,
                         model_name,
                         system_prompt: &system_prompt,
-                        media_files: &request.media_files,
-                        youtube_urls: &request.youtube_urls,
+                        media_files: &request.enrichment.media_files,
+                        youtube_urls: &request.enrichment.youtube_urls,
                         audit_context: audit_context.as_ref(),
                     },
                     &mut progress_reporter,
@@ -365,15 +370,15 @@ pub(super) async fn process_request(
             } else {
                 let mut runtime = ToolRuntime::for_qc(state.db.clone(), request.chat_id);
                 let qc_result = if model_name == MODEL_GEMINI {
-                    let use_pro =
-                        !request.media_files.is_empty() || !request.youtube_urls.is_empty();
+                    let use_pro = !request.enrichment.media_files.is_empty()
+                        || !request.enrichment.youtube_urls.is_empty();
                     call_gemini_with_tool_runtime(
                         &format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance()),
                         &query,
                         &mut runtime,
                         use_pro,
-                        Some(request.media_files.clone()),
-                        Some(request.youtube_urls.clone()),
+                        Some(request.enrichment.media_files.clone()),
+                        Some(request.enrichment.youtube_urls.clone()),
                         Some("QC_SYSTEM_PROMPT"),
                         None,
                         audit_context.as_ref(),
@@ -386,7 +391,7 @@ pub(super) async fn process_request(
                         &query,
                         model_name,
                         "Answer about Chat",
-                        &request.media_files,
+                        &request.enrichment.media_files,
                         &mut runtime,
                         crate::llm::ThirdPartyCallOptions::new(
                             audit_context.as_ref(),
@@ -418,7 +423,7 @@ pub(super) async fn process_request(
                 media_summary.videos,
                 media_summary.audios,
                 media_summary.documents,
-                request.youtube_urls.len(),
+                request.enrichment.youtube_urls.len(),
                 query.chars().count(),
                 err
             );

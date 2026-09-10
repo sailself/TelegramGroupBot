@@ -11,7 +11,7 @@ use tokio::task::AbortHandle;
 
 use crate::config::CONFIG;
 use crate::db::database::Database;
-use crate::llm::media::MediaFile;
+use crate::handlers::enrichment::Enrichment;
 use crate::llm::openai_codex::{CodexReasoningEffortOption, CodexRemoteModel};
 use crate::utils::timing::CommandTimer;
 
@@ -38,10 +38,10 @@ pub struct PendingQRequest {
     pub user_id: i64,
     pub query: String,
     pub telegram_language_code: Option<String>,
-    pub media_files: Vec<MediaFile>,
-    pub youtube_urls: Vec<String>,
-    pub telegraph_contents: Vec<String>,
-    pub twitter_contents: Vec<String>,
+    /// Media, YouTube inputs and fetched link content for this request. The
+    /// fetched text is structured, never pre-spliced into `query`: it reaches
+    /// the prompt only through `handlers::enrichment::render_sources`.
+    pub enrichment: Enrichment,
     pub chat_id: i64,
     pub message_id: i64,
     pub selection_message_id: i64,

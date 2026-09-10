@@ -14,11 +14,6 @@ use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use crate::config::CONFIG;
-use crate::llm::media::MediaFile;
-use crate::tools::external_media::{
-    download_telegraph_media as download_external_telegraph_media,
-    download_twitter_media as download_external_twitter_media, ExternalMediaBudget,
-};
 use crate::tools::telegraph_extractor::{extract_telegraph_content, TelegraphContent};
 use crate::tools::twitter_extractor::{
     canonical_status_key, extract_twitter_content, is_supported_status_url, TwitterContent,
@@ -847,22 +842,6 @@ pub async fn extract_twitter_urls_and_content(
     }
 
     (new_text, extracted)
-}
-
-pub async fn download_telegraph_media(
-    contents: &[TelegraphContent],
-    max_files: usize,
-    budget: &ExternalMediaBudget,
-) -> Vec<MediaFile> {
-    download_external_telegraph_media(contents, max_files, budget).await
-}
-
-pub async fn download_twitter_media(
-    contents: &[TwitterContent],
-    max_files: usize,
-    budget: &ExternalMediaBudget,
-) -> Vec<MediaFile> {
-    download_external_twitter_media(contents, max_files, budget).await
 }
 
 #[cfg(test)]

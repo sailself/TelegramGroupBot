@@ -67,12 +67,13 @@ pub struct UntrustedSource {
 }
 
 /// Everything a request picked up beyond its own text: fetched link content,
-/// plus the media files that came with the message and the media the links
-/// carried.
+/// the media files that came with the message plus the media the links carried,
+/// and the YouTube URLs handed to a video-capable model.
 #[derive(Debug, Clone, Default)]
 pub struct Enrichment {
     pub sources: Vec<UntrustedSource>,
     pub media_files: Vec<MediaFile>,
+    pub youtube_urls: Vec<String>,
 }
 
 /// How many sources of one kind a request fetched and how much media they
@@ -108,6 +109,13 @@ pub struct EnrichmentBudget {
 }
 
 impl EnrichmentBudget {
+    pub fn for_question() -> Self {
+        Self {
+            max_media_files: MediaCollectionOptions::for_qa().max_files,
+            ..Self::for_factcheck()
+        }
+    }
+
     pub fn for_factcheck() -> Self {
         Self {
             max_sources: 6,
@@ -218,6 +226,7 @@ pub async fn enrich_request(
     let mut enrichment = Enrichment {
         sources: Vec::new(),
         media_files: existing_media,
+        youtube_urls: Vec::new(),
     };
 
     let candidates = unique_source_urls(texts);
