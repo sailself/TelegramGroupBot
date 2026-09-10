@@ -9,6 +9,7 @@
 pub mod common;
 pub mod factcheck;
 pub mod qc;
+pub mod qc_analytics;
 pub mod qc_topics;
 pub mod step;
 pub mod tldr;
