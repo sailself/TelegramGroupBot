@@ -10,7 +10,6 @@ use crate::config::CONFIG;
 use crate::handlers::enrichment::Enrichment;
 use crate::llm::audit::LlmAuditContext;
 use crate::llm::tool_runtime::ToolRuntime;
-use crate::llm::{call_gemini_with_tool_runtime, call_third_party_with_tool_runtime};
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
 use crate::utils::telegram::build_message_link;
 use crate::utils::text::{escape_html, split_for_telegram, truncate_with_ellipsis};
@@ -18,6 +17,7 @@ use crate::utils::timing::{now_unix_seconds, CommandTimer};
 use tracing::warn;
 
 use super::model_resolution::{format_llm_error_message, ModelCatalogSnapshot, QaModel};
+use super::process::{dispatch, qa_call_label, QaCall};
 
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
 const CHAT_SEARCH_JSON_OUTPUT_PROMPT: &str = "Final response format: return only valid JSON with this shape: {\"selected_message_ids\":[123],\"note\":\"optional short note\"}. Do not wrap the JSON in Markdown. Do not include message IDs that were not returned by chat_context_query.";
@@ -206,51 +206,46 @@ async fn run_chat_search_model(
         "{result_target}",
         &CONFIG.max_tool_context_items.to_string(),
     );
-
-    let response = if matches!(model, QaModel::Gemini) {
-        call_gemini_with_tool_runtime(
-            &format!(
-                "{}\n\n{}",
-                chat_search_prompt,
-                runtime.tool_limit_guidance()
-            ),
-            query,
-            &mut runtime,
-            false,
-            None,
-            None,
-            Some("CHAT_SEARCH_SYSTEM_PROMPT"),
-            Some(chat_search_response_schema()),
-            audit_context,
-        )
-        .await
-        .map(|result| ChatSearchModelResponse {
-            text: result.text,
-            model_used: result.model_used,
-        })?
-    } else {
-        let third_party_prompt = format!(
+    // Gemini takes the tool budget in its prompt and a response schema;
+    // third-party models are told the JSON shape in words instead.
+    let system_prompt = match model {
+        QaModel::Gemini => format!(
             "{}\n\n{}",
-            chat_search_prompt, CHAT_SEARCH_JSON_OUTPUT_PROMPT
-        );
-        let response = call_third_party_with_tool_runtime(
-            &third_party_prompt,
-            query,
-            model.model_id(),
-            "Chat Search",
-            &[],
-            &mut runtime,
-            crate::llm::ThirdPartyCallOptions::new(
-                audit_context,
-                crate::llm::CodexPromptStyle::TaskSpecific,
+            chat_search_prompt,
+            runtime.tool_limit_guidance()
+        ),
+        QaModel::ThirdParty { .. } => {
+            format!(
+                "{}\n\n{}",
+                chat_search_prompt, CHAT_SEARCH_JSON_OUTPUT_PROMPT
             )
-            .with_reasoning_override(Some(CONFIG.agent_step_reasoning.as_str())),
-        )
-        .await?;
-        ChatSearchModelResponse {
-            text: response,
-            model_used: model.result_display_name(snapshot, QaCommandMode::ChatSearch, None),
         }
+    };
+    let response_schema = matches!(model, QaModel::Gemini).then(chat_search_response_schema);
+
+    let (text, model_used) = dispatch(
+        model,
+        QaCall {
+            system_prompt,
+            user_content: query.to_string(),
+            label: qa_call_label(model, QaCommandMode::ChatSearch),
+            media_files: None,
+            youtube_urls: None,
+            tools: Some(&mut runtime),
+            reasoning_override: Some(CONFIG.agent_step_reasoning.clone()),
+            response_schema,
+            prompt_style: crate::llm::CodexPromptStyle::TaskSpecific,
+            use_pro: false,
+            search_grounding: false,
+            audit_context,
+        },
+    )
+    .await?;
+    let response = ChatSearchModelResponse {
+        text,
+        model_used: model_used.unwrap_or_else(|| {
+            model.result_display_name(snapshot, QaCommandMode::ChatSearch, None)
+        }),
     };
 
     Ok((response, runtime))
