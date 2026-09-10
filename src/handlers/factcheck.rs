@@ -8,8 +8,9 @@ use tracing::{error, info};
 use crate::agents::factcheck::{run_factcheck_pipeline, FactcheckOutcome};
 use crate::config::{CONFIG, FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY};
 use crate::handlers::access::{check_access_control, is_rate_limited};
-use crate::handlers::content::{
-    extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
+use crate::handlers::enrichment::{
+    count_sources, enrich_request, entity_link_urls, render_sources, Enrichment, EnrichmentBudget,
+    SourceCounts, SourceKind,
 };
 use crate::handlers::media::{collect_message_media, MediaCollectionOptions};
 use crate::handlers::responses::send_response;
@@ -17,7 +18,6 @@ use crate::llm::audit::create_command_audit_context;
 use crate::llm::media::{summarize_media_files, MediaSummary};
 use crate::llm::text_model::call_configured_text_model;
 use crate::state::AppState;
-use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::markdown::markdown_to_telegram_html;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::{message_entities_for_text, start_chat_action_heartbeat};
@@ -85,6 +85,41 @@ fn build_factcheck_statement(
     String::new()
 }
 
+/// Name the link content in the progress message, the way the media counts are
+/// named: either as the whole message or appended to what media already said.
+fn append_source_progress(processing_message_text: &mut String, counts: SourceCounts, label: &str) {
+    if counts.sources == 0 {
+        return;
+    }
+
+    let mut media_info = String::new();
+    if counts.images > 0 {
+        media_info.push_str(&format!(" with {} image(s)", counts.images));
+    }
+    if counts.videos > 0 {
+        if media_info.is_empty() {
+            media_info.push_str(&format!(" with {} video(s)", counts.videos));
+        } else {
+            media_info.push_str(&format!(" and {} video(s)", counts.videos));
+        }
+    }
+
+    *processing_message_text = if processing_message_text == "Fact-checking message..." {
+        format!(
+            "Extracting and fact-checking content from {} {}{}...",
+            counts.sources, label, media_info
+        )
+    } else {
+        format!(
+            "{} and {} {}{}...",
+            processing_message_text.trim_end_matches("..."),
+            counts.sources,
+            label,
+            media_info
+        )
+    };
+}
+
 pub async fn factcheck_handler(
     bot: Bot,
     state: AppState,
@@ -112,77 +147,46 @@ pub async fn factcheck_handler(
     let _heavy_permit = state.acquire_heavy_command_permit().await;
 
     let reply_message = message.reply_to_message();
-    let mut query_text = query.unwrap_or_default();
+    let query_text = query.unwrap_or_default();
     let query_entities = message_entities_for_text(&message);
     let user_language_code = message
         .from
         .as_ref()
         .and_then(|user| user.language_code.as_deref());
-    let mut telegraph_contents = Vec::new();
-    let mut twitter_contents = Vec::new();
 
     let mut reply_text = String::new();
+    let mut reply_entities = None;
     if let Some(reply) = reply_message {
         reply_text = reply
             .text()
             .map(|value| value.to_string())
             .or_else(|| reply.caption().map(|value| value.to_string()))
             .unwrap_or_default();
-        if !reply_text.trim().is_empty() {
-            let reply_entities = message_entities_for_text(reply);
-            let (reply_text_processed, reply_telegraph) =
-                extract_telegraph_urls_and_content(&reply_text, reply_entities.as_deref(), 5).await;
-            let (reply_text_processed, reply_twitter) = extract_twitter_urls_and_content(
-                &reply_text_processed,
-                reply_entities.as_deref(),
-                5,
-            )
-            .await;
-            telegraph_contents.extend(reply_telegraph);
-            twitter_contents.extend(reply_twitter);
-            reply_text = reply_text_processed;
-        }
-    }
-
-    if !query_text.trim().is_empty() {
-        let (query_text_processed, query_telegraph) =
-            extract_telegraph_urls_and_content(&query_text, query_entities.as_deref(), 5).await;
-        let (query_text_processed, query_twitter) =
-            extract_twitter_urls_and_content(&query_text_processed, query_entities.as_deref(), 5)
-                .await;
-        telegraph_contents.extend(query_telegraph);
-        twitter_contents.extend(query_twitter);
-        query_text = query_text_processed;
+        reply_entities = message_entities_for_text(reply);
     }
 
     let mut media_options = MediaCollectionOptions::for_commands();
     media_options.include_reply = true;
-    let max_files = media_options.max_files;
     let collected_media = collect_message_media(&bot, &state, &message, media_options).await;
-    let mut media_files = collected_media.files;
 
-    let mut remaining = max_files.saturating_sub(media_files.len());
-    let external_media_budget = ExternalMediaBudget::new(CONFIG.external_media_total_max_bytes);
-    if remaining > 0 {
-        let telegraph_files = crate::handlers::content::download_telegraph_media(
-            &telegraph_contents,
-            remaining,
-            &external_media_budget,
-        )
-        .await;
-        remaining = remaining.saturating_sub(telegraph_files.len());
-        media_files.extend(telegraph_files);
-    }
-
-    if remaining > 0 {
-        let twitter_files = crate::handlers::content::download_twitter_media(
-            &twitter_contents,
-            remaining,
-            &external_media_budget,
-        )
-        .await;
-        media_files.extend(twitter_files);
-    }
+    let budget = EnrichmentBudget::for_factcheck();
+    let reply_entity_urls = entity_link_urls(reply_entities.as_deref());
+    let query_entity_urls = entity_link_urls(query_entities.as_deref());
+    let Enrichment {
+        sources,
+        media_files,
+        ..
+    } = enrich_request(
+        &[
+            &reply_text,
+            &reply_entity_urls,
+            &query_text,
+            &query_entity_urls,
+        ],
+        collected_media.files,
+        &budget,
+    )
+    .await;
 
     let media_summary = summarize_media_files(&media_files);
     let statement = build_factcheck_statement(&query_text, &reply_text, &media_summary);
@@ -193,6 +197,14 @@ pub async fn factcheck_handler(
             .await?;
         return Ok(());
     }
+    // Fetched link content is quoted after the statement, fenced and budgeted,
+    // so remote text can never be read as part of the claim under evaluation.
+    let rendered_sources = render_sources(&sources, &budget);
+    let statement = if rendered_sources.is_empty() {
+        statement
+    } else {
+        format!("{statement}\n\n{rendered_sources}")
+    };
     let audit_context = create_command_audit_context(&state, &message, "factcheck").await;
 
     let mut processing_message_text = if media_summary.videos > 0 {
@@ -213,81 +225,16 @@ pub async fn factcheck_handler(
         "Fact-checking message...".to_string()
     };
 
-    if !telegraph_contents.is_empty() {
-        let image_count: usize = telegraph_contents
-            .iter()
-            .map(|content| content.image_urls.len())
-            .sum();
-        let video_count: usize = telegraph_contents
-            .iter()
-            .map(|content| content.video_urls.len())
-            .sum();
-        let mut media_info = String::new();
-        if image_count > 0 {
-            media_info.push_str(&format!(" with {} image(s)", image_count));
-        }
-        if video_count > 0 {
-            if media_info.is_empty() {
-                media_info.push_str(&format!(" with {} video(s)", video_count));
-            } else {
-                media_info.push_str(&format!(" and {} video(s)", video_count));
-            }
-        }
-
-        if processing_message_text == "Fact-checking message..." {
-            processing_message_text = format!(
-                "Extracting and fact-checking content from {} Telegraph page(s){}...",
-                telegraph_contents.len(),
-                media_info
-            );
-        } else {
-            let base = processing_message_text.trim_end_matches("...");
-            processing_message_text = format!(
-                "{} and {} Telegraph page(s){}...",
-                base,
-                telegraph_contents.len(),
-                media_info
-            );
-        }
-    }
-
-    if !twitter_contents.is_empty() {
-        let image_count: usize = twitter_contents
-            .iter()
-            .map(|content| content.image_urls.len())
-            .sum();
-        let video_count: usize = twitter_contents
-            .iter()
-            .map(|content| content.video_urls.len())
-            .sum();
-        let mut media_info = String::new();
-        if image_count > 0 {
-            media_info.push_str(&format!(" with {} image(s)", image_count));
-        }
-        if video_count > 0 {
-            if media_info.is_empty() {
-                media_info.push_str(&format!(" with {} video(s)", video_count));
-            } else {
-                media_info.push_str(&format!(" and {} video(s)", video_count));
-            }
-        }
-
-        if processing_message_text == "Fact-checking message..." {
-            processing_message_text = format!(
-                "Extracting and fact-checking content from {} Twitter post(s){}...",
-                twitter_contents.len(),
-                media_info
-            );
-        } else {
-            let base = processing_message_text.trim_end_matches("...");
-            processing_message_text = format!(
-                "{} and {} Twitter post(s){}...",
-                base,
-                twitter_contents.len(),
-                media_info
-            );
-        }
-    }
+    append_source_progress(
+        &mut processing_message_text,
+        count_sources(&sources, SourceKind::Telegraph),
+        "Telegraph page(s)",
+    );
+    append_source_progress(
+        &mut processing_message_text,
+        count_sources(&sources, SourceKind::Twitter),
+        "Twitter post(s)",
+    );
 
     let processing_message = bot
         .send_message(message.chat.id, processing_message_text)
@@ -309,10 +256,10 @@ pub async fn factcheck_handler(
         )
         .await
         {
-            Ok(FactcheckOutcome::Answer {
+            Ok(FactcheckOutcome::Answer(crate::agents::common::ModelAnswer {
                 text,
                 model_display,
-            }) => {
+            })) => {
                 let response_with_model = format!(
                     "{}\n\nModel: {}",
                     markdown_to_telegram_html(&text),
@@ -329,7 +276,7 @@ pub async fn factcheck_handler(
                 .await?;
                 return Ok(());
             }
-            Ok(FactcheckOutcome::UseLegacy { reason }) => {
+            Ok(FactcheckOutcome::UseLegacy(reason)) => {
                 info!("Agentic fact-check fell back to the legacy path: {reason}");
             }
             Err(err) => {

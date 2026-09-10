@@ -133,11 +133,11 @@ pub async fn tldr_handler(
         )
         .await
         {
-            Ok(crate::agents::tldr::TldrOutcome::Summary {
+            Ok(crate::agents::tldr::TldrOutcome::Answer(crate::agents::common::ModelAnswer {
                 text,
                 model_display,
-            }) => Ok((text, model_display)),
-            Ok(crate::agents::tldr::TldrOutcome::UseLegacy { reason }) => {
+            })) => Ok((text, model_display)),
+            Ok(crate::agents::tldr::TldrOutcome::UseLegacy(reason)) => {
                 info!("Map-reduce /tldr fell back to the single-call path: {reason}");
                 tldr_single_call(&messages, audit_context.as_ref()).await
             }

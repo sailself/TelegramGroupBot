@@ -7,6 +7,8 @@
 //! answers and error messages are NOT delivered through this type — they keep
 //! going through `send_response` / the handlers' error edits.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use teloxide::prelude::*;
@@ -16,6 +18,14 @@ use tracing::{debug, warn};
 
 const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(2_500);
 const UPDATE_NOW_MAX_ATTEMPTS: usize = 2;
+
+/// Minimal seam so a caller that reports per-item progress (e.g.
+/// `agents::common::map_bounded`) can be driven by a fake sink in tests
+/// instead of a real `ProgressReporter` bound to a live Telegram message.
+pub trait ProgressSink {
+    fn update_text<'a>(&'a mut self, text: String)
+        -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
 
 pub struct ProgressReporter {
     bot: Bot,
@@ -115,6 +125,15 @@ impl ProgressReporter {
                 false
             }
         }
+    }
+}
+
+impl ProgressSink for ProgressReporter {
+    fn update_text<'a>(
+        &'a mut self,
+        text: String,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move { self.update(&text).await })
     }
 }
 

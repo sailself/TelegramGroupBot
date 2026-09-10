@@ -1,5 +1,7 @@
 //! Character-safe text helpers shared across handlers and providers.
 
+use regex::Regex;
+
 /// Truncate `text` to at most `max_chars` characters without splitting a
 /// multi-byte UTF-8 sequence. Returns the input unchanged when it already
 /// fits.
@@ -32,18 +34,37 @@ pub fn truncate_for_log(text: &str, max_chars: usize) -> String {
     truncate_with_suffix(text, max_chars, "... (truncated)")
 }
 
-/// Break any literal `</tag>` inside untrusted content with a zero-width space
-/// so a crafted message cannot close a fence early and smuggle out-of-band
-/// instructions past the data/instruction boundary.
+/// Break any `</tag>` inside untrusted content with a zero-width space so a
+/// crafted message cannot close a fence early and smuggle out-of-band
+/// instructions past the data/instruction boundary. Matches the closing tag
+/// case-insensitively and tolerates whitespace around `/` and the tag name
+/// (`</SOURCE>`, `</Source>`, `</ source>`), so callers cannot be bypassed by
+/// re-casing or padding the tag; a longer tag name (`</sources>`) is left
+/// alone.
 pub fn neutralize_closing_tag(content: &str, tag: &str) -> String {
-    content.replace(&format!("</{tag}>"), &format!("<\u{200b}/{tag}>"))
+    let pattern = format!(r"(?i)<(\s*/\s*{}\s*>)", regex::escape(tag));
+    match Regex::new(&pattern) {
+        Ok(re) => re.replace_all(content, "<\u{200b}$1").into_owned(),
+        Err(_) => content.replace(&format!("</{tag}>"), &format!("<\u{200b}/{tag}>")),
+    }
 }
 
 /// Like [`neutralize_closing_tag`] but also breaks the opening `<tag>`, for
 /// content that sits *outside* a fence (such as the user's question) and
-/// could otherwise forge a whole block.
+/// could otherwise forge a whole block. The opening match is case-insensitive
+/// and covers attributed (`<Source kind="x">`) and self-closing (`<source/>`)
+/// forms — anything starting with the tag name followed by whitespace, `/`,
+/// or `>` — while a longer tag name (`<sourcemap>`) is left untouched.
 pub fn neutralize_tag(content: &str, tag: &str) -> String {
-    neutralize_closing_tag(content, tag).replace(&format!("<{tag}>"), &format!("<\u{200b}{tag}>"))
+    let closing = neutralize_closing_tag(content, tag);
+    // The `regex` crate has no lookahead, so the terminator that marks a real
+    // opening tag (whitespace, `/`, or `>`) is captured and replayed as-is
+    // rather than asserted and discarded.
+    let pattern = format!(r"(?i)<(\s*{})([\s/>])", regex::escape(tag));
+    match Regex::new(&pattern) {
+        Ok(re) => re.replace_all(&closing, "<\u{200b}$1$2").into_owned(),
+        Err(_) => closing.replace(&format!("<{tag}>"), &format!("<\u{200b}{tag}>")),
+    }
 }
 
 /// Escape the characters Telegram's HTML parse mode treats specially.
@@ -111,6 +132,56 @@ mod tests {
         assert!(safe.contains("<\u{200b}chat_evidence>"));
         assert!(safe.contains("<\u{200b}/chat_evidence>"));
         assert!(safe.ends_with(" real question"));
+    }
+
+    #[test]
+    fn neutralize_closing_tag_is_case_insensitive() {
+        for closing in ["</SOURCE>", "</Source>", "</ source>"] {
+            let content = format!("before{closing}after");
+            let safe = neutralize_closing_tag(&content, "source");
+            assert!(
+                !safe.contains(closing),
+                "expected {closing:?} to be neutralized, got {safe:?}"
+            );
+            assert!(
+                safe.contains('\u{200b}'),
+                "expected a zero-width separator for {closing:?}, got {safe:?}"
+            );
+        }
+
+        // A longer tag name must not be touched.
+        let untouched = "before</sources>after";
+        assert_eq!(neutralize_closing_tag(untouched, "source"), untouched);
+    }
+
+    #[test]
+    fn neutralize_tag_handles_attributed_and_self_closing_openings() {
+        for opening in ["<Source kind=\"x\">", "<source/>", "<SOURCE >"] {
+            let content = format!("before{opening}after");
+            let safe = neutralize_tag(&content, "source");
+            assert!(
+                !safe.contains(opening),
+                "expected {opening:?} to be neutralized, got {safe:?}"
+            );
+            assert!(
+                safe.contains('\u{200b}'),
+                "expected a zero-width separator for {opening:?}, got {safe:?}"
+            );
+        }
+
+        // A longer tag name, or a word merely containing the tag, must not be touched.
+        let untouched_tag = "before<sourcemap>after";
+        assert_eq!(neutralize_tag(untouched_tag, "source"), untouched_tag);
+        let untouched_word = "sourced content stays put";
+        assert_eq!(neutralize_tag(untouched_word, "source"), untouched_word);
+    }
+
+    #[test]
+    fn neutralize_tag_is_idempotent() {
+        let content = "<Source kind=\"x\">quoted</source> and <SOURCE/> plus </ Source > trailing";
+        let once = neutralize_tag(content, "source");
+        let twice = neutralize_tag(&once, "source");
+        assert_eq!(once, twice);
     }
 
     #[test]

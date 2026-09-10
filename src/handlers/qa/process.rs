@@ -1,7 +1,8 @@
 //! Running a prepared `/q`-family request against the selected model and
 //! rendering the answer back to the chat.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+use serde_json::Value;
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode,
@@ -10,15 +11,14 @@ use tokio::sync::OwnedSemaphorePermit;
 use tracing::{error, info};
 
 use crate::config::{ThirdPartyProvider, CONFIG};
+use crate::handlers::enrichment::{render_sources, EnrichmentBudget};
 use crate::handlers::responses::send_response;
-use crate::llm::audit::audit_context_from_id;
-use crate::llm::media::summarize_media_files;
-use crate::llm::runtime_models::{runtime_model_config, ResolvedExplicitCodexModel};
-use crate::llm::text_model::MODEL_GEMINI;
+use crate::llm::audit::{audit_context_from_id, LlmAuditContext};
+use crate::llm::media::{summarize_media_files, MediaFile, MediaSummary};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::{
     call_gemini, call_gemini_with_tool_runtime, call_third_party,
-    call_third_party_with_tool_runtime, GeminiCallRequest,
+    call_third_party_with_tool_runtime, CodexPromptStyle, GeminiCallRequest, ThirdPartyCallOptions,
 };
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
 use crate::utils::markdown::markdown_to_telegram_html;
@@ -29,10 +29,7 @@ use crate::utils::text::escape_html;
 use super::chat_search::{
     chat_search_rebuilding_message, process_chat_search_request, warn_on_unverified_chat_links,
 };
-use super::model_resolution::{
-    codex_quick_result_label, configured_model_display_name, format_llm_error_message,
-    result_model_display_name, third_party_provider_label,
-};
+use super::model_resolution::{format_llm_error_message, ModelCatalogSnapshot, QaModel};
 use super::prompt::{
     build_chat_context_system_prompt, build_quick_system_prompt, build_system_prompt,
 };
@@ -87,7 +84,422 @@ pub(super) fn append_quick_search_footer(
     response
 }
 
-/// Run a prepared request against `model_name`. `heavy_permit` is the permit a
+/// One model call: the prompt, its inputs, and the knobs the providers differ
+/// on. Built per mode so [`dispatch`] stays the only place that knows which
+/// provider function answers a request.
+pub(super) struct QaCall<'a> {
+    pub(super) system_prompt: String,
+    pub(super) user_content: String,
+    /// Gemini logs this in place of the system prompt text; third-party
+    /// providers use it as the response title in their audit rows.
+    pub(super) label: &'static str,
+    pub(super) media_files: Option<Vec<MediaFile>>,
+    pub(super) youtube_urls: Option<Vec<String>>,
+    /// Borrowed, not owned: the caller reads the runtime's web-search flag and
+    /// accumulated message ids after the call returns.
+    pub(super) tools: Option<&'a mut ToolRuntime>,
+    pub(super) reasoning_override: Option<String>,
+    pub(super) response_schema: Option<Value>,
+    pub(super) prompt_style: CodexPromptStyle,
+    pub(super) use_pro: bool,
+    pub(super) search_grounding: bool,
+    pub(super) audit_context: Option<&'a LlmAuditContext>,
+}
+
+/// The one place a `/q`-family request reaches a model. Four calls: Gemini and
+/// third-party, each with and without a tool runtime.
+pub(super) async fn dispatch(
+    model: &QaModel,
+    call: QaCall<'_>,
+) -> Result<(String, Option<String>)> {
+    let QaCall {
+        system_prompt,
+        user_content,
+        label,
+        media_files,
+        youtube_urls,
+        tools,
+        reasoning_override,
+        response_schema,
+        prompt_style,
+        use_pro,
+        search_grounding,
+        audit_context,
+    } = call;
+    let third_party_options = ThirdPartyCallOptions::new(audit_context, prompt_style)
+        .with_reasoning_override(reasoning_override.as_deref())
+        .with_explicit_codex_model(model.explicit_codex());
+
+    match (model, tools) {
+        (QaModel::Gemini, Some(runtime)) => call_gemini_with_tool_runtime(
+            &system_prompt,
+            &user_content,
+            runtime,
+            use_pro,
+            media_files,
+            youtube_urls,
+            Some(label),
+            response_schema,
+            audit_context,
+        )
+        .await
+        .map(|result| (result.text, Some(result.model_used))),
+        (QaModel::Gemini, None) => call_gemini(GeminiCallRequest {
+            system_prompt: &system_prompt,
+            user_content: &user_content,
+            use_search_grounding: search_grounding,
+            use_pro_model: use_pro,
+            media_files: media_files.unwrap_or_default(),
+            youtube_urls: youtube_urls.unwrap_or_default(),
+            system_prompt_label: Some(label),
+            audit_context,
+        })
+        .await
+        .map(|result| (result.text, Some(result.model_used))),
+        (QaModel::ThirdParty { .. }, Some(runtime)) => call_third_party_with_tool_runtime(
+            &system_prompt,
+            &user_content,
+            model.model_id(),
+            label,
+            &media_files.unwrap_or_default(),
+            runtime,
+            third_party_options,
+        )
+        .await
+        .map(|response| (response, None)),
+        (QaModel::ThirdParty { .. }, None) => call_third_party(
+            &system_prompt,
+            &user_content,
+            model.model_id(),
+            label,
+            &media_files.unwrap_or_default(),
+            None,
+            third_party_options,
+        )
+        .await
+        .map(|response| (response, None)),
+    }
+}
+
+/// Gemini names the prompt it logs; third-party providers title the response.
+/// Every mode names both, and the resolved model picks which one it uses.
+pub(super) fn qa_call_label(model: &QaModel, mode: QaCommandMode) -> &'static str {
+    match (mode, model) {
+        (QaCommandMode::Standard, QaModel::Gemini) => "Q_SYSTEM_PROMPT",
+        (QaCommandMode::Standard, QaModel::ThirdParty { .. }) => "Answer to Your Question",
+        (QaCommandMode::Quick, QaModel::Gemini) => "QUICK_Q_SYSTEM_PROMPT",
+        (QaCommandMode::Quick, QaModel::ThirdParty { .. }) => "Quick Answer",
+        (QaCommandMode::ChatContext, QaModel::Gemini) => "QC_SYSTEM_PROMPT",
+        (QaCommandMode::ChatContext, QaModel::ThirdParty { .. }) => "Answer about Chat",
+        (QaCommandMode::ChatSearch, QaModel::Gemini) => "CHAT_SEARCH_SYSTEM_PROMPT",
+        (QaCommandMode::ChatSearch, QaModel::ThirdParty { .. }) => "Chat Search",
+    }
+}
+
+/// Gemini's pro model earns its cost when the request carries media or video.
+fn use_pro_gemini(request: &PendingQRequest) -> bool {
+    !request.enrichment.media_files.is_empty() || !request.enrichment.youtube_urls.is_empty()
+}
+
+/// `/q`: one answer, with web search when the model can search.
+async fn run_standard_request(
+    model: &QaModel,
+    request: &PendingQRequest,
+    system_prompt: String,
+    query: String,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<(String, Option<String>)> {
+    let mut web_tools = (!matches!(model, QaModel::Gemini) && model.supports_tools())
+        .then(ToolRuntime::for_web_search);
+    dispatch(
+        model,
+        QaCall {
+            system_prompt,
+            user_content: query,
+            label: qa_call_label(model, QaCommandMode::Standard),
+            media_files: Some(request.enrichment.media_files.clone()),
+            youtube_urls: Some(request.enrichment.youtube_urls.clone()),
+            tools: web_tools.as_mut(),
+            reasoning_override: None,
+            response_schema: None,
+            prompt_style: CodexPromptStyle::FreeformAnswer,
+            use_pro: use_pro_gemini(request),
+            search_grounding: true,
+            audit_context,
+        },
+    )
+    .await
+}
+
+/// The quick call, with or without the tool runtime that gives it its one
+/// web-search round.
+fn quick_call<'a>(
+    model: &QaModel,
+    request: &PendingQRequest,
+    system_prompt: String,
+    query: String,
+    reasoning_override: Option<String>,
+    tools: Option<&'a mut ToolRuntime>,
+    audit_context: Option<&'a LlmAuditContext>,
+) -> QaCall<'a> {
+    QaCall {
+        system_prompt,
+        user_content: query,
+        label: qa_call_label(model, QaCommandMode::Quick),
+        media_files: Some(request.enrichment.media_files.clone()),
+        youtube_urls: Some(request.enrichment.youtube_urls.clone()),
+        tools,
+        reasoning_override,
+        response_schema: None,
+        prompt_style: CodexPromptStyle::FreeformAnswer,
+        use_pro: use_pro_gemini(request),
+        search_grounding: false,
+        audit_context,
+    }
+}
+
+/// `/qq`: one bounded answer, with at most one web-search round. Reports
+/// whether that round happened, for the footer that tells the user so.
+async fn run_quick_request(
+    model: &QaModel,
+    state: &AppState,
+    request: &PendingQRequest,
+    system_prompt: String,
+    query: String,
+    audit_context: Option<&LlmAuditContext>,
+) -> (Result<(String, Option<String>)>, bool) {
+    let reasoning_override = reasoning_override_for_qa_mode(
+        QaCommandMode::Quick,
+        model.third_party_provider(),
+        &CONFIG.quick_reasoning_effort,
+    )
+    .map(str::to_string);
+
+    if !uses_quick_tool_runtime(QaCommandMode::Quick, model.supports_tools()) {
+        let call = quick_call(
+            model,
+            request,
+            system_prompt,
+            query,
+            reasoning_override,
+            None,
+            audit_context,
+        );
+        return (dispatch(model, call).await, false);
+    }
+
+    let mut runtime = ToolRuntime::for_quick(state.db.clone(), request.chat_id);
+    let call = quick_call(
+        model,
+        request,
+        system_prompt,
+        query,
+        reasoning_override,
+        Some(&mut runtime),
+        audit_context,
+    );
+    let result = dispatch(model, call).await;
+    let web_search_attempted = runtime.web_search_attempted();
+    (result, web_search_attempted)
+}
+
+/// `/qc`: the agentic pipeline when it is enabled and takes the request,
+/// otherwise the legacy tool loop. Reports the message ids the tools actually
+/// returned, so a fabricated citation can be spotted.
+async fn run_chat_context_request(
+    bot: &Bot,
+    state: &AppState,
+    model: &QaModel,
+    request: &PendingQRequest,
+    system_prompt: String,
+    query: String,
+    audit_context: Option<&LlmAuditContext>,
+) -> (Result<(String, Option<String>)>, Vec<i64>) {
+    if CONFIG.enable_agentic_qc {
+        let mut progress_reporter = ProgressReporter::new(
+            bot.clone(),
+            ChatId(request.chat_id),
+            MessageId(request.selection_message_id as i32),
+        );
+        match crate::agents::qc::run_qc_pipeline(
+            crate::agents::qc::QcRequest {
+                db: &state.db,
+                chat_id: request.chat_id,
+                query: &query,
+                model_name: model.model_id(),
+                system_prompt: &system_prompt,
+                media_files: &request.enrichment.media_files,
+                youtube_urls: &request.enrichment.youtube_urls,
+                audit_context,
+            },
+            &mut progress_reporter,
+        )
+        .await
+        {
+            Ok(crate::agents::qc::QcPipelineResult::Answer(outcome)) => {
+                return (
+                    Ok((outcome.answer, outcome.gemini_model_used)),
+                    outcome.valid_message_ids,
+                );
+            }
+            Ok(crate::agents::qc::QcPipelineResult::UseLegacy(reason)) => {
+                info!("Agentic /qc fell back to the legacy tool loop: {reason}");
+            }
+            Err(err) => return (Err(err), Vec::new()),
+        }
+    }
+
+    let mut runtime = ToolRuntime::for_qc(state.db.clone(), request.chat_id);
+    // Gemini needs the tool budget spelled out in its system prompt; the
+    // third-party call appends the same guidance itself.
+    let system_prompt = match model {
+        QaModel::Gemini => format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance()),
+        QaModel::ThirdParty { .. } => system_prompt,
+    };
+    let result = dispatch(
+        model,
+        QaCall {
+            system_prompt,
+            user_content: query,
+            label: qa_call_label(model, QaCommandMode::ChatContext),
+            media_files: Some(request.enrichment.media_files.clone()),
+            youtube_urls: Some(request.enrichment.youtube_urls.clone()),
+            tools: Some(&mut runtime),
+            reasoning_override: None,
+            response_schema: None,
+            prompt_style: CodexPromptStyle::FreeformAnswer,
+            use_pro: use_pro_gemini(request),
+            search_grounding: false,
+            audit_context,
+        },
+    )
+    .await;
+    let valid_message_ids = runtime.accumulated_message_ids();
+    (result, valid_message_ids)
+}
+
+/// What a QA call was: logged once when it starts and again, with the error,
+/// if it fails.
+struct QaRequestSummary {
+    mode: &'static str,
+    provider: &'static str,
+    model: String,
+    chat_id: i64,
+    user_id: i64,
+    message_id: i64,
+    selection_message_id: i64,
+    tools_enabled: bool,
+    media: MediaSummary,
+    youtube_urls: usize,
+    query_len: usize,
+}
+
+impl QaRequestSummary {
+    fn new(
+        model: &QaModel,
+        request: &PendingQRequest,
+        model_label: &str,
+        query_len: usize,
+    ) -> Self {
+        Self {
+            mode: qa_mode_label(request.mode),
+            provider: model.provider_label(),
+            model: model_label.to_string(),
+            chat_id: request.chat_id,
+            user_id: request.user_id,
+            message_id: request.message_id,
+            selection_message_id: request.selection_message_id,
+            tools_enabled: model.supports_tools(),
+            media: summarize_media_files(&request.enrichment.media_files),
+            youtube_urls: request.enrichment.youtube_urls.len(),
+            query_len,
+        }
+    }
+}
+
+impl std::fmt::Display for QaRequestSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "mode={}, provider={}, model={}, chat_id={}, user_id={}, message_id={}, selection_message_id={}, tools_enabled={}, images={}, videos={}, audios={}, documents={}, youtube_urls={}, query_len={}",
+            self.mode,
+            self.provider,
+            self.model,
+            self.chat_id,
+            self.user_id,
+            self.message_id,
+            self.selection_message_id,
+            self.tools_enabled,
+            self.media.images,
+            self.media.videos,
+            self.media.audios,
+            self.media.documents,
+            self.youtube_urls,
+            self.query_len
+        )
+    }
+}
+
+fn build_mode_system_prompt(request: &PendingQRequest) -> String {
+    let language = request.telegram_language_code.as_deref();
+    match request.mode {
+        QaCommandMode::Standard => build_system_prompt(language),
+        QaCommandMode::Quick => build_quick_system_prompt(language),
+        QaCommandMode::ChatContext => build_chat_context_system_prompt(language),
+        // Chat search builds its own prompt around the result target.
+        QaCommandMode::ChatSearch => String::new(),
+    }
+}
+
+/// The question, with any fetched link content quoted after it — fenced and
+/// budgeted, so remote text is data the model may cite and never instructions.
+fn build_user_content(request: &PendingQRequest) -> String {
+    let mut content = request.query.clone();
+    let rendered_sources = render_sources(
+        &request.enrichment.sources,
+        &EnrichmentBudget::for_question(),
+    );
+    if !rendered_sources.is_empty() {
+        content.push_str("\n\n");
+        content.push_str(&rendered_sources);
+    }
+    content
+}
+
+/// Render the answer into the message the user is already looking at, naming
+/// the model that produced it.
+async fn send_qa_answer(
+    bot: &Bot,
+    request: &PendingQRequest,
+    model: &QaModel,
+    snapshot: &ModelCatalogSnapshot,
+    response: String,
+    gemini_model_used: Option<&str>,
+    quick_search_attempted: bool,
+) -> Result<()> {
+    let response_text = append_quick_search_footer(response, request.mode, quick_search_attempted);
+    let mut rendered_response = markdown_to_telegram_html(&response_text);
+    if !model.model_id().is_empty() {
+        let display_model = model.result_display_name(snapshot, request.mode, gemini_model_used);
+        rendered_response.push_str(&format!("\n\nModel: {}", escape_html(&display_model)));
+    }
+
+    send_response(
+        bot,
+        ChatId(request.chat_id),
+        MessageId(request.selection_message_id as i32),
+        &rendered_response,
+        if request.mode == QaCommandMode::ChatContext {
+            "Answer about Chat"
+        } else {
+            "Answer to Your Question"
+        },
+        ParseMode::Html,
+    )
+    .await
+}
+
+/// Run a prepared request against `model`. `heavy_permit` is the permit a
 /// caller already holds (the direct `/q` path throttles its own preparation);
 /// passing it through avoids taking a second slot from the same semaphore,
 /// which could exhaust the heavy-command lane and deadlock it.
@@ -95,11 +507,11 @@ pub(super) async fn process_request(
     bot: &Bot,
     state: &AppState,
     request: PendingQRequest,
-    model_name: &str,
-    explicit_codex: Option<&ResolvedExplicitCodexModel>,
+    model: &QaModel,
+    snapshot: &ModelCatalogSnapshot,
     heavy_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<()> {
-    if model_name == MODEL_GEMINI && !CONFIG.gemini_api_available() {
+    if matches!(model, QaModel::Gemini) && !CONFIG.gemini_api_available() {
         bot.edit_message_text(
             ChatId(request.chat_id),
             MessageId(request.selection_message_id as i32),
@@ -111,21 +523,6 @@ pub(super) async fn process_request(
         .await?;
         return Ok(());
     }
-
-    let runtime_config = if explicit_codex.is_none() && model_name != MODEL_GEMINI {
-        runtime_model_config(model_name)
-    } else {
-        None
-    };
-    let request_model_config = match explicit_codex {
-        Some(explicit) => {
-            if explicit.config.id != model_name {
-                return Err(anyhow!("The explicit Codex model changed"));
-            }
-            Some(&explicit.config)
-        }
-        None => runtime_config.as_ref(),
-    };
 
     let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
@@ -139,67 +536,12 @@ pub(super) async fn process_request(
         return Ok(());
     }
 
-    let system_prompt = match request.mode {
-        QaCommandMode::Standard => build_system_prompt(request.telegram_language_code.as_deref()),
-        QaCommandMode::Quick => {
-            build_quick_system_prompt(request.telegram_language_code.as_deref())
-        }
-        QaCommandMode::ChatContext => {
-            build_chat_context_system_prompt(request.telegram_language_code.as_deref())
-        }
-        QaCommandMode::ChatSearch => String::new(),
-    };
+    let system_prompt = build_mode_system_prompt(&request);
+    let query = build_user_content(&request);
 
-    let mut query = request.query.clone();
-    for content in &request.telegraph_contents {
-        query.push_str("\n\n");
-        query.push_str(content);
-    }
-    for content in &request.twitter_contents {
-        query.push_str("\n\n");
-        query.push_str(content);
-    }
-
-    let supports_tools = if model_name == MODEL_GEMINI {
-        true
-    } else {
-        request_model_config.is_some_and(|config| config.tools)
-    };
-    let media_summary = summarize_media_files(&request.media_files);
-    let provider_label = if model_name == MODEL_GEMINI {
-        "Gemini".to_string()
-    } else {
-        request_model_config
-            .map(|config| third_party_provider_label(config.provider).to_string())
-            .unwrap_or_else(|| "Unknown".to_string())
-    };
-    let logged_model_name = explicit_codex
-        .map(|explicit| {
-            codex_quick_result_label(
-                &explicit.config,
-                Some(&explicit.record),
-                Some(&CONFIG.quick_reasoning_effort),
-            )
-        })
-        .unwrap_or_else(|| configured_model_display_name(model_name));
-
-    info!(
-        "Processing QA request: mode={}, provider={}, model={}, chat_id={}, user_id={}, message_id={}, selection_message_id={}, tools_enabled={}, images={}, videos={}, audios={}, documents={}, youtube_urls={}, query_len={}",
-        qa_mode_label(request.mode),
-        provider_label,
-        logged_model_name,
-        request.chat_id,
-        request.user_id,
-        request.message_id,
-        request.selection_message_id,
-        supports_tools,
-        media_summary.images,
-        media_summary.videos,
-        media_summary.audios,
-        media_summary.documents,
-        request.youtube_urls.len(),
-        query.chars().count()
-    );
+    let logged_model_name = model.display_name(snapshot, request.mode);
+    let summary = QaRequestSummary::new(model, &request, &logged_model_name, query.chars().count());
+    info!("Processing QA request: {summary}");
 
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), ChatId(request.chat_id), ChatAction::Typing);
@@ -213,214 +555,55 @@ pub(super) async fn process_request(
                 state,
                 &request,
                 &query,
-                model_name,
+                model,
+                snapshot,
                 audit_context.as_ref(),
             )
             .await;
         }
         QaCommandMode::Standard => {
-            if model_name == MODEL_GEMINI {
-                let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
-                call_gemini(GeminiCallRequest {
-                    system_prompt: &system_prompt,
-                    user_content: &query,
-                    use_search_grounding: true,
-                    use_pro_model: use_pro,
-                    media_files: request.media_files.clone(),
-                    youtube_urls: request.youtube_urls.clone(),
-                    system_prompt_label: Some("Q_SYSTEM_PROMPT"),
-                    audit_context: audit_context.as_ref(),
-                })
-                .await
-                .map(|result| (result.text, Some(result.model_used)))
-            } else {
-                let mut web_tools = supports_tools.then(ToolRuntime::for_web_search);
-                call_third_party(
-                    &system_prompt,
-                    &query,
-                    model_name,
-                    "Answer to Your Question",
-                    &request.media_files,
-                    web_tools.as_mut(),
-                    crate::llm::ThirdPartyCallOptions::new(
-                        audit_context.as_ref(),
-                        crate::llm::CodexPromptStyle::FreeformAnswer,
-                    ),
-                )
-                .await
-                .map(|result| (result, None))
-            }
+            run_standard_request(
+                model,
+                &request,
+                system_prompt,
+                query,
+                audit_context.as_ref(),
+            )
+            .await
         }
         QaCommandMode::Quick => {
-            let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
-            if uses_quick_tool_runtime(request.mode, supports_tools) {
-                let mut runtime = ToolRuntime::for_quick(state.db.clone(), request.chat_id);
-                let result = if model_name == MODEL_GEMINI {
-                    call_gemini_with_tool_runtime(
-                        &system_prompt,
-                        &query,
-                        &mut runtime,
-                        use_pro,
-                        Some(request.media_files.clone()),
-                        Some(request.youtube_urls.clone()),
-                        Some("QUICK_Q_SYSTEM_PROMPT"),
-                        None,
-                        audit_context.as_ref(),
-                    )
-                    .await
-                    .map(|result| (result.text, Some(result.model_used)))
-                } else {
-                    let provider = request_model_config
-                        .map(|config| config.provider)
-                        .unwrap_or(ThirdPartyProvider::OpenRouter);
-                    let reasoning_override = reasoning_override_for_qa_mode(
-                        request.mode,
-                        provider,
-                        &CONFIG.quick_reasoning_effort,
-                    );
-                    call_third_party_with_tool_runtime(
-                        &system_prompt,
-                        &query,
-                        model_name,
-                        "Quick Answer",
-                        &request.media_files,
-                        &mut runtime,
-                        crate::llm::ThirdPartyCallOptions::new(
-                            audit_context.as_ref(),
-                            crate::llm::CodexPromptStyle::FreeformAnswer,
-                        )
-                        .with_reasoning_override(reasoning_override)
-                        .with_explicit_codex_model(explicit_codex),
-                    )
-                    .await
-                    .map(|result| (result, None))
-                };
-                quick_search_attempted = runtime.web_search_attempted();
-                result
-            } else {
-                let provider = request_model_config
-                    .map(|config| config.provider)
-                    .unwrap_or(ThirdPartyProvider::OpenRouter);
-                let reasoning_override = reasoning_override_for_qa_mode(
-                    request.mode,
-                    provider,
-                    &CONFIG.quick_reasoning_effort,
-                );
-                call_third_party(
-                    &system_prompt,
-                    &query,
-                    model_name,
-                    "Quick Answer",
-                    &request.media_files,
-                    None,
-                    crate::llm::ThirdPartyCallOptions::new(
-                        audit_context.as_ref(),
-                        crate::llm::CodexPromptStyle::FreeformAnswer,
-                    )
-                    .with_reasoning_override(reasoning_override)
-                    .with_explicit_codex_model(explicit_codex),
-                )
-                .await
-                .map(|result| (result, None))
-            }
+            let (result, web_search_attempted) = run_quick_request(
+                model,
+                state,
+                &request,
+                system_prompt,
+                query,
+                audit_context.as_ref(),
+            )
+            .await;
+            quick_search_attempted = web_search_attempted;
+            result
         }
         QaCommandMode::ChatContext => {
-            let mut agentic_result: Option<Result<(String, Option<String>)>> = None;
-            if CONFIG.enable_agentic_qc {
-                let mut progress_reporter = ProgressReporter::new(
-                    bot.clone(),
-                    ChatId(request.chat_id),
-                    MessageId(request.selection_message_id as i32),
-                );
-                match crate::agents::qc::run_qc_pipeline(
-                    &state.db,
-                    request.chat_id,
-                    &query,
-                    model_name,
-                    &system_prompt,
-                    &request.media_files,
-                    &request.youtube_urls,
-                    audit_context.as_ref(),
-                    &mut progress_reporter,
-                )
-                .await
-                {
-                    Ok(crate::agents::qc::QcPipelineResult::Answer(outcome)) => {
-                        qc_valid_message_ids = outcome.valid_message_ids;
-                        agentic_result = Some(Ok((outcome.answer, outcome.gemini_model_used)));
-                    }
-                    Ok(crate::agents::qc::QcPipelineResult::UseLegacy(reason)) => {
-                        info!("Agentic /qc fell back to the legacy tool loop: {reason}");
-                    }
-                    Err(err) => {
-                        agentic_result = Some(Err(err));
-                    }
-                }
-            }
-
-            if let Some(result) = agentic_result {
-                result
-            } else {
-                let mut runtime = ToolRuntime::for_qc(state.db.clone(), request.chat_id);
-                let qc_result = if model_name == MODEL_GEMINI {
-                    let use_pro =
-                        !request.media_files.is_empty() || !request.youtube_urls.is_empty();
-                    call_gemini_with_tool_runtime(
-                        &format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance()),
-                        &query,
-                        &mut runtime,
-                        use_pro,
-                        Some(request.media_files.clone()),
-                        Some(request.youtube_urls.clone()),
-                        Some("QC_SYSTEM_PROMPT"),
-                        None,
-                        audit_context.as_ref(),
-                    )
-                    .await
-                    .map(|result| (result.text, Some(result.model_used)))
-                } else {
-                    call_third_party_with_tool_runtime(
-                        &system_prompt,
-                        &query,
-                        model_name,
-                        "Answer about Chat",
-                        &request.media_files,
-                        &mut runtime,
-                        crate::llm::ThirdPartyCallOptions::new(
-                            audit_context.as_ref(),
-                            crate::llm::CodexPromptStyle::FreeformAnswer,
-                        ),
-                    )
-                    .await
-                    .map(|result| (result, None))
-                };
-                qc_valid_message_ids = runtime.accumulated_message_ids();
-                qc_result
-            }
+            let (result, valid_message_ids) = run_chat_context_request(
+                bot,
+                state,
+                model,
+                &request,
+                system_prompt,
+                query,
+                audit_context.as_ref(),
+            )
+            .await;
+            qc_valid_message_ids = valid_message_ids;
+            result
         }
     };
     let (response, gemini_model_used) = match response {
         Ok(response) => response,
         Err(err) => {
-            error!(
-                "QA request failed: mode={}, provider={}, model={}, chat_id={}, user_id={}, message_id={}, selection_message_id={}, tools_enabled={}, images={}, videos={}, audios={}, documents={}, youtube_urls={}, query_len={}, error={:#}",
-                qa_mode_label(request.mode),
-                provider_label,
-                logged_model_name,
-                request.chat_id,
-                request.user_id,
-                request.message_id,
-                request.selection_message_id,
-                supports_tools,
-                media_summary.images,
-                media_summary.videos,
-                media_summary.audios,
-                media_summary.documents,
-                request.youtube_urls.len(),
-                query.chars().count(),
-                err
-            );
-            let message = format_llm_error_message(model_name, &err);
+            error!("QA request failed: {summary}, error={err:#}");
+            let message = format_llm_error_message(model, &logged_model_name, &err);
             bot.edit_message_text(
                 ChatId(request.chat_id),
                 MessageId(request.selection_message_id as i32),
@@ -446,31 +629,14 @@ pub(super) async fn process_request(
         );
     }
 
-    let response_text = append_quick_search_footer(response, request.mode, quick_search_attempted);
-    let mut rendered_response = markdown_to_telegram_html(&response_text);
-    if !model_name.is_empty() {
-        let display_model = result_model_display_name(
-            model_name,
-            gemini_model_used.as_deref(),
-            request.mode,
-            explicit_codex,
-        );
-        rendered_response.push_str(&format!("\n\nModel: {}", escape_html(&display_model)));
-    }
-
-    send_response(
+    send_qa_answer(
         bot,
-        ChatId(request.chat_id),
-        MessageId(request.selection_message_id as i32),
-        &rendered_response,
-        if request.mode == QaCommandMode::ChatContext {
-            "Answer about Chat"
-        } else {
-            "Answer to Your Question"
-        },
-        ParseMode::Html,
+        &request,
+        model,
+        snapshot,
+        response,
+        gemini_model_used.as_deref(),
+        quick_search_attempted,
     )
-    .await?;
-
-    Ok(())
+    .await
 }
