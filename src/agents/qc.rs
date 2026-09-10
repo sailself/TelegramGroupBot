@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::agents::common::{call_step_json, fence, WEB_RESULTS_PER_QUERY};
+use crate::agents::common::{call_step_json, fence, PipelineOutcome, WEB_RESULTS_PER_QUERY};
 use crate::agents::qc_analytics::run_analytics_lane;
 use crate::agents::step::{
     call_step_text, parse_lenient_json, resolve_step_model, StepModel, WallClock,
@@ -163,12 +163,9 @@ pub struct QcAgentOutcome {
     pub valid_message_ids: Vec<i64>,
 }
 
-pub enum QcPipelineResult {
-    Answer(QcAgentOutcome),
-    /// The pipeline could not start; the caller should run the legacy
-    /// monolithic tool loop.
-    UseLegacy(&'static str),
-}
+/// The pipeline either produces a final answer, or signals that the pipeline
+/// could not start; the caller should run the legacy monolithic tool loop.
+pub type QcPipelineResult = PipelineOutcome<QcAgentOutcome>;
 
 /// Compose the final answer using Gemini or a third-party model.
 /// This is the Gemini-vs-third-party branch that was previously inline in

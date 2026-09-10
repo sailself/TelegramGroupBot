@@ -8,7 +8,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::agents::common::{call_step_json, map_bounded, WEB_RESULTS_PER_QUERY};
+use crate::agents::common::{
+    call_step_json, map_bounded, ModelAnswer, PipelineOutcome, WEB_RESULTS_PER_QUERY,
+};
 use crate::agents::step::{resolve_step_model, StepModel, WallClock};
 use crate::config::{
     ThirdPartyProvider, CONFIG, FACTCHECK_CLAIM_EXTRACTION_PROMPT, FACTCHECK_SYNTHESIS_PROMPT,
@@ -45,17 +47,10 @@ struct ClaimEvidence {
     evidence_blocks: Vec<String>,
 }
 
-pub enum FactcheckOutcome {
-    Answer {
-        text: String,
-        model_display: String,
-    },
-    /// The pipeline could not start (unparseable extraction, no claims, no
-    /// step model); the caller should run the legacy single-call path.
-    UseLegacy {
-        reason: &'static str,
-    },
-}
+/// The pipeline either produces a final answer, or signals that the pipeline
+/// could not start (unparseable extraction, no claims, no step model) and the
+/// caller should run the legacy single-call path.
+pub type FactcheckOutcome = PipelineOutcome<ModelAnswer>;
 
 /// Run the multi-phase fact-check. `statement` is the fenced untrusted content
 /// from `build_factcheck_statement`; media files are attached to the
@@ -80,9 +75,7 @@ pub async fn run_factcheck_pipeline(
         Ok(model) => model,
         Err(err) => {
             warn!("factcheck pipeline could not resolve a model: {err}");
-            return Ok(FactcheckOutcome::UseLegacy {
-                reason: "no model resolved",
-            });
+            return Ok(FactcheckOutcome::UseLegacy("no model resolved"));
         }
     };
 
@@ -100,16 +93,12 @@ pub async fn run_factcheck_pipeline(
         Ok(claims) => claims,
         Err(err) => {
             warn!("factcheck claim extraction failed; falling back to legacy: {err}");
-            return Ok(FactcheckOutcome::UseLegacy {
-                reason: "claim extraction failed",
-            });
+            return Ok(FactcheckOutcome::UseLegacy("claim extraction failed"));
         }
     };
     if claims.is_empty() {
         info!("factcheck pipeline extracted no check-worthy claims; using legacy path");
-        return Ok(FactcheckOutcome::UseLegacy {
-            reason: "no check-worthy claims",
-        });
+        return Ok(FactcheckOutcome::UseLegacy("no check-worthy claims"));
     }
 
     // Phase B: per-claim web research, bounded concurrency, no LLM calls.
@@ -133,10 +122,10 @@ pub async fn run_factcheck_pipeline(
     )
     .await?;
 
-    Ok(FactcheckOutcome::Answer {
+    Ok(FactcheckOutcome::Answer(ModelAnswer {
         text,
         model_display,
-    })
+    }))
 }
 
 /// Pick the extraction model. Text-only requests use the cheap step model;

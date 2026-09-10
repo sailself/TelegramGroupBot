@@ -7,6 +7,7 @@
 use anyhow::{anyhow, Result};
 use tracing::{info, warn};
 
+use crate::agents::common::{ModelAnswer, PipelineOutcome};
 use crate::agents::step::{call_step_text, resolve_step_model, StepModel, WallClock};
 use crate::config::{CONFIG, TLDR_CHUNK_PROMPT, TLDR_MERGE_PROMPT};
 use crate::db::models::MessageRow;
@@ -23,17 +24,9 @@ const DEGRADED_TAIL_MESSAGES: usize = 30;
 const DEGRADED_EXCERPT_MAX_CHARS: usize = 2_500;
 const CHUNK_RETRY_DELAY_MS: u64 = 1_500;
 
-pub enum TldrOutcome {
-    Summary {
-        text: String,
-        model_display: String,
-    },
-    /// The pipeline could not start; the caller should run the single-call
-    /// path over the full history.
-    UseLegacy {
-        reason: &'static str,
-    },
-}
+/// The pipeline either produces a final summary, or signals that the caller
+/// should run the single-call path over the full history.
+pub type TldrOutcome = PipelineOutcome<ModelAnswer>;
 
 struct ChunkSummary {
     text: String,
@@ -56,18 +49,14 @@ pub async fn summarize_messages_map_reduce(
         Ok(model) => model,
         Err(err) => {
             warn!("map-reduce /tldr could not resolve a model: {err}");
-            return Ok(TldrOutcome::UseLegacy {
-                reason: "no model resolved",
-            });
+            return Ok(TldrOutcome::UseLegacy("no model resolved"));
         }
     };
     let step_model = match resolve_step_model(&final_model_id) {
         Ok(step_model) => step_model,
         Err(err) => {
             warn!("map-reduce /tldr has no step model: {err}");
-            return Ok(TldrOutcome::UseLegacy {
-                reason: "no step model",
-            });
+            return Ok(TldrOutcome::UseLegacy("no step model"));
         }
     };
 
@@ -133,10 +122,10 @@ pub async fn summarize_messages_map_reduce(
     )
     .await?;
 
-    Ok(TldrOutcome::Summary {
+    Ok(TldrOutcome::Answer(ModelAnswer {
         text,
         model_display,
-    })
+    }))
 }
 
 async fn summarize_chunk(

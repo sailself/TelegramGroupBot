@@ -309,10 +309,10 @@ pub async fn factcheck_handler(
         )
         .await
         {
-            Ok(FactcheckOutcome::Answer {
+            Ok(FactcheckOutcome::Answer(crate::agents::common::ModelAnswer {
                 text,
                 model_display,
-            }) => {
+            })) => {
                 let response_with_model = format!(
                     "{}\n\nModel: {}",
                     markdown_to_telegram_html(&text),
@@ -329,7 +329,7 @@ pub async fn factcheck_handler(
                 .await?;
                 return Ok(());
             }
-            Ok(FactcheckOutcome::UseLegacy { reason }) => {
+            Ok(FactcheckOutcome::UseLegacy(reason)) => {
                 info!("Agentic fact-check fell back to the legacy path: {reason}");
             }
             Err(err) => {
