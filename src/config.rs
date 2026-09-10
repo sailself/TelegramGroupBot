@@ -1114,6 +1114,29 @@ impl Config {
             && !self.img2.api_key.trim().is_empty()
             && !self.img2.base_url.trim().is_empty()
     }
+
+    /// Every configured credential that must never appear in operator-facing
+    /// output (status/diagnose reports, log tails, etc.).
+    pub fn secret_values(&self) -> Vec<&str> {
+        [
+            self.gemini.api_key.as_str(),
+            self.openrouter.api_key.as_str(),
+            self.nvidia.api_key.as_str(),
+            self.ollama.api_key.as_str(),
+            self.openai.api_key.as_str(),
+            self.img2.api_key.as_str(),
+            self.jina.api_key.as_str(),
+            self.search.brave_api_key.as_str(),
+            self.search.exa_api_key.as_str(),
+            self.telegraph.access_token.as_str(),
+            self.cwd_pw.api_key.as_str(),
+            self.telegram.bot_token.as_str(),
+        ]
+        .into_iter()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect()
+    }
 }
 
 pub(crate) fn gemini_api_available_from(enable_gemini: bool, api_key: &str) -> bool {
@@ -1503,5 +1526,17 @@ mod tests {
         let result = Config::load();
         let config = result.expect("loopback Ollama endpoint should be accepted");
         assert_eq!(config.ollama.base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn secret_values_include_every_provider_credential() {
+        let mut config = (*CONFIG).clone();
+        config.ollama.api_key = "ollama-secret".to_string();
+        config.img2.api_key = "img2-secret".to_string();
+        config.telegram.bot_token = "bot-secret".to_string();
+        let secrets = config.secret_values();
+        for expected in ["ollama-secret", "img2-secret", "bot-secret"] {
+            assert!(secrets.contains(&expected), "missing {expected}");
+        }
     }
 }

@@ -27,28 +27,6 @@ fn bool_label(value: bool) -> &'static str {
     }
 }
 
-/// Every configured credential that must never appear in operator output.
-fn config_secret_values(config: &crate::config::Config) -> Vec<String> {
-    [
-        &config.telegram.bot_token,
-        &config.gemini.api_key,
-        &config.openrouter.api_key,
-        &config.nvidia.api_key,
-        &config.ollama.api_key,
-        &config.openai.api_key,
-        &config.img2.api_key,
-        &config.jina.api_key,
-        &config.search.brave_api_key,
-        &config.search.exa_api_key,
-        &config.cwd_pw.api_key,
-        &config.telegraph.access_token,
-    ]
-    .into_iter()
-    .map(|value| value.trim().to_string())
-    .filter(|value| !value.is_empty())
-    .collect()
-}
-
 /// Replace every non-empty secret in `secrets` with a placeholder.
 fn redact_secrets(text: &str, secrets: &[String]) -> String {
     secrets
@@ -61,7 +39,11 @@ fn redact_secrets(text: &str, secrets: &[String]) -> String {
 }
 
 fn redact_sensitive_text(text: &str) -> String {
-    let mut secrets = config_secret_values(&CONFIG);
+    let mut secrets: Vec<String> = CONFIG
+        .secret_values()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     secrets.extend(crate::llm::openai_codex::current_auth_secrets());
     redact_secrets(text, &secrets)
 }
@@ -471,17 +453,5 @@ external_media_total_max_bytes: 52428800\n"
             redact_secrets("key=abc token=xyz other=abc", &secrets),
             "key=[REDACTED] token=[REDACTED] other=[REDACTED]"
         );
-    }
-
-    #[test]
-    fn config_secret_values_include_every_provider_credential() {
-        let mut config = (*CONFIG).clone();
-        config.ollama.api_key = "ollama-secret".to_string();
-        config.img2.api_key = "img2-secret".to_string();
-        config.telegram.bot_token = "bot-secret".to_string();
-        let secrets = config_secret_values(&config);
-        for expected in ["ollama-secret", "img2-secret", "bot-secret"] {
-            assert!(secrets.iter().any(|s| s == expected), "missing {expected}");
-        }
     }
 }
