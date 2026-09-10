@@ -9,7 +9,6 @@ use teloxide::types::{MessageId, ParseMode};
 use crate::config::CONFIG;
 use crate::handlers::enrichment::Enrichment;
 use crate::llm::audit::LlmAuditContext;
-use crate::llm::text_model::MODEL_GEMINI;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::{call_gemini_with_tool_runtime, call_third_party_with_tool_runtime};
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
@@ -18,7 +17,7 @@ use crate::utils::text::{escape_html, split_for_telegram, truncate_with_ellipsis
 use crate::utils::timing::{now_unix_seconds, CommandTimer};
 use tracing::warn;
 
-use super::model_resolution::{format_llm_error_message, result_model_display_name};
+use super::model_resolution::{format_llm_error_message, ModelCatalogSnapshot, QaModel};
 
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
 const CHAT_SEARCH_JSON_OUTPUT_PROMPT: &str = "Final response format: return only valid JSON with this shape: {\"selected_message_ids\":[123],\"note\":\"optional short note\"}. Do not wrap the JSON in Markdown. Do not include message IDs that were not returned by chat_context_query.";
@@ -198,7 +197,8 @@ async fn run_chat_search_model(
     state: &AppState,
     request: &PendingQRequest,
     query: &str,
-    model_name: &str,
+    model: &QaModel,
+    snapshot: &ModelCatalogSnapshot,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<(ChatSearchModelResponse, ToolRuntime)> {
     let mut runtime = ToolRuntime::for_search(state.db.clone(), request.chat_id);
@@ -207,7 +207,7 @@ async fn run_chat_search_model(
         &CONFIG.max_tool_context_items.to_string(),
     );
 
-    let response = if model_name == MODEL_GEMINI {
+    let response = if matches!(model, QaModel::Gemini) {
         call_gemini_with_tool_runtime(
             &format!(
                 "{}\n\n{}",
@@ -236,7 +236,7 @@ async fn run_chat_search_model(
         let response = call_third_party_with_tool_runtime(
             &third_party_prompt,
             query,
-            model_name,
+            model.model_id(),
             "Chat Search",
             &[],
             &mut runtime,
@@ -249,12 +249,7 @@ async fn run_chat_search_model(
         .await?;
         ChatSearchModelResponse {
             text: response,
-            model_used: result_model_display_name(
-                model_name,
-                None,
-                QaCommandMode::ChatSearch,
-                None,
-            ),
+            model_used: model.result_display_name(snapshot, QaCommandMode::ChatSearch, None),
         }
     };
 
@@ -266,14 +261,16 @@ pub(super) async fn process_chat_search_request(
     state: &AppState,
     request: &PendingQRequest,
     query: &str,
-    model_name: &str,
+    model: &QaModel,
+    snapshot: &ModelCatalogSnapshot,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<()> {
     let (response, runtime) =
-        match run_chat_search_model(state, request, query, model_name, audit_context).await {
+        match run_chat_search_model(state, request, query, model, snapshot, audit_context).await {
             Ok(response) => response,
             Err(err) => {
-                let message = format_llm_error_message(model_name, &err);
+                let display_model = model.display_name(snapshot, request.mode);
+                let message = format_llm_error_message(model, &display_model, &err);
                 bot.edit_message_text(
                     ChatId(request.chat_id),
                     MessageId(request.selection_message_id as i32),

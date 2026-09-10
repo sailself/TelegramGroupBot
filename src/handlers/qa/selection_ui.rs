@@ -6,11 +6,10 @@ use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
 use tracing::error;
 
-use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
+use crate::config::{ThirdPartyModelConfig, CONFIG};
 use crate::llm::media::summarize_media_files;
-use crate::llm::runtime_models::runtime_models;
 use crate::llm::text_model::{
-    model_supports_media_for_request, normalize_model_identifier, ready_runtime_providers,
+    model_supports_media_for_request, normalize_model_identifier,
     resolve_default_text_model_for_request, resolve_exact_model_identifier_with_models,
     ModelRequestCapabilities, MODEL_GEMINI,
 };
@@ -19,7 +18,7 @@ use crate::utils::timing::{complete_command_timer, now_unix_seconds};
 
 use super::model_resolution::{
     configured_model_display_name, default_model_selection_key,
-    selectable_model_ids_for_request_with_models,
+    selectable_model_ids_for_request_with_models, ModelCatalogSnapshot, QaModel,
 };
 use super::process::process_request;
 
@@ -123,8 +122,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_model_selection_keyboard_with_models(
-    models: &[ThirdPartyModelConfig],
-    ready_providers: &[ThirdPartyProvider],
+    snapshot: &ModelCatalogSnapshot,
     gemini_available: bool,
     default_model: &str,
     has_images: bool,
@@ -134,10 +132,9 @@ pub(super) fn create_model_selection_keyboard_with_models(
     require_tools: bool,
 ) -> InlineKeyboardMarkup {
     let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
-    let default_model_key = default_model_selection_key(default_model, models);
+    let default_model_key = default_model_selection_key(default_model, &snapshot.models);
     let selectable_model_ids = selectable_model_ids_for_request_with_models(
-        models,
-        ready_providers,
+        snapshot,
         gemini_available,
         has_images,
         has_video,
@@ -149,7 +146,7 @@ pub(super) fn create_model_selection_keyboard_with_models(
         .iter()
         .map(|model_id| {
             InlineKeyboardButton::callback(
-                configured_model_display_name(model_id),
+                configured_model_display_name(snapshot, model_id),
                 model_selection_callback_data(model_id),
             )
         })
@@ -172,17 +169,15 @@ pub(super) fn create_model_selection_keyboard_with_models(
 }
 
 pub(super) fn create_model_selection_keyboard(
+    snapshot: &ModelCatalogSnapshot,
     has_images: bool,
     has_video: bool,
     has_audio: bool,
     has_documents: bool,
     require_tools: bool,
 ) -> InlineKeyboardMarkup {
-    let models = runtime_models();
-    let ready_providers = ready_runtime_providers(&models);
     create_model_selection_keyboard_with_models(
-        &models,
-        &ready_providers,
+        snapshot,
         CONFIG.gemini_api_available(),
         &CONFIG.default_text_model,
         has_images,
@@ -198,18 +193,22 @@ pub(super) async fn process_timed_out_q_request_with_default_model(
     state: &AppState,
     mut request: PendingQRequest,
 ) {
+    let snapshot = ModelCatalogSnapshot::load();
     let summary = summarize_media_files(&request.enrichment.media_files);
     let has_images = summary.images > 0;
     let has_video = summary.videos > 0;
     let has_audio = summary.audios > 0;
     let has_documents = summary.documents > 0;
-    let default_model = match resolve_default_text_model_for_request(ModelRequestCapabilities {
+    let mode = request.mode;
+    let resolved = resolve_default_text_model_for_request(ModelRequestCapabilities {
         has_images,
         has_video,
         has_audio,
         has_documents,
-        require_tools: request.mode.requires_custom_tools(),
-    }) {
+        require_tools: mode.requires_custom_tools(),
+    })
+    .and_then(|model_id| QaModel::resolve(&model_id, &snapshot, None));
+    let model = match resolved {
         Ok(model) => model,
         Err(err) => {
             let _ = bot
@@ -245,7 +244,8 @@ pub(super) async fn process_timed_out_q_request_with_default_model(
         .await;
 
     let command_timer = request.command_timer.take();
-    let result = process_request(bot, state, request, &default_model, None, None).await;
+    let display_name = model.display_name(&snapshot, mode);
+    let result = process_request(bot, state, request, &model, &snapshot, None).await;
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(
@@ -257,8 +257,7 @@ pub(super) async fn process_timed_out_q_request_with_default_model(
     if let Err(err) = result {
         error!(
             "Timed-out QA request failed after default-model fallback: model={}, error={:#}",
-            configured_model_display_name(&default_model),
-            err
+            display_name, err
         );
     }
 }
@@ -278,8 +277,8 @@ pub async fn model_selection_callback(
     }
 
     let selected_token = data.trim_start_matches(MODEL_CALLBACK_PREFIX);
-    let models = runtime_models();
-    let selected_model = resolve_model_callback_token_with_models(selected_token, &models)
+    let snapshot = ModelCatalogSnapshot::load();
+    let selected_model = resolve_model_callback_token_with_models(selected_token, &snapshot.models)
         .unwrap_or_else(|| normalize_model_identifier(selected_token));
 
     let message = match query.message.clone() {
@@ -325,9 +324,24 @@ pub async fn model_selection_callback(
         | PendingQRequestCallbackAction::InvalidSelection => return Ok(()),
     };
 
+    let model = match QaModel::resolve(&selected_model, &snapshot, None) {
+        Ok(model) => model,
+        Err(err) => {
+            if let Some(mut timer) = request.command_timer.take() {
+                complete_command_timer(&mut timer, "error", None);
+            }
+            error!("Selected model is no longer available: {err:#}");
+            bot.edit_message_text(message.chat().id, message.id(), err.to_string())
+                .reply_markup(InlineKeyboardMarkup::new(
+                    Vec::<Vec<InlineKeyboardButton>>::new(),
+                ))
+                .await?;
+            return Ok(());
+        }
+    };
     let summary = summarize_media_files(&request.enrichment.media_files);
 
-    let display_name = configured_model_display_name(&selected_model);
+    let display_name = model.display_name(&snapshot, request.mode);
 
     let processing_text = if request.mode == QaCommandMode::ChatSearch {
         format!("Searching this chat with {}...", display_name)
@@ -362,7 +376,7 @@ pub async fn model_selection_callback(
         .await?;
 
     let command_timer = request.command_timer.take();
-    let result = process_request(&bot, &state, request, &selected_model, None, None).await;
+    let result = process_request(&bot, &state, request, &model, &snapshot, None).await;
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(&mut timer, status, None);

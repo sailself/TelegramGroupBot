@@ -21,7 +21,6 @@ use crate::llm::audit::{
     LLM_TRIGGER_KIND_COMMAND,
 };
 use crate::llm::media::summarize_media_files;
-use crate::llm::runtime_models::runtime_model_count;
 use crate::llm::text_model::{
     has_available_third_party_models_for_request, resolve_default_text_model_for_request,
     ModelRequestCapabilities,
@@ -34,9 +33,9 @@ use crate::utils::timing::{complete_command_timer, now_unix_seconds, start_comma
 
 use super::chat_search::{build_chat_search_pending_request, chat_search_rebuilding_message};
 use super::model_resolution::{
-    configured_model_display_name, resolve_quick_text_model_for_request,
-    selectable_model_ids_for_request, should_use_default_model_without_selection,
-    video_request_has_capable_model,
+    resolve_quick_text_model_for_request, selectable_model_ids_for_request,
+    should_use_default_model_without_selection, video_request_has_capable_model,
+    ModelCatalogSnapshot, QaModel,
 };
 use super::process::process_request;
 use super::prompt::{
@@ -263,6 +262,7 @@ async fn q_handler_internal(
     .await;
     let twitter_source_count = count_sources(&enrichment.sources, SourceKind::Twitter).sources;
     let audit_context = create_q_audit_context(&state, &message, command_name).await;
+    let snapshot = ModelCatalogSnapshot::load();
 
     let media_summary = summarize_media_files(&enrichment.media_files);
     let has_images = media_summary.images > 0;
@@ -314,20 +314,26 @@ async fn q_handler_internal(
         !youtube_urls.is_empty(),
         CONFIG.gemini_api_available(),
         third_party_models_available_for_request,
-        runtime_model_count(),
+        snapshot.count(),
         query_message_is_from_bot,
     );
     let direct_model = if must_use_default_model {
         let resolved = if mode == QaCommandMode::Quick {
-            resolve_quick_text_model_for_request(has_images, has_video, has_audio, has_documents)
-                .await
-                .map(|model| {
-                    (
-                        model.model_id,
-                        "default_quick_text_model",
-                        model.explicit_codex,
-                    )
-                })
+            resolve_quick_text_model_for_request(
+                &snapshot,
+                has_images,
+                has_video,
+                has_audio,
+                has_documents,
+            )
+            .await
+            .map(|prepared| {
+                (
+                    prepared.model_id.clone(),
+                    "default_quick_text_model",
+                    Some(prepared),
+                )
+            })
         } else {
             resolve_default_text_model_for_request(request_capabilities)
                 .map(|model| (model, "default_text_model", None))
@@ -349,6 +355,7 @@ async fn q_handler_internal(
         }
     } else {
         let selectable_model_ids = selectable_model_ids_for_request(
+            &snapshot,
             has_images,
             has_video,
             has_audio,
@@ -365,7 +372,7 @@ async fn q_handler_internal(
         }
     };
 
-    if let Some((selected_model, timer_detail, explicit_codex)) = direct_model {
+    if let Some((selected_model, timer_detail, prepared)) = direct_model {
         if mode == QaCommandMode::Quick {
             (query_text, youtube_urls) = prepare_youtube_inputs_for_qa(
                 &query_base,
@@ -374,10 +381,22 @@ async fn q_handler_internal(
                 CONFIG.gemini_api_available(),
             );
         }
-        let display_name = explicit_codex
-            .as_ref()
-            .map(|explicit| explicit.config.name.clone())
-            .unwrap_or_else(|| configured_model_display_name(&selected_model));
+        let model = match QaModel::resolve(&selected_model, &snapshot, prepared.as_ref()) {
+            Ok(model) => model,
+            Err(err) => {
+                reply_with_retry(
+                    &bot,
+                    message.chat.id,
+                    &err.to_string(),
+                    Some(message.id),
+                    None,
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let display_name = model.display_name(&snapshot, mode);
         let processing_message_text = if has_video {
             format!(
                 "Analyzing video and processing your question with {}...",
@@ -442,8 +461,8 @@ async fn q_handler_internal(
             &bot,
             &state,
             pending_request,
-            &selected_model,
-            explicit_codex.as_ref(),
+            &model,
+            &snapshot,
             Some(heavy_permit),
         )
         .await;
@@ -460,6 +479,7 @@ async fn q_handler_internal(
     }
 
     let keyboard = create_model_selection_keyboard(
+        &snapshot,
         has_images,
         has_video,
         has_audio,
@@ -614,6 +634,7 @@ pub async fn s_handler(
     }
     let audit_context = create_q_audit_context(&state, &message, "s").await;
 
+    let snapshot = ModelCatalogSnapshot::load();
     let request_capabilities = ModelRequestCapabilities {
         require_tools: true,
         ..ModelRequestCapabilities::default()
@@ -626,7 +647,7 @@ pub async fn s_handler(
         false,
         CONFIG.gemini_api_available(),
         third_party_models_available_for_request,
-        runtime_model_count(),
+        snapshot.count(),
         false,
     );
     let direct_model = if must_use_default_model {
@@ -647,7 +668,7 @@ pub async fn s_handler(
         }
     } else {
         let selectable_model_ids =
-            selectable_model_ids_for_request(false, false, false, false, true);
+            selectable_model_ids_for_request(&snapshot, false, false, false, false, true);
         if selectable_model_ids.is_empty() {
             reply_with_retry(
                 &bot,
@@ -671,7 +692,22 @@ pub async fn s_handler(
     };
 
     if let Some((selected_model, timer_detail)) = direct_model {
-        let display_name = configured_model_display_name(&selected_model);
+        let model = match QaModel::resolve(&selected_model, &snapshot, None) {
+            Ok(model) => model,
+            Err(err) => {
+                reply_with_retry(
+                    &bot,
+                    message.chat.id,
+                    &err.to_string(),
+                    Some(message.id),
+                    None,
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let display_name = model.display_name(&snapshot, QaCommandMode::ChatSearch);
         let processing_message = reply_with_retry(
             &bot,
             message.chat.id,
@@ -691,15 +727,14 @@ pub async fn s_handler(
             None,
         );
 
-        let result =
-            process_request(&bot, &state, pending_request, &selected_model, None, None).await;
+        let result = process_request(&bot, &state, pending_request, &model, &snapshot, None).await;
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(&mut timer, status, Some(timer_detail.to_string()));
         result?;
         return Ok(());
     }
 
-    let keyboard = create_model_selection_keyboard(false, false, false, false, true);
+    let keyboard = create_model_selection_keyboard(&snapshot, false, false, false, false, true);
     let selection_message = reply_with_retry(
         &bot,
         message.chat.id,

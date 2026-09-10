@@ -1,7 +1,7 @@
 //! Running a prepared `/q`-family request against the selected model and
 //! rendering the answer back to the chat.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode,
@@ -14,8 +14,6 @@ use crate::handlers::enrichment::{render_sources, EnrichmentBudget};
 use crate::handlers::responses::send_response;
 use crate::llm::audit::audit_context_from_id;
 use crate::llm::media::summarize_media_files;
-use crate::llm::runtime_models::{runtime_model_config, ResolvedExplicitCodexModel};
-use crate::llm::text_model::MODEL_GEMINI;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::{
     call_gemini, call_gemini_with_tool_runtime, call_third_party,
@@ -30,10 +28,7 @@ use crate::utils::text::escape_html;
 use super::chat_search::{
     chat_search_rebuilding_message, process_chat_search_request, warn_on_unverified_chat_links,
 };
-use super::model_resolution::{
-    codex_quick_result_label, configured_model_display_name, format_llm_error_message,
-    result_model_display_name, third_party_provider_label,
-};
+use super::model_resolution::{format_llm_error_message, ModelCatalogSnapshot, QaModel};
 use super::prompt::{
     build_chat_context_system_prompt, build_quick_system_prompt, build_system_prompt,
 };
@@ -88,7 +83,7 @@ pub(super) fn append_quick_search_footer(
     response
 }
 
-/// Run a prepared request against `model_name`. `heavy_permit` is the permit a
+/// Run a prepared request against `model`. `heavy_permit` is the permit a
 /// caller already holds (the direct `/q` path throttles its own preparation);
 /// passing it through avoids taking a second slot from the same semaphore,
 /// which could exhaust the heavy-command lane and deadlock it.
@@ -96,11 +91,11 @@ pub(super) async fn process_request(
     bot: &Bot,
     state: &AppState,
     request: PendingQRequest,
-    model_name: &str,
-    explicit_codex: Option<&ResolvedExplicitCodexModel>,
+    model: &QaModel,
+    snapshot: &ModelCatalogSnapshot,
     heavy_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<()> {
-    if model_name == MODEL_GEMINI && !CONFIG.gemini_api_available() {
+    if matches!(model, QaModel::Gemini) && !CONFIG.gemini_api_available() {
         bot.edit_message_text(
             ChatId(request.chat_id),
             MessageId(request.selection_message_id as i32),
@@ -112,21 +107,6 @@ pub(super) async fn process_request(
         .await?;
         return Ok(());
     }
-
-    let runtime_config = if explicit_codex.is_none() && model_name != MODEL_GEMINI {
-        runtime_model_config(model_name)
-    } else {
-        None
-    };
-    let request_model_config = match explicit_codex {
-        Some(explicit) => {
-            if explicit.config.id != model_name {
-                return Err(anyhow!("The explicit Codex model changed"));
-            }
-            Some(&explicit.config)
-        }
-        None => runtime_config.as_ref(),
-    };
 
     let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
@@ -163,28 +143,10 @@ pub(super) async fn process_request(
         query.push_str(&rendered_sources);
     }
 
-    let supports_tools = if model_name == MODEL_GEMINI {
-        true
-    } else {
-        request_model_config.is_some_and(|config| config.tools)
-    };
+    let supports_tools = model.supports_tools();
     let media_summary = summarize_media_files(&request.enrichment.media_files);
-    let provider_label = if model_name == MODEL_GEMINI {
-        "Gemini".to_string()
-    } else {
-        request_model_config
-            .map(|config| third_party_provider_label(config.provider).to_string())
-            .unwrap_or_else(|| "Unknown".to_string())
-    };
-    let logged_model_name = explicit_codex
-        .map(|explicit| {
-            codex_quick_result_label(
-                &explicit.config,
-                Some(&explicit.record),
-                Some(&CONFIG.quick_reasoning_effort),
-            )
-        })
-        .unwrap_or_else(|| configured_model_display_name(model_name));
+    let provider_label = model.provider_label();
+    let logged_model_name = model.display_name(snapshot, request.mode);
 
     info!(
         "Processing QA request: mode={}, provider={}, model={}, chat_id={}, user_id={}, message_id={}, selection_message_id={}, tools_enabled={}, images={}, videos={}, audios={}, documents={}, youtube_urls={}, query_len={}",
@@ -216,13 +178,14 @@ pub(super) async fn process_request(
                 state,
                 &request,
                 &query,
-                model_name,
+                model,
+                snapshot,
                 audit_context.as_ref(),
             )
             .await;
         }
         QaCommandMode::Standard => {
-            if model_name == MODEL_GEMINI {
+            if matches!(model, QaModel::Gemini) {
                 let use_pro = !request.enrichment.media_files.is_empty()
                     || !request.enrichment.youtube_urls.is_empty();
                 call_gemini(GeminiCallRequest {
@@ -242,7 +205,7 @@ pub(super) async fn process_request(
                 call_third_party(
                     &system_prompt,
                     &query,
-                    model_name,
+                    model.model_id(),
                     "Answer to Your Question",
                     &request.enrichment.media_files,
                     web_tools.as_mut(),
@@ -260,7 +223,7 @@ pub(super) async fn process_request(
                 || !request.enrichment.youtube_urls.is_empty();
             if uses_quick_tool_runtime(request.mode, supports_tools) {
                 let mut runtime = ToolRuntime::for_quick(state.db.clone(), request.chat_id);
-                let result = if model_name == MODEL_GEMINI {
+                let result = if matches!(model, QaModel::Gemini) {
                     call_gemini_with_tool_runtime(
                         &system_prompt,
                         &query,
@@ -275,18 +238,15 @@ pub(super) async fn process_request(
                     .await
                     .map(|result| (result.text, Some(result.model_used)))
                 } else {
-                    let provider = request_model_config
-                        .map(|config| config.provider)
-                        .unwrap_or(ThirdPartyProvider::OpenRouter);
                     let reasoning_override = reasoning_override_for_qa_mode(
                         request.mode,
-                        provider,
+                        model.third_party_provider(),
                         &CONFIG.quick_reasoning_effort,
                     );
                     call_third_party_with_tool_runtime(
                         &system_prompt,
                         &query,
-                        model_name,
+                        model.model_id(),
                         "Quick Answer",
                         &request.enrichment.media_files,
                         &mut runtime,
@@ -295,7 +255,7 @@ pub(super) async fn process_request(
                             crate::llm::CodexPromptStyle::FreeformAnswer,
                         )
                         .with_reasoning_override(reasoning_override)
-                        .with_explicit_codex_model(explicit_codex),
+                        .with_explicit_codex_model(model.explicit_codex()),
                     )
                     .await
                     .map(|result| (result, None))
@@ -303,18 +263,15 @@ pub(super) async fn process_request(
                 quick_search_attempted = runtime.web_search_attempted();
                 result
             } else {
-                let provider = request_model_config
-                    .map(|config| config.provider)
-                    .unwrap_or(ThirdPartyProvider::OpenRouter);
                 let reasoning_override = reasoning_override_for_qa_mode(
                     request.mode,
-                    provider,
+                    model.third_party_provider(),
                     &CONFIG.quick_reasoning_effort,
                 );
                 call_third_party(
                     &system_prompt,
                     &query,
-                    model_name,
+                    model.model_id(),
                     "Quick Answer",
                     &request.enrichment.media_files,
                     None,
@@ -323,7 +280,7 @@ pub(super) async fn process_request(
                         crate::llm::CodexPromptStyle::FreeformAnswer,
                     )
                     .with_reasoning_override(reasoning_override)
-                    .with_explicit_codex_model(explicit_codex),
+                    .with_explicit_codex_model(model.explicit_codex()),
                 )
                 .await
                 .map(|result| (result, None))
@@ -342,7 +299,7 @@ pub(super) async fn process_request(
                         db: &state.db,
                         chat_id: request.chat_id,
                         query: &query,
-                        model_name,
+                        model_name: model.model_id(),
                         system_prompt: &system_prompt,
                         media_files: &request.enrichment.media_files,
                         youtube_urls: &request.enrichment.youtube_urls,
@@ -369,7 +326,7 @@ pub(super) async fn process_request(
                 result
             } else {
                 let mut runtime = ToolRuntime::for_qc(state.db.clone(), request.chat_id);
-                let qc_result = if model_name == MODEL_GEMINI {
+                let qc_result = if matches!(model, QaModel::Gemini) {
                     let use_pro = !request.enrichment.media_files.is_empty()
                         || !request.enrichment.youtube_urls.is_empty();
                     call_gemini_with_tool_runtime(
@@ -389,7 +346,7 @@ pub(super) async fn process_request(
                     call_third_party_with_tool_runtime(
                         &system_prompt,
                         &query,
-                        model_name,
+                        model.model_id(),
                         "Answer about Chat",
                         &request.enrichment.media_files,
                         &mut runtime,
@@ -427,7 +384,7 @@ pub(super) async fn process_request(
                 query.chars().count(),
                 err
             );
-            let message = format_llm_error_message(model_name, &err);
+            let message = format_llm_error_message(model, &logged_model_name, &err);
             bot.edit_message_text(
                 ChatId(request.chat_id),
                 MessageId(request.selection_message_id as i32),
@@ -455,13 +412,9 @@ pub(super) async fn process_request(
 
     let response_text = append_quick_search_footer(response, request.mode, quick_search_attempted);
     let mut rendered_response = markdown_to_telegram_html(&response_text);
-    if !model_name.is_empty() {
-        let display_model = result_model_display_name(
-            model_name,
-            gemini_model_used.as_deref(),
-            request.mode,
-            explicit_codex,
-        );
+    if !model.model_id().is_empty() {
+        let display_model =
+            model.result_display_name(snapshot, request.mode, gemini_model_used.as_deref());
         rendered_response.push_str(&format!("\n\nModel: {}", escape_html(&display_model)));
     }
 
