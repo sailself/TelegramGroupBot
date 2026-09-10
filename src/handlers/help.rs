@@ -122,9 +122,9 @@ pub async fn support_handler(bot: Bot, message: Message) -> Result<()> {
         return Ok(());
     }
 
-    let support_message = escape_html(&CONFIG.support_message);
+    let support_message = escape_html(&CONFIG.telegram.support_message);
 
-    let support_url = match reqwest::Url::parse(CONFIG.support_link.trim()) {
+    let support_url = match reqwest::Url::parse(CONFIG.telegram.support_link.trim()) {
         Ok(url) => url,
         Err(_) => {
             bot.send_message(message.chat.id, support_message)

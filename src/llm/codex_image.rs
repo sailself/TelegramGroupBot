@@ -58,7 +58,7 @@ struct CodexImageGenerationResult {
 }
 
 pub fn codex_image_display_model() -> String {
-    let model = CONFIG.openai_codex_image_model.trim();
+    let model = CONFIG.codex.image_model.trim();
     if model.is_empty() {
         CODEX_IMAGE_TOOL_MODEL.to_string()
     } else {
@@ -67,7 +67,7 @@ pub fn codex_image_display_model() -> String {
 }
 
 fn codex_image_responses_model() -> String {
-    let model = CONFIG.openai_codex_image_responses_model.trim();
+    let model = CONFIG.codex.image_responses_model.trim();
     if model.is_empty() {
         CODEX_IMAGE_RESPONSES_MODEL.to_string()
     } else {
@@ -76,7 +76,7 @@ fn codex_image_responses_model() -> String {
 }
 
 pub fn codex_image_available() -> bool {
-    CONFIG.enable_openai_codex
+    CONFIG.codex.enabled
         && openai_codex::is_auth_ready()
         && crate::llm::runtime_models::selected_codex_model_record().is_some()
 }
@@ -101,7 +101,7 @@ pub fn canonicalize_codex_responses_base_url(base_url: &str) -> String {
 fn codex_image_response_url() -> String {
     format!(
         "{}/responses",
-        canonicalize_codex_responses_base_url(&CONFIG.openai_codex_base_url)
+        canonicalize_codex_responses_base_url(&CONFIG.codex.base_url)
     )
 }
 
@@ -300,7 +300,7 @@ async fn call_codex_image_api(
     let model_ref = model.as_str();
     let metadata = json!({
         "responses_model": payload.get("model").cloned().unwrap_or(Value::Null),
-        "timeout_secs": CONFIG.openai_codex_request_timeout_secs,
+        "timeout_secs": CONFIG.codex.request_timeout_secs,
         "streaming_sse": true,
     });
     let call = LlmCall::begin(
@@ -311,7 +311,7 @@ async fn call_codex_image_api(
         Some(&metadata),
     )
     .with_label(CODEX_IMAGE_PROVIDER);
-    let timeout = Duration::from_secs(CONFIG.openai_codex_request_timeout_secs);
+    let timeout = Duration::from_secs(CONFIG.codex.request_timeout_secs);
 
     let result = call_with_retry(
         &call,
@@ -422,13 +422,13 @@ pub async fn generate_image_with_codex(
     let payload = build_codex_image_generation_payload(prompt, &input_images, size);
     let images = call_codex_image_api(&payload, audit_context).await?;
 
-    if upload_to_cwd && !CONFIG.cwd_pw_api_key.trim().is_empty() {
+    if upload_to_cwd && !CONFIG.cwd_pw.api_key.trim().is_empty() {
         let model = codex_image_display_model();
         for image in &images {
             let mime_type = detect_mime_type(image).unwrap_or_else(|| "image/png".to_string());
             let _ = crate::tools::cwd_uploader::upload_image_bytes_to_cwd(
                 image,
-                &CONFIG.cwd_pw_api_key,
+                &CONFIG.cwd_pw.api_key,
                 &mime_type,
                 Some(model.as_str()),
                 Some(prompt),

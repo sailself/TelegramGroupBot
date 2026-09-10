@@ -1,9 +1,9 @@
 //! System-prompt templating and YouTube-URL extraction shared across QA modes.
 
-use crate::config::{QUICK_Q_SYSTEM_PROMPT, Q_SYSTEM_PROMPT};
 use crate::handlers::content::extract_youtube_urls;
 use crate::llm::media::MediaSummary;
 use crate::llm::text_model::MODEL_GEMINI;
+use crate::prompts::{LANGUAGE_POLICY, QUICK_Q_SYSTEM_PROMPT, Q_SYSTEM_PROMPT};
 use crate::state::QaCommandMode;
 
 pub(super) const NO_VIDEO_CAPABLE_MODEL_MESSAGE: &str =
@@ -38,7 +38,7 @@ fn build_prompt_from_template(template: &str, telegram_user_language_hint: Optio
     // Substitute {language_policy} first: it itself contains the
     // {telegram_user_language_hint} placeholder, which the next call resolves.
     template
-        .replace("{language_policy}", crate::config::LANGUAGE_POLICY)
+        .replace("{language_policy}", LANGUAGE_POLICY)
         .replace("{current_datetime}", &now)
         .replace(
             "{telegram_user_language_hint}",

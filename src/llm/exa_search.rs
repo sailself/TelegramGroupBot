@@ -34,7 +34,7 @@ impl SearchProvider for ExaSearch {
     }
 
     fn is_enabled(&self) -> bool {
-        CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty()
+        CONFIG.search.enable_exa && !CONFIG.search.exa_api_key.trim().is_empty()
     }
 
     fn search<'a>(
@@ -47,8 +47,8 @@ impl SearchProvider for ExaSearch {
                 return Err(anyhow!("EXA_API_KEY is not configured."));
             }
             exa_search_at(
-                &CONFIG.exa_search_endpoint,
-                &CONFIG.exa_api_key,
+                &CONFIG.search.exa_endpoint,
+                &CONFIG.search.exa_api_key,
                 query,
                 max_results,
             )

@@ -9,13 +9,14 @@ use tracing::{info, warn};
 
 use crate::agents::common::{ModelAnswer, PipelineOutcome};
 use crate::agents::step::{call_step_text, resolve_step_model, StepModel, WallClock};
-use crate::config::{CONFIG, TLDR_CHUNK_PROMPT, TLDR_MERGE_PROMPT};
+use crate::config::CONFIG;
 use crate::db::models::MessageRow;
 use crate::llm::prompting::{format_tldr_chat_content, wrap_chat_history};
 use crate::llm::text_model::{
     call_configured_text_model, resolve_default_text_model_for_request, ModelRequestCapabilities,
 };
 use crate::llm::LlmAuditContext;
+use crate::prompts::{TLDR_CHUNK_PROMPT, TLDR_MERGE_PROMPT};
 use crate::utils::progress::ProgressReporter;
 use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 
@@ -61,7 +62,7 @@ pub async fn summarize_messages_map_reduce(
     };
 
     // Map: sequential chunk compression — only one rendered chunk in memory.
-    let chunks: Vec<&[MessageRow]> = messages.chunks(CONFIG.tldr_chunk_size).collect();
+    let chunks: Vec<&[MessageRow]> = messages.chunks(CONFIG.agents.tldr_chunk_size).collect();
     let total = chunks.len();
     let mut chunk_summaries: Vec<ChunkSummary> = Vec::with_capacity(total);
     for (index, chunk) in chunks.into_iter().enumerate() {
@@ -109,7 +110,7 @@ pub async fn summarize_messages_map_reduce(
     // Reduce: merge with the configured default model.
     progress.update_now("Merging partial summaries...").await;
     let merge_input = build_merge_input(&chunk_summaries);
-    let system_prompt = TLDR_MERGE_PROMPT.replace("{bot_name}", &CONFIG.telegraph_author_name);
+    let system_prompt = TLDR_MERGE_PROMPT.replace("{bot_name}", &CONFIG.telegraph.author_name);
     let (text, model_display) = call_configured_text_model(
         &system_prompt,
         &merge_input,

@@ -249,7 +249,7 @@ pub async fn run_qc_pipeline(
     };
     match lane {
         QcLane::Analytics => return run_analytics_lane(&request, progress).await,
-        QcLane::TopicDiscovery if CONFIG.enable_qc_topic_discovery => {
+        QcLane::TopicDiscovery if CONFIG.agents.enable_qc_topic_discovery => {
             return crate::agents::qc_topics::run_topic_discovery_lane(
                 &request,
                 &step_model,

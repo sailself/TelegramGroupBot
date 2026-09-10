@@ -204,7 +204,7 @@ async fn run_chat_search_model(
     let mut runtime = ToolRuntime::for_search(state.db.clone(), request.chat_id);
     let chat_search_prompt = CHAT_SEARCH_SYSTEM_PROMPT.replace(
         "{result_target}",
-        &CONFIG.max_tool_context_items.to_string(),
+        &CONFIG.limits.max_tool_context_items.to_string(),
     );
     // Gemini takes the tool budget in its prompt and a response schema;
     // third-party models are told the JSON shape in words instead.
@@ -232,7 +232,7 @@ async fn run_chat_search_model(
             media_files: None,
             youtube_urls: None,
             tools: Some(&mut runtime),
-            reasoning_override: Some(CONFIG.agent_step_reasoning.clone()),
+            reasoning_override: Some(CONFIG.agents.step_reasoning.clone()),
             response_schema,
             prompt_style: crate::llm::CodexPromptStyle::TaskSpecific,
             use_pro: false,
@@ -276,7 +276,7 @@ pub(super) async fn process_chat_search_request(
             }
         };
 
-    let max_selected_hits = CONFIG.max_tool_context_items;
+    let max_selected_hits = CONFIG.limits.max_tool_context_items;
     let selection = parse_chat_search_selection(&response.text);
     let mut selected_hits = selection
         .as_ref()

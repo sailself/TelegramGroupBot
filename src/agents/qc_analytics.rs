@@ -153,7 +153,7 @@ pub(super) async fn run_analytics_lane(
                 audit_context,
                 crate::llm::CodexPromptStyle::TaskSpecific,
             )
-            .with_reasoning_override(Some(CONFIG.agent_step_reasoning.as_str())),
+            .with_reasoning_override(Some(CONFIG.agents.step_reasoning.as_str())),
         )
         .await
     };

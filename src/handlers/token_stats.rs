@@ -228,7 +228,7 @@ async fn send_plain_text_report(
     report: &str,
     telegraph_notice: &str,
 ) -> Result<()> {
-    let too_long = report.lines().count() > 22 || report.len() > CONFIG.telegram_max_length;
+    let too_long = report.lines().count() > 22 || report.len() > CONFIG.telegram.max_length;
     if !too_long {
         send_message_with_retry(bot, message.chat.id, report, Some(message.id)).await?;
         return Ok(());
@@ -242,7 +242,7 @@ async fn send_plain_text_report(
 
     let chunks = split_for_telegram(
         report,
-        CONFIG.telegram_max_length.saturating_sub(100).max(1),
+        CONFIG.telegram.max_length.saturating_sub(100).max(1),
     );
     for (index, chunk) in chunks.into_iter().enumerate() {
         let reply_to = if index == 0 { Some(message.id) } else { None };

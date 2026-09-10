@@ -179,8 +179,8 @@ pub(super) fn build_native_codex_web_search_tool_from_record(
         record.supports_search_tool,
         record.web_search_tool_type,
         openai_codex::native_web_search_mode(),
-        &CONFIG.openai_codex_web_search_allowed_domains,
-        Some(&CONFIG.openai_codex_web_search_context_size),
+        &CONFIG.codex.web_search_allowed_domains,
+        Some(&CONFIG.codex.web_search_context_size),
     )
 }
 

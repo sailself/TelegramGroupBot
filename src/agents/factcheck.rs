@@ -12,10 +12,7 @@ use crate::agents::common::{
     call_step_json, map_bounded, ModelAnswer, PipelineOutcome, ProgressHook, WEB_RESULTS_PER_QUERY,
 };
 use crate::agents::step::{resolve_step_model, StepModel, WallClock};
-use crate::config::{
-    ThirdPartyProvider, CONFIG, FACTCHECK_CLAIM_EXTRACTION_PROMPT, FACTCHECK_SYNTHESIS_PROMPT,
-    LANGUAGE_POLICY,
-};
+use crate::config::{ThirdPartyProvider, CONFIG};
 use crate::llm::media::{MediaFile, MediaSummary};
 use crate::llm::runtime_models::runtime_model_config;
 use crate::llm::text_model::{
@@ -23,6 +20,9 @@ use crate::llm::text_model::{
 };
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::LlmAuditContext;
+use crate::prompts::{
+    FACTCHECK_CLAIM_EXTRACTION_PROMPT, FACTCHECK_SYNTHESIS_PROMPT, LANGUAGE_POLICY,
+};
 use crate::utils::progress::ProgressReporter;
 use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 
@@ -138,7 +138,7 @@ fn extraction_model(final_model_id: &str, has_media: bool) -> Result<StepModel> 
 
     if final_model_id.eq_ignore_ascii_case("gemini") {
         return Ok(StepModel::Gemini {
-            model: CONFIG.gemini_model.clone(),
+            model: CONFIG.gemini.model.clone(),
         });
     }
 
@@ -148,7 +148,7 @@ fn extraction_model(final_model_id: &str, has_media: bool) -> Result<StepModel> 
         config.provider,
         ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
     )
-    .then(|| CONFIG.agent_step_reasoning.trim().to_string())
+    .then(|| CONFIG.agents.step_reasoning.trim().to_string())
     .filter(|value| !value.is_empty());
     Ok(StepModel::ThirdParty {
         config,
@@ -166,8 +166,8 @@ async fn extract_claims(
     let step_model = extraction_model(final_model_id, media_summary.total > 0)?;
     let prompt = build_extraction_prompt();
     let schema = claim_extraction_schema(
-        CONFIG.factcheck_max_claims,
-        CONFIG.factcheck_searches_per_claim,
+        CONFIG.agents.factcheck_max_claims,
+        CONFIG.agents.factcheck_searches_per_claim,
     );
     let input = truncate_for_log(statement, EXTRACTION_INPUT_MAX_CHARS);
 
@@ -184,8 +184,8 @@ async fn extract_claims(
     .await?;
     Ok(normalize_claims(
         extraction.claims,
-        CONFIG.factcheck_max_claims,
-        CONFIG.factcheck_searches_per_claim,
+        CONFIG.agents.factcheck_max_claims,
+        CONFIG.agents.factcheck_searches_per_claim,
     ))
 }
 
@@ -238,7 +238,7 @@ async fn research_claims(
     let claim_texts: Vec<String> = claims.iter().map(|claim| claim.claim.clone()).collect();
     let results = map_bounded(
         claims,
-        CONFIG.factcheck_claim_concurrency,
+        CONFIG.agents.factcheck_claim_concurrency,
         wall_clock,
         Some(ProgressHook {
             reporter: progress,
@@ -284,7 +284,7 @@ async fn research_single_claim(claim: &ExtractedClaim) -> Vec<String> {
     for query in claim
         .queries
         .iter()
-        .take(CONFIG.factcheck_searches_per_claim)
+        .take(CONFIG.agents.factcheck_searches_per_claim)
     {
         match web_search_tool(query, Some(WEB_RESULTS_PER_QUERY)).await {
             Ok(markdown) => {
@@ -308,10 +308,13 @@ async fn research_single_claim(claim: &ExtractedClaim) -> Vec<String> {
 fn build_extraction_prompt() -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     FACTCHECK_CLAIM_EXTRACTION_PROMPT
-        .replace("{max_claims}", &CONFIG.factcheck_max_claims.to_string())
+        .replace(
+            "{max_claims}",
+            &CONFIG.agents.factcheck_max_claims.to_string(),
+        )
         .replace(
             "{searches_per_claim}",
-            &CONFIG.factcheck_searches_per_claim.to_string(),
+            &CONFIG.agents.factcheck_searches_per_claim.to_string(),
         )
         .replace("{current_datetime}", &now)
 }

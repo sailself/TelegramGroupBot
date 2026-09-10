@@ -221,7 +221,7 @@ pub fn codex_selected_model_label(record: &CodexSelectedModelRecord) -> String {
 }
 
 fn selected_model_path() -> &'static Path {
-    Path::new(&CONFIG.openai_codex_model_path)
+    Path::new(&CONFIG.codex.model_path)
 }
 
 pub(super) fn load_selected_codex_model_record() -> Option<CodexSelectedModelRecord> {

@@ -528,7 +528,7 @@ pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) ->
             etag: list.etag,
             models,
         },
-        Duration::from_secs(crate::config::CONFIG.model_selection_timeout),
+        Duration::from_secs(crate::config::CONFIG.limits.model_selection_timeout),
         move |pending| async move {
             expire_codex_selection_message(
                 timeout_bot,
@@ -655,7 +655,7 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
             timestamp: now_unix_seconds(),
             supported_levels: record.supported_reasoning_levels.clone(),
         },
-        Duration::from_secs(crate::config::CONFIG.model_selection_timeout),
+        Duration::from_secs(crate::config::CONFIG.limits.model_selection_timeout),
         move |pending| async move {
             expire_codex_selection_message(
                 timeout_bot,
@@ -739,7 +739,7 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                 }
                 Some(pending)
                     if now_unix_seconds() - pending.timestamp
-                        > crate::config::CONFIG.model_selection_timeout as i64 =>
+                        > crate::config::CONFIG.limits.model_selection_timeout as i64 =>
                 {
                     pending_map.take();
                     ReasoningAction::Expired
@@ -865,7 +865,7 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                     CallbackAction::Ignore
                 } else if callback_account_id.as_deref() != Some(pending.account_id.as_str())
                     || now_unix_seconds() - pending.timestamp
-                        > crate::config::CONFIG.model_selection_timeout as i64
+                        > crate::config::CONFIG.limits.model_selection_timeout as i64
                 {
                     pending_map.take();
                     CallbackAction::Expired

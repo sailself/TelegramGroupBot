@@ -66,8 +66,8 @@ impl Database {
 }
 
 pub(super) async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<WriterCommand>) {
-    let flush_deadline = Duration::from_millis(CONFIG.db_write_flush_ms);
-    let batch_size = CONFIG.db_write_batch_size.max(1);
+    let flush_deadline = Duration::from_millis(CONFIG.db.write_flush_ms);
+    let batch_size = CONFIG.db.write_batch_size.max(1);
     let mut buffer = Vec::with_capacity(batch_size);
     let mut shutting_down = false;
 

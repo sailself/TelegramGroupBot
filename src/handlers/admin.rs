@@ -27,28 +27,6 @@ fn bool_label(value: bool) -> &'static str {
     }
 }
 
-/// Every configured credential that must never appear in operator output.
-fn config_secret_values(config: &crate::config::Config) -> Vec<String> {
-    [
-        &config.bot_token,
-        &config.gemini_api_key,
-        &config.openrouter_api_key,
-        &config.nvidia_api_key,
-        &config.ollama_api_key,
-        &config.openai_api_key,
-        &config.img2_api_key,
-        &config.jina_ai_api_key,
-        &config.brave_search_api_key,
-        &config.exa_api_key,
-        &config.cwd_pw_api_key,
-        &config.telegraph_access_token,
-    ]
-    .into_iter()
-    .map(|value| value.trim().to_string())
-    .filter(|value| !value.is_empty())
-    .collect()
-}
-
 /// Replace every non-empty secret in `secrets` with a placeholder.
 fn redact_secrets(text: &str, secrets: &[String]) -> String {
     secrets
@@ -61,7 +39,11 @@ fn redact_secrets(text: &str, secrets: &[String]) -> String {
 }
 
 fn redact_sensitive_text(text: &str) -> String {
-    let mut secrets = config_secret_values(&CONFIG);
+    let mut secrets: Vec<String> = CONFIG
+        .secret_values()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     secrets.extend(crate::llm::openai_codex::current_auth_secrets());
     redact_secrets(text, &secrets)
 }
@@ -98,12 +80,12 @@ twitter_provider_timeout_secs: {}\n\
 twitter_response_max_bytes: {}\n\
 external_media_max_bytes: {}\n\
 external_media_total_max_bytes: {}\n",
-        config.twitter_fetch_providers.join(", "),
-        config.twitter_fetch_total_timeout_secs,
-        config.twitter_provider_timeout_secs,
-        config.twitter_response_max_bytes,
-        config.external_media_max_bytes,
-        config.external_media_total_max_bytes,
+        config.twitter.fetch_providers.join(", "),
+        config.twitter.fetch_total_timeout_secs,
+        config.twitter.provider_timeout_secs,
+        config.twitter.response_max_bytes,
+        config.external_media.max_bytes,
+        config.external_media.total_max_bytes,
     )
 }
 
@@ -123,9 +105,9 @@ async fn build_status_report(state: &AppState) -> String {
     let pending_codex_model_requests = state.pending_codex_model_requests.count();
     let pending_codex_reasoning_requests = state.pending_codex_reasoning_requests.count();
 
-    let brave_ready = CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty();
-    let exa_ready = CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty();
-    let jina_ready = CONFIG.enable_jina_mcp;
+    let brave_ready = CONFIG.search.enable_brave && !CONFIG.search.brave_api_key.trim().is_empty();
+    let exa_ready = CONFIG.search.enable_exa && !CONFIG.search.exa_api_key.trim().is_empty();
+    let jina_ready = CONFIG.jina.enable_mcp;
     let openrouter_ready =
         CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenRouter);
     let nvidia_ready =
@@ -141,7 +123,7 @@ async fn build_status_report(state: &AppState) -> String {
     );
     let active_codex_login = state.active_codex_login.lock().clone();
 
-    let whitelist_path = Path::new(&CONFIG.whitelist_file_path);
+    let whitelist_path = Path::new(&CONFIG.access.whitelist_file_path);
     let whitelist_ready = whitelist_path.exists();
     let logs_ready = Path::new("logs").exists();
 
@@ -162,11 +144,11 @@ async fn build_status_report(state: &AppState) -> String {
     ));
     report.push_str(&format!(
         "db_max_connections: {}\n",
-        CONFIG.db_max_connections
+        CONFIG.db.max_connections
     ));
     report.push_str(&format!(
         "heavy_commands: active={} waiting={} max={}\n",
-        heavy_active, heavy_waiting, CONFIG.heavy_command_max_concurrency
+        heavy_active, heavy_waiting, CONFIG.limits.heavy_command_max_concurrency
     ));
     report.push_str(&format!(
         "pending_requests: q={} image={} codex_model={} codex_reasoning={}\n",
@@ -178,11 +160,11 @@ async fn build_status_report(state: &AppState) -> String {
     report.push_str(&format!("media_groups_cached: {}\n", media_group_count));
     report.push_str(&format!(
         "gemini_configured: {}\n",
-        bool_label(!CONFIG.gemini_api_key.trim().is_empty())
+        bool_label(!CONFIG.gemini.api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "tldr_infographic_enabled: {}\n",
-        bool_label(CONFIG.enable_tldr_infographic)
+        bool_label(CONFIG.agents.enable_tldr_infographic)
     ));
     report.push_str(&format!(
         "openrouter_ready: {}\n",
@@ -199,14 +181,14 @@ async fn build_status_report(state: &AppState) -> String {
         "img2_health_url: {}\n",
         crate::llm::img2_image::img2_health_url()
     ));
-    report.push_str(&format!("img2_media_dir: {}\n", CONFIG.img2_media_dir));
+    report.push_str(&format!("img2_media_dir: {}\n", CONFIG.img2.media_dir));
     report.push_str(&format!(
         "openai_codex_ready: {}\n",
         bool_label(codex_ready)
     ));
     report.push_str(&format!(
         "openai_codex_auth_file: {}\n",
-        CONFIG.openai_codex_auth_path
+        CONFIG.codex.auth_path
     ));
     report.push_str(&format!(
         "openai_codex_auth_present: {}\n",
@@ -232,30 +214,26 @@ async fn build_status_report(state: &AppState) -> String {
     }
     report.push_str(&format!(
         "openai_codex_model_file: {}\n",
-        CONFIG.openai_codex_model_path
+        CONFIG.codex.model_path
     ));
     report.push_str(&format!(
         "openai_codex_client_version: {}\n",
-        CONFIG.openai_codex_client_version
+        CONFIG.codex.client_version
     ));
     report.push_str(&format!(
         "openai_codex_web_search_mode: {}\n",
-        CONFIG.openai_codex_web_search_mode
+        CONFIG.codex.web_search_mode
     ));
-    if !CONFIG
-        .openai_codex_web_search_context_size
-        .trim()
-        .is_empty()
-    {
+    if !CONFIG.codex.web_search_context_size.trim().is_empty() {
         report.push_str(&format!(
             "openai_codex_web_search_context_size: {}\n",
-            CONFIG.openai_codex_web_search_context_size
+            CONFIG.codex.web_search_context_size
         ));
     }
-    if !CONFIG.openai_codex_web_search_allowed_domains.is_empty() {
+    if !CONFIG.codex.web_search_allowed_domains.is_empty() {
         report.push_str(&format!(
             "openai_codex_web_search_allowed_domains: {}\n",
-            CONFIG.openai_codex_web_search_allowed_domains.join(", ")
+            CONFIG.codex.web_search_allowed_domains.join(", ")
         ));
     }
     if let Some(model) = codex_selected_model {
@@ -294,7 +272,7 @@ async fn build_status_report(state: &AppState) -> String {
     }
     report.push_str(&format!(
         "third_party_models_config_path: {}\n",
-        CONFIG.third_party_models_config_path.display()
+        CONFIG.models.third_party_models_config_path.display()
     ));
     report.push_str(&format!(
         "third_party_models_count: {}\n",
@@ -306,12 +284,15 @@ async fn build_status_report(state: &AppState) -> String {
     ));
     report.push_str(&format!(
         "web_search_providers_order: {}\n",
-        CONFIG.web_search_providers.join(", ")
+        CONFIG.search.providers.join(", ")
     ));
     report.push_str(&format!("brave_ready: {}\n", bool_label(brave_ready)));
     report.push_str(&format!("exa_ready: {}\n", bool_label(exa_ready)));
     report.push_str(&format!("jina_ready: {}\n", bool_label(jina_ready)));
-    report.push_str(&format!("whitelist_file: {}\n", CONFIG.whitelist_file_path));
+    report.push_str(&format!(
+        "whitelist_file: {}\n",
+        CONFIG.access.whitelist_file_path
+    ));
     report.push_str(&format!(
         "whitelist_present: {}\n",
         bool_label(whitelist_ready)
@@ -331,47 +312,47 @@ async fn build_diagnose_report(state: &AppState) -> String {
     report.push_str("\n\nConfig checks\n");
     report.push_str(&format!(
         "BOT_TOKEN_present: {}\n",
-        bool_label(!CONFIG.bot_token.trim().is_empty())
+        bool_label(!CONFIG.telegram.bot_token.trim().is_empty())
     ));
     report.push_str(&format!(
         "GEMINI_API_KEY_present: {}\n",
-        bool_label(!CONFIG.gemini_api_key.trim().is_empty())
+        bool_label(!CONFIG.gemini.api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "OPENROUTER_API_KEY_present: {}\n",
-        bool_label(!CONFIG.openrouter_api_key.trim().is_empty())
+        bool_label(!CONFIG.openrouter.api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "NVIDIA_API_KEY_present: {}\n",
-        bool_label(!CONFIG.nvidia_api_key.trim().is_empty())
+        bool_label(!CONFIG.nvidia.api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "OLLAMA_API_KEY_present: {}\n",
-        bool_label(!CONFIG.ollama_api_key.trim().is_empty())
+        bool_label(!CONFIG.ollama.api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "OPENAI_API_KEY_present: {}\n",
-        bool_label(!CONFIG.openai_api_key.trim().is_empty())
+        bool_label(!CONFIG.openai.api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "JINA_AI_API_KEY_present: {}\n",
-        bool_label(!CONFIG.jina_ai_api_key.trim().is_empty())
+        bool_label(!CONFIG.jina.api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "BRAVE_SEARCH_API_KEY_present: {}\n",
-        bool_label(!CONFIG.brave_search_api_key.trim().is_empty())
+        bool_label(!CONFIG.search.brave_api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "EXA_API_KEY_present: {}\n",
-        bool_label(!CONFIG.exa_api_key.trim().is_empty())
+        bool_label(!CONFIG.search.exa_api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "OPENAI_CODEX_AUTH_FILE_present: {}\n",
-        bool_label(Path::new(&CONFIG.openai_codex_auth_path).exists())
+        bool_label(Path::new(&CONFIG.codex.auth_path).exists())
     ));
     report.push_str(&format!(
         "OPENAI_CODEX_MODEL_FILE_present: {}\n",
-        bool_label(Path::new(&CONFIG.openai_codex_model_path).exists())
+        bool_label(Path::new(&CONFIG.codex.model_path).exists())
     ));
     report.push_str("\nTwitter fetch diagnostics (sanitized)\n");
     report.push_str(&format_twitter_fetch_diagnostics(&CONFIG));
@@ -428,20 +409,20 @@ mod tests {
     #[test]
     fn twitter_fetch_diagnostics_are_sanitized_and_complete() {
         let mut config = (*CONFIG).clone();
-        config.twitter_fetch_providers = vec![
+        config.twitter.fetch_providers = vec![
             "fxtwitter".to_string(),
             "vxtwitter".to_string(),
             "jina".to_string(),
         ];
-        config.twitter_fetch_total_timeout_secs = 20;
-        config.twitter_provider_timeout_secs = 8;
-        config.twitter_response_max_bytes = 2_097_152;
-        config.external_media_max_bytes = 20_971_520;
-        config.external_media_total_max_bytes = 52_428_800;
-        config.jina_ai_api_key = "seeded-jina-secret".to_string();
-        config.fxtwitter_api_base = "https://seeded-fxtwitter.invalid/api".to_string();
-        config.vxtwitter_api_base = "https://seeded-vxtwitter.invalid/api".to_string();
-        config.jina_reader_endpoint = "https://seeded-jina.invalid/reader".to_string();
+        config.twitter.fetch_total_timeout_secs = 20;
+        config.twitter.provider_timeout_secs = 8;
+        config.twitter.response_max_bytes = 2_097_152;
+        config.external_media.max_bytes = 20_971_520;
+        config.external_media.total_max_bytes = 52_428_800;
+        config.jina.api_key = "seeded-jina-secret".to_string();
+        config.twitter.fxtwitter_api_base = "https://seeded-fxtwitter.invalid/api".to_string();
+        config.twitter.vxtwitter_api_base = "https://seeded-vxtwitter.invalid/api".to_string();
+        config.jina.reader_endpoint = "https://seeded-jina.invalid/reader".to_string();
         let report = format_twitter_fetch_diagnostics(&config);
 
         assert_eq!(
@@ -472,17 +453,5 @@ external_media_total_max_bytes: 52428800\n"
             redact_secrets("key=abc token=xyz other=abc", &secrets),
             "key=[REDACTED] token=[REDACTED] other=[REDACTED]"
         );
-    }
-
-    #[test]
-    fn config_secret_values_include_every_provider_credential() {
-        let mut config = (*CONFIG).clone();
-        config.ollama_api_key = "ollama-secret".to_string();
-        config.img2_api_key = "img2-secret".to_string();
-        config.bot_token = "bot-secret".to_string();
-        let secrets = config_secret_values(&config);
-        for expected in ["ollama-secret", "img2-secret", "bot-secret"] {
-            assert!(secrets.iter().any(|s| s == expected), "missing {expected}");
-        }
     }
 }

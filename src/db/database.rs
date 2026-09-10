@@ -42,7 +42,7 @@ impl Database {
             .pragma("cache_size", "-65536")
             .pragma("mmap_size", "134217728");
         let pool = SqlitePoolOptions::new()
-            .max_connections(CONFIG.db_max_connections)
+            .max_connections(CONFIG.db.max_connections)
             .connect_with(connect_options)
             .await?;
         let search_ready = Arc::new(AtomicBool::new(false));
@@ -60,7 +60,7 @@ impl Database {
 
         info!("Database tables created successfully");
 
-        let (sender, receiver) = mpsc::channel(CONFIG.db_queue_capacity);
+        let (sender, receiver) = mpsc::channel(CONFIG.db.queue_capacity);
         let writer_task = tokio::spawn(db_writer(pool.clone(), receiver));
 
         info!("Database writer task started");
