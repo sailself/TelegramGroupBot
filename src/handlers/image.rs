@@ -332,14 +332,14 @@ pub(super) async fn generate_image_with_configured_default(
     std::result::Result<Vec<Vec<u8>>, ImageGenerationError>,
 ) {
     let model = match resolve_default_image_generation_model(
-        &CONFIG.default_image_model,
+        &CONFIG.models.default_image_model,
         CONFIG.gemini_api_available(),
         crate::llm::codex_image::codex_image_available(),
     ) {
         Ok(model) => model,
         Err(err) => {
             return (
-                CONFIG.default_image_model.clone(),
+                CONFIG.models.default_image_model.clone(),
                 Err(ImageGenerationError(err)),
             );
         }
@@ -347,7 +347,7 @@ pub(super) async fn generate_image_with_configured_default(
 
     match model {
         ImageGenerationModel::Gemini => (
-            CONFIG.gemini_image_model.clone(),
+            CONFIG.gemini.image_model.clone(),
             generate_image_with_gemini(
                 prompt,
                 image_urls,
@@ -383,7 +383,7 @@ fn build_image_model_keyboard(
     let mut buttons = Vec::new();
     if include_gemini {
         buttons.push(InlineKeyboardButton::callback(
-            CONFIG.gemini_image_model.clone(),
+            CONFIG.gemini.image_model.clone(),
             image_model_callback_data(request_key, ImageGenerationModel::Gemini),
         ));
     }
@@ -499,7 +499,7 @@ async fn finalize_image_request(
     let selected_model = match request.model {
         Some(model) => model,
         None => match resolve_default_image_generation_model(
-            &CONFIG.default_image_model,
+            &CONFIG.models.default_image_model,
             CONFIG.gemini_api_available(),
             crate::llm::codex_image::codex_image_available(),
         ) {
@@ -573,23 +573,23 @@ async fn finalize_image_request(
                 if let Some(final_aspect) = final_aspect.as_deref() {
                     format!(
                         "Generating your image with {} at {} resolution with {} aspect ratio...",
-                        CONFIG.gemini_image_model, final_resolution, final_aspect
+                        CONFIG.gemini.image_model, final_resolution, final_aspect
                     )
                 } else {
                     format!(
                         "Generating your image with {} at {} resolution with automatic aspect ratio...",
-                        CONFIG.gemini_image_model, final_resolution
+                        CONFIG.gemini.image_model, final_resolution
                     )
                 },
             )
             .await?;
             (
-                CONFIG.gemini_image_model.clone(),
+                CONFIG.gemini.image_model.clone(),
                 generate_image_with_gemini(
                     &prompt,
                     &request.image_urls,
                     image_config,
-                    !CONFIG.cwd_pw_api_key.is_empty(),
+                    !CONFIG.cwd_pw.api_key.is_empty(),
                     audit_context.as_ref(),
                 )
                 .await,
@@ -618,7 +618,7 @@ async fn finalize_image_request(
                     &prompt,
                     &request.image_urls,
                     Some(CodexImageConfig { size }),
-                    !CONFIG.cwd_pw_api_key.is_empty(),
+                    !CONFIG.cwd_pw.api_key.is_empty(),
                     audit_context.as_ref(),
                 )
                 .await,
@@ -733,7 +733,7 @@ pub async fn image_selection_callback(
                         message.id(),
                         format!(
                             "Choose a resolution for {} (default: {}).",
-                            CONFIG.gemini_image_model, IMAGE_DEFAULT_RESOLUTION
+                            CONFIG.gemini.image_model, IMAGE_DEFAULT_RESOLUTION
                         ),
                     )
                     .reply_markup(build_resolution_keyboard(request_key))
@@ -904,7 +904,7 @@ pub async fn img_handler(
     }
 
     let default_image_model = match resolve_default_image_generation_model(
-        &CONFIG.default_image_model,
+        &CONFIG.models.default_image_model,
         gemini_available,
         codex_available,
     ) {
@@ -946,7 +946,7 @@ pub async fn img_handler(
         state.pending_image_requests.insert_with_timeout(
             request_key,
             pending,
-            Duration::from_secs(CONFIG.model_selection_timeout),
+            Duration::from_secs(CONFIG.limits.model_selection_timeout),
             move |request| async move {
                 let _ =
                     finalize_image_request(&timeout_bot, &timeout_state, request, None, None).await;
@@ -979,7 +979,7 @@ pub async fn img_handler(
         &context.image_urls,
         None,
         None,
-        !CONFIG.cwd_pw_api_key.is_empty(),
+        !CONFIG.cwd_pw.api_key.is_empty(),
         audit_context.as_ref(),
     )
     .await;
@@ -1205,7 +1205,7 @@ pub async fn image_handler(
         return Ok(());
     }
     let default_image_model = match resolve_default_image_generation_model(
-        &CONFIG.default_image_model,
+        &CONFIG.models.default_image_model,
         gemini_available,
         codex_available,
     ) {
@@ -1268,7 +1268,7 @@ pub async fn image_handler(
     state.pending_image_requests.insert_with_timeout(
         request_key,
         pending,
-        Duration::from_secs(CONFIG.model_selection_timeout),
+        Duration::from_secs(CONFIG.limits.model_selection_timeout),
         move |request| async move {
             let should_finalize = match request.model {
                 None => true,

@@ -223,8 +223,8 @@ pub(super) fn capture_response_metadata(
 
 pub(super) fn responses_request_timeout_secs(provider: ThirdPartyProvider) -> u64 {
     match provider {
-        ThirdPartyProvider::OpenAI => CONFIG.openai_request_timeout_secs,
-        ThirdPartyProvider::OpenAICodex => CONFIG.openai_codex_request_timeout_secs,
+        ThirdPartyProvider::OpenAI => CONFIG.openai.request_timeout_secs,
+        ThirdPartyProvider::OpenAICodex => CONFIG.codex.request_timeout_secs,
         ThirdPartyProvider::OpenRouter
         | ThirdPartyProvider::Nvidia
         | ThirdPartyProvider::Ollama => 60,
@@ -260,11 +260,11 @@ pub(super) fn build_request_details(
     let (display_name, url, mut headers, streaming_sse) = match model_config.provider {
         ThirdPartyProvider::OpenAI => (
             "OpenAI",
-            responses_base_url(&CONFIG.openai_base_url),
+            responses_base_url(&CONFIG.openai.base_url),
             vec![
                 (
                     "Authorization".to_string(),
-                    format!("Bearer {}", CONFIG.openai_api_key),
+                    format!("Bearer {}", CONFIG.openai.api_key),
                 ),
                 (
                     "User-Agent".to_string(),

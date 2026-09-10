@@ -300,7 +300,9 @@ impl AppState {
             active_codex_login: Arc::new(Mutex::new(None)),
             codex_auth_flow_lock: Arc::new(AsyncMutex::new(())),
             media_groups: Arc::new(Mutex::new(HashMap::new())),
-            heavy_command_semaphore: Arc::new(Semaphore::new(CONFIG.heavy_command_max_concurrency)),
+            heavy_command_semaphore: Arc::new(Semaphore::new(
+                CONFIG.limits.heavy_command_max_concurrency,
+            )),
             heavy_command_waiters: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -333,6 +335,7 @@ impl AppState {
 
     pub fn heavy_command_active(&self) -> usize {
         CONFIG
+            .limits
             .heavy_command_max_concurrency
             .saturating_sub(self.heavy_command_semaphore.available_permits())
     }
@@ -374,7 +377,7 @@ impl AppState {
 }
 
 fn prune_media_groups(groups: &mut HashMap<MediaGroupId, MediaGroupState>) {
-    let max_items = CONFIG.media_group_max_items;
+    let max_items = CONFIG.telegram.media_group_max_items;
     if groups.len() <= max_items {
         return;
     }

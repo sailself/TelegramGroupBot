@@ -64,7 +64,7 @@ pub async fn send_response(
     title: &str,
     parse_mode: ParseMode,
 ) -> Result<()> {
-    if needs_overflow_delivery(response, CONFIG.telegram_max_length) {
+    if needs_overflow_delivery(response, CONFIG.telegram.max_length) {
         let telegraph_url = create_telegraph_page(title, response).await;
         if let Some(url) = telegraph_url {
             edit_text_with_retry(
@@ -81,7 +81,7 @@ pub async fn send_response(
             return Ok(());
         }
 
-        let truncated = overflow_fallback_text(response, CONFIG.telegram_max_length);
+        let truncated = overflow_fallback_text(response, CONFIG.telegram.max_length);
         edit_text_with_retry(bot, chat_id, message_id, &truncated, None).await?;
         return Ok(());
     }

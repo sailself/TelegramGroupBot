@@ -31,7 +31,7 @@ async fn tldr_single_call(
     let chat_content = crate::llm::prompting::wrap_chat_history(
         &crate::llm::prompting::format_tldr_chat_content(messages),
     );
-    let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph_author_name);
+    let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph.author_name);
     call_configured_text_model(
         &system_prompt,
         &chat_content,
@@ -93,13 +93,13 @@ pub async fn tldr_handler(
     let mut messages = if let Some(reply) = message.reply_to_message() {
         // Fetch one past the cap so the truncation notice below still fires
         // without pulling the whole chat into memory.
-        let fetch_limit = (CONFIG.tldr_max_messages + 1) as i64;
+        let fetch_limit = (CONFIG.agents.tldr_max_messages + 1) as i64;
         state
             .db
             .select_messages_from_id(message.chat.id.0, reply.id.0 as i64, fetch_limit)
             .await?
     } else {
-        let n = resolve_tldr_count(count.as_deref(), CONFIG.tldr_max_messages);
+        let n = resolve_tldr_count(count.as_deref(), CONFIG.agents.tldr_max_messages);
         state.db.select_messages(message.chat.id.0, n).await?
     };
 
@@ -116,14 +116,14 @@ pub async fn tldr_handler(
 
     // The reply-anchored fetch has no LIMIT; cap it, keeping the newest
     // messages, so a reply to an ancient message cannot pull the whole table.
-    let truncated_to_cap = messages.len() > CONFIG.tldr_max_messages;
+    let truncated_to_cap = messages.len() > CONFIG.agents.tldr_max_messages;
     if truncated_to_cap {
-        let skip = messages.len() - CONFIG.tldr_max_messages;
+        let skip = messages.len() - CONFIG.agents.tldr_max_messages;
         messages.drain(..skip);
     }
     let audit_context = create_command_audit_context(&state, &message, "tldr").await;
 
-    let summary_result = if messages.len() > CONFIG.tldr_map_reduce_threshold {
+    let summary_result = if messages.len() > CONFIG.agents.tldr_map_reduce_threshold {
         let mut progress_reporter =
             ProgressReporter::new(bot.clone(), message.chat.id, processing_message.id);
         match crate::agents::tldr::summarize_messages_map_reduce(
@@ -170,7 +170,7 @@ pub async fn tldr_handler(
     if truncated_to_cap {
         summary_text = format!(
             "（注：消息数量超过上限，本次仅总结最近 {} 条消息。）\n\n{}",
-            CONFIG.tldr_max_messages, summary_text
+            CONFIG.agents.tldr_max_messages, summary_text
         );
     }
     if summary_text.trim().is_empty() {
@@ -190,7 +190,7 @@ pub async fn tldr_handler(
         markdown_to_telegram_html(&summary_text),
         model_line
     );
-    let infographic_enabled = CONFIG.enable_tldr_infographic;
+    let infographic_enabled = CONFIG.agents.enable_tldr_infographic;
 
     let _ = bot
         .edit_message_text(
@@ -230,14 +230,14 @@ Use the same language as the summary text for any labels.\
         match infographic_result {
             Ok(images) => {
                 if let Some(image) = images.into_iter().next() {
-                    if CONFIG.cwd_pw_api_key.trim().is_empty() {
+                    if CONFIG.cwd_pw.api_key.trim().is_empty() {
                         warn!("TLDR infographic generated but CWD_PW_API_KEY is not configured.");
                     } else {
                         let mime_type =
                             detect_mime_type(&image).unwrap_or_else(|| "image/png".to_string());
                         infographic_url = upload_image_bytes_to_cwd(
                             &image,
-                            &CONFIG.cwd_pw_api_key,
+                            &CONFIG.cwd_pw.api_key,
                             &mime_type,
                             Some(infographic_model.as_str()),
                             Some(&infographic_prompt),

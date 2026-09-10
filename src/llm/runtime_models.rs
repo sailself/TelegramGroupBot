@@ -20,7 +20,7 @@ pub use crate::llm::codex_selected_model::{
 };
 
 pub(super) fn build_runtime_models_state() -> RuntimeModelsState {
-    let mut models = CONFIG.third_party_models.clone();
+    let mut models = CONFIG.models.third_party_models.clone();
     let stored_codex_selected_model = load_selected_codex_model_record();
     let current_account_id = current_codex_account_id();
     let codex_selected_model = stored_codex_selected_model.filter(|record| {
@@ -117,7 +117,7 @@ pub fn resolve_runtime_model_identifier(identifier: &str) -> Option<String> {
 fn is_runtime_provider_ready_with(config: &Config, provider: ThirdPartyProvider) -> bool {
     match provider {
         ThirdPartyProvider::OpenAICodex => {
-            config.enable_openai_codex
+            config.codex.enabled
                 && crate::llm::openai_codex::is_auth_ready()
                 && selected_codex_model_record().is_some()
         }
@@ -148,20 +148,20 @@ mod tests {
                     let mut config = (*CONFIG).clone();
                     match provider {
                         ThirdPartyProvider::OpenRouter => {
-                            config.enable_openrouter = enabled;
-                            config.openrouter_api_key = key.to_string();
+                            config.openrouter.enabled = enabled;
+                            config.openrouter.api_key = key.to_string();
                         }
                         ThirdPartyProvider::Nvidia => {
-                            config.enable_nvidia = enabled;
-                            config.nvidia_api_key = key.to_string();
+                            config.nvidia.enabled = enabled;
+                            config.nvidia.api_key = key.to_string();
                         }
                         ThirdPartyProvider::Ollama => {
-                            config.enable_ollama = enabled;
-                            config.ollama_api_key = key.to_string();
+                            config.ollama.enabled = enabled;
+                            config.ollama.api_key = key.to_string();
                         }
                         ThirdPartyProvider::OpenAI => {
-                            config.enable_openai = enabled;
-                            config.openai_api_key = key.to_string();
+                            config.openai.enabled = enabled;
+                            config.openai.api_key = key.to_string();
                         }
                         ThirdPartyProvider::OpenAICodex => unreachable!(),
                     }

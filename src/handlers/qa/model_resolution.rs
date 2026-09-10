@@ -169,7 +169,7 @@ impl QaModel {
                 Some(explicit) if mode == QaCommandMode::Quick => codex_quick_result_label(
                     &explicit.config,
                     Some(&explicit.record),
-                    Some(&CONFIG.quick_reasoning_effort),
+                    Some(&CONFIG.models.quick_reasoning_effort),
                 ),
                 Some(explicit) => explicit.config.name.clone(),
                 None => configured_model_display_name(snapshot, &config.id),
@@ -188,7 +188,7 @@ impl QaModel {
         let (config, explicit_codex) = match self {
             QaModel::Gemini => {
                 return gemini_model_used
-                    .unwrap_or(CONFIG.gemini_model.as_str())
+                    .unwrap_or(CONFIG.gemini.model.as_str())
                     .to_string()
             }
             QaModel::ThirdParty {
@@ -202,7 +202,7 @@ impl QaModel {
                 return codex_quick_result_label(
                     &explicit.config,
                     Some(&explicit.record),
-                    Some(&CONFIG.quick_reasoning_effort),
+                    Some(&CONFIG.models.quick_reasoning_effort),
                 );
             }
         }
@@ -213,7 +213,7 @@ impl QaModel {
                 return codex_quick_result_label(
                     config,
                     record.as_ref(),
-                    Some(&CONFIG.quick_reasoning_effort),
+                    Some(&CONFIG.models.quick_reasoning_effort),
                 );
             }
             if let Some(record) = snapshot
@@ -518,7 +518,7 @@ pub(super) async fn resolve_quick_text_model_for_request(
     snapshot: &ModelCatalogSnapshot,
     request: ModelRequestCapabilities,
 ) -> Result<PreparedQuickTextModel> {
-    let configured_model_id = CONFIG.default_quick_text_model.trim();
+    let configured_model_id = CONFIG.models.default_quick_text_model.trim();
     let explicit = match parse_third_party_model_id(configured_model_id) {
         Some((ThirdPartyProvider::OpenAICodex, slug)) if !slug.eq_ignore_ascii_case("selected") => {
             match ensure_explicit_codex_model(configured_model_id).await {
@@ -537,15 +537,15 @@ pub(super) async fn resolve_quick_text_model_for_request(
     };
     let current_account_id = crate::llm::runtime_models::current_codex_account_id();
     resolve_prepared_quick_text_model_with_models(
-        &CONFIG.default_quick_text_model,
-        &CONFIG.default_text_model,
+        &CONFIG.models.default_quick_text_model,
+        &CONFIG.models.default_text_model,
         &snapshot.models,
         &snapshot.ready_providers,
         CONFIG.gemini_api_available(),
         request,
         explicit,
         ExplicitCodexReadiness {
-            enabled: CONFIG.enable_openai_codex,
+            enabled: CONFIG.codex.enabled,
             auth_ready: crate::llm::openai_codex::is_auth_ready(),
             current_account_id: current_account_id.as_deref(),
         },

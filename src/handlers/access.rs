@@ -16,7 +16,7 @@ static WHITELIST_CACHE: LazyLock<Mutex<Option<HashSet<i64>>>> = LazyLock::new(||
 static WHITELIST_LOADED: AtomicBool = AtomicBool::new(false);
 
 fn prune_rate_limits(limits: &mut HashMap<i64, Instant>, now: Instant) {
-    let ttl = Duration::from_secs(CONFIG.rate_limit_seconds.saturating_mul(4).max(60));
+    let ttl = Duration::from_secs(CONFIG.access.rate_limit_seconds.saturating_mul(4).max(60));
     limits.retain(|_, last_seen| now.duration_since(*last_seen) <= ttl);
 }
 
@@ -26,7 +26,7 @@ pub fn is_rate_limited(user_id: i64) -> bool {
     prune_rate_limits(&mut limits, now);
 
     if let Some(last) = limits.get(&user_id) {
-        if now.duration_since(*last) < Duration::from_secs(CONFIG.rate_limit_seconds) {
+        if now.duration_since(*last) < Duration::from_secs(CONFIG.access.rate_limit_seconds) {
             return true;
         }
     }
@@ -40,7 +40,7 @@ pub fn load_whitelist() {
         return;
     }
 
-    let path = &CONFIG.whitelist_file_path;
+    let path = &CONFIG.access.whitelist_file_path;
     let file = std::fs::read_to_string(path);
     let mut cache = WHITELIST_CACHE.lock();
 
@@ -102,11 +102,12 @@ fn normalize_command_name(command: &str) -> String {
 }
 
 pub fn requires_access_control(command: &str) -> bool {
-    if CONFIG.access_controlled_commands.is_empty() {
+    if CONFIG.access.access_controlled_commands.is_empty() {
         return false;
     }
     let command = normalize_command_name(command);
     CONFIG
+        .access
         .access_controlled_commands
         .iter()
         .any(|entry| normalize_command_name(entry) == command)

@@ -43,7 +43,7 @@ impl Database {
         }
         // Per-query timeout so a leading-wildcard scan or a pathological grouping
         // can't pin a connection.
-        let dur = std::time::Duration::from_secs(CONFIG.qc_analytics_query_timeout_secs);
+        let dur = std::time::Duration::from_secs(CONFIG.agents.qc_analytics_query_timeout_secs);
         match tokio::time::timeout(dur, q.fetch_all(&self.pool)).await {
             Ok(Ok(rows)) => Ok((spec, rows)),
             Ok(Err(error)) => Err(error.into()),
@@ -81,7 +81,7 @@ impl Database {
         if let Some(user_id) = spec.user_id {
             count_query = count_query.bind(user_id);
         }
-        let timeout = Duration::from_secs(CONFIG.qc_analytics_query_timeout_secs);
+        let timeout = Duration::from_secs(CONFIG.agents.qc_analytics_query_timeout_secs);
         let total_eligible =
             tokio::time::timeout(timeout, count_query.fetch_one(&mut *transaction))
                 .await

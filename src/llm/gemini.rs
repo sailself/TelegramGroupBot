@@ -151,7 +151,7 @@ const VEO_POLL_INTERVAL_SECS: u64 = 20;
 const VEO_MAX_POLL_ATTEMPTS: usize = 30;
 
 fn redact_gemini_api_key(text: &str) -> String {
-    let key = CONFIG.gemini_api_key.trim();
+    let key = CONFIG.gemini.api_key.trim();
     if key.is_empty() {
         return text.to_string();
     }
@@ -177,7 +177,7 @@ fn gemini_fallback_budget() -> Duration {
 }
 
 fn gemini_generate_content_timeout() -> Duration {
-    Duration::from_secs(CONFIG.gemini_request_timeout_secs)
+    Duration::from_secs(CONFIG.gemini.request_timeout_secs)
 }
 
 fn gemini_generate_content_url(model: &str) -> String {
@@ -195,11 +195,11 @@ fn ensure_gemini_api_available() -> Result<()> {
 }
 
 fn gemini_image_generation_timeout() -> Duration {
-    Duration::from_secs(CONFIG.gemini_image_request_timeout_secs)
+    Duration::from_secs(CONFIG.gemini.image_request_timeout_secs)
 }
 
 fn build_safety_settings() -> Vec<serde_json::Value> {
-    let profile = CONFIG.gemini_safety_settings.as_str();
+    let profile = CONFIG.gemini.safety_settings.as_str();
     let threshold = match profile {
         "standard" => "BLOCK_MEDIUM_AND_ABOVE",
         "permissive" => "OFF",
@@ -484,7 +484,7 @@ async fn upload_file_bytes(
     ensure_gemini_api_available()?;
     upload_file_bytes_at(
         GEMINI_API_BASE,
-        &CONFIG.gemini_api_key,
+        &CONFIG.gemini.api_key,
         display_name,
         mime_type,
         bytes,
@@ -593,7 +593,7 @@ async fn gemini_get_json(
 async fn get_file_metadata(name: &str) -> Result<GeminiFileInfo> {
     get_file_metadata_at(
         GEMINI_API_BASE,
-        &CONFIG.gemini_api_key,
+        &CONFIG.gemini.api_key,
         name,
         GEMINI_FILE_REQUEST_TIMEOUT,
     )
@@ -635,7 +635,7 @@ async fn wait_for_file_active(file: GeminiFileInfo) -> Result<GeminiFileInfo> {
 }
 
 async fn upload_media_files(files: &[MediaFile]) -> Result<Vec<UploadedFileRef>> {
-    let semaphore = Arc::new(Semaphore::new(CONFIG.gemini_upload_fanout));
+    let semaphore = Arc::new(Semaphore::new(CONFIG.gemini.upload_fanout));
     let mut join_set = JoinSet::new();
 
     for (index, file) in files.iter().cloned().enumerate() {
@@ -971,7 +971,7 @@ async fn call_gemini_api_value_with_timeout(
         |_| async move {
             Ok(get_http_client()
                 .post(url)
-                .header("x-goog-api-key", CONFIG.gemini_api_key.as_str())
+                .header("x-goog-api-key", CONFIG.gemini.api_key.as_str())
                 .timeout(timeout)
                 .json(payload))
         },
@@ -1158,10 +1158,10 @@ fn extract_function_calls(content: &Value) -> Vec<Value> {
 
 fn base_generation_config() -> Value {
     json!({
-        "temperature": CONFIG.gemini_temperature,
-        "topK": CONFIG.gemini_top_k,
-        "topP": CONFIG.gemini_top_p,
-        "maxOutputTokens": CONFIG.gemini_max_output_tokens,
+        "temperature": CONFIG.gemini.temperature,
+        "topK": CONFIG.gemini.top_k,
+        "topP": CONFIG.gemini.top_p,
+        "maxOutputTokens": CONFIG.gemini.max_output_tokens,
     })
 }
 
@@ -1278,7 +1278,7 @@ impl ToolProtocol for GeminiProtocol<'_> {
     ) -> BoxFuture<'a, Result<ModelTurn<Value>>> {
         Box::pin(async move {
             let mut generation_config =
-                generation_config_for(self.model, &CONFIG.gemini_thinking_level);
+                generation_config_for(self.model, &CONFIG.gemini.thinking_level);
             if self.final_pass {
                 generation_config = with_response_json_schema(
                     generation_config,
@@ -1366,9 +1366,9 @@ pub async fn call_gemini_with_tool_runtime(
     let contents = vec![json!({ "role": "user", "parts": parts })];
 
     let model = if use_pro_model {
-        CONFIG.gemini_pro_model.as_str()
+        CONFIG.gemini.pro_model.as_str()
     } else {
-        CONFIG.gemini_model.as_str()
+        CONFIG.gemini.model.as_str()
     };
     let deadline = TurnDeadline::for_runtime(gemini_generate_content_timeout(), runtime);
     let mut protocol = GeminiProtocol {
@@ -1389,7 +1389,7 @@ pub async fn call_gemini_with_tool_runtime(
 /// Single Gemini call against a specific model, with optional media and an
 /// optional JSON response schema, and no tools or pro/lite fallback chain.
 /// This is the cheap-step primitive used by the agentic pipelines (typically
-/// with `CONFIG.gemini_lite_model`).
+/// with `CONFIG.gemini.lite_model`).
 #[allow(clippy::too_many_arguments)]
 pub async fn call_gemini_model_simple(
     model: &str,
@@ -1415,7 +1415,7 @@ pub async fn call_gemini_model_simple(
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": [json!({ "role": "user", "parts": parts })],
         "generationConfig": with_response_json_schema(
-            generation_config_for(model, &CONFIG.gemini_thinking_level),
+            generation_config_for(model, &CONFIG.gemini.thinking_level),
             response_json_schema
         ),
         "safetySettings": build_safety_settings(),
@@ -1442,7 +1442,7 @@ async fn call_gemini_lite_fallback(
     previous_err: &anyhow::Error,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiCallResult> {
-    let lite_model = CONFIG.gemini_lite_model.trim();
+    let lite_model = CONFIG.gemini.lite_model.trim();
     if lite_model.is_empty() {
         return Err(anyhow!(
             "Gemini request failed on model '{}' and GEMINI_LITE_MODEL is not configured. Previous error: {}",
@@ -1472,7 +1472,7 @@ async fn call_gemini_lite_fallback(
         let result = async {
             let response = call_gemini_api(
                 lite_model,
-                payload_for_model(payload, lite_model, &CONFIG.gemini_thinking_level),
+                payload_for_model(payload, lite_model, &CONFIG.gemini.thinking_level),
                 system_prompt_label,
                 audit_context,
                 "call_gemini_lite_fallback",
@@ -1567,16 +1567,16 @@ pub async fn call_gemini(request: GeminiCallRequest<'_>) -> Result<GeminiCallRes
     };
 
     let primary_model = if use_pro_model {
-        &CONFIG.gemini_pro_model
+        &CONFIG.gemini.pro_model
     } else {
-        &CONFIG.gemini_model
+        &CONFIG.gemini.model
     };
     // Fallback models reuse this payload with thinkingConfig re-derived per
     // model (payload_for_model): the chain may cross generations.
     let payload = json!({
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": [{ "role": "user", "parts": parts }],
-        "generationConfig": generation_config_for(primary_model, &CONFIG.gemini_thinking_level),
+        "generationConfig": generation_config_for(primary_model, &CONFIG.gemini.thinking_level),
         "safetySettings": build_safety_settings(),
         "tools": tools,
     });
@@ -1656,7 +1656,7 @@ async fn run_gemini_model_fallbacks(
         .await;
     }
 
-    let fallback_model = CONFIG.gemini_model.as_str();
+    let fallback_model = CONFIG.gemini.model.as_str();
     warn!(
         "Gemini Pro model '{}' failed after retries; falling back to default model '{}': {}",
         primary_model, fallback_model, primary_err
@@ -1665,7 +1665,7 @@ async fn run_gemini_model_fallbacks(
     let fallback_text = async {
         let response = call_gemini_api(
             fallback_model,
-            payload_for_model(payload, fallback_model, &CONFIG.gemini_thinking_level),
+            payload_for_model(payload, fallback_model, &CONFIG.gemini.thinking_level),
             system_prompt_label,
             audit_context,
             "call_gemini_fallback",
@@ -1756,7 +1756,7 @@ pub async fn generate_image_with_gemini(
         "tools": [{ "google_search": {"searchTypes": {"webSearch": {}, "imageSearch": {}}} }],
     });
 
-    let model = &CONFIG.gemini_image_model;
+    let model = &CONFIG.gemini.image_model;
     let response = call_gemini_api_with_timeout(
         model,
         payload,
@@ -1776,12 +1776,12 @@ pub async fn generate_image_with_gemini(
         )));
     }
 
-    if upload_to_cwd && !CONFIG.cwd_pw_api_key.trim().is_empty() {
+    if upload_to_cwd && !CONFIG.cwd_pw.api_key.trim().is_empty() {
         for image in &images {
             let mime_type = detect_mime_type(image).unwrap_or_else(|| "image/png".to_string());
             let _ = crate::tools::cwd_uploader::upload_image_bytes_to_cwd(
                 image,
-                &CONFIG.cwd_pw_api_key,
+                &CONFIG.cwd_pw.api_key,
                 &mime_type,
                 Some(model.as_str()),
                 Some(prompt),
@@ -1803,7 +1803,7 @@ pub async fn generate_music_with_lyria(
         return Err(anyhow!("Music prompt is empty"));
     }
 
-    let model = CONFIG.gemini_music_model.trim();
+    let model = CONFIG.gemini.music_model.trim();
     if model.is_empty() {
         return Err(anyhow!("GEMINI_MUSIC_MODEL is not configured"));
     }
@@ -1842,7 +1842,7 @@ pub async fn generate_video_with_veo(
         return Ok((None, None));
     }
 
-    let model = CONFIG.gemini_video_model.trim();
+    let model = CONFIG.gemini.video_model.trim();
     if model.is_empty() {
         return Err(anyhow!("GEMINI_VIDEO_MODEL is not configured"));
     }
@@ -1926,7 +1926,7 @@ pub async fn generate_video_with_veo(
             tokio::time::sleep(Duration::from_secs(VEO_POLL_INTERVAL_SECS)).await;
             current_operation = gemini_get_json(
                 &operation_url,
-                &CONFIG.gemini_api_key,
+                &CONFIG.gemini.api_key,
                 "veo-operation-poll",
                 VEO_REQUEST_TIMEOUT,
             )
@@ -1961,7 +1961,7 @@ async fn veo_start_operation(
         |_| async move {
             Ok(get_http_client()
                 .post(url)
-                .header("x-goog-api-key", CONFIG.gemini_api_key.as_str())
+                .header("x-goog-api-key", CONFIG.gemini.api_key.as_str())
                 .timeout(VEO_REQUEST_TIMEOUT)
                 .json(payload))
         },
@@ -1993,7 +1993,7 @@ async fn veo_download_video(
         |_| async move {
             Ok(get_http_client()
                 .get(video_uri)
-                .header("x-goog-api-key", CONFIG.gemini_api_key.as_str())
+                .header("x-goog-api-key", CONFIG.gemini.api_key.as_str())
                 .timeout(VEO_VIDEO_DOWNLOAD_TIMEOUT))
         },
         |_| {},
@@ -2167,7 +2167,7 @@ mod tests {
     fn generation_config_carries_the_thinking_level_for_gemini_3() {
         let config = generation_config_for("gemini-3-pro", "high");
         assert_eq!(config["thinkingConfig"]["thinkingLevel"], "high");
-        assert_eq!(config["temperature"], json!(CONFIG.gemini_temperature));
+        assert_eq!(config["temperature"], json!(CONFIG.gemini.temperature));
         assert!(generation_config_for("gemini-2.5-flash", "high")
             .get("thinkingConfig")
             .is_none());
@@ -2196,7 +2196,7 @@ mod tests {
     fn fallback_budget_matches_one_request_timeout() {
         assert_eq!(
             gemini_fallback_budget().as_secs(),
-            CONFIG.gemini_request_timeout_secs
+            CONFIG.gemini.request_timeout_secs
         );
     }
 
@@ -2209,8 +2209,8 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-test-model:generateContent"
         );
         assert!(!url.contains("key="));
-        if !CONFIG.gemini_api_key.is_empty() {
-            assert!(!url.contains(&CONFIG.gemini_api_key));
+        if !CONFIG.gemini.api_key.is_empty() {
+            assert!(!url.contains(&CONFIG.gemini.api_key));
         }
     }
 
@@ -2271,11 +2271,11 @@ mod tests {
     fn gemini_timeout_helpers_use_general_and_image_specific_config() {
         assert_eq!(
             gemini_generate_content_timeout().as_secs(),
-            CONFIG.gemini_request_timeout_secs
+            CONFIG.gemini.request_timeout_secs
         );
         assert_eq!(
             gemini_image_generation_timeout().as_secs(),
-            CONFIG.gemini_image_request_timeout_secs
+            CONFIG.gemini.image_request_timeout_secs
         );
     }
 }

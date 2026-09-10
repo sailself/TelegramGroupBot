@@ -271,7 +271,7 @@ async fn run_quick_request(
     let reasoning_override = reasoning_override_for_qa_mode(
         QaCommandMode::Quick,
         model.third_party_provider(),
-        &CONFIG.quick_reasoning_effort,
+        &CONFIG.models.quick_reasoning_effort,
     )
     .map(str::to_string);
 
@@ -315,7 +315,7 @@ async fn run_chat_context_request(
     query: String,
     audit_context: Option<&LlmAuditContext>,
 ) -> (Result<(String, Option<String>)>, Vec<i64>) {
-    if CONFIG.enable_agentic_qc {
+    if CONFIG.agents.enable_agentic_qc {
         let mut progress_reporter = ProgressReporter::new(
             bot.clone(),
             ChatId(request.chat_id),

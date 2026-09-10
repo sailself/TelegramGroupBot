@@ -34,9 +34,9 @@ pub struct Img2RequestOptions {
 impl Img2RequestOptions {
     pub fn from_config() -> Self {
         Self {
-            width: CONFIG.img2_width,
-            height: CONFIG.img2_height,
-            steps: CONFIG.img2_steps,
+            width: CONFIG.img2.width,
+            height: CONFIG.img2.height,
+            steps: CONFIG.img2.steps,
         }
     }
 
@@ -74,11 +74,11 @@ pub fn img2_available() -> bool {
 }
 
 pub fn img2_generate_url() -> String {
-    join_base_and_path(&CONFIG.img2_base_url, &CONFIG.img2_generate_path)
+    join_base_and_path(&CONFIG.img2.base_url, &CONFIG.img2.generate_path)
 }
 
 pub fn img2_health_url() -> String {
-    join_base_and_path(&CONFIG.img2_base_url, &CONFIG.img2_health_path)
+    join_base_and_path(&CONFIG.img2.base_url, &CONFIG.img2.health_path)
 }
 
 fn join_base_and_path(base_url: &str, path: &str) -> String {
@@ -196,7 +196,7 @@ async fn save_image_bytes(
     chat_id: i64,
     message_id: i64,
 ) -> Result<PathBuf, ImageGenerationError> {
-    let media_dir = PathBuf::from(&CONFIG.img2_media_dir);
+    let media_dir = PathBuf::from(&CONFIG.img2.media_dir);
     tokio::fs::create_dir_all(&media_dir).await.map_err(|err| {
         ImageGenerationError(format!(
             "Failed to create Img2 media directory {}: {err}",
@@ -342,12 +342,12 @@ pub async fn generate_image_with_img2(
     message_id: i64,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<Img2GeneratedImage, ImageGenerationError> {
-    if !CONFIG.enable_img2 {
+    if !CONFIG.img2.enabled {
         return Err(ImageGenerationError(
             "Img2 image generation is disabled. Set ENABLE_IMG2=true to enable it.".to_string(),
         ));
     }
-    let api_key = CONFIG.img2_api_key.trim();
+    let api_key = CONFIG.img2.api_key.trim();
     if api_key.is_empty() {
         return Err(ImageGenerationError(
             "Img2 image generation requires IMG2_API_KEY.".to_string(),
@@ -364,15 +364,15 @@ pub async fn generate_image_with_img2(
     let source_image = first_source_image(image_urls).await;
     let source_image_present = source_image.is_some();
     let url = img2_generate_url();
-    let timeout = Duration::from_secs(CONFIG.img2_request_timeout_secs);
+    let timeout = Duration::from_secs(CONFIG.img2.request_timeout_secs);
     let metadata = json!({
         "url": url,
-        "timeout_secs": CONFIG.img2_request_timeout_secs,
+        "timeout_secs": CONFIG.img2.request_timeout_secs,
         "source_image": source_image_present,
         "width": options.width,
         "height": options.height,
         "steps": options.steps,
-        "media_dir": CONFIG.img2_media_dir,
+        "media_dir": CONFIG.img2.media_dir,
     });
 
     debug!(
@@ -381,7 +381,7 @@ pub async fn generate_image_with_img2(
         options.width,
         options.height,
         options.steps,
-        CONFIG.img2_request_timeout_secs,
+        CONFIG.img2.request_timeout_secs,
         url
     );
 

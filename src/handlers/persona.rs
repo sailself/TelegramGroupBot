@@ -101,7 +101,7 @@ pub async fn profileme_handler(
         .select_messages_by_user(
             message.chat.id.0,
             user_id,
-            CONFIG.user_history_message_count,
+            CONFIG.limits.user_history_message_count,
             true,
         )
         .await?;
@@ -207,7 +207,7 @@ pub async fn paintme_handler(
         .select_messages_by_user(
             message.chat.id.0,
             user_id,
-            CONFIG.user_history_message_count,
+            CONFIG.limits.user_history_message_count,
             true,
         )
         .await?;
@@ -299,7 +299,7 @@ pub async fn paintme_handler(
         &[],
         None,
         None,
-        !CONFIG.cwd_pw_api_key.is_empty(),
+        !CONFIG.cwd_pw.api_key.is_empty(),
         audit_context.as_ref(),
     )
     .await;

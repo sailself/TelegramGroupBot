@@ -243,7 +243,7 @@ pub async fn factcheck_handler(
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
 
-    if CONFIG.enable_agentic_factcheck {
+    if CONFIG.agents.enable_agentic_factcheck {
         let mut progress_reporter =
             ProgressReporter::new(bot.clone(), message.chat.id, processing_message.id);
         match run_factcheck_pipeline(

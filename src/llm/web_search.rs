@@ -55,12 +55,8 @@ static BRAVE: BraveSearch = BraveSearch;
 static EXA: ExaSearch = ExaSearch;
 static JINA: JinaSearch = JinaSearch;
 
-static SEARCH_CACHE: LazyLock<Mutex<TtlCache<String, Vec<SearchResult>>>> = LazyLock::new(|| {
-    Mutex::new(TtlCache::new(
-        cache_ttl(),
-        CONFIG.web_search_cache_max_entries,
-    ))
-});
+static SEARCH_CACHE: LazyLock<Mutex<TtlCache<String, Vec<SearchResult>>>> =
+    LazyLock::new(|| Mutex::new(TtlCache::new(cache_ttl(), CONFIG.search.cache_max_entries)));
 
 fn provider_by_name(name: &str) -> Option<&'static dyn SearchProvider> {
     match name.trim().to_lowercase().as_str() {
@@ -75,7 +71,7 @@ fn provider_by_name(name: &str) -> Option<&'static dyn SearchProvider> {
 /// skipped); Brave, Exa, Jina when the list is empty.
 fn configured_providers() -> Vec<&'static dyn SearchProvider> {
     let mut providers = Vec::new();
-    for entry in &CONFIG.web_search_providers {
+    for entry in &CONFIG.search.providers {
         match provider_by_name(entry) {
             Some(provider) => providers.push(provider),
             None => warn!(
@@ -123,7 +119,7 @@ fn cache_key(query: &str, max_results: usize) -> String {
 }
 
 fn cache_ttl() -> Duration {
-    Duration::from_secs(CONFIG.web_search_cache_ttl_seconds)
+    Duration::from_secs(CONFIG.search.cache_ttl_seconds)
 }
 
 fn get_cached(query: &str, max_results: usize) -> Option<Vec<SearchResult>> {
