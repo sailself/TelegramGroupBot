@@ -6,6 +6,7 @@
 //! on the configured step model (`AGENT_STEP_MODEL`, derived when unset);
 //! the user-facing final answer keeps using the command's configured model.
 
+pub mod common;
 pub mod factcheck;
 pub mod qc;
 pub mod qc_topics;

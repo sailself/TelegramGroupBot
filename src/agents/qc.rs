@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use crate::agents::common::{call_step_json, fence, WEB_RESULTS_PER_QUERY};
 use crate::agents::step::{
     call_step_text, parse_lenient_json, resolve_step_model, StepModel, WallClock,
 };
@@ -33,7 +34,6 @@ const EVIDENCE_MAX_HITS: usize = 30;
 const EVIDENCE_MAX_CHARS: usize = 8_000;
 const EVIDENCE_LINE_TEXT_MAX_CHARS: usize = 200;
 const WEB_EVIDENCE_BLOCK_MAX_CHARS: usize = 2_000;
-const WEB_RESULTS_PER_QUERY: usize = 5;
 
 const QC_PLAN_PROMPT: &str = r#"You are the query planner for a Telegram group-chat history search. The chat search index is keyword-based full-text search over tokenized text — it matches words, not meanings.
 
@@ -598,20 +598,17 @@ async fn plan_queries(
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<Vec<String>> {
     let input = truncate_for_log(query, PLANNER_INPUT_MAX_CHARS);
-    let response = call_step_text(
+    let plan: QcPlan = call_step_json(
         step_model,
         QC_PLAN_PROMPT,
         &input,
         &[],
-        Some(&plan_schema()),
+        &plan_schema(),
         "Chat QC Plan",
-        Some("QC_PLAN_PROMPT"),
+        "planner",
         audit_context,
     )
     .await?;
-
-    let plan = parse_lenient_json::<QcPlan>(&response)
-        .ok_or_else(|| anyhow::anyhow!("planner output was not valid JSON"))?;
     Ok(normalize_queries(plan.queries, MAX_PLANNED_QUERIES))
 }
 
@@ -641,20 +638,17 @@ async fn reflect(
         ));
     }
 
-    let response = call_step_text(
+    call_step_json(
         step_model,
         QC_REFLECT_PROMPT,
         &input,
         &[],
-        Some(&reflect_schema()),
+        &reflect_schema(),
         "Chat QC Reflect",
-        Some("QC_REFLECT_PROMPT"),
+        "reflect",
         audit_context,
     )
-    .await?;
-
-    parse_lenient_json::<QcReflection>(&response)
-        .ok_or_else(|| anyhow::anyhow!("reflect output was not valid JSON"))
+    .await
 }
 
 /// Execute one chat search through the runtime, deduplicating hits by id.
@@ -782,7 +776,7 @@ fn fence_user_question(query: &str) -> String {
     let safe = QC_FENCED_BLOCKS
         .iter()
         .fold(query.to_string(), |acc, tag| neutralize_tag(&acc, tag));
-    format!("<user_question>\n{}\n</user_question>", safe.trim())
+    fence("user_question", safe.trim())
 }
 
 fn build_final_input(query: &str, hits: &[EvidenceHit], web_evidence: &[String]) -> String {

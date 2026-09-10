@@ -6,12 +6,10 @@
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::agents::step::{
-    call_step_text, parse_lenient_json, resolve_step_model, StepModel, WallClock,
-};
+use crate::agents::common::{call_step_json, map_bounded, WEB_RESULTS_PER_QUERY};
+use crate::agents::step::{resolve_step_model, StepModel, WallClock};
 use crate::config::{
     ThirdPartyProvider, CONFIG, FACTCHECK_CLAIM_EXTRACTION_PROMPT, FACTCHECK_SYNTHESIS_PROMPT,
     LANGUAGE_POLICY,
@@ -28,7 +26,6 @@ use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 
 const EVIDENCE_BLOCK_MAX_CHARS: usize = 2_000;
 const EXTRACTION_INPUT_MAX_CHARS: usize = 24_000;
-const WEB_RESULTS_PER_QUERY: usize = 5;
 
 #[derive(Debug, Deserialize)]
 struct ClaimExtraction {
@@ -185,20 +182,17 @@ async fn extract_claims(
     );
     let input = truncate_for_log(statement, EXTRACTION_INPUT_MAX_CHARS);
 
-    let response = call_step_text(
+    let extraction: ClaimExtraction = call_step_json(
         &step_model,
         &prompt,
         &input,
         media_files,
-        Some(&schema),
+        &schema,
         "Fact Check Claims",
-        Some("FACTCHECK_CLAIM_EXTRACTION_PROMPT"),
+        "claim extraction",
         audit_context,
     )
     .await?;
-
-    let extraction = parse_lenient_json::<ClaimExtraction>(&response)
-        .ok_or_else(|| anyhow::anyhow!("claim extraction output was not valid JSON"))?;
     Ok(normalize_claims(
         extraction.claims,
         CONFIG.factcheck_max_claims,
@@ -237,11 +231,8 @@ async fn research_claims(
     progress: &mut ProgressReporter,
 ) -> Vec<ClaimEvidence> {
     let total = claims.len();
-    let search_enabled = web_search::is_search_enabled();
-    let mut evidence: Vec<Option<ClaimEvidence>> = Vec::new();
-    evidence.resize_with(total, || None);
 
-    if !search_enabled {
+    if !web_search::is_search_enabled() {
         warn!("factcheck research skipped: no web search provider is enabled");
         return claims
             .into_iter()
@@ -254,62 +245,50 @@ async fn research_claims(
             .collect();
     }
 
-    let mut join_set: JoinSet<(usize, ClaimEvidence)> = JoinSet::new();
-    let mut pending = claims.into_iter().enumerate().collect::<Vec<_>>();
-    pending.reverse(); // pop() admits claims in original order
-    let mut done = 0usize;
-
-    loop {
-        while join_set.len() < CONFIG.factcheck_claim_concurrency {
-            if wall_clock.exceeded() {
-                break;
-            }
-            let Some((index, claim)) = pending.pop() else {
-                break;
-            };
-            join_set.spawn(async move {
-                let blocks = research_single_claim(&claim).await;
-                (
-                    index,
-                    ClaimEvidence {
-                        claim: claim.claim,
-                        evidence_blocks: blocks,
-                    },
-                )
-            });
-        }
-
-        let Some(joined) = join_set.join_next().await else {
-            break;
-        };
-        match joined {
-            Ok((index, claim_evidence)) => {
-                evidence[index] = Some(claim_evidence);
-            }
-            Err(err) => warn!("factcheck research task failed: {err}"),
-        }
-        done += 1;
-        progress
-            .update(&format!("Researching claims... ({done}/{total})"))
-            .await;
-    }
-
-    if !pending.is_empty() {
-        warn!(
-            "factcheck research stopped early after the wall-clock budget; {} claim(s) unresearched",
-            pending.len()
-        );
-        for (index, claim) in pending {
-            evidence[index] = Some(ClaimEvidence {
+    progress
+        .update(&format!("Researching {total} claim(s)..."))
+        .await;
+    // Keep the claim text so a timed-out (never-started) claim still names
+    // itself in the fallback evidence below; `map_bounded` only hands back a
+    // `Result`, not the original item, once a task doesn't complete.
+    let claim_texts: Vec<String> = claims.iter().map(|claim| claim.claim.clone()).collect();
+    let results = map_bounded(
+        claims,
+        CONFIG.factcheck_claim_concurrency,
+        wall_clock,
+        |_, claim| async move {
+            let evidence_blocks = research_single_claim(&claim).await;
+            Ok(ClaimEvidence {
                 claim: claim.claim,
-                evidence_blocks: vec![
-                    "Research skipped: the time budget for this request was exhausted.".to_string(),
-                ],
-            });
-        }
-    }
+                evidence_blocks,
+            })
+        },
+    )
+    .await;
 
-    evidence.into_iter().flatten().collect()
+    let mut unresearched = 0usize;
+    let evidence = results
+        .into_iter()
+        .zip(claim_texts)
+        .map(|(result, claim_text)| {
+            result.unwrap_or_else(|_| {
+                unresearched += 1;
+                ClaimEvidence {
+                    claim: claim_text,
+                    evidence_blocks: vec![
+                        "Research skipped: the time budget for this request was exhausted."
+                            .to_string(),
+                    ],
+                }
+            })
+        })
+        .collect();
+    if unresearched > 0 {
+        warn!(
+            "factcheck research stopped early after the wall-clock budget; {unresearched} claim(s) unresearched"
+        );
+    }
+    evidence
 }
 
 async fn research_single_claim(claim: &ExtractedClaim) -> Vec<String> {
@@ -419,6 +398,7 @@ fn claim_extraction_schema(max_claims: usize, max_queries: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::step::parse_lenient_json;
 
     #[test]
     fn normalize_claims_caps_counts_and_drops_empties() {

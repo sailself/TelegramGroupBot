@@ -4,11 +4,11 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+use crate::agents::common::{call_step_json, map_bounded};
 use crate::agents::qc::{compose_final_answer, QcAgentOutcome, QcPipelineResult};
-use crate::agents::step::{call_step_text, parse_lenient_json, StepModel};
+use crate::agents::step::{StepModel, WallClock};
 use crate::config::CONFIG;
 use crate::db::database::Database;
 use crate::db::models::{MessageRow, TopicWindowSpec};
@@ -16,7 +16,7 @@ use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::build_message_link;
-use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
+use crate::utils::text::{neutralize_closing_tag, neutralize_tag, truncate_for_log};
 
 const MAX_TOPIC_MAP_CONCURRENCY: usize = 4;
 
@@ -198,25 +198,27 @@ fn build_topic_evidence(
     })
 }
 
+/// Tags the untrusted `query`/`error` text sits *outside* of and could
+/// otherwise forge; both the opening and closing form must break.
+const TOPIC_PLAN_FORGEABLE_TAGS: [&str; 2] = ["validation_error", "current_utc"];
+
 fn build_topic_plan_input(
     query: &str,
     current_utc: DateTime<Utc>,
     validation_error: Option<&str>,
 ) -> String {
-    let question = neutralize_closing_tag(query, "untrusted_question")
-        .replace("<validation_error>", "<\u{200b}validation_error>")
-        .replace("</validation_error>", "<\u{200b}/validation_error>")
-        .replace("<current_utc>", "<\u{200b}current_utc>")
-        .replace("</current_utc>", "<\u{200b}/current_utc>");
+    let question = TOPIC_PLAN_FORGEABLE_TAGS.iter().fold(
+        neutralize_closing_tag(query, "untrusted_question"),
+        |acc, tag| neutralize_tag(&acc, tag),
+    );
     let mut input = format!(
         "<current_utc>{}</current_utc>\n<untrusted_question>\n{question}\n</untrusted_question>",
         current_utc.to_rfc3339()
     );
     if let Some(error) = validation_error {
-        let error = neutralize_closing_tag(error, "validation_error")
-            .replace("<validation_error>", "<\u{200b}validation_error>")
-            .replace("<current_utc>", "<\u{200b}current_utc>")
-            .replace("</current_utc>", "<\u{200b}/current_utc>");
+        let error = TOPIC_PLAN_FORGEABLE_TAGS
+            .iter()
+            .fold(error.to_string(), |acc, tag| neutralize_tag(&acc, tag));
         input.push_str(&format!(
             "\n<validation_error>{error}</validation_error>\nCorrect only the JSON plan so it satisfies the schema and validation error."
         ));
@@ -371,13 +373,11 @@ fn validate_map_response(
         .collect()
 }
 
-fn parse_and_validate_topic_map_response(
+fn require_valid_topic_candidates(
     chunk_index: usize,
-    response: &str,
+    response: TopicMapResponse,
     allowed: &BTreeSet<i64>,
 ) -> Result<Vec<TopicCandidate>> {
-    let response = parse_lenient_json::<TopicMapResponse>(response)
-        .ok_or_else(|| anyhow!("topic map output was not valid JSON"))?;
     let had_raw_topics = !response.topics.is_empty();
     let candidates = validate_map_response(chunk_index, response, allowed);
     if had_raw_topics && candidates.is_empty() {
@@ -600,23 +600,21 @@ async fn plan_topic_request(
     for attempt in 0..2 {
         let input = build_topic_plan_input(query, now, validation_error.as_deref());
         let schema = topic_plan_schema();
-        let result = match call_step_text(
-            step_model,
-            TOPIC_PLAN_PROMPT,
-            &input,
-            &[],
-            Some(&schema),
-            "Chat QC Topic Plan",
-            Some("TOPIC_PLAN_PROMPT"),
-            audit_context,
-        )
-        .await
-        {
-            Ok(response) => parse_lenient_json::<TopicPlan>(&response)
-                .ok_or_else(|| anyhow!("planner output was not valid JSON"))
-                .and_then(|plan| normalize_topic_plan(plan, now)),
-            Err(error) => Err(error),
-        };
+        let result: Result<NormalizedTopicPlan> = async {
+            let plan: TopicPlan = call_step_json(
+                step_model,
+                TOPIC_PLAN_PROMPT,
+                &input,
+                &[],
+                &schema,
+                "Chat QC Topic Plan",
+                "planner",
+                audit_context,
+            )
+            .await?;
+            normalize_topic_plan(plan, now)
+        }
+        .await;
 
         match result {
             Ok(plan) => return Ok(plan),
@@ -634,74 +632,60 @@ async fn map_topic_chunks(
     audit_context: Option<&LlmAuditContext>,
     progress: &mut ProgressReporter,
 ) -> TopicMapAggregation {
-    let chunks = messages
+    let chunks: Vec<Vec<MessageRow>> = messages
         .chunks(CONFIG.tldr_chunk_size.max(1))
-        .enumerate()
-        .map(|(index, chunk)| (index, chunk.to_vec()))
-        .collect::<Vec<_>>();
+        .map(<[MessageRow]>::to_vec)
+        .collect();
     let total = chunks.len();
-    let mut pending = chunks.into_iter();
-    let mut join_set = JoinSet::new();
-    let mut results = Vec::with_capacity(total);
-    let mut join_failures = 0usize;
-    let mut completed = 0usize;
+    let chunk_lens: Vec<usize> = chunks.iter().map(Vec::len).collect();
 
-    loop {
-        while join_set.len() < MAX_TOPIC_MAP_CONCURRENCY {
-            let Some((chunk_index, chunk)) = pending.next() else {
-                break;
-            };
+    progress
+        .update(&format!("Analyzing {total} topic chunk(s)..."))
+        .await;
+
+    // Bounded by a fresh clock scoped to this phase; Step 4 threads the
+    // pipeline's own wall clock through instead.
+    let clock = WallClock::start();
+    let step_model = step_model.clone();
+    let audit_context = audit_context.cloned();
+    let results = map_bounded(
+        chunks,
+        MAX_TOPIC_MAP_CONCURRENCY,
+        &clock,
+        move |chunk_index, chunk| {
             let step_model = step_model.clone();
-            let audit_context = audit_context.cloned();
-            join_set.spawn(async move {
-                let chunk_len = chunk.len();
+            let audit_context = audit_context.clone();
+            async move {
                 let allowed = chunk
                     .iter()
                     .map(|message| message.message_id)
                     .collect::<BTreeSet<_>>();
                 let input = format_topic_chunk(&chunk);
                 let schema = topic_map_schema();
-                let result = match call_step_text(
+                let response: TopicMapResponse = call_step_json(
                     &step_model,
                     TOPIC_MAP_PROMPT,
                     &input,
                     &[],
-                    Some(&schema),
+                    &schema,
                     "Chat QC Topic Map",
-                    Some("TOPIC_MAP_PROMPT"),
+                    "topic map",
                     audit_context.as_ref(),
                 )
-                .await
-                {
-                    Ok(response) => {
-                        parse_and_validate_topic_map_response(chunk_index, &response, &allowed)
-                    }
-                    Err(error) => Err(error),
-                };
-                (chunk_index, chunk_len, result)
-            });
-        }
-
-        if join_set.is_empty() {
-            break;
-        }
-        match join_set.join_next().await {
-            Some(Ok(result)) => results.push(result),
-            Some(Err(error)) => {
-                join_failures += 1;
-                warn!("/qc topic map task failed to join: {error}");
+                .await?;
+                require_valid_topic_candidates(chunk_index, response, &allowed)
             }
-            None => break,
-        }
-        completed += 1;
-        progress
-            .update(&format!("Analyzing topic chunks... ({completed}/{total})"))
-            .await;
-    }
+        },
+    )
+    .await;
 
-    let mut aggregated = aggregate_topic_map_results(results);
-    aggregated.failed_chunks += join_failures;
-    aggregated
+    let per_chunk = results
+        .into_iter()
+        .zip(chunk_lens)
+        .enumerate()
+        .map(|(chunk_index, (result, chunk_len))| (chunk_index, chunk_len, result))
+        .collect();
+    aggregate_topic_map_results(per_chunk)
 }
 
 async fn reduce_topic_candidates(
@@ -713,19 +697,17 @@ async fn reduce_topic_candidates(
 ) -> Result<(Vec<FinalTopicEvidence>, Vec<i64>)> {
     let input = format_topic_candidates(candidates);
     let schema = topic_reduce_schema();
-    let response = call_step_text(
+    let response: TopicReduceResponse = call_step_json(
         step_model,
         TOPIC_REDUCE_PROMPT,
         &input,
         &[],
-        Some(&schema),
+        &schema,
         "Chat QC Topic Reduce",
-        Some("TOPIC_REDUCE_PROMPT"),
+        "topic reducer",
         audit_context,
     )
     .await?;
-    let response = parse_lenient_json::<TopicReduceResponse>(&response)
-        .ok_or_else(|| anyhow!("topic reducer output was not valid JSON"))?;
     let (topics, valid_message_ids) =
         validate_reduce_response(response, candidates, selected_messages, topic_count);
     if topics.is_empty() {
@@ -1208,7 +1190,7 @@ mod tests {
     #[test]
     fn topic_map_parse_validation_counts_fully_invalid_nonempty_chunks_as_failures() {
         let allowed = BTreeSet::from([7]);
-        let invalid_nonempty = serde_json::json!({
+        let invalid_nonempty: TopicMapResponse = serde_json::from_value(serde_json::json!({
             "topics": [{
                 "label": "Unknown message",
                 "description": "Does not survive Rust validation",
@@ -1216,14 +1198,15 @@ mod tests {
                 "message_ids": [999],
                 "representative_message_ids": [999]
             }]
-        })
-        .to_string();
-        let empty = serde_json::json!({"topics": []}).to_string();
+        }))
+        .unwrap();
+        let empty: TopicMapResponse =
+            serde_json::from_value(serde_json::json!({"topics": []})).unwrap();
 
         let invalid_aggregated = aggregate_topic_map_results(vec![(
             0,
             10,
-            parse_and_validate_topic_map_response(0, &invalid_nonempty, &allowed),
+            require_valid_topic_candidates(0, invalid_nonempty, &allowed),
         )]);
         assert!(invalid_aggregated.candidates.is_empty());
         assert_eq!(invalid_aggregated.failed_chunks, 1);
@@ -1236,7 +1219,7 @@ mod tests {
         let empty_aggregated = aggregate_topic_map_results(vec![(
             1,
             20,
-            parse_and_validate_topic_map_response(1, &empty, &allowed),
+            require_valid_topic_candidates(1, empty, &allowed),
         )]);
         assert!(empty_aggregated.candidates.is_empty());
         assert_eq!(empty_aggregated.failed_chunks, 0);
