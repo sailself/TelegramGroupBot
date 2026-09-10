@@ -21,7 +21,7 @@ use super::model_resolution::{
     configured_model_display_name, default_model_selection_key,
     selectable_model_ids_for_request_with_models,
 };
-use super::process_request;
+use super::process::process_request;
 
 pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 const MODEL_CALLBACK_COMPACT_PREFIX: &str = "m:";

@@ -22,7 +22,7 @@ use crate::llm::text_model::{
 use crate::state::QaCommandMode;
 use crate::utils::text::truncate_with_ellipsis;
 
-use super::USER_ERROR_DETAIL_LIMIT;
+use super::handler::USER_ERROR_DETAIL_LIMIT;
 
 pub(super) fn third_party_provider_label(provider: ThirdPartyProvider) -> &'static str {
     match provider {
