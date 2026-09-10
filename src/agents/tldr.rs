@@ -9,13 +9,14 @@ use tracing::{info, warn};
 
 use crate::agents::common::{ModelAnswer, PipelineOutcome};
 use crate::agents::step::{call_step_text, resolve_step_model, StepModel, WallClock};
-use crate::config::{CONFIG, TLDR_CHUNK_PROMPT, TLDR_MERGE_PROMPT};
+use crate::config::CONFIG;
 use crate::db::models::MessageRow;
 use crate::llm::prompting::{format_tldr_chat_content, wrap_chat_history};
 use crate::llm::text_model::{
     call_configured_text_model, resolve_default_text_model_for_request, ModelRequestCapabilities,
 };
 use crate::llm::LlmAuditContext;
+use crate::prompts::{TLDR_CHUNK_PROMPT, TLDR_MERGE_PROMPT};
 use crate::utils::progress::ProgressReporter;
 use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 

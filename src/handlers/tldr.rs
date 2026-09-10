@@ -5,7 +5,7 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatAction, ParseMode, ReplyParameters};
 use tracing::{error, info, warn};
 
-use crate::config::{CONFIG, TLDR_SYSTEM_PROMPT};
+use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::content::create_telegraph_page;
 use crate::handlers::image::generate_image_with_configured_default;
@@ -14,6 +14,7 @@ use crate::llm::audit::create_command_audit_context;
 use crate::llm::media::detect_mime_type;
 use crate::llm::text_model::call_configured_text_model;
 use crate::llm::{GeminiImageConfig, LlmAuditContext};
+use crate::prompts::TLDR_SYSTEM_PROMPT;
 use crate::state::AppState;
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::utils::markdown::markdown_to_telegram_html;

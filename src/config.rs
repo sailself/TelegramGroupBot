@@ -8,8 +8,6 @@ use serde::Deserialize;
 use std::sync::LazyLock;
 use tracing::{info, warn};
 
-pub use crate::prompts::*;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub enum ThirdPartyProvider {
     #[serde(rename = "openrouter")]

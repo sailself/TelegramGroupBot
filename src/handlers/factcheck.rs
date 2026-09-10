@@ -6,7 +6,7 @@ use teloxide::types::{ChatAction, ParseMode, ReplyParameters};
 use tracing::{error, info};
 
 use crate::agents::factcheck::{run_factcheck_pipeline, FactcheckOutcome};
-use crate::config::{CONFIG, FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY};
+use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::enrichment::{
     count_sources, enrich_request, entity_link_urls, render_sources, Enrichment, EnrichmentBudget,
@@ -17,6 +17,7 @@ use crate::handlers::responses::send_response;
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::media::{summarize_media_files, MediaSummary};
 use crate::llm::text_model::call_configured_text_model;
+use crate::prompts::{FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY};
 use crate::state::AppState;
 use crate::utils::markdown::markdown_to_telegram_html;
 use crate::utils::progress::ProgressReporter;

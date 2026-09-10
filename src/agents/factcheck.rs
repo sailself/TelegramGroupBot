@@ -12,10 +12,7 @@ use crate::agents::common::{
     call_step_json, map_bounded, ModelAnswer, PipelineOutcome, ProgressHook, WEB_RESULTS_PER_QUERY,
 };
 use crate::agents::step::{resolve_step_model, StepModel, WallClock};
-use crate::config::{
-    ThirdPartyProvider, CONFIG, FACTCHECK_CLAIM_EXTRACTION_PROMPT, FACTCHECK_SYNTHESIS_PROMPT,
-    LANGUAGE_POLICY,
-};
+use crate::config::{ThirdPartyProvider, CONFIG};
 use crate::llm::media::{MediaFile, MediaSummary};
 use crate::llm::runtime_models::runtime_model_config;
 use crate::llm::text_model::{
@@ -23,6 +20,9 @@ use crate::llm::text_model::{
 };
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::LlmAuditContext;
+use crate::prompts::{
+    FACTCHECK_CLAIM_EXTRACTION_PROMPT, FACTCHECK_SYNTHESIS_PROMPT, LANGUAGE_POLICY,
+};
 use crate::utils::progress::ProgressReporter;
 use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 

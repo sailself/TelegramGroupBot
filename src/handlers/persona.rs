@@ -7,14 +7,13 @@ use teloxide::types::{
 };
 use tracing::error;
 
-use crate::config::{
-    CONFIG, PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT,
-};
+use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::image::{build_image_caption, generate_image_with_configured_default};
 use crate::handlers::responses::send_response;
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::text_model::call_configured_text_model;
+use crate::prompts::{PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT};
 use crate::state::AppState;
 use crate::utils::markdown::markdown_to_telegram_html;
 use crate::utils::telegram::start_chat_action_heartbeat;
