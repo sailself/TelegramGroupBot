@@ -12,8 +12,8 @@ use tracing::{error, warn};
 
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
-use crate::handlers::commands::IMAGE_CAPTION_LIMIT;
 use crate::handlers::content::create_telegraph_page;
+use crate::handlers::image::IMAGE_CAPTION_LIMIT;
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::{call_gemini, generate_music_with_lyria, GeminiCallRequest};
 use crate::state::AppState;

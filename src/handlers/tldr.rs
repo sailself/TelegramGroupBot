@@ -7,8 +7,8 @@ use tracing::{error, info, warn};
 
 use crate::config::{CONFIG, TLDR_SYSTEM_PROMPT};
 use crate::handlers::access::{check_access_control, is_rate_limited};
-use crate::handlers::commands::generate_image_with_configured_default;
 use crate::handlers::content::create_telegraph_page;
+use crate::handlers::image::generate_image_with_configured_default;
 use crate::handlers::responses::send_response;
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::media::detect_mime_type;

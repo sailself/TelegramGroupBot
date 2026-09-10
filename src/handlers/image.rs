@@ -1,3 +1,7 @@
+//! Image and video generation commands: `/img`, `/img2`, `/image`, `/vid`,
+//! and the shared image-generation helpers used by `/tldr`, `/paintme`, and
+//! `/portraitme`.
+
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -10,19 +14,10 @@ use teloxide::types::{
 
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
-pub(crate) use crate::handlers::admin::{diagnose_handler, status_handler};
 use crate::handlers::content::{
     create_telegraph_page, extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
 };
-pub(crate) use crate::handlers::factcheck::factcheck_handler;
-pub(crate) use crate::handlers::help::{help_handler, start_handler, support_handler};
 use crate::handlers::media::{get_file_url, message_has_image};
-pub(crate) use crate::handlers::mysong::mysong_handler;
-pub(crate) use crate::handlers::persona::{paintme_handler, profileme_handler};
-pub(crate) use crate::handlers::tldr::tldr_handler;
-pub(crate) use crate::handlers::token_stats::{
-    burn_baby_burn_handler, token_devourers_handler, token_stats_handler,
-};
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::gemini::ImageGenerationError;
 use crate::llm::{
