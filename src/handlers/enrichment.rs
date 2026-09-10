@@ -9,9 +9,8 @@
 //! remote text into a prompt unfenced.
 
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
-use regex::Regex;
 use teloxide::types::{MessageEntityKind, MessageEntityRef};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -178,26 +177,11 @@ pub fn unique_source_urls(texts: &[&str]) -> Vec<(SourceKind, String)> {
     urls
 }
 
-/// Any `<source` in fetched content that opens like a real tag — followed by
-/// whitespace, `/` or `>`, in any case.
-static SOURCE_OPENING_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r"(?i)<({SOURCE_TAG})([\s/>])")).expect("valid source opening tag regex")
-});
-
-/// Break every attributed `<source …>` inside fetched content, not just the
-/// bare `<source>` that `neutralize_tag` handles: otherwise a page can print
-/// `<source kind="telegraph" url="…">` and pass its own text off as a second,
-/// differently attributed source from inside the real fence. Uses the same
-/// zero-width separator as the shared neutralizers, so the text stays readable.
-fn neutralize_source_openings(text: &str) -> String {
-    SOURCE_OPENING_TAG_REGEX
-        .replace_all(text, "<\u{200b}$1$2")
-        .into_owned()
-}
-
 /// Render sources for a prompt: fenced, budgeted, and with any `<source …>` or
 /// `</source>` in the fetched text broken so remote content can neither close
-/// the fence early nor forge a second source inside it.
+/// the fence early nor forge a second source inside it. `neutralize_tag` now
+/// matches attributed (`<source kind="…">`) and self-closing (`<source/>`)
+/// openings case-insensitively on its own, so no extra pass is needed here.
 pub fn render_sources(sources: &[UntrustedSource], budget: &EnrichmentBudget) -> String {
     if sources.is_empty() {
         return String::new();
@@ -210,7 +194,7 @@ pub fn render_sources(sources: &[UntrustedSource], budget: &EnrichmentBudget) ->
             break;
         }
         let limit = budget.max_chars_per_source.min(remaining_total);
-        let fenced = neutralize_source_openings(&neutralize_tag(&source.text, SOURCE_TAG));
+        let fenced = neutralize_tag(&source.text, SOURCE_TAG);
         let text = truncate_with_ellipsis(&fenced, limit);
         remaining_total = remaining_total.saturating_sub(text.chars().count());
 
