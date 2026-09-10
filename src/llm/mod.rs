@@ -2,14 +2,17 @@ pub mod analytics;
 pub mod audit;
 pub mod brave_search;
 pub mod codex_image;
+pub mod codex_selected_model;
 pub mod exa_search;
 pub mod gemini;
 pub mod img2_image;
 pub mod jina_search;
 pub mod media;
 pub mod openai_codex;
+pub mod prompting;
 pub mod responses_provider;
 pub mod runtime_models;
+pub mod text_model;
 pub mod third_party;
 pub mod tool_loop;
 pub mod tool_prompts;
@@ -24,7 +27,7 @@ pub(crate) enum CodexPromptStyle {
     FreeformAnswer,
 }
 
-pub use audit::{audit_context_from_id, create_audit_context_from_message, LlmAuditContext};
+pub use audit::{audit_context_from_id, LlmAuditContext};
 pub use codex_image::{generate_image_with_codex, CodexImageConfig};
 pub use gemini::{
     call_gemini, call_gemini_with_tool_runtime, generate_image_with_gemini,

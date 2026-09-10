@@ -9,6 +9,18 @@ use std::thread::{self, JoinHandle};
 
 use url::Url;
 
+use super::url::XStatusIdentity;
+
+/// A status identity fixture: `id` as both the numeric ID and the fake
+/// canonical URL's path segment. Shared by every provider's test module
+/// instead of each redefining its own copy.
+pub(crate) fn identity(id: &str) -> XStatusIdentity {
+    XStatusIdentity {
+        id: id.to_owned(),
+        canonical_url: Url::parse(&format!("https://x.com/i/status/{id}")).unwrap(),
+    }
+}
+
 pub(crate) struct ExpectedRequest {
     method: Option<String>,
     path: Option<String>,
@@ -479,4 +491,137 @@ pub(crate) fn chunked_response(chunks: Vec<Vec<u8>>) -> Vec<u8> {
     }
     response.extend_from_slice(b"0\r\n\r\n");
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    fn join_with_timeout(server: TestServer) -> Result<Result<(), String>, &'static str> {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(server.join());
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "TestServer::join timed out")
+    }
+
+    #[test]
+    fn test_server_join_surfaces_missing_expectations_without_hanging() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/never-requested",
+            response_with_content_length(0, Vec::new()),
+        )]);
+        let error = join_with_timeout(server)
+            .expect("missing-expectation join must terminate")
+            .unwrap_err();
+        assert!(error.contains("unmet"));
+    }
+
+    #[tokio::test]
+    async fn test_server_join_surfaces_unexpected_extra_requests() {
+        let server = TestServer::single(response_with_content_length(0, Vec::new()));
+        let client = reqwest::Client::new();
+        client.get(server.url("/first")).send().await.unwrap();
+        let extra = client.get(server.url("/extra")).send().await.unwrap();
+        assert_eq!(extra.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        let error = join_with_timeout(server)
+            .expect("extra-request join must terminate")
+            .unwrap_err();
+        assert!(error.contains("unexpected extra request"));
+    }
+
+    #[tokio::test]
+    async fn delayed_join_still_surfaces_request_mismatch() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/expected",
+            response_with_content_length(0, Vec::new()),
+        )
+        .delayed(Duration::from_millis(1))]);
+        reqwest::Client::new()
+            .get(server.url("/wrong"))
+            .send()
+            .await
+            .unwrap();
+        let error = server.join_allowing_client_disconnect().unwrap_err();
+        assert!(error.contains("expected path"));
+    }
+
+    #[test]
+    fn test_server_client_disconnect_requires_explicit_allowance() {
+        let allowing = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/delayed",
+            response_with_content_length(0, Vec::new()),
+        )
+        .delayed(Duration::from_millis(1))]);
+        let allowing_address = format!(
+            "127.0.0.1:{}",
+            allowing.base_url().port().expect("test server port")
+        );
+        let stream = std::net::TcpStream::connect(allowing_address).unwrap();
+        drop(stream);
+        allowing.join_allowing_client_disconnect().unwrap();
+
+        let strict = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/delayed",
+            response_with_content_length(0, Vec::new()),
+        )
+        .delayed(Duration::from_millis(1))]);
+        let strict_address = format!(
+            "127.0.0.1:{}",
+            strict.base_url().port().expect("test server port")
+        );
+        let stream = std::net::TcpStream::connect(strict_address).unwrap();
+        drop(stream);
+        let error = strict.join().unwrap_err();
+        assert!(error.contains("client disconnected"));
+    }
+
+    #[test]
+    fn test_server_non_delayed_client_disconnect_requires_explicit_allowance() {
+        let allowing = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/immediate",
+            response_with_content_length(0, Vec::new()),
+        )]);
+        let allowing_address = format!(
+            "127.0.0.1:{}",
+            allowing.base_url().port().expect("test server port")
+        );
+        drop(std::net::TcpStream::connect(allowing_address).unwrap());
+        allowing.join_allowing_client_disconnect().unwrap();
+
+        let strict = TestServer::new(vec![ExpectedRequest::new(
+            "GET",
+            "/immediate",
+            response_with_content_length(0, Vec::new()),
+        )]);
+        let strict_address = format!(
+            "127.0.0.1:{}",
+            strict.base_url().port().expect("test server port")
+        );
+        drop(std::net::TcpStream::connect(strict_address).unwrap());
+        let error = strict.join().unwrap_err();
+        assert!(error.contains("client disconnected"));
+    }
+
+    #[test]
+    fn client_disconnect_error_kinds_are_typed_and_narrow() {
+        assert!(is_client_disconnect_kind(
+            std::io::ErrorKind::ConnectionReset
+        ));
+        assert!(is_client_disconnect_kind(
+            std::io::ErrorKind::ConnectionAborted
+        ));
+        assert!(is_client_disconnect_kind(std::io::ErrorKind::BrokenPipe));
+        assert!(!is_client_disconnect_kind(std::io::ErrorKind::Other));
+    }
 }

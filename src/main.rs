@@ -15,6 +15,7 @@ mod config;
 mod db;
 mod handlers;
 mod llm;
+mod prompts;
 mod state;
 mod tools;
 mod utils;
@@ -25,12 +26,12 @@ use handlers::codex_admin::{
     CODEX_MODEL_PAGE_CALLBACK_PREFIX, CODEX_MODEL_SELECT_CALLBACK_PREFIX,
     CODEX_REASONING_SELECT_CALLBACK_PREFIX,
 };
-use handlers::commands::{
+use handlers::image::{
     IMAGE_ASPECT_RATIO_CALLBACK_PREFIX, IMAGE_CODEX_SIZE_CALLBACK_PREFIX,
     IMAGE_MODEL_CALLBACK_PREFIX, IMAGE_RESOLUTION_CALLBACK_PREFIX,
 };
 use handlers::qa::MODEL_CALLBACK_PREFIX;
-use handlers::{commands, qa};
+use handlers::{media, qa};
 use state::AppState;
 use utils::logging::init_logging;
 
@@ -283,19 +284,19 @@ async fn handle_command(
     // Light commands answer inline; everything else runs on its own task so
     // the dispatcher keeps draining updates while the LLM works.
     match command {
-        Command::Start => commands::start_handler(bot, message).await?,
-        Command::Help => commands::help_handler(bot, message).await?,
-        Command::Support => commands::support_handler(bot, message).await?,
+        Command::Start => handlers::help::start_handler(bot, message).await?,
+        Command::Help => handlers::help::help_handler(bot, message).await?,
+        Command::Support => handlers::help::support_handler(bot, message).await?,
         Command::Tldr(arg) => {
             spawn_logged(
                 "tldr",
-                commands::tldr_handler(bot, state, message, optional_arg(arg)),
+                handlers::tldr::tldr_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Factcheck(arg) => {
             spawn_logged(
                 "factcheck",
-                commands::factcheck_handler(bot, state, message, optional_arg(arg)),
+                handlers::factcheck::factcheck_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Q(arg) => {
@@ -313,13 +314,18 @@ async fn handle_command(
         Command::BurnBabyBurn => {
             spawn_logged(
                 "burn_baby_burn",
-                commands::burn_baby_burn_handler(bot, state, message),
+                handlers::token_stats::burn_baby_burn_handler(bot, state, message),
             );
         }
         Command::TokenDevourers(arg) => {
             spawn_logged(
                 "token_devourers",
-                commands::token_devourers_handler(bot, state, message, optional_arg(arg)),
+                handlers::token_stats::token_devourers_handler(
+                    bot,
+                    state,
+                    message,
+                    optional_arg(arg),
+                ),
             );
         }
         Command::S(arg) => {
@@ -328,61 +334,67 @@ async fn handle_command(
         Command::Img(arg) => {
             spawn_logged(
                 "img",
-                commands::img_handler(bot, state, message, optional_arg(arg)),
+                handlers::image::img_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Img2(arg) => {
             spawn_logged(
                 "img2",
-                commands::img2_handler(bot, state, message, optional_arg(arg)),
+                handlers::image::img2_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Image(arg) => {
             spawn_logged(
                 "image",
-                commands::image_handler(bot, state, message, optional_arg(arg)),
+                handlers::image::image_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Vid(arg) => {
             spawn_logged(
                 "vid",
-                commands::vid_handler(bot, state, message, optional_arg(arg)),
+                handlers::image::vid_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Mysong(arg) => {
             spawn_logged(
                 "mysong",
-                commands::mysong_handler(bot, state, message, optional_arg(arg)),
+                handlers::mysong::mysong_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Profileme(arg) => {
             spawn_logged(
                 "profileme",
-                commands::profileme_handler(bot, state, message, optional_arg(arg)),
+                handlers::persona::profileme_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Paintme => {
             spawn_logged(
                 "paintme",
-                commands::paintme_handler(bot, state, message, false),
+                handlers::persona::paintme_handler(bot, state, message, false),
             );
         }
         Command::Portraitme => {
             spawn_logged(
                 "portraitme",
-                commands::paintme_handler(bot, state, message, true),
+                handlers::persona::paintme_handler(bot, state, message, true),
             );
         }
         Command::Status => {
-            spawn_logged("status", commands::status_handler(bot, state, message));
+            spawn_logged(
+                "status",
+                handlers::admin::status_handler(bot, state, message),
+            );
         }
         Command::Diagnose => {
-            spawn_logged("diagnose", commands::diagnose_handler(bot, state, message));
+            spawn_logged(
+                "diagnose",
+                handlers::admin::diagnose_handler(bot, state, message),
+            );
         }
         Command::TokenStats(arg) => {
             spawn_logged(
                 "token_stats",
-                commands::token_stats_handler(bot, state, message, optional_arg(arg)),
+                handlers::token_stats::token_stats_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Codexlogin => {
@@ -443,14 +455,14 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
     if is_image_selection_callback(&data) {
         spawn_logged(
             "image selection callback",
-            commands::image_selection_callback(bot, state, query),
+            handlers::image::image_selection_callback(bot, state, query),
         );
     }
     Ok(())
 }
 
 async fn handle_media_group(state: AppState, message: Message) -> HandlerResult {
-    commands::handle_media_group(state, message).await;
+    media::handle_media_group(state, message).await;
     Ok(())
 }
 

@@ -16,15 +16,15 @@ use crate::config::{
     ThirdPartyProvider, CONFIG, FACTCHECK_CLAIM_EXTRACTION_PROMPT, FACTCHECK_SYNTHESIS_PROMPT,
     LANGUAGE_POLICY,
 };
-use crate::handlers::media::MediaSummary;
-use crate::handlers::neutralize_closing_tag;
-use crate::handlers::qa::resolve_default_text_model_for_request;
-use crate::llm::media::MediaFile;
+use crate::llm::media::{MediaFile, MediaSummary};
 use crate::llm::runtime_models::runtime_model_config;
+use crate::llm::text_model::{
+    call_configured_text_model, resolve_default_text_model_for_request, ModelRequestCapabilities,
+};
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::text::truncate_for_log;
+use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 
 const EVIDENCE_BLOCK_MAX_CHARS: usize = 2_000;
 const EXTRACTION_INPUT_MAX_CHARS: usize = 24_000;
@@ -73,13 +73,13 @@ pub async fn run_factcheck_pipeline(
 ) -> Result<FactcheckOutcome> {
     let wall_clock = WallClock::start();
 
-    let final_model_id = match resolve_default_text_model_for_request(
-        media_summary.images > 0,
-        media_summary.videos > 0,
-        media_summary.audios > 0,
-        media_summary.documents > 0,
-        false,
-    ) {
+    let final_model_id = match resolve_default_text_model_for_request(ModelRequestCapabilities {
+        has_images: media_summary.images > 0,
+        has_video: media_summary.videos > 0,
+        has_audio: media_summary.audios > 0,
+        has_documents: media_summary.documents > 0,
+        require_tools: false,
+    }) {
         Ok(model) => model,
         Err(err) => {
             warn!("factcheck pipeline could not resolve a model: {err}");
@@ -124,7 +124,7 @@ pub async fn run_factcheck_pipeline(
         .await;
     let system_prompt = build_synthesis_prompt(telegram_user_language_hint);
     let user_content = build_synthesis_input(statement, &evidence);
-    let (text, model_display) = crate::handlers::commands::call_configured_text_model(
+    let (text, model_display) = call_configured_text_model(
         &system_prompt,
         &user_content,
         "Fact Check",

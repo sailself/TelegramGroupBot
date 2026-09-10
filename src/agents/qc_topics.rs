@@ -12,12 +12,11 @@ use crate::agents::step::{call_step_text, parse_lenient_json, StepModel};
 use crate::config::CONFIG;
 use crate::db::database::Database;
 use crate::db::models::{MessageRow, TopicWindowSpec};
-use crate::handlers::neutralize_closing_tag;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::build_message_link;
-use crate::utils::text::truncate_for_log;
+use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
 
 const MAX_TOPIC_MAP_CONCURRENCY: usize = 4;
 

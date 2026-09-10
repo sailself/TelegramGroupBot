@@ -9,7 +9,7 @@ use crate::db::search::derive_search_provenance;
 use crate::handlers::content::create_telegraph_page;
 use crate::state::AppState;
 use crate::utils::telegram::retry_telegram;
-use crate::utils::text::truncate_to_chars;
+use crate::utils::text::{escape_html, truncate_to_chars};
 
 /// Edit a message, retrying only transient Telegram failures. Permanent
 /// rejections (bad markup, unmodified text) surface immediately so callers
@@ -56,7 +56,6 @@ fn overflow_fallback_text(response: &str, max_chars: usize) -> String {
     }
 }
 
-#[allow(deprecated)]
 pub async fn send_response(
     bot: &Bot,
     chat_id: ChatId,
@@ -72,8 +71,11 @@ pub async fn send_response(
                 bot,
                 chat_id,
                 message_id,
-                &format!("I have too much to say. [View it here]({})", url),
-                Some(ParseMode::Markdown),
+                &format!(
+                    "I have too much to say. <a href=\"{}\">View it here</a>",
+                    escape_html(&url)
+                ),
+                Some(ParseMode::Html),
             )
             .await?;
             return Ok(());

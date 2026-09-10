@@ -1,80 +1,18 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use reqwest::Response;
-use std::sync::LazyLock;
-use tokio::sync::Semaphore;
-use tokio::task::{JoinError, JoinHandle};
 use url::Url;
 
 use crate::config::Config;
+use crate::tools::twitter_extractor::model::XPost;
+use crate::utils::http::NoRedirectClient;
 
 pub(crate) mod fxtwitter;
 pub(crate) mod jina;
 pub(crate) mod vxtwitter;
 
-static BLOCKING_PARSER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(4)));
-
 const TWITTER_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-
-struct AbortOnDropParser<T> {
-    handle: Option<JoinHandle<T>>,
-}
-
-impl<T> AbortOnDropParser<T> {
-    fn new(handle: JoinHandle<T>) -> Self {
-        Self {
-            handle: Some(handle),
-        }
-    }
-
-    async fn join(mut self) -> Result<T, JoinError> {
-        let result = self
-            .handle
-            .as_mut()
-            .expect("parser handle should remain owned until join")
-            .await;
-        self.handle.take();
-        result
-    }
-}
-
-impl<T> Drop for AbortOnDropParser<T> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-    }
-}
-
-async fn run_blocking_parser<F, T>(parser: F) -> Result<T, JoinError>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    run_blocking_parser_with_semaphore(BLOCKING_PARSER_SEMAPHORE.clone(), parser).await
-}
-
-async fn run_blocking_parser_with_semaphore<F, T>(
-    semaphore: Arc<Semaphore>,
-    parser: F,
-) -> Result<T, JoinError>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    let permit = semaphore
-        .acquire_owned()
-        .await
-        .expect("static parser semaphore must remain open");
-    AbortOnDropParser::new(tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        parser()
-    }))
-    .join()
-    .await
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TwitterProvider {
@@ -223,63 +161,115 @@ impl TryFrom<&Config> for TwitterFetchConfig {
 
 pub(crate) async fn read_limited_body(
     provider: TwitterProvider,
-    mut response: Response,
+    response: Response,
     max_bytes: usize,
-) -> std::result::Result<Vec<u8>, ProviderError> {
+) -> std::result::Result<bytes::Bytes, ProviderError> {
     let status = response.status();
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_bytes as u64)
-    {
-        return Err(ProviderError {
-            provider,
-            kind: ProviderErrorKind::BodyTooLarge,
-            status: Some(status),
-            detail: "provider response exceeds configured byte limit".to_string(),
-        });
-    }
-
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| ProviderError {
-        provider,
-        kind: ProviderErrorKind::Transport,
-        status: Some(status),
-        detail: "provider response body read failed".to_string(),
-    })? {
-        if body.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(ProviderError {
+    crate::utils::http::read_body_capped("twitter provider", response, max_bytes)
+        .await
+        .map_err(|err| match err {
+            crate::utils::http::BodyCapError::DeclaredTooLarge { .. }
+            | crate::utils::http::BodyCapError::StreamedTooLarge { .. } => ProviderError {
                 provider,
                 kind: ProviderErrorKind::BodyTooLarge,
                 status: Some(status),
                 detail: "provider response exceeds configured byte limit".to_string(),
+            },
+            crate::utils::http::BodyCapError::Read { .. } => ProviderError {
+                provider,
+                kind: ProviderErrorKind::Transport,
+                status: Some(status),
+                detail: "provider response body read failed".to_string(),
+            },
+        })
+}
+
+/// Everything a provider's HTTP request needs beyond the endpoint URL: the
+/// client to send it with (each provider is invoked with the same shared,
+/// no-redirect client the extractor holds), an optional bearer token (jina
+/// only), and an optional `User-Agent` override (fx/vx only).
+pub(super) struct ProviderFetch<'a> {
+    pub(super) url: Url,
+    pub(super) bearer: Option<&'a str>,
+    pub(super) user_agent: Option<&'static str>,
+    pub(super) client: &'a NoRedirectClient,
+    pub(super) provider: TwitterProvider,
+}
+
+/// One GET with the shared no-redirect client, bounded by `timeout` and
+/// `max_bytes`; returns the status and body so the caller's `parse` can
+/// back-fill the status on error.
+pub(super) async fn fetch_provider_body(
+    fetch: ProviderFetch<'_>,
+    max_bytes: usize,
+    timeout: Duration,
+) -> std::result::Result<(reqwest::StatusCode, bytes::Bytes), ProviderError> {
+    let provider = fetch.provider;
+    let future = async {
+        let mut request = fetch.client.get(fetch.url);
+        if let Some(agent) = fetch.user_agent {
+            request = request.header(reqwest::header::USER_AGENT, agent);
+        }
+        if let Some(token) = fetch.bearer {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|_| ProviderError {
+            provider,
+            kind: ProviderErrorKind::Transport,
+            status: None,
+            detail: "provider request failed".to_string(),
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProviderError {
+                provider,
+                kind: ProviderErrorKind::HttpStatus,
+                status: Some(status),
+                detail: "provider returned a non-success status".to_string(),
             });
         }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+        let body = read_limited_body(provider, response, max_bytes).await?;
+        Ok((status, body))
+    };
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| ProviderError {
+            provider,
+            kind: ProviderErrorKind::Timeout,
+            status: None,
+            detail: "provider request timed out".to_string(),
+        })?
+}
+
+/// Fetches the provider's response then hands the body to `parse`; if
+/// `parse` fails without a status, back-fills the HTTP status observed on
+/// the wire (every provider gets this uniformly now, closing a gap where
+/// jina previously did not).
+pub(super) async fn fetch_and_parse<P>(
+    fetch: ProviderFetch<'_>,
+    max_bytes: usize,
+    timeout: Duration,
+    parse: P,
+) -> std::result::Result<XPost, ProviderError>
+where
+    P: FnOnce(&[u8]) -> std::result::Result<XPost, ProviderError>,
+{
+    let (status, body) = fetch_provider_body(fetch, max_bytes, timeout).await?;
+    parse(&body).map_err(|mut error| {
+        if error.status.is_none() {
+            error.status = Some(status);
+        }
+        error
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
     use super::*;
     use crate::config::CONFIG;
     use crate::tools::twitter_extractor::test_support::{
-        chunked_response, is_client_disconnect_kind, response_with_content_length, ExpectedRequest,
-        TestServer,
+        chunked_response, response_with_content_length, ExpectedRequest, TestServer,
     };
-
-    fn join_with_timeout(server: TestServer) -> Result<Result<(), String>, &'static str> {
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(server.join());
-        });
-        receiver
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| "TestServer::join timed out")
-    }
 
     #[test]
     fn provider_names_round_trip_without_aliases() {
@@ -359,120 +349,5 @@ mod tests {
             TwitterFetchConfig::try_from(&enabled).unwrap().providers,
             vec![TwitterProvider::Jina]
         );
-    }
-
-    #[test]
-    fn test_server_join_surfaces_missing_expectations_without_hanging() {
-        let server = TestServer::new(vec![ExpectedRequest::new(
-            "GET",
-            "/never-requested",
-            response_with_content_length(0, Vec::new()),
-        )]);
-        let error = join_with_timeout(server)
-            .expect("missing-expectation join must terminate")
-            .unwrap_err();
-        assert!(error.contains("unmet"));
-    }
-
-    #[tokio::test]
-    async fn test_server_join_surfaces_unexpected_extra_requests() {
-        let server = TestServer::single(response_with_content_length(0, Vec::new()));
-        let client = reqwest::Client::new();
-        client.get(server.url("/first")).send().await.unwrap();
-        let extra = client.get(server.url("/extra")).send().await.unwrap();
-        assert_eq!(extra.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-        let error = join_with_timeout(server)
-            .expect("extra-request join must terminate")
-            .unwrap_err();
-        assert!(error.contains("unexpected extra request"));
-    }
-
-    #[tokio::test]
-    async fn delayed_join_still_surfaces_request_mismatch() {
-        let server = TestServer::new(vec![ExpectedRequest::new(
-            "GET",
-            "/expected",
-            response_with_content_length(0, Vec::new()),
-        )
-        .delayed(Duration::from_millis(1))]);
-        reqwest::Client::new()
-            .get(server.url("/wrong"))
-            .send()
-            .await
-            .unwrap();
-        let error = server.join_allowing_client_disconnect().unwrap_err();
-        assert!(error.contains("expected path"));
-    }
-
-    #[test]
-    fn test_server_client_disconnect_requires_explicit_allowance() {
-        let allowing = TestServer::new(vec![ExpectedRequest::new(
-            "GET",
-            "/delayed",
-            response_with_content_length(0, Vec::new()),
-        )
-        .delayed(Duration::from_millis(1))]);
-        let allowing_address = format!(
-            "127.0.0.1:{}",
-            allowing.base_url().port().expect("test server port")
-        );
-        let stream = std::net::TcpStream::connect(allowing_address).unwrap();
-        drop(stream);
-        allowing.join_allowing_client_disconnect().unwrap();
-
-        let strict = TestServer::new(vec![ExpectedRequest::new(
-            "GET",
-            "/delayed",
-            response_with_content_length(0, Vec::new()),
-        )
-        .delayed(Duration::from_millis(1))]);
-        let strict_address = format!(
-            "127.0.0.1:{}",
-            strict.base_url().port().expect("test server port")
-        );
-        let stream = std::net::TcpStream::connect(strict_address).unwrap();
-        drop(stream);
-        let error = strict.join().unwrap_err();
-        assert!(error.contains("client disconnected"));
-    }
-
-    #[test]
-    fn test_server_non_delayed_client_disconnect_requires_explicit_allowance() {
-        let allowing = TestServer::new(vec![ExpectedRequest::new(
-            "GET",
-            "/immediate",
-            response_with_content_length(0, Vec::new()),
-        )]);
-        let allowing_address = format!(
-            "127.0.0.1:{}",
-            allowing.base_url().port().expect("test server port")
-        );
-        drop(std::net::TcpStream::connect(allowing_address).unwrap());
-        allowing.join_allowing_client_disconnect().unwrap();
-
-        let strict = TestServer::new(vec![ExpectedRequest::new(
-            "GET",
-            "/immediate",
-            response_with_content_length(0, Vec::new()),
-        )]);
-        let strict_address = format!(
-            "127.0.0.1:{}",
-            strict.base_url().port().expect("test server port")
-        );
-        drop(std::net::TcpStream::connect(strict_address).unwrap());
-        let error = strict.join().unwrap_err();
-        assert!(error.contains("client disconnected"));
-    }
-
-    #[test]
-    fn client_disconnect_error_kinds_are_typed_and_narrow() {
-        assert!(is_client_disconnect_kind(
-            std::io::ErrorKind::ConnectionReset
-        ));
-        assert!(is_client_disconnect_kind(
-            std::io::ErrorKind::ConnectionAborted
-        ));
-        assert!(is_client_disconnect_kind(std::io::ErrorKind::BrokenPipe));
-        assert!(!is_client_disconnect_kind(std::io::ErrorKind::Other));
     }
 }

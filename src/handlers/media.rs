@@ -9,7 +9,7 @@ use teloxide::types::FileId;
 
 use crate::config::CONFIG;
 use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
-use crate::state::AppState;
+use crate::state::{AppState, MediaGroupItem};
 use crate::utils::ttl_cache::TtlCache;
 
 const DEFAULT_MAX_FILES: usize = 10;
@@ -51,33 +51,6 @@ impl MediaCollectionOptions {
             max_files: DEFAULT_MAX_FILES,
         }
     }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MediaSummary {
-    pub total: usize,
-    pub images: usize,
-    pub videos: usize,
-    pub audios: usize,
-    pub documents: usize,
-}
-
-pub fn summarize_media_files(files: &[MediaFile]) -> MediaSummary {
-    let mut summary = MediaSummary {
-        total: files.len(),
-        ..MediaSummary::default()
-    };
-
-    for file in files {
-        match file.kind {
-            MediaKind::Image => summary.images += 1,
-            MediaKind::Video => summary.videos += 1,
-            MediaKind::Audio => summary.audios += 1,
-            MediaKind::Document => summary.documents += 1,
-        }
-    }
-
-    summary
 }
 
 pub async fn get_file_url(bot: &Bot, file_id: &FileId) -> Result<String> {
@@ -416,6 +389,58 @@ pub async fn collect_message_media(
     }
 
     collection
+}
+
+pub(crate) fn message_has_image(message: &Message) -> bool {
+    if message.photo().is_some() {
+        return true;
+    }
+
+    if let Some(document) = message.document() {
+        let mime_is_image = document
+            .mime_type
+            .as_ref()
+            .map(|mime| mime.essence_str().starts_with("image/"))
+            .unwrap_or(false);
+        let name_is_image = document
+            .file_name
+            .as_ref()
+            .map(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.ends_with(".png")
+                    || lower.ends_with(".jpg")
+                    || lower.ends_with(".jpeg")
+                    || lower.ends_with(".webp")
+                    || lower.ends_with(".gif")
+            })
+            .unwrap_or(false);
+        if mime_is_image || name_is_image {
+            return true;
+        }
+    }
+
+    if let Some(sticker) = message.sticker() {
+        if !sticker.flags.is_animated && !sticker.flags.is_video {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub async fn handle_media_group(state: AppState, message: Message) {
+    if let Some(media_group_id) = message.media_group_id() {
+        if let Some(photo_sizes) = message.photo() {
+            if let Some(photo) = photo_sizes.last() {
+                state.store_media_group_item(
+                    media_group_id,
+                    MediaGroupItem {
+                        file_id: photo.file.id.clone(),
+                    },
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
