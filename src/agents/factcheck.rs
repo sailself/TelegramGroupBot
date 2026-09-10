@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::agents::common::{
-    call_step_json, map_bounded, ModelAnswer, PipelineOutcome, WEB_RESULTS_PER_QUERY,
+    call_step_json, map_bounded, ModelAnswer, PipelineOutcome, ProgressHook, WEB_RESULTS_PER_QUERY,
 };
 use crate::agents::step::{resolve_step_model, StepModel, WallClock};
 use crate::config::{
@@ -219,8 +219,6 @@ async fn research_claims(
     wall_clock: &WallClock,
     progress: &mut ProgressReporter,
 ) -> Vec<ClaimEvidence> {
-    let total = claims.len();
-
     if !web_search::is_search_enabled() {
         warn!("factcheck research skipped: no web search provider is enabled");
         return claims
@@ -234,9 +232,6 @@ async fn research_claims(
             .collect();
     }
 
-    progress
-        .update(&format!("Researching {total} claim(s)..."))
-        .await;
     // Keep the claim text so a timed-out (never-started) claim still names
     // itself in the fallback evidence below; `map_bounded` only hands back a
     // `Result`, not the original item, once a task doesn't complete.
@@ -245,6 +240,10 @@ async fn research_claims(
         claims,
         CONFIG.factcheck_claim_concurrency,
         wall_clock,
+        Some(ProgressHook {
+            reporter: progress,
+            label: "Researching claims...",
+        }),
         |_, claim| async move {
             let evidence_blocks = research_single_claim(&claim).await;
             Ok(ClaimEvidence {

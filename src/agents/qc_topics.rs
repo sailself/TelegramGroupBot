@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::agents::common::{call_step_json, map_bounded};
+use crate::agents::common::{call_step_json, map_bounded, ProgressHook};
 use crate::agents::qc::{compose_final_answer, QcAgentOutcome, QcPipelineResult, QcRequest};
 use crate::agents::step::{StepModel, WallClock};
 use crate::config::CONFIG;
@@ -637,12 +637,7 @@ async fn map_topic_chunks(
         .chunks(CONFIG.tldr_chunk_size.max(1))
         .map(<[MessageRow]>::to_vec)
         .collect();
-    let total = chunks.len();
     let chunk_lens: Vec<usize> = chunks.iter().map(Vec::len).collect();
-
-    progress
-        .update(&format!("Analyzing {total} topic chunk(s)..."))
-        .await;
 
     let step_model = step_model.clone();
     let audit_context = audit_context.cloned();
@@ -650,6 +645,10 @@ async fn map_topic_chunks(
         chunks,
         MAX_TOPIC_MAP_CONCURRENCY,
         clock,
+        Some(ProgressHook {
+            reporter: progress,
+            label: "Analyzing topic chunks...",
+        }),
         move |chunk_index, chunk| {
             let step_model = step_model.clone();
             let audit_context = audit_context.clone();

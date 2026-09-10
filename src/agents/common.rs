@@ -16,6 +16,7 @@ use tracing::warn;
 use crate::agents::step::{call_step_text, parse_lenient_json, StepModel, WallClock};
 use crate::llm::media::MediaFile;
 use crate::llm::LlmAuditContext;
+use crate::utils::progress::ProgressSink;
 use crate::utils::text::neutralize_closing_tag;
 
 /// Web search results requested per query across the agentic pipelines.
@@ -45,6 +46,16 @@ pub fn fence(tag: &str, body: &str) -> String {
     format!("<{tag}>\n{body}\n</{tag}>")
 }
 
+/// Optional per-completion progress for [`map_bounded`]: after each item
+/// finishes (successfully or not), the reporter shows
+/// `"{label} ({done}/{total})"`, exactly as the callers' old hand-rolled
+/// admission loops did. `reporter` is a [`ProgressSink`] rather than a
+/// concrete `ProgressReporter` so tests can drive it with a fake sink.
+pub struct ProgressHook<'a> {
+    pub reporter: &'a mut (dyn ProgressSink + Send),
+    pub label: &'static str,
+}
+
 /// Run `f` over `items` with at most `concurrency` in flight, admitting new
 /// items only while `clock` has budget left. Results are returned in input
 /// order; items never started (because the clock ran out first) and tasks
@@ -53,6 +64,7 @@ pub async fn map_bounded<I, T, F, Fut>(
     items: Vec<I>,
     concurrency: usize,
     clock: &WallClock,
+    progress: Option<ProgressHook<'_>>,
     f: F,
 ) -> Vec<Result<T>>
 where
@@ -64,6 +76,7 @@ where
     let total = items.len();
     let concurrency = concurrency.max(1);
     let f = Arc::new(f);
+    let mut progress = progress;
 
     // Reversed so `pop()` yields items in original order.
     let mut pending: Vec<(usize, I)> = items.into_iter().enumerate().collect();
@@ -72,6 +85,7 @@ where
     let mut results: Vec<Option<Result<T>>> = (0..total).map(|_| None).collect();
     let mut join_set: JoinSet<(usize, Result<T>)> = JoinSet::new();
     let mut task_index: HashMap<tokio::task::Id, usize> = HashMap::new();
+    let mut done = 0usize;
 
     loop {
         while join_set.len() < concurrency && !clock.exceeded() {
@@ -99,6 +113,13 @@ where
                 }
             }
             None => break,
+        }
+
+        done += 1;
+        if let Some(hook) = progress.as_mut() {
+            hook.reporter
+                .update_text(format!("{} ({done}/{total})", hook.label))
+                .await;
         }
     }
 
@@ -183,7 +204,7 @@ mod tests {
 
         let active_for_task = Arc::clone(&active);
         let high_water_for_task = Arc::clone(&high_water);
-        let results = map_bounded(items, 2, &clock, move |index, item| {
+        let results = map_bounded(items, 2, &clock, None, move |index, item| {
             let active = Arc::clone(&active_for_task);
             let high_water = Arc::clone(&high_water_for_task);
             async move {
@@ -210,7 +231,7 @@ mod tests {
         let clock = WallClock::for_budget(Duration::from_secs(0));
         let items = vec![1, 2, 3];
 
-        let results = map_bounded(items, 2, &clock, |_, item: i32| async move {
+        let results = map_bounded(items, 2, &clock, None, |_, item: i32| async move {
             Ok::<i32, anyhow::Error>(item)
         })
         .await;
@@ -219,6 +240,52 @@ mod tests {
         assert!(
             results.iter().all(|result| result.is_err()),
             "an exhausted clock must admit no work at all"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        updates: Vec<String>,
+    }
+
+    impl ProgressSink for RecordingSink {
+        fn update_text<'a>(
+            &'a mut self,
+            text: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                self.updates.push(text);
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn map_bounded_reports_progress_after_each_completion() {
+        let clock = WallClock::for_budget(Duration::from_secs(30));
+        let items: Vec<usize> = (0..4).collect();
+        let total = items.len();
+        let mut sink = RecordingSink::default();
+
+        let results = map_bounded(
+            items,
+            2,
+            &clock,
+            Some(ProgressHook {
+                reporter: &mut sink,
+                label: "Testing items...",
+            }),
+            |_, item| async move { Ok::<usize, anyhow::Error>(item) },
+        )
+        .await;
+
+        assert_eq!(results.len(), total);
+        assert_eq!(sink.updates.len(), total);
+        for (index, text) in sink.updates.iter().enumerate() {
+            assert_eq!(text, &format!("Testing items... ({}/{total})", index + 1));
+        }
+        assert_eq!(
+            sink.updates.last().unwrap(),
+            &format!("Testing items... ({total}/{total})")
         );
     }
 
