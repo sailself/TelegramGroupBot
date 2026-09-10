@@ -106,6 +106,16 @@ fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPart
     }
 }
 
+/// The request capabilities a media-kind flag stands for in the picker tests.
+fn media_request(has_images: bool, has_video: bool, has_audio: bool) -> ModelRequestCapabilities {
+    ModelRequestCapabilities {
+        has_images,
+        has_video,
+        has_audio,
+        ..ModelRequestCapabilities::default()
+    }
+}
+
 fn snapshot_of(
     models: Vec<ThirdPartyModelConfig>,
     ready_providers: &[ThirdPartyProvider],
@@ -963,7 +973,10 @@ fn audio_selection_includes_only_audio_capable_ready_models() {
 
     let snapshot = snapshot_of(models, &[ThirdPartyProvider::Nvidia]);
     let keyboard = create_model_selection_keyboard_with_models(
-        &snapshot, false, "gemini", false, false, true, false, false,
+        &snapshot,
+        false,
+        "gemini",
+        media_request(false, false, true),
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -991,7 +1004,9 @@ fn selectable_models_returns_single_audio_model_when_it_is_the_only_option() {
 
     let snapshot = snapshot_of(models, &[ThirdPartyProvider::Nvidia]);
     let model_ids = selectable_model_ids_for_request_with_models(
-        &snapshot, false, false, false, true, false, false,
+        &snapshot,
+        false,
+        media_request(false, false, true),
     );
 
     assert_eq!(model_ids, vec!["nvidia:nemotron-omni"]);
@@ -1009,7 +1024,9 @@ fn selectable_models_keeps_picker_when_gemini_and_audio_model_are_available() {
 
     let snapshot = snapshot_of(models, &[ThirdPartyProvider::Nvidia]);
     let model_ids = selectable_model_ids_for_request_with_models(
-        &snapshot, true, false, false, true, false, false,
+        &snapshot,
+        true,
+        media_request(false, false, true),
     );
 
     assert_eq!(
@@ -1022,7 +1039,10 @@ fn selectable_models_keeps_picker_when_gemini_and_audio_model_are_available() {
 fn model_selection_keyboard_omits_gemini_when_disabled() {
     let snapshot = snapshot_of(Vec::new(), &[]);
     let keyboard = create_model_selection_keyboard_with_models(
-        &snapshot, false, "gemini", false, false, false, false, false,
+        &snapshot,
+        false,
+        "gemini",
+        ModelRequestCapabilities::default(),
     );
 
     let callbacks = keyboard
@@ -1055,7 +1075,10 @@ fn video_selection_includes_only_video_capable_ready_models() {
 
     let snapshot = snapshot_of(models, &[ThirdPartyProvider::Nvidia]);
     let keyboard = create_model_selection_keyboard_with_models(
-        &snapshot, false, "gemini", false, true, false, false, false,
+        &snapshot,
+        false,
+        "gemini",
+        media_request(false, true, false),
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -1084,11 +1107,7 @@ fn model_selection_keyboard_compacts_long_third_party_model_callbacks() {
         &snapshot,
         false,
         &long_model.id,
-        false,
-        false,
-        false,
-        false,
-        false,
+        ModelRequestCapabilities::default(),
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -1127,11 +1146,7 @@ fn model_selection_keyboard_puts_default_third_party_model_first() {
         &snapshot,
         true,
         "nvidia:nv-qwen",
-        false,
-        false,
-        false,
-        false,
-        false,
+        ModelRequestCapabilities::default(),
     );
     let callbacks = keyboard
         .inline_keyboard

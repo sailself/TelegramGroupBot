@@ -120,28 +120,16 @@ where
         .unwrap_or(PendingQRequestCallbackAction::Missing)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn create_model_selection_keyboard_with_models(
     snapshot: &ModelCatalogSnapshot,
     gemini_available: bool,
     default_model: &str,
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> InlineKeyboardMarkup {
     let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     let default_model_key = default_model_selection_key(default_model, &snapshot.models);
-    let selectable_model_ids = selectable_model_ids_for_request_with_models(
-        snapshot,
-        gemini_available,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    );
+    let selectable_model_ids =
+        selectable_model_ids_for_request_with_models(snapshot, gemini_available, request);
     let mut model_buttons = selectable_model_ids
         .iter()
         .map(|model_id| {
@@ -170,21 +158,13 @@ pub(super) fn create_model_selection_keyboard_with_models(
 
 pub(super) fn create_model_selection_keyboard(
     snapshot: &ModelCatalogSnapshot,
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> InlineKeyboardMarkup {
     create_model_selection_keyboard_with_models(
         snapshot,
         CONFIG.gemini_api_available(),
         &CONFIG.default_text_model,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
+        request,
     )
 }
 
@@ -195,18 +175,11 @@ pub(super) async fn process_timed_out_q_request_with_default_model(
 ) {
     let snapshot = ModelCatalogSnapshot::load();
     let summary = summarize_media_files(&request.enrichment.media_files);
-    let has_images = summary.images > 0;
-    let has_video = summary.videos > 0;
-    let has_audio = summary.audios > 0;
-    let has_documents = summary.documents > 0;
     let mode = request.mode;
-    let resolved = resolve_default_text_model_for_request(ModelRequestCapabilities {
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools: mode.requires_custom_tools(),
-    })
+    let resolved = resolve_default_text_model_for_request(ModelRequestCapabilities::from_media(
+        &summary,
+        mode.requires_custom_tools(),
+    ))
     .and_then(|model_id| QaModel::resolve(&model_id, &snapshot, None));
     let model = match resolved {
         Ok(model) => model,
@@ -297,17 +270,12 @@ pub async fn model_selection_callback(
             CONFIG.model_selection_timeout,
             |request| {
                 let summary = summarize_media_files(&request.enrichment.media_files);
-                let has_images = summary.images > 0;
-                let has_video = summary.videos > 0;
-                let has_audio = summary.audios > 0;
-                let has_documents = summary.documents > 0;
                 model_supports_media_for_request(
                     &selected_model,
-                    has_images,
-                    has_video,
-                    has_audio,
-                    has_documents,
-                    request.mode.requires_custom_tools(),
+                    ModelRequestCapabilities::from_media(
+                        &summary,
+                        request.mode.requires_custom_tools(),
+                    ),
                 )
             },
         )

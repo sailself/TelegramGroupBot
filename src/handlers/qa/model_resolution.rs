@@ -516,10 +516,7 @@ pub(super) fn should_use_default_model_without_selection(
 
 pub(super) async fn resolve_quick_text_model_for_request(
     snapshot: &ModelCatalogSnapshot,
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
+    request: ModelRequestCapabilities,
 ) -> Result<PreparedQuickTextModel> {
     let configured_model_id = CONFIG.default_quick_text_model.trim();
     let explicit = match parse_third_party_model_id(configured_model_id) {
@@ -545,13 +542,7 @@ pub(super) async fn resolve_quick_text_model_for_request(
         &snapshot.models,
         &snapshot.ready_providers,
         CONFIG.gemini_api_available(),
-        ModelRequestCapabilities {
-            has_images,
-            has_video,
-            has_audio,
-            has_documents,
-            require_tools: false,
-        },
+        request,
         explicit,
         ExplicitCodexReadiness {
             enabled: CONFIG.enable_openai_codex,
@@ -562,15 +553,10 @@ pub(super) async fn resolve_quick_text_model_for_request(
     .map_err(|message| anyhow!(message))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn selectable_model_ids_for_request_with_models(
     snapshot: &ModelCatalogSnapshot,
     gemini_available: bool,
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> Vec<String> {
     let mut model_ids = Vec::new();
     if gemini_available {
@@ -581,11 +567,7 @@ pub(super) fn selectable_model_ids_for_request_with_models(
         available_third_party_models_for_request(
             &snapshot.models,
             &snapshot.ready_providers,
-            has_images,
-            has_video,
-            has_audio,
-            has_documents,
-            require_tools,
+            request,
         )
         .into_iter()
         .filter_map(|config| {
@@ -599,21 +581,9 @@ pub(super) fn selectable_model_ids_for_request_with_models(
 
 pub(super) fn selectable_model_ids_for_request(
     snapshot: &ModelCatalogSnapshot,
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> Vec<String> {
-    selectable_model_ids_for_request_with_models(
-        snapshot,
-        CONFIG.gemini_api_available(),
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    )
+    selectable_model_ids_for_request_with_models(snapshot, CONFIG.gemini_api_available(), request)
 }
 
 pub(super) fn default_model_selection_key(

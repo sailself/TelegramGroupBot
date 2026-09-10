@@ -270,21 +270,10 @@ async fn q_handler_internal(
     let has_audio = media_summary.audios > 0;
     let has_documents = media_summary.documents > 0;
 
-    let require_tools = mode.requires_custom_tools();
-    let request_capabilities = ModelRequestCapabilities {
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    };
-    let third_party_models_available_for_request = has_available_third_party_models_for_request(
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    );
+    let request_capabilities =
+        ModelRequestCapabilities::from_media(&media_summary, mode.requires_custom_tools());
+    let third_party_models_available_for_request =
+        has_available_third_party_models_for_request(request_capabilities);
     if has_video
         && !video_request_has_capable_model(
             CONFIG.gemini_api_available(),
@@ -319,21 +308,15 @@ async fn q_handler_internal(
     );
     let direct_model = if must_use_default_model {
         let resolved = if mode == QaCommandMode::Quick {
-            resolve_quick_text_model_for_request(
-                &snapshot,
-                has_images,
-                has_video,
-                has_audio,
-                has_documents,
-            )
-            .await
-            .map(|prepared| {
-                (
-                    prepared.model_id.clone(),
-                    "default_quick_text_model",
-                    Some(prepared),
-                )
-            })
+            resolve_quick_text_model_for_request(&snapshot, request_capabilities)
+                .await
+                .map(|prepared| {
+                    (
+                        prepared.model_id.clone(),
+                        "default_quick_text_model",
+                        Some(prepared),
+                    )
+                })
         } else {
             resolve_default_text_model_for_request(request_capabilities)
                 .map(|model| (model, "default_text_model", None))
@@ -354,14 +337,8 @@ async fn q_handler_internal(
             }
         }
     } else {
-        let selectable_model_ids = selectable_model_ids_for_request(
-            &snapshot,
-            has_images,
-            has_video,
-            has_audio,
-            has_documents,
-            require_tools,
-        );
+        let selectable_model_ids =
+            selectable_model_ids_for_request(&snapshot, request_capabilities);
         if selectable_model_ids.len() == 1 {
             selectable_model_ids
                 .into_iter()
@@ -478,14 +455,7 @@ async fn q_handler_internal(
         selection_text.push_str("\n\n<i>Note: Only models that support media are shown.</i>");
     }
 
-    let keyboard = create_model_selection_keyboard(
-        &snapshot,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    );
+    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities);
     let selection_message = reply_with_retry(
         &bot,
         message.chat.id,
@@ -640,7 +610,7 @@ pub async fn s_handler(
         ..ModelRequestCapabilities::default()
     };
     let third_party_models_available_for_request =
-        has_available_third_party_models_for_request(false, false, false, false, true);
+        has_available_third_party_models_for_request(request_capabilities);
     let must_use_default_model = should_use_default_model_without_selection(
         QaCommandMode::ChatSearch,
         request_capabilities,
@@ -668,7 +638,7 @@ pub async fn s_handler(
         }
     } else {
         let selectable_model_ids =
-            selectable_model_ids_for_request(&snapshot, false, false, false, false, true);
+            selectable_model_ids_for_request(&snapshot, request_capabilities);
         if selectable_model_ids.is_empty() {
             reply_with_retry(
                 &bot,
@@ -734,7 +704,7 @@ pub async fn s_handler(
         return Ok(());
     }
 
-    let keyboard = create_model_selection_keyboard(&snapshot, false, false, false, false, true);
+    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities);
     let selection_message = reply_with_retry(
         &bot,
         message.chat.id,

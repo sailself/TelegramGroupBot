@@ -4,7 +4,7 @@ use crate::config::{
     parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
 };
 use crate::llm::audit::LlmAuditContext;
-use crate::llm::media::summarize_media_files;
+use crate::llm::media::{summarize_media_files, MediaSummary};
 use crate::llm::runtime_models::{
     codex_selected_model_label, is_runtime_provider_ready, resolve_runtime_model_identifier,
     runtime_model_config, runtime_models, selected_codex_model_record,
@@ -165,38 +165,21 @@ fn is_third_party_model_available_with_ready_providers(
 }
 
 pub(crate) fn has_available_third_party_models_for_request(
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> bool {
     let models = runtime_models();
     let ready_providers = ready_runtime_providers(&models);
-    !available_third_party_models_for_request(
-        &models,
-        &ready_providers,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    )
-    .is_empty()
+    !available_third_party_models_for_request(&models, &ready_providers, request).is_empty()
 }
 
 pub(crate) fn model_supports_media_for_request(
     model_name: &str,
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> bool {
     if model_name == MODEL_GEMINI {
         return CONFIG.gemini_api_available();
     }
-    if has_documents {
+    if request.has_documents {
         return false;
     }
 
@@ -206,14 +189,7 @@ pub(crate) fn model_supports_media_for_request(
     if !is_third_party_model_available(&config) {
         return false;
     }
-    third_party_model_matches_request_capabilities(
-        &config,
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    )
+    third_party_model_matches_request_capabilities(&config, request)
 }
 
 pub(crate) fn default_text_model_error(model_name: &str, reason: &str) -> String {
@@ -223,13 +199,27 @@ pub(crate) fn default_text_model_error(model_name: &str, reason: &str) -> String
     )
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+/// What one request needs from a model: which media kinds it carries, and
+/// whether the command it came from needs tool calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ModelRequestCapabilities {
     pub(crate) has_images: bool,
     pub(crate) has_video: bool,
     pub(crate) has_audio: bool,
     pub(crate) has_documents: bool,
     pub(crate) require_tools: bool,
+}
+
+impl ModelRequestCapabilities {
+    pub(crate) fn from_media(summary: &MediaSummary, require_tools: bool) -> Self {
+        Self {
+            has_images: summary.images > 0,
+            has_video: summary.videos > 0,
+            has_audio: summary.audios > 0,
+            has_documents: summary.documents > 0,
+            require_tools,
+        }
+    }
 }
 
 pub(crate) fn resolve_default_text_model_with_models(
@@ -270,14 +260,7 @@ pub(crate) fn resolve_default_text_model_with_models(
         return Err(default_text_model_error(&normalized, "unavailable"));
     }
 
-    if !third_party_model_matches_request_capabilities(
-        config,
-        request.has_images,
-        request.has_video,
-        request.has_audio,
-        request.has_documents,
-        request.require_tools,
-    ) {
+    if !third_party_model_matches_request_capabilities(config, request) {
         return Err(default_text_model_error(
             &normalized,
             "unsupported for this request",
@@ -305,25 +288,21 @@ pub(crate) fn resolve_default_text_model_for_request(
 
 fn third_party_model_matches_request_capabilities(
     config: &ThirdPartyModelConfig,
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> bool {
-    if has_documents {
+    if request.has_documents {
         return false;
     }
-    if require_tools && !config.tools {
+    if request.require_tools && !config.tools {
         return false;
     }
-    if has_images && !config.image {
+    if request.has_images && !config.image {
         return false;
     }
-    if has_video && !config.video {
+    if request.has_video && !config.video {
         return false;
     }
-    if has_audio && !config.audio {
+    if request.has_audio && !config.audio {
         return false;
     }
     true
@@ -332,27 +311,14 @@ fn third_party_model_matches_request_capabilities(
 pub(crate) fn available_third_party_models_for_request<'a>(
     models: &'a [ThirdPartyModelConfig],
     ready_providers: &[ThirdPartyProvider],
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> Vec<&'a ThirdPartyModelConfig> {
     models
         .iter()
         .filter(|config| {
             is_third_party_model_available_with_ready_providers(config, ready_providers)
         })
-        .filter(|config| {
-            third_party_model_matches_request_capabilities(
-                config,
-                has_images,
-                has_video,
-                has_audio,
-                has_documents,
-                require_tools,
-            )
-        })
+        .filter(|config| third_party_model_matches_request_capabilities(config, request))
         .collect()
 }
 
@@ -395,13 +361,10 @@ pub(crate) async fn call_configured_text_model(
         .as_ref()
         .map(|files| summarize_media_files(files))
         .unwrap_or_default();
-    let model_name = resolve_default_text_model_for_request(ModelRequestCapabilities {
-        has_images: media_summary.images > 0,
-        has_video: media_summary.videos > 0,
-        has_audio: media_summary.audios > 0,
-        has_documents: media_summary.documents > 0,
-        require_tools: tools_enabled,
-    })?;
+    let model_name = resolve_default_text_model_for_request(ModelRequestCapabilities::from_media(
+        &media_summary,
+        tools_enabled,
+    ))?;
 
     if model_name == MODEL_GEMINI {
         let response = call_gemini(GeminiCallRequest {
@@ -457,6 +420,32 @@ mod tests {
     }
 
     #[test]
+    fn request_capabilities_come_from_the_media_summary() {
+        let summary = MediaSummary {
+            total: 3,
+            images: 2,
+            videos: 0,
+            audios: 1,
+            documents: 0,
+        };
+
+        assert_eq!(
+            ModelRequestCapabilities::from_media(&summary, true),
+            ModelRequestCapabilities {
+                has_images: true,
+                has_video: false,
+                has_audio: true,
+                has_documents: false,
+                require_tools: true,
+            }
+        );
+        assert_eq!(
+            ModelRequestCapabilities::from_media(&MediaSummary::default(), false),
+            ModelRequestCapabilities::default()
+        );
+    }
+
+    #[test]
     fn available_third_party_models_can_require_tools() {
         let mut without_tools = model(
             ThirdPartyProvider::OpenRouter,
@@ -473,11 +462,18 @@ mod tests {
             without_tools,
         ];
 
+        let tool_request = ModelRequestCapabilities {
+            require_tools: true,
+            ..ModelRequestCapabilities::default()
+        };
+
         assert!(third_party_model_matches_request_capabilities(
-            &models[0], false, false, false, false, true,
+            &models[0],
+            tool_request
         ));
         assert!(!third_party_model_matches_request_capabilities(
-            &models[1], false, false, false, false, true,
+            &models[1],
+            tool_request
         ));
     }
 
