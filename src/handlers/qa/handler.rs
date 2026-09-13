@@ -490,7 +490,7 @@ async fn q_handler_internal(
     state.pending_q_requests.insert_with_timeout(
         request_key,
         pending_request,
-        Duration::from_secs(CONFIG.model_selection_timeout),
+        Duration::from_secs(CONFIG.limits.model_selection_timeout),
         move |request| async move {
             process_timed_out_q_request_with_default_model(&timeout_bot, &timeout_state, request)
                 .await;
@@ -730,7 +730,7 @@ pub async fn s_handler(
     state.pending_q_requests.insert_with_timeout(
         request_key,
         pending_request,
-        Duration::from_secs(CONFIG.model_selection_timeout),
+        Duration::from_secs(CONFIG.limits.model_selection_timeout),
         move |request| async move {
             process_timed_out_q_request_with_default_model(&timeout_bot, &timeout_state, request)
                 .await;

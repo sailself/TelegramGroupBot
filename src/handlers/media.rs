@@ -62,7 +62,7 @@ pub async fn get_file_url(bot: &Bot, file_id: &FileId) -> Result<String> {
     let file = bot.get_file(file_id.clone()).await?;
     let url = format!(
         "https://api.telegram.org/file/bot{}/{}",
-        CONFIG.bot_token, file.path
+        CONFIG.telegram.bot_token, file.path
     );
 
     FILE_URL_CACHE.lock().insert(key, url.clone());

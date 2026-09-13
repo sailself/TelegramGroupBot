@@ -32,7 +32,7 @@ impl SearchProvider for JinaSearch {
     }
 
     fn is_enabled(&self) -> bool {
-        CONFIG.enable_jina_mcp
+        CONFIG.jina.enable_mcp
     }
 
     fn search<'a>(
@@ -45,8 +45,8 @@ impl SearchProvider for JinaSearch {
                 return Err(anyhow!("Jina search is disabled."));
             }
             search_jina_web_at(
-                &CONFIG.jina_search_endpoint,
-                &CONFIG.jina_ai_api_key,
+                &CONFIG.search.jina_endpoint,
+                &CONFIG.jina.api_key,
                 query,
                 max_results,
             )

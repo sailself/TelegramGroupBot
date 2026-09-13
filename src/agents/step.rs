@@ -52,11 +52,11 @@ impl StepModel {
 /// `GEMINI_LITE_MODEL`, and other providers reuse the final model as-is.
 pub fn resolve_step_model(final_model_id: &str) -> Result<StepModel> {
     let step_model = resolve_step_model_value(
-        &CONFIG.agent_step_model,
-        &CONFIG.agent_step_reasoning,
+        &CONFIG.agents.step_model,
+        &CONFIG.agents.step_reasoning,
         final_model_id,
-        &CONFIG.gemini_lite_model,
-        &CONFIG.gemini_model,
+        &CONFIG.gemini.lite_model,
+        &CONFIG.gemini.model,
         CONFIG.gemini_api_available(),
         runtime_model_config,
     )?;
@@ -279,7 +279,7 @@ impl WallClock {
     pub fn start() -> Self {
         Self {
             started: Instant::now(),
-            budget: Duration::from_secs(CONFIG.agent_max_wall_clock_secs),
+            budget: Duration::from_secs(CONFIG.agents.max_wall_clock_secs),
         }
     }
 

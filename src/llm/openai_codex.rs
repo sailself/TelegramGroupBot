@@ -446,11 +446,11 @@ where
 }
 
 fn auth_file_path() -> &'static Path {
-    Path::new(&CONFIG.openai_codex_auth_path)
+    Path::new(&CONFIG.codex.auth_path)
 }
 
 fn current_originator() -> String {
-    let configured = CONFIG.openai_codex_originator.trim();
+    let configured = CONFIG.codex.originator.trim();
     if configured.is_empty() {
         OPENAI_CODEX_DEFAULT_ORIGINATOR.to_string()
     } else {
@@ -463,7 +463,7 @@ fn current_user_agent() -> String {
 }
 
 fn configured_auth_storage_mode() -> Result<CodexAuthStorageMode> {
-    CodexAuthStorageMode::parse(&CONFIG.openai_codex_auth_storage)
+    CodexAuthStorageMode::parse(&CONFIG.codex.auth_storage)
 }
 
 fn desired_auth_file_encoding(mode: CodexAuthStorageMode) -> AuthFileEncoding {
@@ -1158,10 +1158,7 @@ pub fn codex_headers(
 }
 
 pub fn codex_base_url() -> String {
-    CONFIG
-        .openai_codex_base_url
-        .trim_end_matches('/')
-        .to_string()
+    CONFIG.codex.base_url.trim_end_matches('/').to_string()
 }
 
 pub fn codex_response_url() -> String {
@@ -1184,7 +1181,7 @@ pub fn codex_usage_url() -> String {
 }
 
 pub fn native_web_search_mode() -> CodexWebSearchMode {
-    CodexWebSearchMode::from_config(&CONFIG.openai_codex_web_search_mode)
+    CodexWebSearchMode::from_config(&CONFIG.codex.web_search_mode)
 }
 
 pub fn build_native_web_search_tool_from_record(
@@ -1333,10 +1330,10 @@ pub async fn fetch_usage_snapshot() -> Result<CodexUsageSnapshot> {
 }
 
 pub async fn fetch_models() -> Result<CodexModelList> {
-    let version = if CONFIG.openai_codex_client_version.trim().is_empty() {
+    let version = if CONFIG.codex.client_version.trim().is_empty() {
         CODEX_CLIENT_VERSION
     } else {
-        CONFIG.openai_codex_client_version.trim()
+        CONFIG.codex.client_version.trim()
     };
     for attempt in 0..2 {
         let auth = get_valid_auth_context().await?;

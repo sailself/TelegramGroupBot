@@ -194,7 +194,7 @@ async fn main() -> HandlerResult {
     dotenv().ok();
     let _guards = init_logging();
 
-    let bot = Bot::new(CONFIG.bot_token.clone());
+    let bot = Bot::new(CONFIG.telegram.bot_token.clone());
     let me = bot.get_me().await?;
     let bot_user_id = i64::try_from(me.id.0).unwrap_or_default();
     let bot_username_lower = me
@@ -204,11 +204,11 @@ async fn main() -> HandlerResult {
         .unwrap_or_default();
     info!("Starting TelegramGroupHelperBot (Rust)");
 
-    let db = Database::init(&CONFIG.database_url).await?;
+    let db = Database::init(&CONFIG.db.url).await?;
     let state = AppState::new(db.clone(), bot_user_id, bot_username_lower);
 
     handlers::access::load_whitelist();
-    if CONFIG.publish_bot_commands {
+    if CONFIG.telegram.publish_bot_commands {
         let commands = published_bot_commands(CONFIG.gemini_api_available());
         info!(
             "Publishing {} bot commands to Telegram because PUBLISH_BOT_COMMANDS=true; \

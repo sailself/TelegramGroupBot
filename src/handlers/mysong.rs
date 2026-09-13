@@ -388,7 +388,7 @@ pub async fn mysong_handler(
             .select_messages_by_user(
                 message.chat.id.0,
                 user_id,
-                CONFIG.user_history_message_count,
+                CONFIG.limits.user_history_message_count,
                 true,
             )
             .await?;
