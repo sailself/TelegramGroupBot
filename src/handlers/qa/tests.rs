@@ -6,6 +6,7 @@ use super::{
     trigger::*,
 };
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider};
+use crate::handlers::enrichment::Enrichment;
 use crate::llm::media::MediaSummary;
 use crate::llm::runtime_models::{codex_selected_model_label, ResolvedExplicitCodexModel};
 use crate::llm::text_model::{ModelRequestCapabilities, MODEL_GEMINI};
@@ -105,15 +106,33 @@ fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPart
     }
 }
 
+/// The request capabilities a media-kind flag stands for in the picker tests.
+fn media_request(has_images: bool, has_video: bool, has_audio: bool) -> ModelRequestCapabilities {
+    ModelRequestCapabilities {
+        has_images,
+        has_video,
+        has_audio,
+        ..ModelRequestCapabilities::default()
+    }
+}
+
+fn snapshot_of(
+    models: Vec<ThirdPartyModelConfig>,
+    ready_providers: &[ThirdPartyProvider],
+) -> ModelCatalogSnapshot {
+    ModelCatalogSnapshot {
+        models,
+        ready_providers: ready_providers.to_vec(),
+        codex_record: None,
+    }
+}
+
 fn pending_q_request(original_user_id: i64, timestamp: i64) -> PendingQRequest {
     PendingQRequest {
         user_id: original_user_id,
         query: "question".to_string(),
         telegram_language_code: None,
-        media_files: Vec::new(),
-        youtube_urls: Vec::new(),
-        telegraph_contents: Vec::new(),
-        twitter_contents: Vec::new(),
+        enrichment: Enrichment::default(),
         chat_id: 123,
         message_id: 456,
         selection_message_id: 789,
@@ -578,13 +597,13 @@ fn quick_result_label_uses_the_explicit_record_after_runtime_cache_loss() {
         "simulated runtime reload clears metadata"
     );
 
+    let model = QaModel::ThirdParty {
+        config: explicit.config.clone(),
+        explicit_codex: Some(Box::new(explicit)),
+    };
+
     assert_eq!(
-        result_model_display_name(
-            "openai-codex:gpt-5.6-terra",
-            None,
-            QaCommandMode::Quick,
-            Some(&explicit),
-        ),
+        model.result_display_name(&snapshot_of(Vec::new(), &[]), QaCommandMode::Quick, None),
         "gpt-5.6-terra medium"
     );
 }
@@ -952,16 +971,12 @@ fn audio_selection_includes_only_audio_capable_ready_models() {
     unavailable_audio.audio = true;
     let models = vec![audio_model, text_model, unavailable_audio];
 
+    let snapshot = snapshot_of(models, &[ThirdPartyProvider::Nvidia]);
     let keyboard = create_model_selection_keyboard_with_models(
-        &models,
-        &[ThirdPartyProvider::Nvidia],
+        &snapshot,
         false,
         "gemini",
-        false,
-        false,
-        true,
-        false,
-        false,
+        media_request(false, false, true),
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -987,15 +1002,11 @@ fn selectable_models_returns_single_audio_model_when_it_is_the_only_option() {
     let text_model = model(ThirdPartyProvider::Nvidia, "Text Only", "text-only");
     let models = vec![audio_model, text_model];
 
+    let snapshot = snapshot_of(models, &[ThirdPartyProvider::Nvidia]);
     let model_ids = selectable_model_ids_for_request_with_models(
-        &models,
-        &[ThirdPartyProvider::Nvidia],
+        &snapshot,
         false,
-        false,
-        false,
-        true,
-        false,
-        false,
+        media_request(false, false, true),
     );
 
     assert_eq!(model_ids, vec!["nvidia:nemotron-omni"]);
@@ -1011,15 +1022,11 @@ fn selectable_models_keeps_picker_when_gemini_and_audio_model_are_available() {
     audio_model.audio = true;
     let models = vec![audio_model];
 
+    let snapshot = snapshot_of(models, &[ThirdPartyProvider::Nvidia]);
     let model_ids = selectable_model_ids_for_request_with_models(
-        &models,
-        &[ThirdPartyProvider::Nvidia],
+        &snapshot,
         true,
-        false,
-        false,
-        true,
-        false,
-        false,
+        media_request(false, false, true),
     );
 
     assert_eq!(
@@ -1030,16 +1037,12 @@ fn selectable_models_keeps_picker_when_gemini_and_audio_model_are_available() {
 
 #[test]
 fn model_selection_keyboard_omits_gemini_when_disabled() {
+    let snapshot = snapshot_of(Vec::new(), &[]);
     let keyboard = create_model_selection_keyboard_with_models(
-        &[],
-        &[],
+        &snapshot,
         false,
         "gemini",
-        false,
-        false,
-        false,
-        false,
-        false,
+        ModelRequestCapabilities::default(),
     );
 
     let callbacks = keyboard
@@ -1070,16 +1073,12 @@ fn video_selection_includes_only_video_capable_ready_models() {
     unavailable_video.video = true;
     let models = vec![video_model, text_model, unavailable_video];
 
+    let snapshot = snapshot_of(models, &[ThirdPartyProvider::Nvidia]);
     let keyboard = create_model_selection_keyboard_with_models(
-        &models,
-        &[ThirdPartyProvider::Nvidia],
+        &snapshot,
         false,
         "gemini",
-        false,
-        true,
-        false,
-        false,
-        false,
+        media_request(false, true, false),
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -1103,16 +1102,12 @@ fn model_selection_keyboard_compacts_long_third_party_model_callbacks() {
     );
     let models = vec![long_model.clone()];
 
+    let snapshot = snapshot_of(models.clone(), &[ThirdPartyProvider::Nvidia]);
     let keyboard = create_model_selection_keyboard_with_models(
-        &models,
-        &[ThirdPartyProvider::Nvidia],
+        &snapshot,
         false,
         &long_model.id,
-        false,
-        false,
-        false,
-        false,
-        false,
+        ModelRequestCapabilities::default(),
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -1143,16 +1138,15 @@ fn model_selection_keyboard_puts_default_third_party_model_first() {
     let nvidia = model(ThirdPartyProvider::Nvidia, "NVIDIA Qwen", "nv-qwen");
     let models = vec![openrouter, nvidia];
 
-    let keyboard = create_model_selection_keyboard_with_models(
-        &models,
+    let snapshot = snapshot_of(
+        models,
         &[ThirdPartyProvider::OpenRouter, ThirdPartyProvider::Nvidia],
+    );
+    let keyboard = create_model_selection_keyboard_with_models(
+        &snapshot,
         true,
         "nvidia:nv-qwen",
-        false,
-        false,
-        false,
-        false,
-        false,
+        ModelRequestCapabilities::default(),
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -1233,4 +1227,103 @@ fn chat_search_selection_accepts_wrapped_json() {
 
     assert_eq!(selection.selected_message_ids, vec![42, 43]);
     assert_eq!(selection.note.as_deref(), Some("two hits"));
+}
+
+fn selected_record(slug: &str) -> crate::llm::runtime_models::CodexSelectedModelRecord {
+    crate::llm::runtime_models::CodexSelectedModelRecord {
+        metadata_version: crate::llm::runtime_models::CODEX_SELECTED_MODEL_METADATA_VERSION,
+        account_id: Some("acct-1".to_string()),
+        slug: slug.to_string(),
+        display_name: slug.to_uppercase(),
+        description: None,
+        input_modalities: vec!["text".to_string()],
+        priority: 1,
+        etag: None,
+        default_reasoning_level: Some("medium".to_string()),
+        supported_reasoning_levels: vec![crate::llm::openai_codex::CodexReasoningEffortOption {
+            effort: "medium".to_string(),
+            description: "Medium effort".to_string(),
+        }],
+        selected_reasoning_level: None,
+        web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
+        supports_search_tool: true,
+        use_responses_lite: true,
+        fetched_at: chrono::Utc::now(),
+    }
+}
+
+#[test]
+fn model_catalog_snapshot_resolves_codex_aliases() {
+    let selected = model(ThirdPartyProvider::OpenAICodex, "GPT-5.4 Codex", "selected");
+    let openrouter = model(ThirdPartyProvider::OpenRouter, "OpenRouter Qwen", "or-qwen");
+    let snapshot = ModelCatalogSnapshot {
+        models: vec![selected.clone(), openrouter.clone()],
+        ready_providers: vec![ThirdPartyProvider::OpenAICodex],
+        codex_record: Some(selected_record("gpt-5.4")),
+    };
+
+    assert_eq!(snapshot.count(), 2);
+    assert_eq!(
+        snapshot
+            .config(&openrouter.id)
+            .map(|config| config.id.as_str()),
+        Some(openrouter.id.as_str())
+    );
+    // The bare alias and the slug the selected record names both land on the
+    // single selected-model entry.
+    assert_eq!(
+        snapshot
+            .config("openai-codex")
+            .map(|config| config.id.as_str()),
+        Some(selected.id.as_str())
+    );
+    assert_eq!(
+        snapshot
+            .config("openai-codex:gpt-5.4")
+            .map(|config| config.id.as_str()),
+        Some(selected.id.as_str())
+    );
+    assert!(snapshot.config("openai-codex:gpt-9").is_none());
+    assert!(snapshot.config("nvidia:missing").is_none());
+}
+
+#[test]
+fn qa_model_resolve_keeps_the_explicit_codex_model_and_rejects_a_changed_one() {
+    let config = model(
+        ThirdPartyProvider::OpenAICodex,
+        "GPT-5.6-Terra",
+        "gpt-5.6-terra",
+    );
+    let prepared = PreparedQuickTextModel {
+        model_id: config.id.clone(),
+        explicit_codex: Some(ResolvedExplicitCodexModel {
+            config: config.clone(),
+            record: selected_record("gpt-5.6-terra"),
+        }),
+    };
+    // A runtime reload dropped the explicit slug from the catalog; the prepared
+    // model still carries it.
+    let snapshot = ModelCatalogSnapshot {
+        models: Vec::new(),
+        ready_providers: Vec::new(),
+        codex_record: None,
+    };
+
+    let resolved = QaModel::resolve(&config.id, &snapshot, Some(&prepared))
+        .expect("the prepared explicit Codex model resolves without the catalog");
+    assert_eq!(resolved.model_id(), config.id);
+    assert!(resolved.supports_tools());
+    assert_eq!(resolved.provider_label(), "OpenAI Codex");
+    assert_eq!(
+        resolved.result_display_name(&snapshot, QaCommandMode::Quick, None),
+        "gpt-5.6-terra medium"
+    );
+
+    // The selection changed under us, or the model is simply not in the catalog.
+    assert!(QaModel::resolve("openai-codex:other", &snapshot, Some(&prepared)).is_err());
+    assert!(QaModel::resolve("nvidia:missing", &snapshot, None).is_err());
+    assert!(matches!(
+        QaModel::resolve(MODEL_GEMINI, &snapshot, None),
+        Ok(QaModel::Gemini)
+    ));
 }

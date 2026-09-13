@@ -283,6 +283,16 @@ impl WallClock {
         }
     }
 
+    /// Test-only constructor for an explicit budget, bypassing `CONFIG` so
+    /// tests can exercise an already-exceeded or generously long clock.
+    #[cfg(test)]
+    pub(crate) fn for_budget(budget: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            budget,
+        }
+    }
+
     pub fn exceeded(&self) -> bool {
         self.started.elapsed() >= self.budget
     }

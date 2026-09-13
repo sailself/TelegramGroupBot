@@ -10,7 +10,7 @@ use crate::config::{
 use crate::llm::responses_provider::effective_reasoning_effort;
 use crate::llm::runtime_models::{
     codex_model_record_for_request, codex_selected_model_label, ensure_explicit_codex_model,
-    runtime_model_config, runtime_models, selected_codex_model_record, CodexSelectedModelRecord,
+    runtime_models, selected_codex_model_record, CodexSelectedModelRecord,
     ResolvedExplicitCodexModel, CODEX_SELECTED_MODEL_METADATA_VERSION,
     OPENAI_CODEX_SELECTED_MODEL_ID,
 };
@@ -24,6 +24,211 @@ use crate::utils::text::truncate_with_ellipsis;
 
 use super::handler::USER_ERROR_DETAIL_LIMIT;
 
+/// The model catalog as one request sees it. Read once per request, so a
+/// catalog reload between the picker, the resolution and the answer cannot make
+/// them disagree about which models exist.
+pub(super) struct ModelCatalogSnapshot {
+    pub models: Vec<ThirdPartyModelConfig>,
+    pub ready_providers: Vec<ThirdPartyProvider>,
+    pub codex_record: Option<CodexSelectedModelRecord>,
+}
+
+impl ModelCatalogSnapshot {
+    pub fn load() -> Self {
+        let models = runtime_models();
+        let ready_providers = ready_runtime_providers(&models);
+        Self {
+            models,
+            ready_providers,
+            codex_record: selected_codex_model_record(),
+        }
+    }
+
+    /// Config for `id`, resolving the same Codex aliases the runtime catalog
+    /// does: bare `openai-codex`, and an explicit Codex slug that the selected
+    /// record names, both land on the selected-model entry.
+    pub fn config(&self, id: &str) -> Option<&ThirdPartyModelConfig> {
+        let id = id.trim();
+        if id.eq_ignore_ascii_case("openai-codex") {
+            return self.selected_codex_config();
+        }
+        if let Some(config) = self.models.iter().find(|config| config.id == id) {
+            return Some(config);
+        }
+        match parse_third_party_model_id(id) {
+            Some((ThirdPartyProvider::OpenAICodex, slug))
+                if self
+                    .codex_record
+                    .as_ref()
+                    .is_some_and(|record| record.slug == slug) =>
+            {
+                self.selected_codex_config()
+            }
+            _ => None,
+        }
+    }
+
+    fn selected_codex_config(&self) -> Option<&ThirdPartyModelConfig> {
+        self.models
+            .iter()
+            .find(|config| config.id == OPENAI_CODEX_SELECTED_MODEL_ID)
+    }
+
+    pub fn count(&self) -> usize {
+        self.models.len()
+    }
+}
+
+/// The model that answers one `/q`-family request, resolved once against a
+/// [`ModelCatalogSnapshot`] so every later step agrees on its capabilities.
+pub(super) enum QaModel {
+    Gemini,
+    ThirdParty {
+        config: ThirdPartyModelConfig,
+        /// Set when quick mode pinned an explicit Codex model, whose config and
+        /// catalog record the request carries itself. Boxed: the catalog record
+        /// dwarfs every other variant of this enum.
+        explicit_codex: Option<Box<ResolvedExplicitCodexModel>>,
+    },
+}
+
+impl QaModel {
+    pub fn resolve(
+        model_name: &str,
+        snapshot: &ModelCatalogSnapshot,
+        prepared: Option<&PreparedQuickTextModel>,
+    ) -> Result<Self> {
+        if model_name == MODEL_GEMINI {
+            return Ok(Self::Gemini);
+        }
+
+        if let Some(explicit) = prepared.and_then(|prepared| prepared.explicit_codex.as_ref()) {
+            if explicit.config.id != model_name {
+                return Err(anyhow!("The explicit Codex model changed"));
+            }
+            return Ok(Self::ThirdParty {
+                config: explicit.config.clone(),
+                explicit_codex: Some(Box::new(explicit.clone())),
+            });
+        }
+
+        let config = snapshot
+            .config(model_name)
+            .ok_or_else(|| anyhow!(default_text_model_error(model_name, "not configured")))?;
+        Ok(Self::ThirdParty {
+            config: config.clone(),
+            explicit_codex: None,
+        })
+    }
+
+    pub fn model_id(&self) -> &str {
+        match self {
+            QaModel::Gemini => MODEL_GEMINI,
+            QaModel::ThirdParty { config, .. } => config.id.as_str(),
+        }
+    }
+
+    pub fn supports_tools(&self) -> bool {
+        match self {
+            QaModel::Gemini => true,
+            QaModel::ThirdParty { config, .. } => config.tools,
+        }
+    }
+
+    pub fn explicit_codex(&self) -> Option<&ResolvedExplicitCodexModel> {
+        match self {
+            QaModel::Gemini => None,
+            QaModel::ThirdParty { explicit_codex, .. } => explicit_codex.as_deref(),
+        }
+    }
+
+    /// Provider whose reasoning conventions this call follows. Gemini has no
+    /// third-party provider; the reasoning override it reports is never read.
+    pub fn third_party_provider(&self) -> ThirdPartyProvider {
+        match self {
+            QaModel::Gemini => ThirdPartyProvider::OpenRouter,
+            QaModel::ThirdParty { config, .. } => config.provider,
+        }
+    }
+
+    pub fn provider_label(&self) -> &'static str {
+        match self {
+            QaModel::Gemini => "Gemini",
+            QaModel::ThirdParty { config, .. } => third_party_provider_label(config.provider),
+        }
+    }
+
+    /// Label shown before the answer: in progress messages and pickers.
+    pub fn display_name(&self, snapshot: &ModelCatalogSnapshot, mode: QaCommandMode) -> String {
+        match self {
+            QaModel::Gemini => "Gemini".to_string(),
+            QaModel::ThirdParty {
+                config,
+                explicit_codex,
+            } => match explicit_codex {
+                Some(explicit) if mode == QaCommandMode::Quick => codex_quick_result_label(
+                    &explicit.config,
+                    Some(&explicit.record),
+                    Some(&CONFIG.quick_reasoning_effort),
+                ),
+                Some(explicit) => explicit.config.name.clone(),
+                None => configured_model_display_name(snapshot, &config.id),
+            },
+        }
+    }
+
+    /// Label shown with the answer and in the request logs: the concrete model
+    /// that ran, with the reasoning level when quick mode pinned one.
+    pub fn result_display_name(
+        &self,
+        snapshot: &ModelCatalogSnapshot,
+        mode: QaCommandMode,
+        gemini_model_used: Option<&str>,
+    ) -> String {
+        let (config, explicit_codex) = match self {
+            QaModel::Gemini => {
+                return gemini_model_used
+                    .unwrap_or(CONFIG.gemini_model.as_str())
+                    .to_string()
+            }
+            QaModel::ThirdParty {
+                config,
+                explicit_codex,
+            } => (config, explicit_codex),
+        };
+
+        if let Some(explicit) = explicit_codex {
+            if mode == QaCommandMode::Quick {
+                return codex_quick_result_label(
+                    &explicit.config,
+                    Some(&explicit.record),
+                    Some(&CONFIG.quick_reasoning_effort),
+                );
+            }
+        }
+
+        if config.provider == ThirdPartyProvider::OpenAICodex {
+            if mode == QaCommandMode::Quick {
+                let record = codex_model_record_for_request(config).ok().flatten();
+                return codex_quick_result_label(
+                    config,
+                    record.as_ref(),
+                    Some(&CONFIG.quick_reasoning_effort),
+                );
+            }
+            if let Some(record) = snapshot
+                .codex_record
+                .as_ref()
+                .filter(|record| record.slug == config.model)
+            {
+                return codex_selected_model_label(record);
+            }
+        }
+
+        config.model.clone()
+    }
+}
+
 pub(super) fn third_party_provider_label(provider: ThirdPartyProvider) -> &'static str {
     match provider {
         ThirdPartyProvider::OpenRouter => "OpenRouter",
@@ -34,17 +239,23 @@ pub(super) fn third_party_provider_label(provider: ThirdPartyProvider) -> &'stat
     }
 }
 
-pub(super) fn configured_model_display_name(model_name: &str) -> String {
+pub(super) fn configured_model_display_name(
+    snapshot: &ModelCatalogSnapshot,
+    model_name: &str,
+) -> String {
     if model_name == MODEL_GEMINI {
         "Gemini".to_string()
     } else {
-        runtime_model_config(model_name)
+        snapshot
+            .config(model_name)
             .map(|config| {
                 if config.provider == ThirdPartyProvider::OpenAICodex {
-                    if let Some(record) = selected_codex_model_record() {
-                        if record.slug == config.model {
-                            return codex_selected_model_label(&record);
-                        }
+                    if let Some(record) = snapshot
+                        .codex_record
+                        .as_ref()
+                        .filter(|record| record.slug == config.model)
+                    {
+                        return codex_selected_model_label(record);
                     }
                 }
                 config.name.clone()
@@ -63,51 +274,15 @@ pub(super) fn codex_quick_result_label(
         .unwrap_or_else(|| config.model.clone())
 }
 
-pub(super) fn result_model_display_name(
-    model_name: &str,
-    gemini_model_used: Option<&str>,
-    mode: QaCommandMode,
-    explicit_codex: Option<&ResolvedExplicitCodexModel>,
+pub(super) fn format_llm_error_message(
+    model: &QaModel,
+    display_model: &str,
+    err: &anyhow::Error,
 ) -> String {
-    if mode == QaCommandMode::Quick {
-        if let Some(explicit) = explicit_codex {
-            return codex_quick_result_label(
-                &explicit.config,
-                Some(&explicit.record),
-                Some(&CONFIG.quick_reasoning_effort),
-            );
-        }
-    }
-    if model_name == MODEL_GEMINI {
-        gemini_model_used
-            .unwrap_or(CONFIG.gemini_model.as_str())
-            .to_string()
-    } else if let Some(config) = runtime_model_config(model_name) {
-        if mode == QaCommandMode::Quick && config.provider == ThirdPartyProvider::OpenAICodex {
-            let record = codex_model_record_for_request(&config).ok().flatten();
-            return codex_quick_result_label(
-                &config,
-                record.as_ref(),
-                Some(&CONFIG.quick_reasoning_effort),
-            );
-        }
-        if config.provider == ThirdPartyProvider::OpenAICodex {
-            if let Some(record) = selected_codex_model_record() {
-                if record.slug == config.model {
-                    return codex_selected_model_label(&record);
-                }
-            }
-        }
-        config.model.clone()
-    } else {
-        model_name.to_string()
-    }
-}
-
-pub(super) fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
-    let display_model = configured_model_display_name(model_name);
-    let provider =
-        runtime_model_config(model_name).map(|config| third_party_provider_label(config.provider));
+    let provider = match model {
+        QaModel::Gemini => None,
+        QaModel::ThirdParty { config, .. } => Some(third_party_provider_label(config.provider)),
+    };
     let err_text = err.to_string();
 
     let friendly = match provider {
@@ -340,10 +515,8 @@ pub(super) fn should_use_default_model_without_selection(
 }
 
 pub(super) async fn resolve_quick_text_model_for_request(
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
+    snapshot: &ModelCatalogSnapshot,
+    request: ModelRequestCapabilities,
 ) -> Result<PreparedQuickTextModel> {
     let configured_model_id = CONFIG.default_quick_text_model.trim();
     let explicit = match parse_third_party_model_id(configured_model_id) {
@@ -362,22 +535,14 @@ pub(super) async fn resolve_quick_text_model_for_request(
         }
         _ => None,
     };
-    let models = runtime_models();
-    let ready_providers = ready_runtime_providers(&models);
     let current_account_id = crate::llm::runtime_models::current_codex_account_id();
     resolve_prepared_quick_text_model_with_models(
         &CONFIG.default_quick_text_model,
         &CONFIG.default_text_model,
-        &models,
-        &ready_providers,
+        &snapshot.models,
+        &snapshot.ready_providers,
         CONFIG.gemini_api_available(),
-        ModelRequestCapabilities {
-            has_images,
-            has_video,
-            has_audio,
-            has_documents,
-            require_tools: false,
-        },
+        request,
         explicit,
         ExplicitCodexReadiness {
             enabled: CONFIG.enable_openai_codex,
@@ -388,16 +553,10 @@ pub(super) async fn resolve_quick_text_model_for_request(
     .map_err(|message| anyhow!(message))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn selectable_model_ids_for_request_with_models(
-    models: &[ThirdPartyModelConfig],
-    ready_providers: &[ThirdPartyProvider],
+    snapshot: &ModelCatalogSnapshot,
     gemini_available: bool,
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    request: ModelRequestCapabilities,
 ) -> Vec<String> {
     let mut model_ids = Vec::new();
     if gemini_available {
@@ -406,13 +565,9 @@ pub(super) fn selectable_model_ids_for_request_with_models(
 
     model_ids.extend(
         available_third_party_models_for_request(
-            models,
-            ready_providers,
-            has_images,
-            has_video,
-            has_audio,
-            has_documents,
-            require_tools,
+            &snapshot.models,
+            &snapshot.ready_providers,
+            request,
         )
         .into_iter()
         .filter_map(|config| {
@@ -425,24 +580,10 @@ pub(super) fn selectable_model_ids_for_request_with_models(
 }
 
 pub(super) fn selectable_model_ids_for_request(
-    has_images: bool,
-    has_video: bool,
-    has_audio: bool,
-    has_documents: bool,
-    require_tools: bool,
+    snapshot: &ModelCatalogSnapshot,
+    request: ModelRequestCapabilities,
 ) -> Vec<String> {
-    let models = runtime_models();
-    let ready_providers = ready_runtime_providers(&models);
-    selectable_model_ids_for_request_with_models(
-        &models,
-        &ready_providers,
-        CONFIG.gemini_api_available(),
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    )
+    selectable_model_ids_for_request_with_models(snapshot, CONFIG.gemini_api_available(), request)
 }
 
 pub(super) fn default_model_selection_key(

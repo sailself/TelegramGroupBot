@@ -12,9 +12,8 @@ use crate::config::CONFIG;
 use crate::db::database::build_message_insert;
 use crate::db::models::MessageInsert;
 use crate::handlers::access::{check_access_control, is_rate_limited};
-use crate::handlers::content::{
-    download_telegraph_media, download_twitter_media, extract_telegraph_urls_and_content,
-    extract_twitter_urls_and_content,
+use crate::handlers::enrichment::{
+    count_sources, enrich_request, entity_link_urls, EnrichmentBudget, SourceKind,
 };
 use crate::handlers::media::{collect_message_media, MediaCollectionOptions};
 use crate::llm::audit::{
@@ -22,13 +21,11 @@ use crate::llm::audit::{
     LLM_TRIGGER_KIND_COMMAND,
 };
 use crate::llm::media::summarize_media_files;
-use crate::llm::runtime_models::runtime_model_count;
 use crate::llm::text_model::{
     has_available_third_party_models_for_request, resolve_default_text_model_for_request,
     ModelRequestCapabilities,
 };
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
-use crate::tools::external_media::ExternalMediaBudget;
 use crate::utils::telegram::{
     message_entities_for_text, message_text_or_caption, reply_with_retry,
 };
@@ -36,9 +33,9 @@ use crate::utils::timing::{complete_command_timer, now_unix_seconds, start_comma
 
 use super::chat_search::{build_chat_search_pending_request, chat_search_rebuilding_message};
 use super::model_resolution::{
-    configured_model_display_name, resolve_quick_text_model_for_request,
-    selectable_model_ids_for_request, should_use_default_model_without_selection,
-    video_request_has_capable_model,
+    resolve_quick_text_model_for_request, selectable_model_ids_for_request,
+    should_use_default_model_without_selection, video_request_has_capable_model,
+    ModelCatalogSnapshot, QaModel,
 };
 use super::process::process_request;
 use super::prompt::{
@@ -133,45 +130,27 @@ async fn q_handler_internal(
     let query_text_raw = query.unwrap_or_default();
     let query_entities = message_entities_for_text(&message);
     let reply_message = message.reply_to_message();
-    let mut reply_text_raw = String::new();
     let mut reply_text = String::new();
-    let mut telegraph_contents = Vec::new();
-    let mut twitter_contents = Vec::new();
+    let mut reply_entities = None;
 
     if let Some(reply) = reply_message {
-        reply_text_raw = reply
+        reply_text = reply
             .text()
             .map(|value| value.to_string())
             .or_else(|| reply.caption().map(|value| value.to_string()))
             .unwrap_or_default();
-        if !reply_text_raw.trim().is_empty() {
-            let reply_entities = message_entities_for_text(reply);
-            let (reply_text_processed, reply_telegraph) =
-                extract_telegraph_urls_and_content(&reply_text_raw, reply_entities.as_deref(), 5)
-                    .await;
-            let (reply_text_processed, reply_twitter) = extract_twitter_urls_and_content(
-                &reply_text_processed,
-                reply_entities.as_deref(),
-                5,
-            )
-            .await;
-            telegraph_contents.extend(reply_telegraph);
-            twitter_contents.extend(reply_twitter);
-            reply_text = reply_text_processed;
-        }
+        reply_entities = message_entities_for_text(reply);
     }
 
-    let media_options = MediaCollectionOptions::for_qa();
-    let max_files = media_options.max_files;
-    let media = collect_message_media(&bot, &state, &message, media_options).await;
-    let mut media_files = media.files;
-    let initial_media_summary = summarize_media_files(&media_files);
+    let media =
+        collect_message_media(&bot, &state, &message, MediaCollectionOptions::for_qa()).await;
+    let initial_media_summary = summarize_media_files(&media.files);
 
     let original_query = if query_text_raw.trim().is_empty() {
-        if reply_text_raw.trim().is_empty() {
+        if reply_text.trim().is_empty() {
             build_media_only_qa_prompt(&initial_media_summary).unwrap_or_default()
         } else {
-            reply_text_raw.clone()
+            reply_text.clone()
         }
     } else {
         query_text_raw.clone()
@@ -206,30 +185,18 @@ async fn q_handler_internal(
         return Ok(());
     }
 
-    let mut query_text = query_text_raw.clone();
-    if !query_text.trim().is_empty() {
-        let (query_text_processed, query_telegraph) =
-            extract_telegraph_urls_and_content(&query_text, query_entities.as_deref(), 5).await;
-        let (query_text_processed, query_twitter) =
-            extract_twitter_urls_and_content(&query_text_processed, query_entities.as_deref(), 5)
-                .await;
-        telegraph_contents.extend(query_telegraph);
-        twitter_contents.extend(query_twitter);
-        query_text = query_text_processed;
-    }
-
-    let query_base = if query_text.trim().is_empty() {
+    let query_base = if query_text_raw.trim().is_empty() {
         if reply_text.trim().is_empty() {
             original_query.clone()
         } else {
             reply_text.clone()
         }
     } else if reply_text.trim().is_empty() {
-        query_text.clone()
+        query_text_raw.clone()
     } else {
         format!(
             "Context from replied message: \"{}\"\n\nQuestion: {}",
-            reply_text, query_text
+            reply_text, query_text_raw
         )
     };
 
@@ -279,43 +246,34 @@ async fn q_handler_internal(
         warn!("Failed to queue /{command_name} message insert: {err}");
     }
 
-    let mut remaining = max_files.saturating_sub(media_files.len());
-    let external_media_budget = ExternalMediaBudget::new(CONFIG.external_media_total_max_bytes);
-    if remaining > 0 {
-        let telegraph_files =
-            download_telegraph_media(&telegraph_contents, remaining, &external_media_budget).await;
-        remaining = remaining.saturating_sub(telegraph_files.len());
-        media_files.extend(telegraph_files);
-    }
-
-    if remaining > 0 {
-        let twitter_files =
-            download_twitter_media(&twitter_contents, remaining, &external_media_budget).await;
-        media_files.extend(twitter_files);
-    }
+    let enrichment_budget = EnrichmentBudget::for_question();
+    let reply_entity_urls = entity_link_urls(reply_entities.as_deref());
+    let query_entity_urls = entity_link_urls(query_entities.as_deref());
+    let mut enrichment = enrich_request(
+        &[
+            &reply_text,
+            &reply_entity_urls,
+            &query_text_raw,
+            &query_entity_urls,
+        ],
+        media.files,
+        &enrichment_budget,
+    )
+    .await;
+    let twitter_source_count = count_sources(&enrichment.sources, SourceKind::Twitter).sources;
     let audit_context = create_q_audit_context(&state, &message, command_name).await;
+    let snapshot = ModelCatalogSnapshot::load();
 
-    let media_summary = summarize_media_files(&media_files);
+    let media_summary = summarize_media_files(&enrichment.media_files);
     let has_images = media_summary.images > 0;
     let has_video = media_summary.videos > 0;
     let has_audio = media_summary.audios > 0;
     let has_documents = media_summary.documents > 0;
 
-    let require_tools = mode.requires_custom_tools();
-    let request_capabilities = ModelRequestCapabilities {
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    };
-    let third_party_models_available_for_request = has_available_third_party_models_for_request(
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    );
+    let request_capabilities =
+        ModelRequestCapabilities::from_media(&media_summary, mode.requires_custom_tools());
+    let third_party_models_available_for_request =
+        has_available_third_party_models_for_request(request_capabilities);
     if has_video
         && !video_request_has_capable_model(
             CONFIG.gemini_api_available(),
@@ -345,18 +303,18 @@ async fn q_handler_internal(
         !youtube_urls.is_empty(),
         CONFIG.gemini_api_available(),
         third_party_models_available_for_request,
-        runtime_model_count(),
+        snapshot.count(),
         query_message_is_from_bot,
     );
     let direct_model = if must_use_default_model {
         let resolved = if mode == QaCommandMode::Quick {
-            resolve_quick_text_model_for_request(has_images, has_video, has_audio, has_documents)
+            resolve_quick_text_model_for_request(&snapshot, request_capabilities)
                 .await
-                .map(|model| {
+                .map(|prepared| {
                     (
-                        model.model_id,
+                        prepared.model_id.clone(),
                         "default_quick_text_model",
-                        model.explicit_codex,
+                        Some(prepared),
                     )
                 })
         } else {
@@ -379,13 +337,8 @@ async fn q_handler_internal(
             }
         }
     } else {
-        let selectable_model_ids = selectable_model_ids_for_request(
-            has_images,
-            has_video,
-            has_audio,
-            has_documents,
-            require_tools,
-        );
+        let selectable_model_ids =
+            selectable_model_ids_for_request(&snapshot, request_capabilities);
         if selectable_model_ids.len() == 1 {
             selectable_model_ids
                 .into_iter()
@@ -396,7 +349,7 @@ async fn q_handler_internal(
         }
     };
 
-    if let Some((selected_model, timer_detail, explicit_codex)) = direct_model {
+    if let Some((selected_model, timer_detail, prepared)) = direct_model {
         if mode == QaCommandMode::Quick {
             (query_text, youtube_urls) = prepare_youtube_inputs_for_qa(
                 &query_base,
@@ -405,10 +358,22 @@ async fn q_handler_internal(
                 CONFIG.gemini_api_available(),
             );
         }
-        let display_name = explicit_codex
-            .as_ref()
-            .map(|explicit| explicit.config.name.clone())
-            .unwrap_or_else(|| configured_model_display_name(&selected_model));
+        let model = match QaModel::resolve(&selected_model, &snapshot, prepared.as_ref()) {
+            Ok(model) => model,
+            Err(err) => {
+                reply_with_retry(
+                    &bot,
+                    message.chat.id,
+                    &err.to_string(),
+                    Some(message.id),
+                    None,
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let display_name = model.display_name(&snapshot, mode);
         let processing_message_text = if has_video {
             format!(
                 "Analyzing video and processing your question with {}...",
@@ -429,11 +394,10 @@ async fn q_handler_internal(
                 "Analyzing {} document(s) and processing your question with {}...",
                 media_summary.documents, display_name
             )
-        } else if !twitter_contents.is_empty() {
+        } else if twitter_source_count > 0 {
             format!(
                 "Analyzing {} Twitter post(s) and processing your question with {}...",
-                twitter_contents.len(),
-                display_name
+                twitter_source_count, display_name
             )
         } else if !youtube_urls.is_empty() {
             format!(
@@ -454,20 +418,12 @@ async fn q_handler_internal(
         )
         .await?;
         let mut timer = start_command_timer(command_name, &message);
+        enrichment.youtube_urls = youtube_urls;
         let pending_request = PendingQRequest {
             user_id,
             query: query_text.clone(),
             telegram_language_code: user_language_code.map(str::to_string),
-            media_files,
-            youtube_urls,
-            telegraph_contents: telegraph_contents
-                .iter()
-                .map(|c| c.text_content.clone())
-                .collect(),
-            twitter_contents: twitter_contents
-                .iter()
-                .map(|c| c.text_content.clone())
-                .collect(),
+            enrichment,
             chat_id: message.chat.id.0,
             message_id: message.id.0 as i64,
             selection_message_id: processing_message.id.0 as i64,
@@ -482,8 +438,8 @@ async fn q_handler_internal(
             &bot,
             &state,
             pending_request,
-            &selected_model,
-            explicit_codex.as_ref(),
+            &model,
+            &snapshot,
             Some(heavy_permit),
         )
         .await;
@@ -499,13 +455,7 @@ async fn q_handler_internal(
         selection_text.push_str("\n\n<i>Note: Only models that support media are shown.</i>");
     }
 
-    let keyboard = create_model_selection_keyboard(
-        has_images,
-        has_video,
-        has_audio,
-        has_documents,
-        require_tools,
-    );
+    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities);
     let selection_message = reply_with_retry(
         &bot,
         message.chat.id,
@@ -519,20 +469,12 @@ async fn q_handler_internal(
     let request_key = format!("{}_{}", message.chat.id.0, selection_message.id.0);
     let timer = start_command_timer(command_name, &message);
 
+    enrichment.youtube_urls = youtube_urls;
     let pending_request = PendingQRequest {
         user_id,
         query: query_text.clone(),
         telegram_language_code: user_language_code.map(str::to_string),
-        media_files,
-        youtube_urls,
-        telegraph_contents: telegraph_contents
-            .iter()
-            .map(|c| c.text_content.clone())
-            .collect(),
-        twitter_contents: twitter_contents
-            .iter()
-            .map(|c| c.text_content.clone())
-            .collect(),
+        enrichment,
         chat_id: message.chat.id.0,
         message_id: message.id.0 as i64,
         selection_message_id: selection_message.id.0 as i64,
@@ -662,19 +604,20 @@ pub async fn s_handler(
     }
     let audit_context = create_q_audit_context(&state, &message, "s").await;
 
+    let snapshot = ModelCatalogSnapshot::load();
     let request_capabilities = ModelRequestCapabilities {
         require_tools: true,
         ..ModelRequestCapabilities::default()
     };
     let third_party_models_available_for_request =
-        has_available_third_party_models_for_request(false, false, false, false, true);
+        has_available_third_party_models_for_request(request_capabilities);
     let must_use_default_model = should_use_default_model_without_selection(
         QaCommandMode::ChatSearch,
         request_capabilities,
         false,
         CONFIG.gemini_api_available(),
         third_party_models_available_for_request,
-        runtime_model_count(),
+        snapshot.count(),
         false,
     );
     let direct_model = if must_use_default_model {
@@ -695,7 +638,7 @@ pub async fn s_handler(
         }
     } else {
         let selectable_model_ids =
-            selectable_model_ids_for_request(false, false, false, false, true);
+            selectable_model_ids_for_request(&snapshot, request_capabilities);
         if selectable_model_ids.is_empty() {
             reply_with_retry(
                 &bot,
@@ -719,7 +662,22 @@ pub async fn s_handler(
     };
 
     if let Some((selected_model, timer_detail)) = direct_model {
-        let display_name = configured_model_display_name(&selected_model);
+        let model = match QaModel::resolve(&selected_model, &snapshot, None) {
+            Ok(model) => model,
+            Err(err) => {
+                reply_with_retry(
+                    &bot,
+                    message.chat.id,
+                    &err.to_string(),
+                    Some(message.id),
+                    None,
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let display_name = model.display_name(&snapshot, QaCommandMode::ChatSearch);
         let processing_message = reply_with_retry(
             &bot,
             message.chat.id,
@@ -739,15 +697,14 @@ pub async fn s_handler(
             None,
         );
 
-        let result =
-            process_request(&bot, &state, pending_request, &selected_model, None, None).await;
+        let result = process_request(&bot, &state, pending_request, &model, &snapshot, None).await;
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(&mut timer, status, Some(timer_detail.to_string()));
         result?;
         return Ok(());
     }
 
-    let keyboard = create_model_selection_keyboard(false, false, false, false, true);
+    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities);
     let selection_message = reply_with_retry(
         &bot,
         message.chat.id,

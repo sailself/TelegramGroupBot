@@ -2,6 +2,7 @@ pub mod access;
 pub mod admin;
 pub mod codex_admin;
 pub mod content;
+pub mod enrichment;
 pub mod factcheck;
 pub mod help;
 pub mod image;
