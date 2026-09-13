@@ -57,16 +57,23 @@ struct StageHit {
     hit: ChatSearchHit,
 }
 
-fn find_snippet_offset(text: &str, terms: &[String]) -> usize {
-    let lower = text.to_lowercase();
-    terms
+fn snippet_matcher(terms: &[String]) -> Option<regex::Regex> {
+    let pattern = terms
         .iter()
-        .filter_map(|term| lower.find(term))
-        .min()
-        .unwrap_or(0)
+        .filter(|term| !term.is_empty())
+        .map(|term| regex::escape(term))
+        .collect::<Vec<_>>()
+        .join("|");
+    if pattern.is_empty() {
+        return None;
+    }
+    regex::RegexBuilder::new(&pattern)
+        .case_insensitive(true)
+        .build()
+        .ok()
 }
 
-fn build_snippet(text: &str, terms: &[String]) -> String {
+fn build_snippet(text: &str, matcher: Option<&regex::Regex>) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
         return String::new();
@@ -76,7 +83,9 @@ fn build_snippet(text: &str, terms: &[String]) -> String {
         return normalized;
     }
 
-    let start = find_snippet_offset(&normalized, terms);
+    let start = matcher
+        .and_then(|matcher| matcher.find(&normalized))
+        .map_or(0, |found| found.start());
     let prefix_char_count = normalized[..start.min(normalized.len())].chars().count();
     let snippet_start = prefix_char_count.saturating_sub(SNIPPET_LIMIT / 3);
     let snippet_body: String = normalized
@@ -119,7 +128,8 @@ impl Database {
 
         let limit = limit.clamp(1, SEARCH_LIMIT_MAX);
         let offset = offset.clamp(0, SEARCH_OFFSET_MAX) as usize;
-        let stage_limit = (limit * 2).min(40);
+        let stage_limit = (limit * 2).max(offset as i64 + limit);
+        let matcher = snippet_matcher(&query_spec.snippet_terms);
         let mut merged = BTreeMap::new();
 
         if let Some(stage_query) = build_phrase_stage_query(&query_spec) {
@@ -129,7 +139,7 @@ impl Database {
                     stage_limit,
                     &stage_query,
                     SearchMatchStage::Phrase,
-                    &query_spec.snippet_terms,
+                    matcher.as_ref(),
                 )
                 .await?
             {
@@ -144,7 +154,7 @@ impl Database {
                     stage_limit,
                     &stage_query,
                     SearchMatchStage::And,
-                    &query_spec.snippet_terms,
+                    matcher.as_ref(),
                 )
                 .await?
             {
@@ -159,7 +169,7 @@ impl Database {
                     stage_limit,
                     &stage_query,
                     SearchMatchStage::OrPrefix,
-                    &query_spec.snippet_terms,
+                    matcher.as_ref(),
                 )
                 .await?
             {
@@ -192,7 +202,7 @@ impl Database {
         limit: i64,
         stage_query: &str,
         match_stage: SearchMatchStage,
-        snippet_terms: &[String],
+        matcher: Option<&regex::Regex>,
     ) -> Result<Vec<StageHit>> {
         let rows = sqlx::query_as::<_, SearchRow>(
             "SELECT \
@@ -240,7 +250,7 @@ impl Database {
                         language: row.language,
                         date: row.date,
                         reply_to_message_id: row.reply_to_message_id,
-                        snippet: build_snippet(&snippet_source, snippet_terms),
+                        snippet: build_snippet(&snippet_source, matcher),
                         link: build_message_link(row.chat_id, row.message_id),
                         score: row.score,
                         asks_ai: row.asks_ai,
@@ -329,64 +339,131 @@ pub(super) fn spawn_search_rebuild(pool: SqlitePool, search_ready: Arc<AtomicBoo
     });
 }
 
+fn retryable_search_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<sqlx::Error>()
+        .and_then(|error| match error {
+            sqlx::Error::Database(error) => error.code(),
+            _ => None,
+        })
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+}
+
 async fn rebuild_search_index(pool: SqlitePool, search_ready: Arc<AtomicBool>) -> Result<()> {
     search_ready.store(false, Ordering::Relaxed);
-
+    let mut cursor = 0;
+    let mut delay = Duration::from_millis(500);
     loop {
-        let rows = sqlx::query_as::<_, RebuildRow>(
-            "SELECT id, text, asks_ai, ai_command, is_command, is_synthetic_record \
-             FROM messages \
-             WHERE search_version != ? \
-             ORDER BY id ASC \
-             LIMIT ?",
-        )
-        .bind(CURRENT_SEARCH_SCHEMA_VERSION)
-        .bind(SEARCH_REBUILD_BATCH_SIZE)
-        .fetch_all(&pool)
-        .await?;
-
-        if rows.is_empty() {
-            set_search_schema_version(&pool, CURRENT_SEARCH_SCHEMA_VERSION).await?;
-            search_ready.store(true, Ordering::Relaxed);
-            info!("Search index rebuild completed");
-            break;
+        match rebuild_search_batch(&pool, cursor, SEARCH_REBUILD_BATCH_SIZE).await {
+            Ok(Some(last_id)) => {
+                cursor = last_id;
+                delay = Duration::from_millis(500);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(None) => {
+                // Include finalization in the retry boundary too.
+                let finish = async {
+                    if count_pending_search_rows(&pool).await? != 0 {
+                        return Ok(false);
+                    }
+                    set_search_schema_version(&pool, CURRENT_SEARCH_SCHEMA_VERSION).await?;
+                    Ok::<_, anyhow::Error>(true)
+                }
+                .await;
+                match finish {
+                    Ok(true) => {
+                        search_ready.store(true, Ordering::Relaxed);
+                        info!("Search index rebuild completed");
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        cursor = 0;
+                        continue;
+                    }
+                    Err(error) if retryable_search_error(&error) && !pool.is_closed() => {
+                        warn!("Search rebuild finalization busy; retrying: {error}");
+                    }
+                    Err(error) => return Err(error),
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+            Err(error) if retryable_search_error(&error) && !pool.is_closed() => {
+                warn!(
+                    cursor,
+                    ?delay,
+                    "Search rebuild busy; retrying batch: {error}"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+            Err(error) => return Err(error),
         }
+    }
+}
 
-        let mut tx = pool.begin().await?;
-        for row in rows {
+async fn rebuild_search_batch(
+    pool: &SqlitePool,
+    cursor: i64,
+    batch_size: i64,
+) -> Result<Option<i64>> {
+    let rows = sqlx::query_as::<_, RebuildRow>(
+        "SELECT id, text, asks_ai, ai_command, is_command, is_synthetic_record FROM messages \
+         WHERE id > ? AND search_version != ? ORDER BY id ASC LIMIT ?",
+    )
+    .bind(cursor)
+    .bind(CURRENT_SEARCH_SCHEMA_VERSION)
+    .bind(batch_size)
+    .fetch_all(pool)
+    .await?;
+    let Some(last_id) = rows.last().map(|row| row.id) else {
+        return Ok(None);
+    };
+    // CPU normalization happens outside the write transaction.
+    let documents = rows
+        .into_iter()
+        .map(|row| {
             let explicit = SearchProvenance {
                 asks_ai: row.asks_ai,
                 ai_command: row.ai_command,
                 is_command: row.is_command,
                 is_synthetic_record: row.is_synthetic_record,
             };
-            let document = normalize_message_document(row.text.as_deref(), None, &explicit);
-            sqlx::query(
-                "UPDATE messages SET \
-                     search_text = ?, \
-                     search_tags = ?, \
-                     search_version = ?, \
-                     asks_ai = ?, \
-                     ai_command = ?, \
-                     is_command = ?, \
-                     is_synthetic_record = ? \
-                 WHERE id = ?",
+            (
+                row.id,
+                normalize_message_document(row.text.as_deref(), None, &explicit),
             )
-            .bind(document.search_text)
-            .bind(document.search_tags)
-            .bind(CURRENT_SEARCH_SCHEMA_VERSION)
-            .bind(document.provenance.asks_ai)
-            .bind(document.provenance.ai_command)
-            .bind(document.provenance.is_command)
-            .bind(document.provenance.is_synthetic_record)
-            .bind(row.id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+        })
+        .collect::<Vec<_>>();
+    write_search_documents(pool, documents).await?;
+    Ok(Some(last_id))
+}
 
+async fn write_search_documents(
+    pool: &SqlitePool,
+    documents: Vec<(i64, crate::db::search::SearchDocument)>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for (id, document) in documents {
+        sqlx::query(
+            "UPDATE messages SET search_text = ?, search_tags = ?, search_version = ?, \
+            asks_ai = ?, ai_command = ?, is_command = ?, is_synthetic_record = ? \
+            WHERE id = ? AND search_version != ?",
+        )
+        .bind(document.search_text)
+        .bind(document.search_tags)
+        .bind(CURRENT_SEARCH_SCHEMA_VERSION)
+        .bind(document.provenance.asks_ai)
+        .bind(document.provenance.ai_command)
+        .bind(document.provenance.is_command)
+        .bind(document.provenance.is_synthetic_record)
+        .bind(id)
+        .bind(CURRENT_SEARCH_SCHEMA_VERSION)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -586,5 +663,223 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, 77);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn snippets_match_original_unicode_boundaries() {
+        for prefix in ["K", "İ", "好😀"] {
+            let text = format!("{}{}needle{}", "好".repeat(70), prefix, "好".repeat(150));
+            let matcher = snippet_matcher(&["NEEDLE".to_string()]);
+            let result = build_snippet(&text, matcher.as_ref());
+            assert!(result.contains("needle"));
+        }
+    }
+    #[tokio::test]
+    async fn pagination_reaches_third_page_with_overlapping_stages() {
+        use crate::db::test_support::{init_test_db, queue_message};
+        let db = init_test_db("pagination-v2").await;
+        for id in 1..=60 {
+            queue_message(&db, id, -1001374348669, "alice", "alpha beta same text").await;
+        }
+        let hits = db
+            .search_chat_messages(-1001374348669, "alpha beta", 20, 40)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 20);
+        let first = db
+            .search_chat_messages(-1001374348669, "alpha beta", 20, 0)
+            .await
+            .unwrap();
+        assert!(!hits
+            .iter()
+            .any(|hit| first.iter().any(|other| other.message_id == hit.message_id)));
+        db.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod migration_regressions {
+    use super::*;
+    use crate::db::test_support::{init_test_db, queue_message, wait_for_search_ready};
+    #[tokio::test]
+    async fn normalization_upgrade_resumes_without_resetting_completed_rows() {
+        let db = init_test_db("normalization-resume").await;
+        for id in 1..=3 {
+            queue_message(&db, id, -100123, "alice", "原始中文消息计算机科学").await;
+        }
+        sqlx::query("UPDATE messages SET search_version = 1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE messages SET search_version = ?, search_text = 'completed sentinel' WHERE message_id = 1")
+            .bind(CURRENT_SEARCH_SCHEMA_VERSION).execute(db.pool()).await.unwrap();
+        set_search_schema_version(db.pool(), 1).await.unwrap();
+        let first = rebuild_search_batch(db.pool(), 0, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first > 0);
+        assert_eq!(count_pending_search_rows(db.pool()).await.unwrap(), 1);
+        let path: String =
+            sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        db.shutdown().await;
+        let db = Database::init(&crate::db::test_support::sqlite_url_for_path(
+            std::path::Path::new(&path),
+        ))
+        .await
+        .unwrap();
+        wait_for_search_ready(&db).await;
+        let sentinel: String =
+            sqlx::query_scalar("SELECT search_text FROM messages WHERE message_id = 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(sentinel, "completed sentinel");
+        assert_eq!(count_pending_search_rows(db.pool()).await.unwrap(), 0);
+        let schema: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            schema, 1,
+            "normalization must not change the database format"
+        );
+        // A missing index must rebuild even rows stamped as current.
+        sqlx::query("DROP TABLE messages_fts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        crate::db::schema::prepare_search_fts(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count_pending_search_rows(db.pool()).await.unwrap(), 3);
+        rebuild_search_index(db.pool().clone(), db.search_ready.clone())
+            .await
+            .unwrap();
+        wait_for_search_ready(&db).await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages_fts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        let texts: Vec<String> = sqlx::query_scalar("SELECT text FROM messages")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(texts.iter().all(|text| text == "原始中文消息计算机科学"));
+        db.shutdown().await;
+    }
+    #[tokio::test]
+    async fn long_chinese_message_retains_segmented_words() {
+        let db = init_test_db("long-cjk-v2").await;
+        let text = format!("计算机科学{}", "这是一个普通消息".repeat(650));
+        queue_message(&db, 1, -100123, "alice", &text).await;
+        assert!(!db
+            .search_chat_messages(-100123, "计算机", 10, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        let indexed: String = sqlx::query_scalar("SELECT search_text FROM messages")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(indexed.contains('\n'));
+        assert!(indexed.chars().count() <= 12_001);
+        db.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod writer_race_tests {
+    use super::*;
+    use crate::db::test_support::{init_test_db, queue_message};
+    #[tokio::test]
+    async fn rebuild_commit_does_not_overwrite_a_newer_writer_document() {
+        let db = init_test_db("rebuild-writer-race").await;
+        queue_message(&db, 1, -100123, "alice", "old text").await;
+        let id: i64 = sqlx::query_scalar("SELECT id FROM messages")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let stale =
+            normalize_message_document(Some("old text"), None, &SearchProvenance::default());
+        // The normal writer has committed between our snapshot and batch write.
+        sqlx::query("UPDATE messages SET text = 'new text', search_text = 'new indexed text', search_version = ?")
+            .bind(CURRENT_SEARCH_SCHEMA_VERSION).execute(db.pool()).await.unwrap();
+        write_search_documents(db.pool(), vec![(id, stale)])
+            .await
+            .unwrap();
+        let indexed: String = sqlx::query_scalar("SELECT search_text FROM messages")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(indexed, "new indexed text");
+        db.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod lock_recovery_tests {
+    use super::*;
+    use crate::db::test_support::{init_test_db, queue_message, sqlite_url_for_path};
+    use crate::utils::log_capture::capture_json_events_on;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+    #[tokio::test]
+    async fn rebuild_recovers_after_sqlite_lock_without_restart() {
+        let db = init_test_db("rebuild-lock").await;
+        queue_message(&db, 1, -100123, "alice", "searchable text").await;
+        sqlx::query("UPDATE messages SET search_version = 1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let path: String =
+            sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let options =
+            SqliteConnectOptions::from_str(&sqlite_url_for_path(std::path::Path::new(&path)))
+                .unwrap()
+                .busy_timeout(Duration::ZERO);
+        let rebuild_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let mut lock = db.pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let seen_retry = Arc::new(tokio::sync::Notify::new());
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(10), seen_retry.notified())
+                .await
+                .expect("rebuild must report a lock retry");
+            sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+        };
+        let run = capture_json_events_on(
+            rebuild_search_index(rebuild_pool.clone(), db.search_ready.clone()),
+            "retrying batch",
+            seen_retry.clone(),
+        );
+        let ((result, events), ()) = tokio::join!(run, release);
+        result.unwrap();
+        assert!(db.is_search_ready());
+        assert_eq!(count_pending_search_rows(db.pool()).await.unwrap(), 0);
+        assert!(serde_json::to_string(&events)
+            .unwrap()
+            .contains("retrying batch"));
+        drop(lock);
+        rebuild_pool.close().await;
+        db.shutdown().await;
     }
 }

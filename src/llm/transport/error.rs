@@ -44,6 +44,37 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
+    /// Sanitize at the transport boundary without losing retry/status metadata.
+    pub fn sanitized(mut self, redact: impl Fn(&str) -> String) -> Self {
+        match &mut self {
+            Self::Transport {
+                provider, message, ..
+            } => {
+                *provider = redact(provider);
+                *message = redact(message);
+            }
+            Self::Http {
+                provider,
+                message,
+                body_snippet,
+                ..
+            } => {
+                *provider = redact(provider);
+                *message = message.as_deref().map(&redact);
+                *body_snippet = redact(body_snippet);
+            }
+            Self::Decode {
+                provider, detail, ..
+            } => {
+                *provider = redact(provider);
+                *detail = redact(detail);
+            }
+            Self::BodyTooLarge { provider, .. } => *provider = redact(provider),
+            Self::Rejected(message) => *message = redact(message),
+        }
+        self
+    }
+
     pub fn transport(provider: &str, err: &reqwest::Error, message: String) -> Self {
         Self::Transport {
             provider: provider.to_string(),

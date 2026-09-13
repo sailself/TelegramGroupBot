@@ -12,9 +12,8 @@ use crate::agents::step::{call_step_text, resolve_step_model, StepModel, WallClo
 use crate::config::CONFIG;
 use crate::db::models::MessageRow;
 use crate::llm::prompting::{format_tldr_chat_content, wrap_chat_history};
-use crate::llm::text_model::{
-    call_configured_text_model, resolve_default_text_model_for_request, ModelRequestCapabilities,
-};
+use crate::llm::resolved_model::ResolvedTextModel;
+use crate::llm::text_model::call_resolved_text_model;
 use crate::llm::LlmAuditContext;
 use crate::prompts::{TLDR_CHUNK_PROMPT, TLDR_MERGE_PROMPT};
 use crate::utils::progress::ProgressReporter;
@@ -40,20 +39,11 @@ pub async fn summarize_messages_map_reduce(
     messages: &[MessageRow],
     audit_context: Option<&LlmAuditContext>,
     progress: &mut ProgressReporter,
+    wall_clock: &WallClock,
+    final_model: &ResolvedTextModel,
 ) -> Result<TldrOutcome> {
-    let wall_clock = WallClock::start();
-
-    let final_model_id = match resolve_default_text_model_for_request(ModelRequestCapabilities {
-        require_tools: true,
-        ..ModelRequestCapabilities::default()
-    }) {
-        Ok(model) => model,
-        Err(err) => {
-            warn!("map-reduce /tldr could not resolve a model: {err}");
-            return Ok(TldrOutcome::UseLegacy("no model resolved"));
-        }
-    };
-    let step_model = match resolve_step_model(&final_model_id) {
+    wall_clock.check()?;
+    let step_model = match resolve_step_model(final_model).await {
         Ok(step_model) => step_model,
         Err(err) => {
             warn!("map-reduce /tldr has no step model: {err}");
@@ -107,11 +97,13 @@ pub async fn summarize_messages_map_reduce(
         info!("map-reduce /tldr proceeding with {degraded}/{total} degraded chunk(s)");
     }
 
+    wall_clock.check()?;
     // Reduce: merge with the configured default model.
     progress.update_now("Merging partial summaries...").await;
     let merge_input = build_merge_input(&chunk_summaries);
     let system_prompt = TLDR_MERGE_PROMPT.replace("{bot_name}", &CONFIG.telegraph.author_name);
-    let (text, model_display) = call_configured_text_model(
+    let (text, model_display) = call_resolved_text_model(
+        final_model,
         &system_prompt,
         &merge_input,
         "Message Summary",

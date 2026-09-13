@@ -14,10 +14,8 @@ use crate::agents::common::{
 use crate::agents::step::{resolve_step_model, StepModel, WallClock};
 use crate::config::{ThirdPartyProvider, CONFIG};
 use crate::llm::media::{MediaFile, MediaSummary};
-use crate::llm::runtime_models::runtime_model_config;
-use crate::llm::text_model::{
-    call_configured_text_model, resolve_default_text_model_for_request, ModelRequestCapabilities,
-};
+use crate::llm::resolved_model::ResolvedTextModel;
+use crate::llm::text_model::call_resolved_text_model;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::llm::LlmAuditContext;
 use crate::prompts::{
@@ -55,6 +53,7 @@ pub type FactcheckOutcome = PipelineOutcome<ModelAnswer>;
 /// Run the multi-phase fact-check. `statement` is the fenced untrusted content
 /// from `build_factcheck_statement`; media files are attached to the
 /// extraction and synthesis calls.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_factcheck_pipeline(
     statement: &str,
     media_files: &[MediaFile],
@@ -62,30 +61,17 @@ pub async fn run_factcheck_pipeline(
     telegram_user_language_hint: Option<&str>,
     audit_context: Option<&LlmAuditContext>,
     progress: &mut ProgressReporter,
+    wall_clock: &WallClock,
+    final_model: &ResolvedTextModel,
 ) -> Result<FactcheckOutcome> {
-    let wall_clock = WallClock::start();
-
-    let final_model_id = match resolve_default_text_model_for_request(ModelRequestCapabilities {
-        has_images: media_summary.images > 0,
-        has_video: media_summary.videos > 0,
-        has_audio: media_summary.audios > 0,
-        has_documents: media_summary.documents > 0,
-        require_tools: false,
-    }) {
-        Ok(model) => model,
-        Err(err) => {
-            warn!("factcheck pipeline could not resolve a model: {err}");
-            return Ok(FactcheckOutcome::UseLegacy("no model resolved"));
-        }
-    };
-
+    wall_clock.check()?;
     // Phase A: claim extraction.
     progress.update("Extracting claims to verify...").await;
     let claims = match extract_claims(
         statement,
         media_files,
         media_summary,
-        &final_model_id,
+        final_model,
         audit_context,
     )
     .await
@@ -101,16 +87,19 @@ pub async fn run_factcheck_pipeline(
         return Ok(FactcheckOutcome::UseLegacy("no check-worthy claims"));
     }
 
+    wall_clock.check()?;
     // Phase B: per-claim web research, bounded concurrency, no LLM calls.
-    let evidence = research_claims(claims, &wall_clock, progress).await;
+    let evidence = research_claims(claims, wall_clock, progress).await;
 
+    wall_clock.check()?;
     // Phase C: synthesis with the configured default model.
     progress
         .update_now("Composing the fact-check report...")
         .await;
     let system_prompt = build_synthesis_prompt(telegram_user_language_hint);
     let user_content = build_synthesis_input(statement, &evidence);
-    let (text, model_display) = call_configured_text_model(
+    let (text, model_display) = call_resolved_text_model(
+        final_model,
         &system_prompt,
         &user_content,
         "Fact Check",
@@ -131,19 +120,18 @@ pub async fn run_factcheck_pipeline(
 /// Pick the extraction model. Text-only requests use the cheap step model;
 /// requests with media use the resolved default (media-capable) model, still
 /// with the step reasoning override for Responses providers.
-fn extraction_model(final_model_id: &str, has_media: bool) -> Result<StepModel> {
+async fn extraction_model(final_model: &ResolvedTextModel, has_media: bool) -> Result<StepModel> {
     if !has_media {
-        return resolve_step_model(final_model_id);
+        return resolve_step_model(final_model).await;
     }
 
-    if final_model_id.eq_ignore_ascii_case("gemini") {
+    if final_model.model_id().eq_ignore_ascii_case("gemini") {
         return Ok(StepModel::Gemini {
             model: CONFIG.gemini.model.clone(),
         });
     }
 
-    let config = runtime_model_config(final_model_id)
-        .ok_or_else(|| anyhow::anyhow!("unknown model '{final_model_id}'"))?;
+    let config = final_model.config().expect("third-party config").clone();
     let reasoning_override = matches!(
         config.provider,
         ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
@@ -153,6 +141,7 @@ fn extraction_model(final_model_id: &str, has_media: bool) -> Result<StepModel> 
     Ok(StepModel::ThirdParty {
         config,
         reasoning_override,
+        explicit_codex: final_model.explicit_codex().cloned().map(Box::new),
     })
 }
 
@@ -160,10 +149,10 @@ async fn extract_claims(
     statement: &str,
     media_files: &[MediaFile],
     media_summary: &MediaSummary,
-    final_model_id: &str,
+    final_model: &ResolvedTextModel,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<Vec<ExtractedClaim>> {
-    let step_model = extraction_model(final_model_id, media_summary.total > 0)?;
+    let step_model = extraction_model(final_model, media_summary.total > 0).await?;
     let prompt = build_extraction_prompt();
     let schema = claim_extraction_schema(
         CONFIG.agents.factcheck_max_claims,

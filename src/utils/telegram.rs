@@ -58,6 +58,67 @@ where
     }
 }
 
+/// Generation succeeded, but Telegram did not confirm photo delivery.
+#[derive(Debug, thiserror::Error)]
+#[error("Generated image delivery failed: {0}")]
+pub(crate) struct ImageDeliveryError(#[source] pub RequestError);
+
+impl ImageDeliveryError {
+    fn user_message(&self) -> &'static str {
+        if telegram_error_is_retryable(&self.0) {
+            "Your image was generated, but a network or temporary Telegram error prevented delivery after retries. Please try again later."
+        } else {
+            "Your image was generated, but Telegram rejected its delivery. Please try again later."
+        }
+    }
+}
+
+/// Every post-status operation either completes normally or attempts a terminal
+/// edit. A failed edit must never replace the error that caused the command to fail.
+pub async fn run_with_status_message<T>(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    failure_text: &str,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    run_with_status_report(work, |error| {
+        let text = if error.is::<crate::utils::timing::OperationDeadlineExceeded>() {
+            "This request reached its time limit. Please try a smaller request.".to_string()
+        } else if let Some(delivery_error) = error.downcast_ref::<ImageDeliveryError>() {
+            delivery_error.user_message().to_string()
+        } else {
+            failure_text.to_string()
+        };
+        async move {
+            retry_telegram("terminal command status", || {
+                bot.edit_message_text(chat_id, message_id, text.clone())
+            })
+            .await?;
+            Ok(())
+        }
+    })
+    .await
+}
+
+async fn run_with_status_report<T, R>(
+    work: impl std::future::Future<Output = Result<T>>,
+    report: impl FnOnce(&anyhow::Error) -> R,
+) -> Result<T>
+where
+    R: std::future::Future<Output = Result<()>>,
+{
+    match work.await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Err(report_error) = report(&error).await {
+                warn!("Failed to report terminal command status: {report_error}");
+            }
+            Err(error)
+        }
+    }
+}
+
 pub struct ChatActionHeartbeat {
     task_handle: Option<JoinHandle<()>>,
 }
@@ -236,6 +297,18 @@ mod tests {
         )))
     }
 
+    #[test]
+    fn image_delivery_errors_report_generation_success_and_keep_the_cause() {
+        let error = anyhow::Error::new(ImageDeliveryError(io_error())).context("photo upload");
+        let delivery = error.downcast_ref::<ImageDeliveryError>().unwrap();
+        assert!(delivery.user_message().contains("image was generated"));
+        assert!(delivery.user_message().contains("after retries"));
+        assert!(matches!(delivery.0, RequestError::Io(_)));
+        let rejected = ImageDeliveryError(RequestError::Api(ApiError::MessageNotModified));
+        assert!(rejected.user_message().contains("Telegram rejected"));
+        assert!(!rejected.user_message().contains("after retries"));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn retry_telegram_retries_transient_errors_and_returns_the_first_success() {
         let calls = AtomicUsize::new(0);
@@ -336,5 +409,53 @@ mod tests {
             "@alice as a knight"
         );
         assert_eq!(strip_command_prefix("draw a cat", "/img"), "draw a cat");
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    #[tokio::test]
+    async fn status_failure_is_reported_once_and_preserves_original_error() {
+        let mut reports = 0;
+        let result: Result<()> =
+            run_with_status_report(async { Err(anyhow::anyhow!("original failure")) }, |_| {
+                reports += 1;
+                async { Err(anyhow::anyhow!("edit failed")) }
+            })
+            .await;
+        assert_eq!(reports, 1);
+        assert_eq!(result.unwrap_err().to_string(), "original failure");
+    }
+    #[tokio::test]
+    async fn successful_command_does_not_report_an_error() {
+        let result =
+            run_with_status_report(async { Ok(42) }, |_| async { panic!("unexpected report") })
+                .await
+                .unwrap();
+        assert_eq!(result, 42);
+    }
+}
+
+#[cfg(test)]
+mod permit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn work_permit_is_released_before_status_reporting() {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let result: Result<()> = run_with_status_report(
+            async move {
+                let _permit = permit;
+                Err(crate::utils::timing::OperationDeadlineExceeded.into())
+            },
+            |error| {
+                assert!(error.is::<crate::utils::timing::OperationDeadlineExceeded>());
+                assert_eq!(semaphore.available_permits(), 1);
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

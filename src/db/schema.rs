@@ -240,54 +240,59 @@ async fn ensure_messages_column(
     Ok(())
 }
 
-pub(super) async fn ensure_search_fts_exists(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(search_text, search_tags);",
+/// Repair/bootstrap derived FTS state on one connection and transaction.
+/// Normalization upgrades retain current rows; only a missing table resets them.
+pub(super) async fn prepare_search_fts(pool: &SqlitePool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
     )
-    .execute(pool)
+    .fetch_one(&mut *tx)
     .await?;
-    create_search_fts_triggers(pool).await?;
-    Ok(())
-}
-
-pub(super) async fn recreate_search_fts(pool: &SqlitePool) -> Result<()> {
-    drop_search_fts(pool).await?;
-    ensure_search_fts_exists(pool).await?;
-    Ok(())
-}
-
-async fn drop_search_fts(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("DROP TRIGGER IF EXISTS messages_ai;")
-        .execute(pool)
-        .await?;
-    sqlx::query("DROP TRIGGER IF EXISTS messages_ad;")
-        .execute(pool)
-        .await?;
-    sqlx::query("DROP TRIGGER IF EXISTS messages_au;")
-        .execute(pool)
-        .await?;
-    sqlx::query("DROP TABLE IF EXISTS messages_fts;")
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-async fn create_search_fts_triggers(pool: &SqlitePool) -> Result<()> {
+    if exists == 0 {
+        for statement in [
+            "DROP TRIGGER IF EXISTS messages_ai",
+            "DROP TRIGGER IF EXISTS messages_ad",
+            "DROP TRIGGER IF EXISTS messages_au",
+        ] {
+            sqlx::query(statement)
+                .persistent(false)
+                .execute(&mut *tx)
+                .await
+                .context("dropping orphaned FTS triggers")?;
+        }
+    }
     sqlx::query(
-        "CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages \
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(search_text, search_tags)",
+    )
+    .persistent(false)
+    .execute(&mut *tx)
+    .await
+    .context("creating FTS table")?;
+    if exists == 0 {
+        sqlx::query("UPDATE messages SET search_version = 0 WHERE search_version != 0")
+            .persistent(false)
+            .execute(&mut *tx)
+            .await
+            .context("resetting rows for missing FTS table")?;
+        sqlx::query("DELETE FROM app_meta WHERE key = ?")
+            .bind(SEARCH_INDEX_META_KEY)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages \
          WHEN NEW.search_text IS NOT NULL OR NEW.search_tags IS NOT NULL BEGIN \
          INSERT INTO messages_fts(rowid, search_text, search_tags) VALUES (NEW.id, NEW.search_text, NEW.search_tags); \
-         END;",
-    )
-    .execute(pool)
-    .await?;
+         END;").persistent(false).execute(&mut *tx).await.context("creating FTS trigger")?;
     sqlx::query(
         "CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN \
          DELETE FROM messages_fts WHERE rowid = OLD.id; \
          END;",
     )
-    .execute(pool)
-    .await?;
+    .persistent(false)
+    .execute(&mut *tx)
+    .await
+    .context("creating FTS trigger")?;
     sqlx::query(
         "CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN \
          DELETE FROM messages_fts WHERE rowid = OLD.id; \
@@ -296,8 +301,11 @@ async fn create_search_fts_triggers(pool: &SqlitePool) -> Result<()> {
          WHERE NEW.search_text IS NOT NULL OR NEW.search_tags IS NOT NULL; \
          END;",
     )
-    .execute(pool)
-    .await?;
+    .persistent(false)
+    .execute(&mut *tx)
+    .await
+    .context("creating FTS trigger")?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -324,8 +332,9 @@ pub(super) async fn set_search_schema_version(pool: &SqlitePool, version: i64) -
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) async fn reset_search_versions(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("UPDATE messages SET search_version = 0")
+    sqlx::query("UPDATE messages SET search_version = 0 WHERE search_version != 0")
         .execute(pool)
         .await?;
     sqlx::query("DELETE FROM app_meta WHERE key = ?")

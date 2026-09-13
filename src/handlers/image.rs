@@ -31,7 +31,7 @@ use crate::utils::telegram::{
     send_message_with_retry, start_chat_action_heartbeat, strip_command_prefix,
 };
 use crate::utils::text::{escape_html, truncate_with_ellipsis};
-use tracing::{error, info};
+use tracing::info;
 
 const IMAGE_RESOLUTION_OPTIONS: [&str; 3] = ["2K", "4K", "1K"];
 const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 14] = [
@@ -549,6 +549,9 @@ async fn finalize_image_request(
     }
 
     let processing_message_id = MessageId(request.selection_message_id as i32);
+    crate::utils::telegram::run_with_status_message(bot, ChatId(request.chat_id), processing_message_id, "Failed to generate your image. Please try again.", async {
+            let _heavy_permit = _heavy_permit;
+
     let _chat_action = start_chat_action_heartbeat(
         bot.clone(),
         ChatId(request.chat_id),
@@ -628,23 +631,11 @@ async fn finalize_image_request(
 
     let images = match image_result {
         Ok(images) => images,
-        Err(err) => {
-            error!(
-                model = model_name.as_str(),
-                "Image generation failed: {}", err.0
-            );
-            let error_text = format!(
-                "Sorry, I couldn't generate the image using {}.\n\nError: {}",
-                model_name, err.0
-            );
-            let _ = bot
-                .edit_message_text(ChatId(request.chat_id), processing_message_id, error_text)
-                .await;
-            return Ok(());
-        }
+        Err(err) => return Err(anyhow::anyhow!(err.0)),
     };
     let caption = build_image_caption(&model_name, &prompt).await;
 
+    if images.is_empty() { return Err(anyhow::anyhow!("Image generation returned no images")); }
     let mut image_iter = images.into_iter();
     if let Some(first_image) = image_iter.next() {
         let media = InputMedia::Photo(
@@ -656,21 +647,25 @@ async fn finalize_image_request(
             .edit_message_media(ChatId(request.chat_id), processing_message_id, media)
             .await;
         if edit_result.is_err() {
-            bot.send_photo(ChatId(request.chat_id), InputFile::memory(first_image))
+            retry_telegram("send_photo", || {
+                bot.send_photo(ChatId(request.chat_id), InputFile::memory(first_image.clone()))
                 .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
-                .caption(caption)
+                .caption(caption.clone())
                 .parse_mode(ParseMode::Html)
-                .await?;
+            }).await.map_err(crate::utils::telegram::ImageDeliveryError)?;
+            let _ = edit_message_text_with_retry(bot, ChatId(request.chat_id), processing_message_id, "Generated image below.").await;
         }
     }
 
     for image in image_iter {
-        bot.send_photo(ChatId(request.chat_id), InputFile::memory(image))
+        retry_telegram("send_photo", || {
+            bot.send_photo(ChatId(request.chat_id), InputFile::memory(image.clone()))
             .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
-            .await?;
+        }).await.map_err(crate::utils::telegram::ImageDeliveryError)?;
     }
 
     Ok(())
+    }).await
 }
 
 pub async fn image_selection_callback(
@@ -962,80 +957,85 @@ pub async fn img_handler(
         .send_message(message.chat.id, "Generating your image...")
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
+    crate::utils::telegram::run_with_status_message(
+        &bot,
+        processing_message.chat.id,
+        processing_message.id,
+        "Failed to generate your image. Please try again.",
+        async {
+            let _heavy_permit = _heavy_permit;
+            let mut prompt_text = context.prompt.clone();
+            if !context.telegraph_contents.is_empty() {
+                prompt_text.push_str("\n\nAdditional context:\n");
+                for content in &context.telegraph_contents {
+                    prompt_text.push_str(content);
+                    prompt_text.push('\n');
+                }
+            }
+            let _chat_action =
+                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
 
-    let mut prompt_text = context.prompt.clone();
-    if !context.telegraph_contents.is_empty() {
-        prompt_text.push_str("\n\nAdditional context:\n");
-        for content in &context.telegraph_contents {
-            prompt_text.push_str(content);
-            prompt_text.push('\n');
-        }
-    }
-    let _chat_action =
-        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
-
-    let (model_name, image_result) = generate_image_with_configured_default(
-        &prompt_text,
-        &context.image_urls,
-        None,
-        None,
-        !CONFIG.cwd_pw.api_key.is_empty(),
-        audit_context.as_ref(),
-    )
-    .await;
-
-    let images = match image_result {
-        Ok(images) => images,
-        Err(err) => {
-            error!(
-                model = model_name.as_str(),
-                "Image generation failed: {}", err.0
-            );
-            let error_text = format!(
-                "Sorry, I couldn't generate the image using {}.\n\nError: {}",
-                model_name, err.0
-            );
-            let _ = bot
-                .edit_message_text(message.chat.id, processing_message.id, error_text)
-                .await;
-            return Ok(());
-        }
-    };
-
-    let caption = build_image_caption(&model_name, &prompt_text).await;
-    let mut image_iter = images.into_iter();
-    if let Some(first_image) = image_iter.next() {
-        let media = InputMedia::Photo(
-            InputMediaPhoto::new(InputFile::memory(first_image.clone()))
-                .caption(caption.clone())
-                .parse_mode(ParseMode::Html),
-        );
-        let edit_result = bot
-            .edit_message_media(message.chat.id, processing_message.id, media)
+            let (model_name, image_result) = generate_image_with_configured_default(
+                &prompt_text,
+                &context.image_urls,
+                None,
+                None,
+                !CONFIG.cwd_pw.api_key.is_empty(),
+                audit_context.as_ref(),
+            )
             .await;
-        if edit_result.is_err() {
-            bot.send_photo(message.chat.id, InputFile::memory(first_image))
-                .reply_parameters(ReplyParameters::new(message.id))
-                .caption(caption)
-                .parse_mode(ParseMode::Html)
-                .await?;
-            let _ = bot
-                .edit_message_text(
-                    message.chat.id,
-                    processing_message.id,
-                    "Generated image below.",
-                )
-                .await;
-        }
-    }
 
-    for image in image_iter {
-        bot.send_photo(message.chat.id, InputFile::memory(image))
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
-    }
+            let images = match image_result {
+                Ok(images) => images,
+                Err(err) => return Err(anyhow::anyhow!(err.0)),
+            };
 
-    Ok(())
+            let caption = build_image_caption(&model_name, &prompt_text).await;
+            if images.is_empty() {
+                return Err(anyhow::anyhow!("Image generation returned no images"));
+            }
+            let mut image_iter = images.into_iter();
+            if let Some(first_image) = image_iter.next() {
+                let media = InputMedia::Photo(
+                    InputMediaPhoto::new(InputFile::memory(first_image.clone()))
+                        .caption(caption.clone())
+                        .parse_mode(ParseMode::Html),
+                );
+                let edit_result = bot
+                    .edit_message_media(message.chat.id, processing_message.id, media)
+                    .await;
+                if edit_result.is_err() {
+                    retry_telegram("send_photo", || {
+                        bot.send_photo(message.chat.id, InputFile::memory(first_image.clone()))
+                            .reply_parameters(ReplyParameters::new(message.id))
+                            .caption(caption.clone())
+                            .parse_mode(ParseMode::Html)
+                    })
+                    .await
+                    .map_err(crate::utils::telegram::ImageDeliveryError)?;
+                    let _ = bot
+                        .edit_message_text(
+                            message.chat.id,
+                            processing_message.id,
+                            "Generated image below.",
+                        )
+                        .await;
+                }
+            }
+
+            for image in image_iter {
+                retry_telegram("send_photo", || {
+                    bot.send_photo(message.chat.id, InputFile::memory(image.clone()))
+                        .reply_parameters(ReplyParameters::new(message.id))
+                })
+                .await
+                .map_err(crate::utils::telegram::ImageDeliveryError)?;
+            }
+
+            Ok(())
+        },
+    )
+    .await
 }
 
 pub async fn img2_handler(
@@ -1087,73 +1087,73 @@ pub async fn img2_handler(
         .send_message(message.chat.id, "Generating your image with img2...")
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
+    crate::utils::telegram::run_with_status_message(
+        &bot,
+        processing_message.chat.id,
+        processing_message.id,
+        "Failed to generate your image. Please try again.",
+        async {
+            let _heavy_permit = _heavy_permit;
+            let mut prompt_text = context.prompt.clone();
+            if !context.telegraph_contents.is_empty() {
+                prompt_text.push_str("\n\nAdditional context:\n");
+                for content in &context.telegraph_contents {
+                    prompt_text.push_str(content);
+                    prompt_text.push('\n');
+                }
+            }
 
-    let mut prompt_text = context.prompt.clone();
-    if !context.telegraph_contents.is_empty() {
-        prompt_text.push_str("\n\nAdditional context:\n");
-        for content in &context.telegraph_contents {
-            prompt_text.push_str(content);
-            prompt_text.push('\n');
-        }
-    }
+            let _chat_action =
+                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
+            let result = match generate_image_with_img2(
+                &prompt_text,
+                &context.image_urls,
+                message.chat.id.0,
+                message.id.0 as i64,
+                audit_context.as_ref(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(err) => return Err(anyhow::anyhow!(err.0)),
+            };
 
-    let _chat_action =
-        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
-    let result = match generate_image_with_img2(
-        &prompt_text,
-        &context.image_urls,
-        message.chat.id.0,
-        message.id.0 as i64,
-        audit_context.as_ref(),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(err) => {
-            error!("Img2 image generation failed: {}", err.0);
-            let _ = bot
-                .edit_message_text(
-                    message.chat.id,
-                    processing_message.id,
-                    format!(
-                        "Sorry, I couldn't generate the image with img2.\n\nError: {}",
-                        err.0
-                    ),
-                )
-                .await;
-            return Ok(());
-        }
-    };
-
-    info!(
+            info!(
         "Sending Img2 image to Telegram: request_id={:?}, bytes={}, content_type={:?}, path={}",
         result.request_id,
         result.byte_len,
         result.content_type,
         result.path.display()
     );
-    let caption = build_image_caption("img2", &prompt_text).await;
-    let media = build_img2_spoiler_photo_media(InputFile::file(result.path.clone()), &caption);
-    let edit_result = bot
-        .edit_message_media(message.chat.id, processing_message.id, media)
-        .await;
-    if edit_result.is_err() {
-        bot.send_photo(message.chat.id, InputFile::file(result.path.clone()))
-            .reply_parameters(ReplyParameters::new(message.id))
-            .caption(build_img2_spoiler_caption(&caption))
-            .parse_mode(ParseMode::Html)
-            .has_spoiler(true)
-            .await?;
-        let _ = bot
-            .edit_message_text(
-                message.chat.id,
-                processing_message.id,
-                "Generated image below.",
-            )
-            .await;
-    }
+            let caption = build_image_caption("img2", &prompt_text).await;
+            let media =
+                build_img2_spoiler_photo_media(InputFile::file(result.path.clone()), &caption);
+            let edit_result = bot
+                .edit_message_media(message.chat.id, processing_message.id, media)
+                .await;
+            if edit_result.is_err() {
+                retry_telegram("send_photo", || {
+                    bot.send_photo(message.chat.id, InputFile::file(result.path.clone()))
+                        .reply_parameters(ReplyParameters::new(message.id))
+                        .caption(build_img2_spoiler_caption(&caption))
+                        .parse_mode(ParseMode::Html)
+                        .has_spoiler(true)
+                })
+                .await
+                .map_err(crate::utils::telegram::ImageDeliveryError)?;
+                let _ = bot
+                    .edit_message_text(
+                        message.chat.id,
+                        processing_message.id,
+                        "Generated image below.",
+                    )
+                    .await;
+            }
 
-    Ok(())
+            Ok(())
+        },
+    )
+    .await
 }
 
 pub async fn image_handler(
@@ -1374,24 +1374,42 @@ pub async fn vid_handler(
         Some(message.id),
     )
     .await?;
-    let _chat_action =
-        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-    let (video_bytes, _mime_type) =
-        generate_video_with_veo(&prompt_text, audit_context.as_ref()).await?;
+    crate::utils::telegram::run_with_status_message(
+        &bot,
+        processing_message.chat.id,
+        processing_message.id,
+        "Failed to generate your video. Please try again.",
+        async {
+            let _heavy_permit = _heavy_permit;
+            let _chat_action =
+                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
+            let (video_bytes, _mime_type) =
+                generate_video_with_veo(&prompt_text, audit_context.as_ref()).await?;
 
-    if let Some(video_bytes) = video_bytes {
-        send_video_with_retry(&bot, message.chat.id, &video_bytes, Some(message.id)).await?;
-    } else {
-        edit_message_text_with_retry(
-            &bot,
-            message.chat.id,
-            processing_message.id,
-            "Video generation is unavailable right now.",
-        )
-        .await?;
-    }
+            if let Some(video_bytes) = video_bytes {
+                send_video_with_retry(&bot, message.chat.id, &video_bytes, Some(message.id))
+                    .await?;
+                edit_message_text_with_retry(
+                    &bot,
+                    message.chat.id,
+                    processing_message.id,
+                    "Video generated below.",
+                )
+                .await?;
+            } else {
+                edit_message_text_with_retry(
+                    &bot,
+                    message.chat.id,
+                    processing_message.id,
+                    "Video generation is unavailable right now.",
+                )
+                .await?;
+            }
 
-    Ok(())
+            Ok(())
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

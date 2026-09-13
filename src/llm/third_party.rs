@@ -11,9 +11,7 @@ use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
 use crate::llm::audit::LlmAuditContext;
 use crate::llm::media::{MediaFile, MediaKind};
 use crate::llm::responses_provider::call_responses_provider;
-use crate::llm::runtime_models::{
-    is_runtime_provider_ready, runtime_model_config, ResolvedExplicitCodexModel,
-};
+use crate::llm::runtime_models::{is_runtime_provider_ready, ResolvedExplicitCodexModel};
 use crate::llm::tool_loop::{
     clamp_request_timeout_secs, run_tool_loop, BoxFuture, ModelTurn, ToolCall, ToolProtocol,
     TurnDeadline,
@@ -37,6 +35,7 @@ pub struct ThirdPartyCallOptions<'a> {
     /// resolved, so the call does not depend on the runtime catalog for it.
     explicit_codex: Option<&'a ResolvedExplicitCodexModel>,
     codex_prompt_style: CodexPromptStyle,
+    pinned_codex_metadata: bool,
 }
 
 impl<'a> ThirdPartyCallOptions<'a> {
@@ -49,11 +48,17 @@ impl<'a> ThirdPartyCallOptions<'a> {
             reasoning_override: None,
             explicit_codex: None,
             codex_prompt_style,
+            pinned_codex_metadata: false,
         }
     }
 
     pub(crate) fn with_reasoning_override(mut self, reasoning_override: Option<&'a str>) -> Self {
         self.reasoning_override = reasoning_override;
+        self
+    }
+
+    pub(crate) fn with_pinned_codex_metadata(mut self) -> Self {
+        self.pinned_codex_metadata = true;
         self
     }
 
@@ -64,24 +69,6 @@ impl<'a> ThirdPartyCallOptions<'a> {
         self.explicit_codex = explicit_codex;
         self
     }
-}
-
-fn model_config_for_call(
-    model_id: &str,
-    explicit_codex: Option<&ResolvedExplicitCodexModel>,
-) -> Result<ThirdPartyModelConfig> {
-    if let Some(explicit) = explicit_codex {
-        if explicit.config.id != model_id {
-            return Err(anyhow!("The explicit Codex model changed"));
-        }
-        return Ok(explicit.config.clone());
-    }
-
-    CONFIG
-        .get_third_party_model_config(model_id)
-        .cloned()
-        .or_else(|| runtime_model_config(model_id))
-        .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))
 }
 
 #[derive(Debug, Clone)]
@@ -620,60 +607,8 @@ async fn chat_completion_with_tool_runtime(
     run_tool_loop(&mut protocol, runtime, messages, &deadline).await
 }
 
-/// [`call_third_party`] with a tool runtime, for the `/qc`, `/s` and
-/// quick-answer paths that manage their own runtime.
-pub async fn call_third_party_with_tool_runtime(
-    system_prompt: &str,
-    user_content: &str,
-    model_id: &str,
-    response_title: &str,
-    media_files: &[MediaFile],
-    runtime: &mut ToolRuntime,
-    options: ThirdPartyCallOptions<'_>,
-) -> Result<String> {
-    call_third_party(
-        system_prompt,
-        user_content,
-        model_id,
-        response_title,
-        media_files,
-        Some(runtime),
-        options,
-    )
-    .await
-}
-
-/// Answer with a third-party model. `tools` runs the shared tool loop over
-/// that runtime's budget; `None` is a single request without tools.
-pub async fn call_third_party(
-    system_prompt: &str,
-    user_content: &str,
-    model_id: &str,
-    response_title: &str,
-    media_files: &[MediaFile],
-    tools: Option<&mut ToolRuntime>,
-    options: ThirdPartyCallOptions<'_>,
-) -> Result<String> {
-    if model_id.trim().is_empty() {
-        return Err(anyhow!("Model identifier is required"));
-    }
-
-    let model_config = model_config_for_call(model_id, options.explicit_codex)?;
-    call_third_party_with_reasoning_config(
-        system_prompt,
-        user_content,
-        &model_config,
-        response_title,
-        media_files,
-        tools,
-        options,
-    )
-    .await
-}
-
-/// Variant of [`call_third_party`] that takes an already resolved model config,
-/// so callers can use synthesized configs that are not in the runtime catalog
-/// (e.g. a foreign Codex slug used as agent step model).
+/// Answer with the configuration already resolved for this execution.
+/// Synthesized agent models need not exist in the runtime catalog.
 pub async fn call_third_party_with_reasoning_config(
     system_prompt: &str,
     user_content: &str,
@@ -688,6 +623,7 @@ pub async fn call_third_party_with_reasoning_config(
         reasoning_override,
         explicit_codex,
         codex_prompt_style,
+        pinned_codex_metadata,
     } = options;
     if matches!(
         model_config.provider,
@@ -704,6 +640,7 @@ pub async fn call_third_party_with_reasoning_config(
             audit_context,
             reasoning_override,
             explicit_codex,
+            pinned_codex_metadata,
             codex_prompt_style,
         )
         .await;

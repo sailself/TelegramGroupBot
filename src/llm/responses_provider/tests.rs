@@ -1267,3 +1267,33 @@ async fn call_provider_api_retries_after_truncated_stream() {
     assert_eq!(extract_response_text(&output), "recovered");
     handle.join().unwrap();
 }
+
+#[test]
+fn pinned_model_metadata_drives_payload_after_catalog_replacement() {
+    use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel};
+    let mut config = model_config(ThirdPartyProvider::OpenAICodex, "pinned-model");
+    config.id = crate::llm::runtime_models::OPENAI_CODEX_SELECTED_MODEL_ID.into();
+    let record = codex_record("pinned-model", &["low", "high"], Some("low"), true);
+    let mut snapshot = ModelCatalogSnapshot {
+        models: vec![config.clone()],
+        ready_providers: vec![ThirdPartyProvider::OpenAICodex],
+        codex_record: Some(record),
+    };
+    let pinned = ResolvedTextModel::from_snapshot(&config.id, &snapshot, None).unwrap();
+    snapshot.models[0].model = "replacement".into();
+    snapshot.codex_record = None;
+    let record = &pinned.explicit_codex().unwrap().record;
+    let identity = test_identity(pinned.config().unwrap(), Some(record), Some("high"));
+    let (payload, lite) = build_responses_payload(
+        pinned.config().unwrap(),
+        "instructions",
+        vec![],
+        None,
+        "session",
+        Some(&identity),
+        true,
+    );
+    assert_eq!(payload["model"], "pinned-model");
+    assert_eq!(payload["reasoning"]["effort"], "high");
+    assert!(lite);
+}

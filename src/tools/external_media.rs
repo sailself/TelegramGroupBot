@@ -405,8 +405,8 @@ pub(crate) const EXTERNAL_MEDIA_COLLECTION_TIMEOUT: Duration = Duration::from_se
 
 /// Downloads every request, bounded to at most `fanout` concurrent fetches
 /// and `EXTERNAL_MEDIA_COLLECTION_TIMEOUT` total, returning the successful
-/// files in input order (results race independently, so an index travels
-/// with each one to restore that order at the end).
+/// files in input order. Headers overlap, but body reads and budget admission
+/// follow input priority; no later attachment can steal an earlier byte budget.
 async fn collect_external_media<S, Fut>(
     requests: Vec<ExternalMediaRequest>,
     budget: &ExternalMediaBudget,
@@ -420,49 +420,71 @@ where
     if requests.is_empty() {
         return Vec::new();
     }
-    let semaphore = Arc::new(Semaphore::new(fanout.max(1)));
+    let fanout = fanout.max(1);
+    let semaphore = Arc::new(Semaphore::new(fanout));
     let mut workers = JoinSet::new();
-    for request in requests {
+    let mut task_indices = std::collections::HashMap::new();
+    let mut waiting = requests.into_iter().enumerate();
+    let spawn = |workers: &mut JoinSet<_>, ordinal, request: ExternalMediaRequest| {
         let semaphore = semaphore.clone();
         let start = start.clone();
-        let budget = budget.clone();
-        workers.spawn(async move {
-            let index = request.index;
-            let permit = match semaphore.acquire_owned().await {
-                Ok(permit) => permit,
-                // The semaphore is only ever closed if it were `close()`d,
-                // which nothing here does; treat it as "this request did
-                // not produce a file" rather than panicking a worker task.
-                Err(_) => return (index, None),
-            };
-            let response = start_logged(start.clone(), request.clone()).await;
-            let fallback_start = {
-                let start = start.clone();
-                move |fallback: ExternalMediaRequest| start_logged(start, fallback)
-            };
-            let file = process_response_with_fallback(request, response, &budget, fallback_start)
-                .await
-                .map(|(_, file)| file);
-            drop(permit);
-            (index, file)
-        });
+        workers
+            .spawn(async move {
+                let permit = semaphore.acquire_owned().await.ok();
+                let response = start_logged(start, request.clone()).await;
+                (ordinal, request, response, permit)
+            })
+            .id()
+    };
+    for (ordinal, request) in waiting.by_ref().take(fanout) {
+        task_indices.insert(spawn(&mut workers, ordinal, request), ordinal);
     }
-
+    let mut ready = std::collections::BTreeMap::new();
+    let mut next = 0;
     let mut collected = Vec::new();
     let drain = async {
-        while let Some(joined) = workers.join_next().await {
-            if let Ok((index, Some(file))) = joined {
-                collected.push((index, file));
+        loop {
+            while !ready.contains_key(&next) {
+                match workers.join_next_with_id().await {
+                    Some(Ok((id, (ordinal, request, response, permit)))) => {
+                        task_indices.remove(&id);
+                        ready.insert(ordinal, Some((request, response, permit)));
+                    }
+                    Some(Err(err)) => {
+                        warn!("External media worker failed: {err}");
+                        if let Some(ordinal) = task_indices.remove(&err.id()) {
+                            ready.insert(ordinal, None);
+                        }
+                    }
+                    None => return,
+                }
+            }
+            if let Some(Some((request, response, permit))) = ready.remove(&next) {
+                let fallback_start = {
+                    let start = start.clone();
+                    move |fallback| start_logged(start, fallback)
+                };
+                if let Some((_, file)) =
+                    process_response_with_fallback(request, response, budget, fallback_start).await
+                {
+                    collected.push(file);
+                }
+                drop(permit);
+            }
+            next += 1;
+            if let Some((ordinal, request)) = waiting.next() {
+                task_indices.insert(spawn(&mut workers, ordinal, request), ordinal);
             }
         }
     };
-    // On timeout `workers` (still owned here) is dropped at the end of this
-    // function, which aborts every worker still running; the same happens if
-    // our own caller cancels this future mid-poll.
-    let _ = tokio::time::timeout(EXTERNAL_MEDIA_COLLECTION_TIMEOUT, drain).await;
-
-    collected.sort_by_key(|(index, _)| *index);
-    collected.into_iter().map(|(_, file)| file).collect()
+    if tokio::time::timeout(EXTERNAL_MEDIA_COLLECTION_TIMEOUT, drain)
+        .await
+        .is_err()
+    {
+        warn!("External media collection deadline exhausted");
+    }
+    // Dropping ready releases open bodies/permits; dropping workers aborts starts.
+    collected
 }
 
 pub async fn download_telegraph_media(
@@ -1030,6 +1052,64 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].bytes(), b"0");
         assert_eq!(files[1].bytes(), b"1");
+        slow.join().unwrap();
+        fast.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn collector_preserves_input_priority_under_tight_budget() {
+        let slow = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_content_length(
+                    1,
+                    b"0".to_vec(),
+                ),
+            )
+            .delayed(std::time::Duration::from_millis(40)),
+        ]);
+        let fast = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                1,
+                b"1".to_vec(),
+            ),
+        );
+        let requests = vec![
+            ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file/0.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+            ExternalMediaRequest {
+                index: 1,
+                url: "https://telegra.ph/file/1.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+        ];
+        let slow_url = slow.url("/media");
+        let fast_url = fast.url("/media");
+        let budget = ExternalMediaBudget::new(1);
+        // Index 0 answers slower than index 1, so a naive first-finished
+        // order would come back reversed; the collector must still restore
+        // input order.
+        let files = collect_external_media(requests, &budget, 4, move |request| {
+            let slow_url = slow_url.clone();
+            let fast_url = fast_url.clone();
+            async move {
+                let url = if request.index == 0 {
+                    slow_url
+                } else {
+                    fast_url
+                };
+                Ok(get_http_client_no_redirect().get(url).send().await?)
+            }
+        })
+        .await;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].bytes(), b"0");
         slow.join().unwrap();
         fast.join().unwrap();
     }

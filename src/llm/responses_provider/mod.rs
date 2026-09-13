@@ -35,14 +35,24 @@ pub async fn call_responses_provider(
     audit_context: Option<&LlmAuditContext>,
     reasoning_override: Option<&str>,
     explicit_codex: Option<&ResolvedExplicitCodexModel>,
+    pinned_codex_metadata: bool,
     codex_prompt_style: crate::llm::CodexPromptStyle,
 ) -> Result<String> {
-    crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config).await?;
-    let identity = CodexRequestIdentity::resolve(
-        model_config,
-        explicit_codex.map(|explicit| &explicit.record),
-        reasoning_override,
-    )?;
+    let identity = if pinned_codex_metadata {
+        CodexRequestIdentity::resolve_pinned(
+            model_config,
+            explicit_codex.map(|explicit| &explicit.record),
+            reasoning_override,
+        )?
+    } else {
+        crate::llm::runtime_models::ensure_selected_codex_model_metadata_current(model_config)
+            .await?;
+        CodexRequestIdentity::resolve(
+            model_config,
+            explicit_codex.map(|explicit| &explicit.record),
+            reasoning_override,
+        )?
+    };
     let model_label = debug_model_label(model_config);
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);

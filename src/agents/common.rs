@@ -305,3 +305,47 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    struct Guard(Arc<AtomicUsize>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn deadline_cancels_all_mapping_workers() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let active_for_tasks = active.clone();
+        let started_for_tasks = started.clone();
+        let clock = WallClock::for_budget(Duration::from_secs(10));
+        let future = async {
+            map_bounded(vec![0, 1], 2, &clock, None, move |_, _| {
+                let active = active_for_tasks.clone();
+                let started = started_for_tasks.clone();
+                async move {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = Guard(active);
+                    started.add_permits(1);
+                    std::future::pending::<Result<()>>().await
+                }
+            })
+            .await;
+            Ok(())
+        };
+        let (result, _) = tokio::join!(clock.run(future), async {
+            let _ready = started.acquire_many(2).await.unwrap();
+            assert_eq!(active.load(Ordering::SeqCst), 2);
+        });
+        assert!(result
+            .unwrap_err()
+            .is::<crate::utils::timing::OperationDeadlineExceeded>());
+        tokio::task::yield_now().await;
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+}

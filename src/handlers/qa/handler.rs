@@ -21,10 +21,7 @@ use crate::llm::audit::{
     LLM_TRIGGER_KIND_COMMAND,
 };
 use crate::llm::media::summarize_media_files;
-use crate::llm::text_model::{
-    has_available_third_party_models_for_request, resolve_default_text_model_for_request,
-    ModelRequestCapabilities,
-};
+use crate::llm::text_model::ModelRequestCapabilities;
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
 use crate::utils::telegram::{
     message_entities_for_text, message_text_or_caption, reply_with_retry,
@@ -44,8 +41,6 @@ use super::prompt::{
 use super::selection_ui::{
     create_model_selection_keyboard, process_timed_out_q_request_with_default_model,
 };
-
-pub(super) const USER_ERROR_DETAIL_LIMIT: usize = 400;
 
 async fn create_q_audit_context(
     state: &AppState,
@@ -262,7 +257,7 @@ async fn q_handler_internal(
     .await;
     let twitter_source_count = count_sources(&enrichment.sources, SourceKind::Twitter).sources;
     let audit_context = create_q_audit_context(&state, &message, command_name).await;
-    let snapshot = ModelCatalogSnapshot::load();
+    let mut snapshot = ModelCatalogSnapshot::load();
 
     let media_summary = summarize_media_files(&enrichment.media_files);
     let has_images = media_summary.images > 0;
@@ -272,8 +267,7 @@ async fn q_handler_internal(
 
     let request_capabilities =
         ModelRequestCapabilities::from_media(&media_summary, mode.requires_custom_tools());
-    let third_party_models_available_for_request =
-        has_available_third_party_models_for_request(request_capabilities);
+    let third_party_models_available_for_request = snapshot.has_available(request_capabilities);
     if has_video
         && !video_request_has_capable_model(
             CONFIG.gemini_api_available(),
@@ -318,7 +312,8 @@ async fn q_handler_internal(
                     )
                 })
         } else {
-            resolve_default_text_model_for_request(request_capabilities)
+            snapshot
+                .resolve_default(request_capabilities)
                 .map(|model| (model, "default_text_model", None))
         };
         match resolved {
@@ -358,7 +353,15 @@ async fn q_handler_internal(
                 CONFIG.gemini_api_available(),
             );
         }
-        let model = match QaModel::resolve(&selected_model, &snapshot, prepared.as_ref()) {
+        let model = match QaModel::prepare(
+            &selected_model,
+            &mut snapshot,
+            prepared
+                .as_ref()
+                .and_then(|prepared| prepared.explicit_codex.as_ref()),
+        )
+        .await
+        {
             Ok(model) => model,
             Err(err) => {
                 reply_with_retry(
@@ -604,13 +607,12 @@ pub async fn s_handler(
     }
     let audit_context = create_q_audit_context(&state, &message, "s").await;
 
-    let snapshot = ModelCatalogSnapshot::load();
+    let mut snapshot = ModelCatalogSnapshot::load();
     let request_capabilities = ModelRequestCapabilities {
         require_tools: true,
         ..ModelRequestCapabilities::default()
     };
-    let third_party_models_available_for_request =
-        has_available_third_party_models_for_request(request_capabilities);
+    let third_party_models_available_for_request = snapshot.has_available(request_capabilities);
     let must_use_default_model = should_use_default_model_without_selection(
         QaCommandMode::ChatSearch,
         request_capabilities,
@@ -621,7 +623,7 @@ pub async fn s_handler(
         false,
     );
     let direct_model = if must_use_default_model {
-        match resolve_default_text_model_for_request(request_capabilities) {
+        match snapshot.resolve_default(request_capabilities) {
             Ok(model) => Some((model, "default_text_model")),
             Err(err) => {
                 reply_with_retry(
@@ -662,7 +664,7 @@ pub async fn s_handler(
     };
 
     if let Some((selected_model, timer_detail)) = direct_model {
-        let model = match QaModel::resolve(&selected_model, &snapshot, None) {
+        let model = match QaModel::prepare(&selected_model, &mut snapshot, None).await {
             Ok(model) => model,
             Err(err) => {
                 reply_with_retry(

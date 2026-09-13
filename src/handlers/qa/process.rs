@@ -4,32 +4,28 @@
 use anyhow::Result;
 use serde_json::Value;
 use teloxide::prelude::*;
-use teloxide::types::{
-    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode,
-};
+use teloxide::types::{ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{error, info};
 
 use crate::config::{ThirdPartyProvider, CONFIG};
 use crate::handlers::enrichment::{render_sources, EnrichmentBudget};
-use crate::handlers::responses::send_response;
+use crate::handlers::responses::{send_response, ResponseContent};
 use crate::llm::audit::{audit_context_from_id, LlmAuditContext};
 use crate::llm::media::{summarize_media_files, MediaFile, MediaSummary};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::{
-    call_gemini, call_gemini_with_tool_runtime, call_third_party,
-    call_third_party_with_tool_runtime, CodexPromptStyle, GeminiCallRequest, ThirdPartyCallOptions,
+    call_gemini, call_gemini_with_tool_runtime, call_third_party_with_reasoning_config,
+    CodexPromptStyle, GeminiCallRequest, ThirdPartyCallOptions,
 };
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
-use crate::utils::markdown::markdown_to_telegram_html;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::start_chat_action_heartbeat;
-use crate::utils::text::escape_html;
 
 use super::chat_search::{
     chat_search_rebuilding_message, process_chat_search_request, warn_on_unverified_chat_links,
 };
-use super::model_resolution::{format_llm_error_message, ModelCatalogSnapshot, QaModel};
+use super::model_resolution::{ModelCatalogSnapshot, QaModel};
 use super::prompt::{
     build_chat_context_system_prompt, build_quick_system_prompt, build_system_prompt,
 };
@@ -126,9 +122,10 @@ pub(super) async fn dispatch(
         search_grounding,
         audit_context,
     } = call;
-    let third_party_options = ThirdPartyCallOptions::new(audit_context, prompt_style)
-        .with_reasoning_override(reasoning_override.as_deref())
-        .with_explicit_codex_model(model.explicit_codex());
+    let third_party_options = model.options(
+        ThirdPartyCallOptions::new(audit_context, prompt_style)
+            .with_reasoning_override(reasoning_override.as_deref()),
+    );
 
     match (model, tools) {
         (QaModel::Gemini, Some(runtime)) => call_gemini_with_tool_runtime(
@@ -156,21 +153,23 @@ pub(super) async fn dispatch(
         })
         .await
         .map(|result| (result.text, Some(result.model_used))),
-        (QaModel::ThirdParty { .. }, Some(runtime)) => call_third_party_with_tool_runtime(
+        (QaModel::ThirdParty { config, .. }, Some(runtime)) => {
+            call_third_party_with_reasoning_config(
+                &system_prompt,
+                &user_content,
+                config,
+                label,
+                &media_files.unwrap_or_default(),
+                Some(runtime),
+                third_party_options,
+            )
+            .await
+            .map(|response| (response, None))
+        }
+        (QaModel::ThirdParty { config, .. }, None) => call_third_party_with_reasoning_config(
             &system_prompt,
             &user_content,
-            model.model_id(),
-            label,
-            &media_files.unwrap_or_default(),
-            runtime,
-            third_party_options,
-        )
-        .await
-        .map(|response| (response, None)),
-        (QaModel::ThirdParty { .. }, None) => call_third_party(
-            &system_prompt,
-            &user_content,
-            model.model_id(),
+            config,
             label,
             &media_files.unwrap_or_default(),
             None,
@@ -315,6 +314,40 @@ async fn run_chat_context_request(
     query: String,
     audit_context: Option<&LlmAuditContext>,
 ) -> (Result<(String, Option<String>)>, Vec<i64>) {
+    let clock = crate::agents::step::WallClock::start();
+    match clock
+        .run(async {
+            let (result, ids) = run_chat_context_request_inner(
+                bot,
+                state,
+                model,
+                request,
+                system_prompt,
+                query,
+                audit_context,
+                &clock,
+            )
+            .await;
+            result.map(|answer| (answer, ids))
+        })
+        .await
+    {
+        Ok((answer, ids)) => (Ok(answer), ids),
+        Err(error) => (Err(error), Vec::new()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_context_request_inner(
+    bot: &Bot,
+    state: &AppState,
+    model: &QaModel,
+    request: &PendingQRequest,
+    system_prompt: String,
+    query: String,
+    audit_context: Option<&LlmAuditContext>,
+    clock: &crate::agents::step::WallClock,
+) -> (Result<(String, Option<String>)>, Vec<i64>) {
     if CONFIG.agents.enable_agentic_qc {
         let mut progress_reporter = ProgressReporter::new(
             bot.clone(),
@@ -326,13 +359,14 @@ async fn run_chat_context_request(
                 db: &state.db,
                 chat_id: request.chat_id,
                 query: &query,
-                model_name: model.model_id(),
+                model,
                 system_prompt: &system_prompt,
                 media_files: &request.enrichment.media_files,
                 youtube_urls: &request.enrichment.youtube_urls,
                 audit_context,
             },
             &mut progress_reporter,
+            clock,
         )
         .await
         {
@@ -349,6 +383,9 @@ async fn run_chat_context_request(
         }
     }
 
+    if let Err(error) = clock.check() {
+        return (Err(error), Vec::new());
+    }
     let mut runtime = ToolRuntime::for_qc(state.db.clone(), request.chat_id);
     // Gemini needs the tool budget spelled out in its system prompt; the
     // third-party call appends the same guidance itself.
@@ -478,23 +515,25 @@ async fn send_qa_answer(
     quick_search_attempted: bool,
 ) -> Result<()> {
     let response_text = append_quick_search_footer(response, request.mode, quick_search_attempted);
-    let mut rendered_response = markdown_to_telegram_html(&response_text);
+    let mut content = ResponseContent::new(response_text);
     if !model.model_id().is_empty() {
-        let display_model = model.result_display_name(snapshot, request.mode, gemini_model_used);
-        rendered_response.push_str(&format!("\n\nModel: {}", escape_html(&display_model)));
+        content = content.with_model(model.result_display_name(
+            snapshot,
+            request.mode,
+            gemini_model_used,
+        ));
     }
 
     send_response(
         bot,
         ChatId(request.chat_id),
         MessageId(request.selection_message_id as i32),
-        &rendered_response,
+        &content,
         if request.mode == QaCommandMode::ChatContext {
             "Answer about Chat"
         } else {
             "Answer to Your Question"
         },
-        ParseMode::Html,
     )
     .await
 }
@@ -525,6 +564,9 @@ pub(super) async fn process_request(
     }
 
     let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
+    crate::utils::telegram::run_with_status_message(bot, ChatId(request.chat_id), MessageId(request.selection_message_id as i32), "Failed to answer this request. Please try again.", async {
+            let _heavy_permit = _heavy_permit;
+
     let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
     if request.mode.requires_chat_search_index() && !state.db.is_search_ready() {
         bot.edit_message_text(
@@ -536,6 +578,12 @@ pub(super) async fn process_request(
         return Ok(());
     }
 
+    if let Some(config) = model.config() {
+        let summary = summarize_media_files(&request.enrichment.media_files);
+        if !crate::llm::text_model::third_party_model_matches_request_capabilities(config, crate::llm::text_model::ModelRequestCapabilities::from_media(&summary, request.mode.requires_custom_tools())) {
+            return Err(anyhow::anyhow!("The selected model no longer supports this request"));
+        }
+    }
     let system_prompt = build_mode_system_prompt(&request);
     let query = build_user_content(&request);
 
@@ -599,20 +647,10 @@ pub(super) async fn process_request(
             result
         }
     };
-    let (response, gemini_model_used) = match response {
-        Ok(response) => response,
-        Err(err) => {
-            error!("QA request failed: {summary}, error={err:#}");
-            let message = format_llm_error_message(model, &logged_model_name, &err);
-            bot.edit_message_text(
-                ChatId(request.chat_id),
-                MessageId(request.selection_message_id as i32),
-                message,
-            )
-            .await?;
-            return Err(err);
-        }
-    };
+    let (response, gemini_model_used) = response.map_err(|err| {
+        error!("QA request failed: {summary}, error={err:#}");
+        err
+    })?;
 
     if response.trim().is_empty() {
         bot.edit_message_text(ChatId(request.chat_id), MessageId(request.selection_message_id as i32), "I couldn't find an answer to your question. Please try rephrasing or asking something else.")
@@ -639,4 +677,5 @@ pub(super) async fn process_request(
         quick_search_attempted,
     )
     .await
+    }).await
 }

@@ -1,17 +1,12 @@
 use anyhow::{anyhow, Result};
 
-use crate::config::{
-    parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
-};
+use crate::config::{parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider};
 use crate::llm::audit::LlmAuditContext;
 use crate::llm::media::{summarize_media_files, MediaSummary};
-use crate::llm::runtime_models::{
-    codex_selected_model_label, is_runtime_provider_ready, resolve_runtime_model_identifier,
-    runtime_model_config, runtime_models, selected_codex_model_record,
-    OPENAI_CODEX_SELECTED_MODEL_ID,
-};
+use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel};
+use crate::llm::runtime_models::{is_runtime_provider_ready, OPENAI_CODEX_SELECTED_MODEL_ID};
 use crate::llm::tool_runtime::ToolRuntime;
-use crate::llm::{call_gemini, call_third_party, GeminiCallRequest};
+use crate::llm::{call_gemini, call_third_party_with_reasoning_config, GeminiCallRequest};
 
 pub const MODEL_GEMINI: &str = "gemini";
 
@@ -90,34 +85,6 @@ fn resolve_alias_to_model_id_with_models(
     None
 }
 
-fn resolve_keyword_alias_with_models(
-    identifier: &str,
-    models: &[ThirdPartyModelConfig],
-) -> Option<String> {
-    let alias = identifier.trim().to_lowercase();
-    let keywords = match alias.as_str() {
-        "llama" => &["llama"][..],
-        "grok" => &["grok"][..],
-        "qwen" => &["qwen"][..],
-        "deepseek" => &["deepseek"][..],
-        "gpt" => &["gpt"][..],
-        _ => return None,
-    };
-
-    let matches = models
-        .iter()
-        .filter(|config| {
-            let name = config.name.to_lowercase();
-            keywords.iter().all(|keyword| name.contains(keyword))
-        })
-        .collect::<Vec<_>>();
-    if matches.len() == 1 {
-        return Some(matches[0].id.clone());
-    }
-
-    None
-}
-
 pub(crate) fn normalize_model_identifier_with_models(
     identifier: &str,
     models: &[ThirdPartyModelConfig],
@@ -135,20 +102,6 @@ pub(crate) fn normalize_model_identifier_with_models(
         .unwrap_or_else(|| stripped.to_string())
 }
 
-pub(crate) fn normalize_model_identifier(identifier: &str) -> String {
-    if let Some(resolved) = resolve_runtime_model_identifier(identifier) {
-        return resolved;
-    }
-
-    let models = runtime_models();
-    resolve_keyword_alias_with_models(identifier, &models)
-        .unwrap_or_else(|| normalize_model_identifier_with_models(identifier, &models, &[]))
-}
-
-fn is_third_party_model_available(config: &ThirdPartyModelConfig) -> bool {
-    is_runtime_provider_ready(config.provider)
-}
-
 pub(crate) fn ready_runtime_providers(models: &[ThirdPartyModelConfig]) -> Vec<ThirdPartyProvider> {
     models
         .iter()
@@ -162,34 +115,6 @@ fn is_third_party_model_available_with_ready_providers(
     ready_providers: &[ThirdPartyProvider],
 ) -> bool {
     ready_providers.contains(&config.provider)
-}
-
-pub(crate) fn has_available_third_party_models_for_request(
-    request: ModelRequestCapabilities,
-) -> bool {
-    let models = runtime_models();
-    let ready_providers = ready_runtime_providers(&models);
-    !available_third_party_models_for_request(&models, &ready_providers, request).is_empty()
-}
-
-pub(crate) fn model_supports_media_for_request(
-    model_name: &str,
-    request: ModelRequestCapabilities,
-) -> bool {
-    if model_name == MODEL_GEMINI {
-        return CONFIG.gemini_api_available();
-    }
-    if request.has_documents {
-        return false;
-    }
-
-    let Some(config) = runtime_model_config(model_name) else {
-        return false;
-    };
-    if !is_third_party_model_available(&config) {
-        return false;
-    }
-    third_party_model_matches_request_capabilities(&config, request)
 }
 
 pub(crate) fn default_text_model_error(model_name: &str, reason: &str) -> String {
@@ -270,23 +195,7 @@ pub(crate) fn resolve_default_text_model_with_models(
     Ok(normalized)
 }
 
-pub(crate) fn resolve_default_text_model_for_request(
-    request: ModelRequestCapabilities,
-) -> Result<String> {
-    let models = runtime_models();
-    let ready_providers = ready_runtime_providers(&models);
-
-    resolve_default_text_model_with_models(
-        &CONFIG.models.default_text_model,
-        &models,
-        &ready_providers,
-        CONFIG.gemini_api_available(),
-        request,
-    )
-    .map_err(|message| anyhow!(message))
-}
-
-fn third_party_model_matches_request_capabilities(
+pub(crate) fn third_party_model_matches_request_capabilities(
     config: &ThirdPartyModelConfig,
     request: ModelRequestCapabilities,
 ) -> bool {
@@ -322,30 +231,6 @@ pub(crate) fn available_third_party_models_for_request<'a>(
         .collect()
 }
 
-pub(crate) fn default_text_model_display_name(
-    model_name: &str,
-    gemini_model_used: Option<&str>,
-) -> String {
-    if model_name == MODEL_GEMINI {
-        return gemini_model_used
-            .unwrap_or(CONFIG.gemini.model.as_str())
-            .to_string();
-    }
-
-    if let Some(config) = runtime_model_config(model_name) {
-        if config.provider == ThirdPartyProvider::OpenAICodex {
-            if let Some(record) = selected_codex_model_record() {
-                if record.slug == config.model {
-                    return codex_selected_model_label(&record);
-                }
-            }
-        }
-        return config.model;
-    }
-
-    model_name.to_string()
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_configured_text_model(
     system_prompt: &str,
@@ -361,11 +246,53 @@ pub(crate) async fn call_configured_text_model(
         .as_ref()
         .map(|files| summarize_media_files(files))
         .unwrap_or_default();
-    let model_name = resolve_default_text_model_for_request(ModelRequestCapabilities::from_media(
+    let mut snapshot = ModelCatalogSnapshot::load();
+    let id = snapshot.resolve_default(ModelRequestCapabilities::from_media(
         &media_summary,
         tools_enabled,
     ))?;
+    let model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
+    call_resolved_text_model(
+        &model,
+        system_prompt,
+        user_content,
+        response_title,
+        tools_enabled,
+        use_pro,
+        media_files,
+        prompt_name,
+        audit_context,
+    )
+    .await
+}
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_resolved_text_model(
+    model: &ResolvedTextModel,
+    system_prompt: &str,
+    user_content: &str,
+    response_title: &str,
+    tools_enabled: bool,
+    use_pro: bool,
+    media_files: Option<Vec<crate::llm::media::MediaFile>>,
+    prompt_name: Option<&str>,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<(String, String)> {
+    if let Some(config) = model.config() {
+        let summary = media_files
+            .as_ref()
+            .map(|files| summarize_media_files(files))
+            .unwrap_or_default();
+        if !third_party_model_matches_request_capabilities(
+            config,
+            ModelRequestCapabilities::from_media(&summary, tools_enabled),
+        ) {
+            return Err(anyhow!(
+                "The resolved model cannot satisfy this request's capabilities"
+            ));
+        }
+    }
+    let model_name = model.model_id();
     if model_name == MODEL_GEMINI {
         let response = call_gemini(GeminiCallRequest {
             system_prompt,
@@ -384,20 +311,22 @@ pub(crate) async fn call_configured_text_model(
 
     let media_files = media_files.unwrap_or_default();
     let mut web_tools = tools_enabled.then(ToolRuntime::for_web_search);
-    let response = call_third_party(
+    let response = call_third_party_with_reasoning_config(
         system_prompt,
         user_content,
-        &model_name,
+        model
+            .config()
+            .expect("non-Gemini resolved model has a config"),
         response_title,
         &media_files,
         web_tools.as_mut(),
-        crate::llm::ThirdPartyCallOptions::new(
+        model.options(crate::llm::ThirdPartyCallOptions::new(
             audit_context,
             crate::llm::CodexPromptStyle::TaskSpecific,
-        ),
+        )),
     )
     .await?;
-    let model_used = default_text_model_display_name(&model_name, None);
+    let model_used = model.result_label(None);
 
     Ok((response, model_used))
 }

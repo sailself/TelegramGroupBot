@@ -2,30 +2,31 @@
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ParseMode, ReplyParameters};
+use teloxide::types::{ChatAction, ReplyParameters};
 use tracing::{error, info, warn};
 
+use crate::agents::step::WallClock;
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
-use crate::handlers::content::create_telegraph_page;
+use crate::handlers::content::create_telegraph_answer;
 use crate::handlers::image::generate_image_with_configured_default;
-use crate::handlers::responses::send_response;
+use crate::handlers::responses::{send_response, ResponseContent};
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::media::detect_mime_type;
-use crate::llm::text_model::call_configured_text_model;
+use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel};
+use crate::llm::text_model::{call_resolved_text_model, ModelRequestCapabilities};
 use crate::llm::{GeminiImageConfig, LlmAuditContext};
 use crate::prompts::TLDR_SYSTEM_PROMPT;
 use crate::state::AppState;
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
-use crate::utils::markdown::markdown_to_telegram_html;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::start_chat_action_heartbeat;
-use crate::utils::text::escape_html;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 
 /// Legacy single-call /tldr: the whole history in one prompt. Used below the
 /// map-reduce threshold and as the fallback when the pipeline cannot start.
 async fn tldr_single_call(
+    model: &ResolvedTextModel,
     messages: &[crate::db::models::MessageRow],
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<(String, String)> {
@@ -33,7 +34,8 @@ async fn tldr_single_call(
         &crate::llm::prompting::format_tldr_chat_content(messages),
     );
     let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph.author_name);
-    call_configured_text_model(
+    call_resolved_text_model(
+        model,
         &system_prompt,
         &chat_content,
         "Message Summary",
@@ -88,6 +90,9 @@ pub async fn tldr_handler(
         .send_message(message.chat.id, "Summarizing recent messages...")
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
+    crate::utils::telegram::run_with_status_message(&bot, processing_message.chat.id, processing_message.id, "Failed to generate a summary. Please try again.", async {
+            let _heavy_permit = _heavy_permit;
+
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
 
@@ -115,8 +120,7 @@ pub async fn tldr_handler(
         return Ok(());
     }
 
-    // The reply-anchored fetch has no LIMIT; cap it, keeping the newest
-    // messages, so a reply to an ancient message cannot pull the whole table.
+    // The bounded fetch includes one extra row to detect truncation.
     let truncated_to_cap = messages.len() > CONFIG.agents.tldr_max_messages;
     if truncated_to_cap {
         let skip = messages.len() - CONFIG.agents.tldr_max_messages;
@@ -124,13 +128,20 @@ pub async fn tldr_handler(
     }
     let audit_context = create_command_audit_context(&state, &message, "tldr").await;
 
-    let summary_result = if messages.len() > CONFIG.agents.tldr_map_reduce_threshold {
+    let clock = WallClock::start();
+    let response = clock.run(async {
+        let mut snapshot = ModelCatalogSnapshot::load();
+        let id = snapshot.resolve_default(ModelRequestCapabilities { require_tools: true, ..Default::default() })?;
+        let final_model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
+        if messages.len() > CONFIG.agents.tldr_map_reduce_threshold {
         let mut progress_reporter =
             ProgressReporter::new(bot.clone(), message.chat.id, processing_message.id);
         match crate::agents::tldr::summarize_messages_map_reduce(
             &messages,
             audit_context.as_ref(),
             &mut progress_reporter,
+            &clock,
+            &final_model,
         )
         .await
         {
@@ -139,33 +150,16 @@ pub async fn tldr_handler(
                 model_display,
             })) => Ok((text, model_display)),
             Ok(crate::agents::tldr::TldrOutcome::UseLegacy(reason)) => {
+                clock.check()?;
                 info!("Map-reduce /tldr fell back to the single-call path: {reason}");
-                tldr_single_call(&messages, audit_context.as_ref()).await
+                tldr_single_call(&final_model, &messages, audit_context.as_ref()).await
             }
             Err(err) => Err(err),
         }
     } else {
-        tldr_single_call(&messages, audit_context.as_ref()).await
-    };
-
-    let response = match summary_result {
-        Ok(response) => response,
-        Err(err) => {
-            error!("TLDR summary generation failed: {}", err);
-            bot.edit_message_text(
-                processing_message.chat.id,
-                processing_message.id,
-                format!("Failed to generate a summary.\n\nError: {}", err),
-            )
-            .await?;
-            complete_command_timer(
-                &mut timer,
-                "error",
-                Some("summary_generation_failed".to_string()),
-            );
-            return Ok(());
-        }
-    };
+        tldr_single_call(&final_model, &messages, audit_context.as_ref()).await
+    }
+    }).await?;
 
     let (mut summary_text, summary_model) = response;
     if truncated_to_cap {
@@ -185,12 +179,6 @@ pub async fn tldr_handler(
         return Ok(());
     }
 
-    let model_line = format!("Model: {}", escape_html(&summary_model));
-    let summary_with_model = format!(
-        "{}\n\n{}",
-        markdown_to_telegram_html(&summary_text),
-        model_line
-    );
     let infographic_enabled = CONFIG.agents.enable_tldr_infographic;
 
     let _ = bot
@@ -261,27 +249,19 @@ Use the same language as the summary text for any labels.\
     let mut telegraph_url = None;
     if let Some(url) = &infographic_url {
         let telegraph_content = format!(
-            "![Infographic]({})\n\n{}\n\nModel: {}",
-            url, summary_text, summary_model
+            "![Infographic]({})\n\n{}",
+            url, summary_text
         );
         telegraph_url =
-            create_telegraph_page("Message Summary with Infographic", &telegraph_content).await;
+            create_telegraph_answer("Message Summary with Infographic", &telegraph_content, Some(&summary_model)).await;
     }
 
     let final_message = if let Some(url) = telegraph_url {
-        format!(
-            "Chat summary with infographic: <a href=\"{}\">View it here</a>\n\n{}",
-            escape_html(&url),
-            model_line
-        )
+        ResponseContent::new(format!("Chat summary with infographic: [View it here](<{url}>)")).with_model(&summary_model)
     } else if let Some(url) = infographic_url {
-        format!(
-            "{}\n\nInfographic: <a href=\"{}\">View it here</a>",
-            summary_with_model,
-            escape_html(&url)
-        )
+        ResponseContent::new(format!("{summary_text}\n\nInfographic: [View it here](<{url}>)")).with_model(&summary_model)
     } else {
-        summary_with_model
+        ResponseContent::new(summary_text).with_model(&summary_model)
     };
 
     let _ = bot
@@ -302,12 +282,12 @@ Use the same language as the summary text for any labels.\
         processing_message.id,
         &final_message,
         "Message Summary",
-        ParseMode::Html,
     )
     .await?;
     complete_command_timer(&mut timer, "success", None);
 
     Ok(())
+    }).await
 }
 
 #[cfg(test)]

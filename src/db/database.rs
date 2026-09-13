@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crate::config::CONFIG;
 use crate::db::schema::{
-    self, count_messages, current_search_schema_version, ensure_search_fts_exists,
-    recreate_search_fts, reset_search_versions, set_search_schema_version,
+    self, count_messages, current_search_schema_version, prepare_search_fts,
+    set_search_schema_version,
 };
 use crate::db::search::CURRENT_SEARCH_SCHEMA_VERSION;
 use crate::db::search_index::{count_pending_search_rows, spawn_search_rebuild};
@@ -52,11 +52,13 @@ impl Database {
 
         let schema_version = current_search_schema_version(&pool).await?;
         if schema_version != CURRENT_SEARCH_SCHEMA_VERSION {
-            recreate_search_fts(&pool).await?;
-            reset_search_versions(&pool).await?;
-        } else {
-            ensure_search_fts_exists(&pool).await?;
+            info!(
+                from = schema_version,
+                to = CURRENT_SEARCH_SCHEMA_VERSION,
+                "Search normalization upgrade; retaining completed rows"
+            );
         }
+        prepare_search_fts(&pool).await?;
 
         info!("Database tables created successfully");
 
