@@ -37,7 +37,7 @@ impl SearchProvider for BraveSearch {
     }
 
     fn is_enabled(&self) -> bool {
-        CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty()
+        CONFIG.search.enable_brave && !CONFIG.search.brave_api_key.trim().is_empty()
     }
 
     fn search<'a>(
@@ -50,8 +50,8 @@ impl SearchProvider for BraveSearch {
                 return Err(anyhow!("BRAVE_SEARCH_API_KEY is not configured."));
             }
             brave_search_at(
-                &CONFIG.brave_search_endpoint,
-                &CONFIG.brave_search_api_key,
+                &CONFIG.search.brave_endpoint,
+                &CONFIG.search.brave_api_key,
                 query,
                 max_results,
             )

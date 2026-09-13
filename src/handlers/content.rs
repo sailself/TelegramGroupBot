@@ -14,11 +14,6 @@ use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use crate::config::CONFIG;
-use crate::llm::media::MediaFile;
-use crate::tools::external_media::{
-    download_telegraph_media as download_external_telegraph_media,
-    download_twitter_media as download_external_twitter_media, ExternalMediaBudget,
-};
 use crate::tools::telegraph_extractor::{extract_telegraph_content, TelegraphContent};
 use crate::tools::twitter_extractor::{
     canonical_status_key, extract_twitter_content, is_supported_status_url, TwitterContent,
@@ -509,7 +504,7 @@ struct TelegraphCreateResult {
 }
 
 pub async fn create_telegraph_page(title: &str, content: &str) -> Option<String> {
-    if CONFIG.telegraph_access_token.trim().is_empty() {
+    if CONFIG.telegraph.access_token.trim().is_empty() {
         warn!("Telegraph access token missing; skipping page creation");
         return None;
     }
@@ -519,15 +514,15 @@ pub async fn create_telegraph_page(title: &str, content: &str) -> Option<String>
     let form = vec![
         (
             "access_token".to_string(),
-            CONFIG.telegraph_access_token.clone(),
+            CONFIG.telegraph.access_token.clone(),
         ),
         (
             "author_name".to_string(),
-            CONFIG.telegraph_author_name.clone(),
+            CONFIG.telegraph.author_name.clone(),
         ),
         (
             "author_url".to_string(),
-            CONFIG.telegraph_author_url.clone(),
+            CONFIG.telegraph.author_url.clone(),
         ),
         ("title".to_string(), title.to_string()),
         ("content".to_string(), content_json),
@@ -619,7 +614,35 @@ fn is_telegraph_url(url: &str) -> bool {
     lowered.contains("telegra.ph") || lowered.contains("t.me/")
 }
 
-async fn extract_cached_telegraph_content(url: &str) -> anyhow::Result<TelegraphContent> {
+/// Telegraph/`t.me` URLs mentioned in `text`, in scan order: bare URLs first,
+/// then Markdown and HTML link targets. Callers deduplicate.
+pub(crate) fn discover_telegraph_urls(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for matched in TELEGRAPH_URL_REGEX.find_iter(text) {
+        urls.push(matched.as_str().to_string());
+    }
+    for caps in MARKDOWN_LINK_REGEX.captures_iter(text) {
+        if let Some(url) = caps.get(1) {
+            let candidate = clean_url_candidate(url.as_str());
+            if is_telegraph_url(candidate) {
+                urls.push(candidate.to_string());
+            }
+        }
+    }
+    for caps in HTML_LINK_REGEX.captures_iter(text) {
+        if let Some(url) = caps.get(1) {
+            let candidate = clean_url_candidate(url.as_str());
+            if is_telegraph_url(candidate) {
+                urls.push(candidate.to_string());
+            }
+        }
+    }
+    urls
+}
+
+pub(crate) async fn extract_cached_telegraph_content(
+    url: &str,
+) -> anyhow::Result<TelegraphContent> {
     if let Some(content) = TELEGRAPH_CACHE.lock().get(url) {
         return Ok(content);
     }
@@ -631,7 +654,7 @@ async fn extract_cached_telegraph_content(url: &str) -> anyhow::Result<Telegraph
     Ok(content)
 }
 
-async fn extract_cached_twitter_content(url: &str) -> anyhow::Result<TwitterContent> {
+pub(crate) async fn extract_cached_twitter_content(url: &str) -> anyhow::Result<TwitterContent> {
     let cache_key = twitter_cache_key(url).ok();
     if let Some(cache_key) = cache_key.as_ref() {
         if let Some(content) = TWITTER_CACHE.lock().get(cache_key) {
@@ -674,31 +697,13 @@ pub async fn extract_telegraph_urls_and_content(
         }
     }
 
-    for m in TELEGRAPH_URL_REGEX.find_iter(text) {
-        urls.push(m.as_str().to_string());
-    }
-    for caps in MARKDOWN_LINK_REGEX.captures_iter(text) {
-        if let Some(url) = caps.get(1) {
-            let candidate = clean_url_candidate(url.as_str());
-            if is_telegraph_url(candidate) {
-                urls.push(candidate.to_string());
-            }
-        }
-    }
-    for caps in HTML_LINK_REGEX.captures_iter(text) {
-        if let Some(url) = caps.get(1) {
-            let candidate = clean_url_candidate(url.as_str());
-            if is_telegraph_url(candidate) {
-                urls.push(candidate.to_string());
-            }
-        }
-    }
+    urls.extend(discover_telegraph_urls(text));
 
     urls.sort();
     urls.dedup();
 
     let ordered_urls = urls.into_iter().take(max_urls).collect::<Vec<_>>();
-    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
+    let semaphore = Arc::new(Semaphore::new(CONFIG.external_media.enrich_fanout));
     let mut join_set = JoinSet::new();
     for url in ordered_urls.iter().cloned() {
         let semaphore = semaphore.clone();
@@ -785,7 +790,7 @@ pub async fn extract_twitter_urls_and_content(
     urls.dedup();
 
     let ordered_urls = urls.into_iter().take(max_urls).collect::<Vec<_>>();
-    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
+    let semaphore = Arc::new(Semaphore::new(CONFIG.external_media.enrich_fanout));
     let mut join_set = JoinSet::new();
     for url in ordered_urls.iter().cloned() {
         let semaphore = semaphore.clone();
@@ -837,22 +842,6 @@ pub async fn extract_twitter_urls_and_content(
     }
 
     (new_text, extracted)
-}
-
-pub async fn download_telegraph_media(
-    contents: &[TelegraphContent],
-    max_files: usize,
-    budget: &ExternalMediaBudget,
-) -> Vec<MediaFile> {
-    download_external_telegraph_media(contents, max_files, budget).await
-}
-
-pub async fn download_twitter_media(
-    contents: &[TwitterContent],
-    max_files: usize,
-    budget: &ExternalMediaBudget,
-) -> Vec<MediaFile> {
-    download_external_twitter_media(contents, max_files, budget).await
 }
 
 #[cfg(test)]

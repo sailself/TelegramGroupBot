@@ -101,7 +101,7 @@ pub fn should_auto_q_trigger(
         message,
         bot_user_id,
         bot_username_lower,
-        CONFIG.enable_bot_to_bot_auto_q,
+        CONFIG.telegram.enable_bot_to_bot_auto_q,
     )
 }
 

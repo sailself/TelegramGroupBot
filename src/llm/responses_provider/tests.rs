@@ -746,11 +746,11 @@ fn public_openai_system_prompt_skips_codex_style_guidance() {
 fn responses_request_timeout_uses_provider_config() {
     assert_eq!(
         responses_request_timeout_secs(ThirdPartyProvider::OpenAI),
-        CONFIG.openai_request_timeout_secs
+        CONFIG.openai.request_timeout_secs
     );
     assert_eq!(
         responses_request_timeout_secs(ThirdPartyProvider::OpenAICodex),
-        CONFIG.openai_codex_request_timeout_secs
+        CONFIG.codex.request_timeout_secs
     );
 }
 

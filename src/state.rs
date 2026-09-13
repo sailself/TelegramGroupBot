@@ -11,7 +11,7 @@ use tokio::task::AbortHandle;
 
 use crate::config::CONFIG;
 use crate::db::database::Database;
-use crate::llm::media::MediaFile;
+use crate::handlers::enrichment::Enrichment;
 use crate::llm::openai_codex::{CodexReasoningEffortOption, CodexRemoteModel};
 use crate::utils::timing::CommandTimer;
 
@@ -38,10 +38,10 @@ pub struct PendingQRequest {
     pub user_id: i64,
     pub query: String,
     pub telegram_language_code: Option<String>,
-    pub media_files: Vec<MediaFile>,
-    pub youtube_urls: Vec<String>,
-    pub telegraph_contents: Vec<String>,
-    pub twitter_contents: Vec<String>,
+    /// Media, YouTube inputs and fetched link content for this request. The
+    /// fetched text is structured, never pre-spliced into `query`: it reaches
+    /// the prompt only through `handlers::enrichment::render_sources`.
+    pub enrichment: Enrichment,
     pub chat_id: i64,
     pub message_id: i64,
     pub selection_message_id: i64,
@@ -300,7 +300,9 @@ impl AppState {
             active_codex_login: Arc::new(Mutex::new(None)),
             codex_auth_flow_lock: Arc::new(AsyncMutex::new(())),
             media_groups: Arc::new(Mutex::new(HashMap::new())),
-            heavy_command_semaphore: Arc::new(Semaphore::new(CONFIG.heavy_command_max_concurrency)),
+            heavy_command_semaphore: Arc::new(Semaphore::new(
+                CONFIG.limits.heavy_command_max_concurrency,
+            )),
             heavy_command_waiters: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -333,6 +335,7 @@ impl AppState {
 
     pub fn heavy_command_active(&self) -> usize {
         CONFIG
+            .limits
             .heavy_command_max_concurrency
             .saturating_sub(self.heavy_command_semaphore.available_permits())
     }
@@ -374,7 +377,7 @@ impl AppState {
 }
 
 fn prune_media_groups(groups: &mut HashMap<MediaGroupId, MediaGroupState>) {
-    let max_items = CONFIG.media_group_max_items;
+    let max_items = CONFIG.telegram.media_group_max_items;
     if groups.len() <= max_items {
         return;
     }
