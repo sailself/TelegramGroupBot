@@ -119,6 +119,33 @@ pub fn kind_for_mime(mime_type: &str) -> MediaKind {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MediaSummary {
+    pub total: usize,
+    pub images: usize,
+    pub videos: usize,
+    pub audios: usize,
+    pub documents: usize,
+}
+
+pub fn summarize_media_files(files: &[MediaFile]) -> MediaSummary {
+    let mut summary = MediaSummary {
+        total: files.len(),
+        ..MediaSummary::default()
+    };
+
+    for file in files {
+        match file.kind {
+            MediaKind::Image => summary.images += 1,
+            MediaKind::Video => summary.videos += 1,
+            MediaKind::Audio => summary.audios += 1,
+            MediaKind::Document => summary.documents += 1,
+        }
+    }
+
+    summary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

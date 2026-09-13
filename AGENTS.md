@@ -3,13 +3,13 @@
 ## Project Structure & Module Organization
 - `src/` contains all Rust source files.
   - `src/main.rs` wires the Telegram dispatcher and startup.
-  - `src/config.rs` loads environment variables and defaults.
+  - `src/config.rs` loads environment variables and defaults (unparsable values warn and fall back; every provider endpoint is validated); `src/prompts.rs` holds the system-prompt text.
   - `src/state.rs` defines `AppState`, the cloneable shared state (DB handle, bot identity, pending-request maps, media-group cache, heavy-command semaphore).
-  - `src/handlers/` holds command routing, access control, and response logic.
-  - `src/llm/` integrates Gemini, OpenRouter/NVIDIA/Ollama, OpenAI Responses, and ChatGPT Codex providers, plus the tool-runtime loop and web search helpers.
-  - `src/db/` manages SQLite models, the chat-search index, and the async write queue.
+  - `src/handlers/` holds one file per command family (`image.rs`, `tldr.rs`, `factcheck.rs`, `persona.rs`, `mysong.rs`, `token_stats.rs`, `admin.rs`, `help.rs`, `codex_admin.rs`), the `/q` family as a module directory (`qa/{trigger,model_resolution,selection_ui,prompt,chat_search,process,handler,tests}.rs`), plus access control (`access.rs`), link/media enrichment (`content.rs`, `media.rs`), and response delivery (`responses.rs`).
+  - `src/llm/` integrates Gemini, OpenRouter/NVIDIA/Ollama, OpenAI Responses (`responses_provider/{payload,sse,transport,codex_identity,tool_loop}.rs`), and ChatGPT Codex providers; `transport/` is the shared retry/body/SSE layer, `tool_loop.rs`/`tool_runtime.rs` the tool loop, `text_model.rs` default text-model resolution and `call_configured_text_model`, `prompting.rs` chat-history fencing, `runtime_models.rs` the model catalog with `codex_selected_model.rs` holding the persisted Codex selection, plus web search helpers.
+  - `src/db/` manages SQLite: `database.rs` (the `Database` handle and `init`), `schema.rs` (`PRAGMA user_version` migrations), `writer.rs` (async write queue), `messages.rs`, `search_index.rs` + `search.rs` (chat-search index), `audit.rs` (LLM usage rows), `models.rs`, and `test_support.rs`.
   - `src/tools/` extracts Telegraph/Twitter link content and uploads images to CWD.PW.
-  - `src/utils/` contains logging, timing, and HTTP helpers.
+  - `src/utils/` contains logging, timing, HTTP helpers (`parse_https_allowlisted`, `read_body_capped`), Telegram send/edit retries, text truncation/escaping, and the Markdown-to-Telegram-HTML renderer (`markdown.rs`) every answer goes through.
 - Root files: `Cargo.toml`, `Dockerfile`, `README.md`.
 - Data/log outputs are runtime artifacts under `./data` and `./logs`.
 
@@ -33,18 +33,18 @@ Read these together before changing request-handling behavior:
 - **Dispatch (`main.rs`).** A teloxide `dptree` routes updates into three message branches (commands, media groups, free text) plus a callback-query branch. The `Command` enum derives `BotCommands` (descriptions are in Chinese). Heavy commands are `tokio::spawn`ed so the dispatcher never blocks; their errors are logged, not propagated. Light commands (`/start`, `/help`, `/support`) run inline.
 - **Shared state (`state.rs`).** `AppState` is cloned into every handler. It owns the `Database`, the bot's own id/username (used to detect mentions for auto-`/q`), `Arc<Mutex<HashMap>>` maps of pending interactive requests, an in-memory media-group cache, and a Tokio `Semaphore` enforcing `HEAVY_COMMAND_MAX_CONCURRENCY`. Throttle heavy work with `acquire_heavy_command_permit()`.
 - **Interactive flows.** Selection menus (model picker, image options, Codex model/reasoning) reply with inline keyboards, stash a pending request in the matching `AppState` map keyed by callback-data prefix, and resolve in `handle_callback_query`; unanswered menus fall back to defaults after `MODEL_SELECTION_TIMEOUT`.
-- **Persistence (`db/`).** Incoming messages are recorded through an async write queue (batched by `DB_WRITE_BATCH_SIZE`/`DB_WRITE_FLUSH_MS`) rather than written inline. `db/search.rs` maintains the normalized chat-search index (jieba tokenization) backing `/s` and `/qc`.
-- **LLM layer (`llm/`).** `runtime_models.rs` exposes one model catalog: built-in `gemini` plus runtime models from `third_party_models.json` and the `openai-codex:selected` alias. Tool-capable models run through `*_with_tool_runtime` (`tool_runtime.rs`), which drives web search (`WEB_SEARCH_PROVIDERS` order: brave/exa/jina), Telegraph/Twitter enrichment, and image hosting. `audit.rs` records per-call token usage powering `/burn_baby_burn`, `/token_devourers`, and `/token_stats`.
+- **Persistence (`db/`).** `schema::migrate` stamps `PRAGMA user_version` and applies numbered migrations at startup (v1 is the idempotent `CREATE IF NOT EXISTS` schema, so existing databases are stamped, not rebuilt). Incoming messages are recorded through an async write queue (batched by `DB_WRITE_BATCH_SIZE`/`DB_WRITE_FLUSH_MS`) rather than written inline. `db/search.rs` maintains the normalized chat-search index (jieba tokenization) backing `/s` and `/qc`.
+- **LLM layer (`llm/`).** `runtime_models.rs` exposes one model catalog: built-in `gemini` plus runtime models from `third_party_models.json` and the `openai-codex:selected` alias (persisted by `codex_selected_model.rs`); `text_model.rs` resolves the default text model for a request's capabilities and is the only place agents call the configured model, so `agents/` never imports from `handlers/`. Tool-capable models run through `*_with_tool_runtime` (`tool_runtime.rs`), which drives web search (`WEB_SEARCH_PROVIDERS` order: brave/exa/jina), Telegraph/Twitter enrichment, and image hosting. `audit.rs` records per-call token usage powering `/burn_baby_burn`, `/token_devourers`, and `/token_stats`.
 - **Capability gates.** `ENABLE_GEMINI=false` disables Gemini-only commands (`/vid`, `/mysong`) and hides them from pickers, but `/s` survives if another `tools=true` model is ready. Provider `ENABLE_*` flags plus `DEFAULT_TEXT_MODEL`/`DEFAULT_IMAGE_MODEL` shape what is offered at runtime.
 
 ## Coding Style & Naming Conventions
 - Rust style follows `rustfmt` defaults; use 4-space indentation.
-- Module/file names: `snake_case` (e.g., `handlers/commands.rs`).
+- Module/file names: `snake_case` (e.g., `handlers/token_stats.rs`).
 - Types: `CamelCase`; functions/vars: `snake_case`; constants: `SCREAMING_SNAKE_CASE`.
 - Keep async boundaries clear and prefer early returns for error handling.
 
 ## Testing Guidelines
-- Unit tests live in `#[cfg(test)] mod tests` blocks next to the code they cover (e.g. `handlers/mod.rs`, `handlers/qa.rs`, `db/database.rs`); run them with `cargo test`.
+- Unit tests live in `#[cfg(test)] mod tests` blocks next to the code they cover (e.g. `handlers/image.rs`, `handlers/qa/tests.rs`, `db/schema.rs`, `llm/responses_provider/tests.rs`); run them with `cargo test`.
 - Place new unit tests near their module; add cross-module integration tests under `tests/` (none exist yet).
 - Aim for coverage on handlers and DB helpers when adding new features.
 

@@ -1,21 +1,23 @@
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Response;
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
-use tokio::task::{AbortHandle, JoinHandle, JoinSet};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
 use url::Url;
 
 use crate::config::CONFIG;
-use crate::llm::media::{detect_mime_type, MediaFile, MediaKind};
+use crate::llm::media::{detect_mime_type, redact_url_for_log, MediaFile, MediaKind};
 use crate::tools::telegraph_extractor::TelegraphContent;
 use crate::tools::twitter_extractor::{parse_allowed_media_url, TwitterAttachment, TwitterContent};
-use crate::utils::http::get_http_client_no_redirect;
+use crate::utils::http::{get_http_client_no_redirect, parse_https_allowlisted};
 
 #[derive(Clone, Debug)]
 pub struct ExternalMediaBudget {
@@ -77,106 +79,6 @@ pub(crate) struct ExternalMediaReservation {
     budget: ExternalMediaBudget,
     reserved: usize,
     committed: bool,
-}
-
-struct AbortOnDropLauncher {
-    handle: Option<JoinHandle<()>>,
-}
-
-type StartedExternalMedia = (ExternalMediaRequest, Option<Response>, OwnedSemaphorePermit);
-
-struct PendingRequestGuard {
-    receiver: Option<oneshot::Receiver<StartedExternalMedia>>,
-    launcher_abort: AbortHandle,
-    armed: bool,
-}
-
-struct ActiveRequestGuard {
-    permit: Option<OwnedSemaphorePermit>,
-    launcher_abort: AbortHandle,
-    armed: bool,
-}
-
-impl AbortOnDropLauncher {
-    fn new(handle: JoinHandle<()>) -> Self {
-        Self {
-            handle: Some(handle),
-        }
-    }
-
-    fn abort_handle(&self) -> AbortHandle {
-        self.handle
-            .as_ref()
-            .expect("launcher handle should remain owned until finish")
-            .abort_handle()
-    }
-
-    async fn finish(mut self) {
-        if let Some(handle) = self.handle.as_mut() {
-            let _ = handle.await;
-        }
-        self.handle.take();
-    }
-}
-
-impl Drop for AbortOnDropLauncher {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-    }
-}
-
-impl PendingRequestGuard {
-    fn new(receiver: oneshot::Receiver<StartedExternalMedia>, launcher_abort: AbortHandle) -> Self {
-        Self {
-            receiver: Some(receiver),
-            launcher_abort,
-            armed: true,
-        }
-    }
-
-    async fn receive(mut self) -> Result<StartedExternalMedia, oneshot::error::RecvError> {
-        let result = self
-            .receiver
-            .as_mut()
-            .expect("pending request receiver should remain owned while armed")
-            .await;
-        self.armed = false;
-        self.receiver.take();
-        result
-    }
-}
-
-impl Drop for PendingRequestGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.launcher_abort.abort();
-        }
-    }
-}
-
-impl ActiveRequestGuard {
-    fn new(permit: OwnedSemaphorePermit, launcher_abort: AbortHandle) -> Self {
-        Self {
-            permit: Some(permit),
-            launcher_abort,
-            armed: true,
-        }
-    }
-
-    fn disarm_and_release(mut self) {
-        self.armed = false;
-        drop(self.permit.take());
-    }
-}
-
-impl Drop for ActiveRequestGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.launcher_abort.abort();
-        }
-    }
 }
 
 impl ExternalMediaReservation {
@@ -248,8 +150,23 @@ pub(crate) async fn read_external_media_response(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExternalMediaKind {
-    Image(&'static str),
+    Image,
     Video,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaSource {
+    Telegraph,
+    Twitter,
+}
+
+impl MediaSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Telegraph => "telegraph",
+            Self::Twitter => "twitter",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -257,7 +174,7 @@ pub(crate) struct ExternalMediaRequest {
     pub(crate) index: usize,
     pub(crate) url: String,
     pub(crate) kind: ExternalMediaKind,
-    source: &'static str,
+    source: MediaSource,
     thumbnail_url: Option<String>,
 }
 
@@ -266,7 +183,7 @@ impl ExternalMediaRequest {
         self.thumbnail_url.as_ref().map(|url| Self {
             index: self.index,
             url: url.clone(),
-            kind: ExternalMediaKind::Image(self.source),
+            kind: ExternalMediaKind::Image,
             source: self.source,
             thumbnail_url: None,
         })
@@ -282,34 +199,24 @@ pub(crate) fn twitter_video_request(
         index,
         url: video_url.to_string(),
         kind: ExternalMediaKind::Video,
-        source: "twitter",
+        source: MediaSource::Twitter,
         thumbnail_url: thumbnail_url.map(str::to_string),
     }
 }
 
 fn telegraph_media_url(raw_url: &str) -> Result<Url> {
-    let parsed = Url::parse(raw_url.trim())?;
-    if parsed.scheme() != "https" {
-        bail!("Telegraph media must use HTTPS")
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        bail!("Telegraph media must not contain credentials")
-    }
-    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    if host != "telegra.ph" && host != "graph.org" {
-        bail!("Telegraph media host is not allowlisted")
-    }
-    if parsed.port().is_some_and(|port| port != 443) {
-        bail!("Telegraph media has a non-default port")
-    }
-    Ok(parsed)
+    parse_https_allowlisted(
+        "telegraph media",
+        raw_url,
+        Some(&["telegra.ph", "graph.org"]),
+    )
 }
 
-fn validate_media_url(url: &str, source: &str) -> Result<Url> {
-    if source == "twitter" {
-        return parse_allowed_media_url(url);
+fn validate_media_url(url: &str, source: MediaSource) -> Result<Url> {
+    match source {
+        MediaSource::Twitter => parse_allowed_media_url(url),
+        MediaSource::Telegraph => telegraph_media_url(url),
     }
-    telegraph_media_url(url)
 }
 
 fn display_name_from_url(url: &str) -> Option<String> {
@@ -364,28 +271,33 @@ fn resolve_video_mime_type(url: &str, _content_type: Option<&str>, bytes: &[u8])
         .unwrap_or_else(|| "video/mp4".to_string())
 }
 
-async fn start_request(request: &ExternalMediaRequest) -> Option<Response> {
-    let parsed_url = match validate_media_url(&request.url, request.source) {
-        Ok(url) => url,
-        Err(err) => {
-            warn!(media_url = %request.url, error = %err, "Skipping disallowed external media URL");
-            return None;
-        }
-    };
-    if matches!(request.kind, ExternalMediaKind::Image(_))
+async fn start_request(request: &ExternalMediaRequest) -> Result<Response> {
+    let parsed_url = validate_media_url(&request.url, request.source)?;
+    if matches!(request.kind, ExternalMediaKind::Image)
         && request.url.to_ascii_lowercase().contains(".svg")
     {
-        return None;
+        bail!("external media URL looks like an SVG image");
     }
+    Ok(get_http_client_no_redirect().get(parsed_url).send().await?)
+}
 
-    let response = match get_http_client_no_redirect().get(parsed_url).send().await {
-        Ok(response) => response,
+/// Runs `start` and turns a transport/validation failure into a logged
+/// `warn!` (with the URL redacted) plus `None`, so callers can treat a
+/// failed fetch the same way as a rejected response.
+async fn start_logged<S, Fut>(start: S, request: ExternalMediaRequest) -> Option<Response>
+where
+    S: FnOnce(ExternalMediaRequest) -> Fut,
+    Fut: Future<Output = Result<Response>>,
+{
+    let source = request.source.as_str();
+    let redacted_url = redact_url_for_log(&request.url);
+    match start(request).await {
+        Ok(response) => Some(response),
         Err(err) => {
-            warn!(media_url = %request.url, error = %err, "Failed to fetch external media");
-            return None;
+            warn!(source, media_url = %redacted_url, error = %err, "External media download failed");
+            None
         }
-    };
-    Some(response)
+    }
 }
 
 async fn process_response(
@@ -405,20 +317,31 @@ async fn process_response(
                 .trim()
                 .to_ascii_lowercase()
         });
-    if let ExternalMediaKind::Image(source) = request.kind {
+    if let ExternalMediaKind::Image = request.kind {
+        let source = request.source.as_str();
         let content_type =
             content_type.or_else(|| image_mime_from_url(&request.url).map(ToString::to_string));
         let Some(content_type) = content_type else {
-            warn!(source, media_url = %request.url, "Skipping image without Content-Type or URL MIME hint");
+            warn!(source, media_url = %redact_url_for_log(&request.url), "Skipping image without Content-Type or URL MIME hint");
             return None;
         };
         if !content_type.starts_with("image/") || content_type == "image/svg+xml" {
-            warn!(source, media_url = %request.url, content_type = %content_type, "Skipping non-image external media");
+            warn!(source, media_url = %redact_url_for_log(&request.url), content_type = %content_type, "Skipping non-image external media");
             return None;
         }
-        let bytes = read_external_media_response(response, CONFIG.external_media_max_bytes, budget)
-            .await
-            .ok()?;
+        let bytes = match read_external_media_response(
+            response,
+            CONFIG.external_media_max_bytes,
+            budget,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(source, media_url = %redact_url_for_log(&request.url), error = %err, "Skipping image that failed to download");
+                return None;
+            }
+        };
         return Some(MediaFile::new(
             bytes,
             content_type,
@@ -427,15 +350,19 @@ async fn process_response(
         ));
     }
 
-    let bytes =
-        match read_external_media_response(response, CONFIG.external_media_max_bytes, budget).await
-        {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                debug!(media_url = %request.url, error = %err, "External video download failed");
-                return None;
-            }
-        };
+    let bytes = match read_external_media_response(
+        response,
+        CONFIG.external_media_max_bytes,
+        budget,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            debug!(media_url = %redact_url_for_log(&request.url), error = %err, "External video download failed");
+            return None;
+        }
+    };
     let mime_type = resolve_video_mime_type(&request.url, content_type.as_deref(), &bytes);
     Some(MediaFile::new(
         bytes,
@@ -469,100 +396,73 @@ where
     media.map(|file| (request.index, file))
 }
 
-async fn collect_external_media_with_starts_limit<F, Fut>(
+/// Upper bound on how long a single `collect_external_media` call may take
+/// across every request combined, regardless of `fanout`. A caller-side
+/// cancellation is handled the same way: dropping this function's `JoinSet`
+/// (on timeout, or because our own future got dropped) aborts every worker
+/// still in flight.
+pub(crate) const EXTERNAL_MEDIA_COLLECTION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Downloads every request, bounded to at most `fanout` concurrent fetches
+/// and `EXTERNAL_MEDIA_COLLECTION_TIMEOUT` total, returning the successful
+/// files in input order (results race independently, so an index travels
+/// with each one to restore that order at the end).
+async fn collect_external_media<S, Fut>(
     requests: Vec<ExternalMediaRequest>,
-    max_files: usize,
     budget: &ExternalMediaBudget,
-    start: F,
     fanout: usize,
+    start: S,
 ) -> Vec<MediaFile>
 where
-    F: Fn(ExternalMediaRequest) -> Fut + Clone + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Option<Response>> + Send + 'static,
+    S: Fn(ExternalMediaRequest) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Response>> + Send + 'static,
 {
-    if requests.is_empty() || max_files == 0 {
+    if requests.is_empty() {
         return Vec::new();
     }
     let semaphore = Arc::new(Semaphore::new(fanout.max(1)));
-    let mut receivers = Vec::with_capacity(requests.len());
-    let mut senders = Vec::with_capacity(requests.len());
-    for _ in 0..requests.len() {
-        let (sender, receiver) = oneshot::channel::<StartedExternalMedia>();
-        senders.push(sender);
-        receivers.push(receiver);
-    }
-    let launcher_semaphore = semaphore.clone();
-    let launcher = AbortOnDropLauncher::new(tokio::spawn(async move {
-        let mut workers = JoinSet::new();
-        for (request, sender) in requests.into_iter().zip(senders) {
-            let permit = match launcher_semaphore.clone().acquire_owned().await {
+    let mut workers = JoinSet::new();
+    for request in requests {
+        let semaphore = semaphore.clone();
+        let start = start.clone();
+        let budget = budget.clone();
+        workers.spawn(async move {
+            let index = request.index;
+            let permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
-                Err(_) => return,
+                // The semaphore is only ever closed if it were `close()`d,
+                // which nothing here does; treat it as "this request did
+                // not produce a file" rather than panicking a worker task.
+                Err(_) => return (index, None),
             };
-            let start = start.clone();
-            workers.spawn(async move {
-                let response = start(request.clone()).await;
-                let _ = sender.send((request, response, permit));
-            });
-        }
-        while workers.join_next().await.is_some() {}
-    }));
+            let response = start_logged(start.clone(), request.clone()).await;
+            let fallback_start = {
+                let start = start.clone();
+                move |fallback: ExternalMediaRequest| start_logged(start, fallback)
+            };
+            let file = process_response_with_fallback(request, response, &budget, fallback_start)
+                .await
+                .map(|(_, file)| file);
+            drop(permit);
+            (index, file)
+        });
+    }
 
     let mut collected = Vec::new();
-    for receiver in receivers {
-        let pending_request = PendingRequestGuard::new(receiver, launcher.abort_handle());
-        let Ok((request, response, permit)) = pending_request.receive().await else {
-            continue;
-        };
-        let active_request = ActiveRequestGuard::new(permit, launcher.abort_handle());
-        if let Some((index, file)) =
-            process_response_with_fallback(request, response, budget, |fallback| async move {
-                start_request(&fallback).await
-            })
-            .await
-        {
-            collected.push((index, file));
+    let drain = async {
+        while let Some(joined) = workers.join_next().await {
+            if let Ok((index, Some(file))) = joined {
+                collected.push((index, file));
+            }
         }
-        active_request.disarm_and_release();
-    }
-    launcher.finish().await;
+    };
+    // On timeout `workers` (still owned here) is dropped at the end of this
+    // function, which aborts every worker still running; the same happens if
+    // our own caller cancels this future mid-poll.
+    let _ = tokio::time::timeout(EXTERNAL_MEDIA_COLLECTION_TIMEOUT, drain).await;
+
     collected.sort_by_key(|(index, _)| *index);
-    collected
-        .into_iter()
-        .take(max_files)
-        .map(|(_, file)| file)
-        .collect()
-}
-
-async fn collect_external_media_with_starts<F, Fut>(
-    requests: Vec<ExternalMediaRequest>,
-    max_files: usize,
-    budget: &ExternalMediaBudget,
-    start: F,
-) -> Vec<MediaFile>
-where
-    F: Fn(ExternalMediaRequest) -> Fut + Clone + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Option<Response>> + Send + 'static,
-{
-    collect_external_media_with_starts_limit(
-        requests,
-        max_files,
-        budget,
-        start,
-        CONFIG.external_enrich_fanout,
-    )
-    .await
-}
-
-async fn collect_external_media(
-    requests: Vec<ExternalMediaRequest>,
-    max_files: usize,
-    budget: &ExternalMediaBudget,
-) -> Vec<MediaFile> {
-    collect_external_media_with_starts(requests, max_files, budget, |request| async move {
-        start_request(&request).await
-    })
-    .await
+    collected.into_iter().map(|(_, file)| file).collect()
 }
 
 pub async fn download_telegraph_media(
@@ -580,8 +480,8 @@ pub async fn download_telegraph_media(
             requests.push(ExternalMediaRequest {
                 index,
                 url: url.clone(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             });
             index += 1;
@@ -594,13 +494,19 @@ pub async fn download_telegraph_media(
                 index,
                 url: url.clone(),
                 kind: ExternalMediaKind::Video,
-                source: "telegraph",
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             });
             index += 1;
         }
     }
-    collect_external_media(requests, max_files, budget).await
+    collect_external_media(
+        requests,
+        budget,
+        CONFIG.external_enrich_fanout,
+        |request| async move { start_request(&request).await },
+    )
+    .await
 }
 
 pub async fn download_twitter_media(
@@ -610,8 +516,9 @@ pub async fn download_twitter_media(
 ) -> Vec<MediaFile> {
     collect_external_media(
         twitter_media_requests(contents, max_files),
-        max_files,
         budget,
+        CONFIG.external_enrich_fanout,
+        |request| async move { start_request(&request).await },
     )
     .await
 }
@@ -631,8 +538,8 @@ fn twitter_media_requests(
                 TwitterAttachment::Image { url } => requests.push(ExternalMediaRequest {
                     index,
                     url: url.clone(),
-                    kind: ExternalMediaKind::Image("twitter"),
-                    source: "twitter",
+                    kind: ExternalMediaKind::Image,
+                    source: MediaSource::Twitter,
                     thumbnail_url: None,
                 }),
                 TwitterAttachment::Video { url, thumbnail_url } => {
@@ -647,7 +554,6 @@ fn twitter_media_requests(
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver, Sender};
@@ -684,70 +590,6 @@ mod tests {
         .unwrap()
     }
 
-    fn twitter_content_with_root_video_and_quoted_image() -> TwitterContent {
-        build_twitter_content(
-            &XStatusIdentity {
-                id: "123".to_owned(),
-                canonical_url: Url::parse("https://x.com/i/status/123").unwrap(),
-            },
-            XPost {
-                id: "123".to_owned(),
-                author: None,
-                text: "root video".to_owned(),
-                created_at: None,
-                media: vec![XMedia::Video {
-                    url: Some(Url::parse("https://video.twimg.com/video/root.mp4").unwrap()),
-                    thumbnail_url: Some(
-                        Url::parse("https://pbs.twimg.com/media/root-thumb.jpg").unwrap(),
-                    ),
-                    alt_text: None,
-                    bitrate: Some(1_000),
-                }],
-                quote: Some(Box::new(XPost {
-                    id: "456".to_owned(),
-                    author: None,
-                    text: "quoted image".to_owned(),
-                    created_at: None,
-                    media: vec![XMedia::Image {
-                        url: Url::parse("https://pbs.twimg.com/media/quoted.jpg").unwrap(),
-                        alt_text: None,
-                    }],
-                    quote: None,
-                })),
-            },
-        )
-        .unwrap()
-    }
-
-    fn controlled_body_server() -> (
-        url::Url,
-        tokio::sync::oneshot::Receiver<()>,
-        Sender<()>,
-        JoinHandle<()>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let url = url::Url::parse(&format!("http://{address}/media")).unwrap();
-        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
-        let (release_sender, release_receiver): (Sender<()>, Receiver<()>) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n",
-                )
-                .unwrap();
-            stream.flush().unwrap();
-            let _ = ready_sender.send(());
-            let _ = release_receiver.recv_timeout(std::time::Duration::from_secs(2));
-            stream.write_all(b"1\r\ny\r\n0\r\n\r\n").unwrap();
-            stream.flush().unwrap();
-        });
-        (url, ready_receiver, release_sender, worker)
-    }
-
     fn controlled_thirty_chunk_server() -> (
         url::Url,
         tokio::sync::oneshot::Receiver<()>,
@@ -779,50 +621,6 @@ mod tests {
             stream.flush().unwrap();
         });
         (url, ready_receiver, release_sender, worker)
-    }
-
-    fn cancellation_body_server() -> (
-        url::Url,
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Receiver<()>,
-        JoinHandle<()>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let url = url::Url::parse(&format!("http://{address}/media")).unwrap();
-        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
-        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
-        let worker = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
-            let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n",
-                )
-                .unwrap();
-            stream.flush().unwrap();
-            let _ = ready_sender.send(());
-            let mut buffer = [0u8; 1];
-            loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => {
-                        let _ = closed_sender.send(());
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            || error.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(_) => {
-                        let _ = closed_sender.send(());
-                        break;
-                    }
-                }
-            }
-        });
-        (url, ready_receiver, closed_receiver, worker)
     }
 
     #[tokio::test]
@@ -866,7 +664,8 @@ mod tests {
         );
         let fallback = request.thumbnail_fallback().unwrap();
         assert_eq!(fallback.index, 3);
-        assert!(matches!(fallback.kind, ExternalMediaKind::Image("twitter")));
+        assert!(matches!(fallback.kind, ExternalMediaKind::Image));
+        assert_eq!(fallback.source, MediaSource::Twitter);
     }
 
     #[test]
@@ -1119,571 +918,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn twitter_max_one_prefers_slow_root_video_over_fast_quoted_image() {
-        let slow = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_content_length(
-                    4,
-                    b"root".to_vec(),
-                ),
-            )
-            .delayed(std::time::Duration::from_millis(50)),
-        ]);
-        let fast = TestServer::expect_no_requests();
-        let content = twitter_content_with_root_video_and_quoted_image();
-        let requests = twitter_media_requests(&[content], 1);
-        assert_eq!(requests.len(), 1);
-        let slow_url = slow.url("/root");
-        let fast_url = fast.url("/quote");
-        let budget = ExternalMediaBudget::new(100);
-        let files = collect_external_media_with_starts(requests, 1, &budget, move |request| {
-            let slow_url = slow_url.clone();
-            let fast_url = fast_url.clone();
-            async move {
-                let url = if request.url.contains("root.mp4") {
-                    slow_url
-                } else {
-                    fast_url
-                };
-                get_http_client_no_redirect().get(url).send().await.ok()
-            }
-        })
-        .await;
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].kind, MediaKind::Video);
-        assert_eq!(files[0].bytes(), b"root");
-        slow.join().unwrap();
-        fast.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn inverted_response_delays_keep_source_index_priority_for_budget_survivors() {
-        let slow = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_content_length(
-                    2,
-                    b"0a".to_vec(),
-                ),
-            )
-            .delayed(std::time::Duration::from_millis(50)),
-        ]);
-        let fast = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_content_length(
-                    2,
-                    b"1b".to_vec(),
-                ),
-            )
-            .delayed(std::time::Duration::from_millis(1)),
-        ]);
-        let requests = vec![
-            ExternalMediaRequest {
-                index: 0,
-                url: "https://telegra.ph/file/0.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
-                thumbnail_url: None,
-            },
-            ExternalMediaRequest {
-                index: 1,
-                url: "https://telegra.ph/file/1.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
-                thumbnail_url: None,
-            },
-        ];
-        let slow_url = slow.url("/media");
-        let fast_url = fast.url("/media");
-        let budget = ExternalMediaBudget::new(2);
-        let files = collect_external_media_with_starts(requests, 2, &budget, move |request| {
-            let slow_url = slow_url.clone();
-            let fast_url = fast_url.clone();
-            async move {
-                let url = if request.index == 0 {
-                    slow_url
-                } else {
-                    fast_url
-                };
-                get_http_client_no_redirect().get(url).send().await.ok()
-            }
-        })
-        .await;
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].bytes(), b"0a");
-        slow.join().unwrap();
-        fast.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn failed_lower_index_start_advances_without_deadlock_or_budget_leak() {
-        let server = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                2,
-                b"1b".to_vec(),
-            ),
-        );
-        let url = server.url("/media");
-        let requests = vec![
-            ExternalMediaRequest {
-                index: 0,
-                url: "https://telegra.ph/file/0.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
-                thumbnail_url: None,
-            },
-            ExternalMediaRequest {
-                index: 1,
-                url: "https://telegra.ph/file/1.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
-                thumbnail_url: None,
-            },
-        ];
-        let budget = ExternalMediaBudget::new(2);
-        let files = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            collect_external_media_with_starts(requests, 2, &budget, move |request| {
-                let url = url.clone();
-                async move {
-                    if request.index == 0 {
-                        panic!("simulated lower-index start panic");
-                    }
-                    get_http_client_no_redirect().get(url).send().await.ok()
-                }
-            }),
-        )
-        .await
-        .expect("a failed lower-index start must not hang");
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].bytes(), b"1b");
-        assert_eq!(budget.remaining(), 0);
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn fanout_permit_stays_held_through_body_consumption() {
-        let (slow_url, mut body_ready, release_body, slow_worker) = controlled_body_server();
-        let fast = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                1,
-                b"1".to_vec(),
-            ),
-        );
-        let fast_url = fast.url("/media");
-        let started = Arc::new(AtomicUsize::new(0));
-        let started_for_start = started.clone();
-        let requests = vec![
-            ExternalMediaRequest {
-                index: 0,
-                url: "https://telegra.ph/file/0.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
-                thumbnail_url: None,
-            },
-            ExternalMediaRequest {
-                index: 1,
-                url: "https://telegra.ph/file/1.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
-                thumbnail_url: None,
-            },
-        ];
-        let budget = ExternalMediaBudget::new(10);
-        let collection = collect_external_media_with_starts_limit(
-            requests,
-            2,
-            &budget,
-            move |request| {
-                started_for_start.fetch_add(1, Ordering::SeqCst);
-                let url = if request.index == 0 {
-                    slow_url.clone()
-                } else {
-                    fast_url.clone()
-                };
-                async move { get_http_client_no_redirect().get(url).send().await.ok() }
-            },
-            1,
-        );
-        tokio::pin!(collection);
-        tokio::time::timeout(SIGNAL_TIMEOUT, async {
-            tokio::select! {
-                result = &mut body_ready => result.expect("controlled body readiness sender dropped"),
-                _ = &mut collection => panic!("collection completed before the controlled body was released"),
-            }
-        })
-        .await
-        .expect("controlled body should become ready");
-        assert_eq!(started.load(Ordering::SeqCst), 1);
-        release_body.send(()).unwrap();
-        let files = tokio::time::timeout(std::time::Duration::from_secs(2), collection)
-            .await
-            .unwrap();
-        assert_eq!(files.len(), 2);
-        assert_eq!(started.load(Ordering::SeqCst), 2);
-        slow_worker.join().unwrap();
-        fast.join().unwrap();
-    }
-
-    // The guard tests below run on the current-thread runtime on purpose: with
-    // parallel workers the launcher task can still be mid-poll when the guard
-    // aborts it and releases the permit, so it may legitimately grab the permit
-    // before observing cancellation. The ordering the guards guarantee is
-    // "abort is requested before the permit is released", which the
-    // single-threaded scheduler makes observable deterministically.
-    #[tokio::test]
-    async fn pending_request_guard_aborts_launcher_before_releasing_buffered_permit() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let (sender, receiver) = oneshot::channel();
-        sender
-            .send((
-                ExternalMediaRequest {
-                    index: 0,
-                    url: "https://telegra.ph/file/0.jpg".to_string(),
-                    kind: ExternalMediaKind::Image("telegraph"),
-                    source: "telegraph",
-                    thumbnail_url: None,
-                },
-                None,
-                permit,
-            ))
-            .expect("buffered request tuple should have a receiver");
-        let waiter_semaphore = semaphore.clone();
-        let (queued_sender, queued_receiver) = oneshot::channel();
-        let (started_sender, started_receiver) = oneshot::channel();
-        let launcher = AbortOnDropLauncher::new(tokio::spawn(async move {
-            let acquire = waiter_semaphore.acquire_owned();
-            tokio::pin!(acquire);
-            let mut queued_sender = Some(queued_sender);
-            std::future::poll_fn(|context| match acquire.as_mut().poll(context) {
-                std::task::Poll::Pending => {
-                    let _ = queued_sender.take().unwrap().send(());
-                    std::task::Poll::Ready(())
-                }
-                std::task::Poll::Ready(_) => {
-                    panic!("queued launcher unexpectedly acquired the buffered permit")
-                }
-            })
-            .await;
-            let _permit = acquire.await.unwrap();
-            let _ = started_sender.send(());
-        }));
-        let pending_request = PendingRequestGuard::new(receiver, launcher.abort_handle());
-
-        tokio::time::timeout(SIGNAL_TIMEOUT, queued_receiver)
-            .await
-            .expect("launcher should queue behind the buffered permit")
-            .unwrap();
-        drop(pending_request);
-        tokio::time::timeout(SIGNAL_TIMEOUT, launcher.finish())
-            .await
-            .expect("aborted launcher should stop");
-
-        assert!(!matches!(
-            tokio::time::timeout(std::time::Duration::from_millis(250), started_receiver).await,
-            Ok(Ok(()))
-        ));
-        assert_eq!(semaphore.available_permits(), 1);
-    }
-
-    #[tokio::test]
-    async fn active_request_guard_aborts_launcher_before_releasing_permit() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let waiter_semaphore = semaphore.clone();
-        let (queued_sender, queued_receiver) = tokio::sync::oneshot::channel();
-        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
-        let launcher = AbortOnDropLauncher::new(tokio::spawn(async move {
-            let acquire = waiter_semaphore.acquire_owned();
-            tokio::pin!(acquire);
-            let mut queued_sender = Some(queued_sender);
-            std::future::poll_fn(|context| match acquire.as_mut().poll(context) {
-                std::task::Poll::Pending => {
-                    let _ = queued_sender.take().unwrap().send(());
-                    std::task::Poll::Ready(())
-                }
-                std::task::Poll::Ready(_) => {
-                    panic!("queued launcher unexpectedly acquired the active permit")
-                }
-            })
-            .await;
-            let _permit = acquire.await.unwrap();
-            let _ = started_sender.send(());
-        }));
-        let active_request = ActiveRequestGuard::new(permit, launcher.abort_handle());
-
-        tokio::time::timeout(SIGNAL_TIMEOUT, queued_receiver)
-            .await
-            .expect("launcher should queue behind the active permit")
-            .unwrap();
-        drop(active_request);
-        tokio::time::timeout(SIGNAL_TIMEOUT, launcher.finish())
-            .await
-            .expect("aborted launcher should stop");
-
-        assert!(!matches!(
-            tokio::time::timeout(std::time::Duration::from_millis(250), started_receiver).await,
-            Ok(Ok(()))
-        ));
-    }
-
-    #[tokio::test]
-    async fn cancelling_launcher_finish_still_aborts_the_launcher() {
-        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
-
-        impl Drop for DropSignal {
-            fn drop(&mut self) {
-                if let Some(sender) = self.0.take() {
-                    let _ = sender.send(());
-                }
-            }
-        }
-
-        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
-        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
-        let launcher = AbortOnDropLauncher::new(tokio::spawn(async move {
-            let _drop_signal = DropSignal(Some(dropped_sender));
-            let _ = ready_sender.send(());
-            std::future::pending::<()>().await;
-        }));
-        tokio::time::timeout(SIGNAL_TIMEOUT, ready_receiver)
-            .await
-            .expect("launcher should start")
-            .unwrap();
-
-        let mut finish = Box::pin(launcher.finish());
-        std::future::poll_fn(|context| match finish.as_mut().poll(context) {
-            std::task::Poll::Pending => std::task::Poll::Ready(()),
-            std::task::Poll::Ready(()) => panic!("launcher unexpectedly finished"),
-        })
-        .await;
-        drop(finish);
-
-        tokio::time::timeout(SIGNAL_TIMEOUT, dropped_receiver)
-            .await
-            .expect("cancelling finish should abort the launcher")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelling_pending_receiver_aborts_before_buffered_tuple_releases_permit() {
-        struct WorkerStopSignal {
-            index: usize,
-            sender: tokio::sync::mpsc::UnboundedSender<usize>,
-        }
-
-        impl Drop for WorkerStopSignal {
-            fn drop(&mut self) {
-                let _ = self.sender.send(self.index);
-            }
-        }
-
-        let (buffered_url, body_ready, response_closed, response_worker) =
-            cancellation_body_server();
-        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (stopped_sender, mut stopped_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let requests = (0..3)
-            .map(|index| ExternalMediaRequest {
-                index,
-                url: format!("https://telegra.ph/file/{index}.jpg"),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
-                thumbnail_url: None,
-            })
-            .collect::<Vec<_>>();
-        let budget = ExternalMediaBudget::new(10);
-        let parent_budget = budget.clone();
-        let parent = tokio::spawn(async move {
-            collect_external_media_with_starts_limit(
-                requests,
-                3,
-                &parent_budget,
-                move |request| {
-                    let buffered_url = buffered_url.clone();
-                    let started_sender = started_sender.clone();
-                    let stopped_sender = stopped_sender.clone();
-                    async move {
-                        let _stop_signal = WorkerStopSignal {
-                            index: request.index,
-                            sender: stopped_sender,
-                        };
-                        let _ = started_sender.send(request.index);
-                        match request.index {
-                            0 => std::future::pending::<Option<Response>>().await,
-                            1 => get_http_client_no_redirect()
-                                .get(buffered_url)
-                                .send()
-                                .await
-                                .ok(),
-                            _ => None,
-                        }
-                    }
-                },
-                2,
-            )
-            .await
-        });
-
-        let mut starts = Vec::new();
-        tokio::time::timeout(SIGNAL_TIMEOUT, async {
-            while starts.len() < 2 {
-                starts.push(
-                    started_receiver
-                        .recv()
-                        .await
-                        .expect("initial worker start channel should remain open"),
-                );
-            }
-        })
-        .await
-        .expect("the first two workers should start");
-        starts.sort_unstable();
-        assert_eq!(starts, vec![0, 1]);
-        tokio::time::timeout(SIGNAL_TIMEOUT, body_ready)
-            .await
-            .expect("the index-1 response should reach the buffered body")
-            .unwrap();
-        assert_eq!(
-            tokio::time::timeout(SIGNAL_TIMEOUT, stopped_receiver.recv())
-                .await
-                .expect("the index-1 start future should return its response"),
-            Some(1)
-        );
-        assert_eq!(budget.remaining(), 10);
-
-        parent.abort();
-        tokio::time::timeout(SIGNAL_TIMEOUT, parent)
-            .await
-            .expect("the cancelled collector should stop")
-            .expect_err("the cancelled collector unexpectedly completed normally");
-
-        assert!(!matches!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                started_receiver.recv(),
-            )
-            .await,
-            Ok(Some(2))
-        ));
-        assert_eq!(budget.remaining(), 10);
-        tokio::time::timeout(SIGNAL_TIMEOUT, response_closed)
-            .await
-            .expect("dropping the buffered response should disconnect its body")
-            .unwrap();
-        assert_eq!(
-            tokio::time::timeout(SIGNAL_TIMEOUT, stopped_receiver.recv())
-                .await
-                .expect("aborting the launcher should stop the index-0 worker"),
-            Some(0)
-        );
-        tokio::time::timeout(
-            SIGNAL_TIMEOUT,
-            tokio::task::spawn_blocking(move || response_worker.join()),
-        )
-        .await
-        .expect("the buffered response worker should stop")
-        .expect("the buffered response join task should run")
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelling_parent_stops_unsent_starts_and_refunds_open_body() {
-        let (slow_url, body_ready, closed, slow_worker) = cancellation_body_server();
-        let started = Arc::new(AtomicUsize::new(0));
-        let (second_started_sender, mut second_started_receiver) =
-            tokio::sync::mpsc::unbounded_channel();
-        let started_for_start = started.clone();
-        let requests = (0..4)
-            .map(|index| ExternalMediaRequest {
-                index,
-                url: format!("https://telegra.ph/file/{index}.jpg"),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
-                thumbnail_url: None,
-            })
-            .collect::<Vec<_>>();
-        let budget = ExternalMediaBudget::new(10);
-        let observed_budget = budget.clone();
-        let parent_budget = budget.clone();
-        let parent = tokio::spawn(async move {
-            collect_external_media_with_starts_limit(
-                requests,
-                4,
-                &parent_budget,
-                move |request| {
-                    let slow_url = slow_url.clone();
-                    let started_for_start = started_for_start.clone();
-                    let second_started_sender = second_started_sender.clone();
-                    async move {
-                        started_for_start.fetch_add(1, Ordering::SeqCst);
-                        if request.index > 0 {
-                            let _ = second_started_sender.send(request.index);
-                            return None;
-                        }
-                        get_http_client_no_redirect()
-                            .get(slow_url)
-                            .send()
-                            .await
-                            .ok()
-                    }
-                },
-                1,
-            )
-            .await
-        });
-        tokio::time::timeout(SIGNAL_TIMEOUT, body_ready)
-            .await
-            .expect("controlled cancellation body should become ready")
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if observed_budget.remaining() == 9 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first body chunk should reserve before cancellation");
-        parent.abort();
-        tokio::time::timeout(SIGNAL_TIMEOUT, parent)
-            .await
-            .expect("cancelled collector should stop")
-            .expect_err("aborted collector unexpectedly completed normally");
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if observed_budget.remaining() == 10 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("parent cancellation should refund the partial reservation");
-        assert!(!matches!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                second_started_receiver.recv(),
-            )
-            .await,
-            Ok(Some(_))
-        ));
-        tokio::time::timeout(std::time::Duration::from_secs(1), closed)
-            .await
-            .expect("controlled response should observe client disconnect")
-            .unwrap();
-        assert_eq!(started.load(Ordering::SeqCst), 1);
-        tokio::time::timeout(
-            SIGNAL_TIMEOUT,
-            tokio::task::spawn_blocking(move || slow_worker.join()),
-        )
-        .await
-        .expect("controlled response worker should stop")
-        .expect("controlled response join task should run")
-        .unwrap();
-    }
-
-    #[tokio::test]
     async fn shared_budget_carries_committed_telegraph_bytes_into_twitter_stage() {
         let telegraph = TestServer::single(
             crate::tools::twitter_extractor::test_support::response_with_content_length(
@@ -1700,19 +934,19 @@ mod tests {
         let telegraph_url = telegraph.url("/media");
         let twitter_url = twitter.url("/media");
         let budget = ExternalMediaBudget::new(100);
-        let telegraph_files = collect_external_media_with_starts(
+        let telegraph_files = collect_external_media(
             vec![ExternalMediaRequest {
                 index: 0,
                 url: "https://telegra.ph/file/stage.jpg".to_string(),
-                kind: ExternalMediaKind::Image("telegraph"),
-                source: "telegraph",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
                 thumbnail_url: None,
             }],
-            1,
             &budget,
+            4,
             move |_| {
                 let url = telegraph_url.clone();
-                async move { get_http_client_no_redirect().get(url).send().await.ok() }
+                async move { Ok(get_http_client_no_redirect().get(url).send().await?) }
             },
         )
         .await;
@@ -1720,25 +954,424 @@ mod tests {
         assert_eq!(budget.remaining(), 40);
         telegraph.join().unwrap();
 
-        let twitter_files = collect_external_media_with_starts(
+        let twitter_files = collect_external_media(
             vec![ExternalMediaRequest {
                 index: 0,
                 url: "https://pbs.twimg.com/media/stage.jpg".to_string(),
-                kind: ExternalMediaKind::Image("twitter"),
-                source: "twitter",
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Twitter,
                 thumbnail_url: None,
             }],
-            1,
             &budget,
+            4,
             move |_| {
                 let url = twitter_url.clone();
-                async move { get_http_client_no_redirect().get(url).send().await.ok() }
+                async move { Ok(get_http_client_no_redirect().get(url).send().await?) }
             },
         )
         .await;
         assert!(twitter_files.is_empty());
         assert_eq!(budget.remaining(), 40);
         twitter.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn collector_preserves_input_order() {
+        let slow = TestServer::new(vec![
+            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                crate::tools::twitter_extractor::test_support::response_with_content_length(
+                    1,
+                    b"0".to_vec(),
+                ),
+            )
+            .delayed(std::time::Duration::from_millis(40)),
+        ]);
+        let fast = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                1,
+                b"1".to_vec(),
+            ),
+        );
+        let requests = vec![
+            ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file/0.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+            ExternalMediaRequest {
+                index: 1,
+                url: "https://telegra.ph/file/1.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+        ];
+        let slow_url = slow.url("/media");
+        let fast_url = fast.url("/media");
+        let budget = ExternalMediaBudget::new(100);
+        // Index 0 answers slower than index 1, so a naive first-finished
+        // order would come back reversed; the collector must still restore
+        // input order.
+        let files = collect_external_media(requests, &budget, 4, move |request| {
+            let slow_url = slow_url.clone();
+            let fast_url = fast_url.clone();
+            async move {
+                let url = if request.index == 0 {
+                    slow_url
+                } else {
+                    fast_url
+                };
+                Ok(get_http_client_no_redirect().get(url).send().await?)
+            }
+        })
+        .await;
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].bytes(), b"0");
+        assert_eq!(files[1].bytes(), b"1");
+        slow.join().unwrap();
+        fast.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn collector_never_exceeds_fanout() {
+        const FANOUT: usize = 2;
+        const REQUEST_COUNT: usize = 5;
+        let responses = (0..REQUEST_COUNT)
+            .map(|i| {
+                crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
+                    crate::tools::twitter_extractor::test_support::response_with_content_length(
+                        1,
+                        vec![b'a' + i as u8],
+                    ),
+                )
+                .delayed(std::time::Duration::from_millis(30))
+            })
+            .collect();
+        let server = TestServer::new(responses);
+        let url = server.url("/media");
+        let requests = (0..REQUEST_COUNT)
+            .map(|index| ExternalMediaRequest {
+                index,
+                url: format!("https://telegra.ph/file/{index}.jpg"),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            })
+            .collect::<Vec<_>>();
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::new(AtomicUsize::new(0));
+        let budget = ExternalMediaBudget::new(1_000);
+        let concurrent_for_start = concurrent.clone();
+        let high_water_for_start = high_water.clone();
+        let files = collect_external_media(requests, &budget, FANOUT, move |_request| {
+            let url = url.clone();
+            let concurrent = concurrent_for_start.clone();
+            let high_water = high_water_for_start.clone();
+            async move {
+                let current = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                high_water.fetch_max(current, Ordering::SeqCst);
+                let result = get_http_client_no_redirect().get(url).send().await;
+                concurrent.fetch_sub(1, Ordering::SeqCst);
+                Ok(result?)
+            }
+        })
+        .await;
+        assert_eq!(files.len(), REQUEST_COUNT);
+        assert!(
+            high_water.load(Ordering::SeqCst) <= FANOUT,
+            "high water mark {} exceeded fanout {FANOUT}",
+            high_water.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            high_water.load(Ordering::SeqCst),
+            FANOUT,
+            "more requests than permits should saturate the fanout"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn collector_holds_permit_until_body_is_consumed() {
+        // With fanout 1, the second request must not be able to start
+        // while the first is still streaming its body: the fanout permit
+        // is only released after process_response_with_fallback (which
+        // reads the whole body) returns, not as soon as the response
+        // headers arrive.
+        let (slow_url, mut body_ready, release_body, slow_worker) =
+            controlled_thirty_chunk_server();
+        let fast = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                1,
+                b"1".to_vec(),
+            ),
+        );
+        let fast_url = fast.url("/media");
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_for_start = started.clone();
+        let requests = vec![
+            ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file/0.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+            ExternalMediaRequest {
+                index: 1,
+                url: "https://telegra.ph/file/1.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+        ];
+        let budget = ExternalMediaBudget::new(200);
+        let collection = collect_external_media(requests, &budget, 1, move |request| {
+            started_for_start.fetch_add(1, Ordering::SeqCst);
+            let slow_url = slow_url.clone();
+            let fast_url = fast_url.clone();
+            async move {
+                let url = if request.index == 0 {
+                    slow_url
+                } else {
+                    fast_url
+                };
+                Ok(get_http_client_no_redirect().get(url).send().await?)
+            }
+        });
+        tokio::pin!(collection);
+
+        // The slow leg's first chunk has landed, but its body is not yet
+        // fully read (the second chunk is still gated on `release_body`).
+        // Only one worker may have started at this point.
+        tokio::time::timeout(SIGNAL_TIMEOUT, async {
+            tokio::select! {
+                result = &mut body_ready => result.expect("controlled first chunk should become ready"),
+                _ = &mut collection => panic!("collection completed before the controlled body was released"),
+            }
+        })
+        .await
+        .expect("controlled body should become ready");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the second request must not start while the first body is still streaming"
+        );
+
+        release_body.send(()).unwrap();
+        let files = tokio::time::timeout(std::time::Duration::from_secs(2), collection)
+            .await
+            .expect("collection should finish once the body is released");
+        assert_eq!(files.len(), 2);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        slow_worker.join().unwrap();
+        fast.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn collector_times_out_and_returns_partial_results() {
+        // Real listeners are created before pausing time: the fast one
+        // answers over genuine (instant, real-time) localhost I/O, and the
+        // hang one never answers, standing in for a provider that never
+        // completes.
+        let fast = TestServer::single(
+            crate::tools::twitter_extractor::test_support::response_with_content_length(
+                1,
+                b"x".to_vec(),
+            ),
+        );
+        let hang_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hang_addr = hang_listener.local_addr().unwrap();
+        let hang_worker = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = hang_listener.accept() else {
+                return;
+            };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            // Never write a response; block until the collector aborts this
+            // connection (or the read errors out), simulating a provider
+            // that never completes.
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        });
+
+        let fast_url = fast.url("/media");
+        let hang_url = url::Url::parse(&format!("http://{hang_addr}/media")).unwrap();
+        let requests = vec![
+            ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file/0.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+            ExternalMediaRequest {
+                index: 1,
+                url: "https://telegra.ph/file/1.jpg".to_string(),
+                kind: ExternalMediaKind::Image,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            },
+        ];
+        let budget = ExternalMediaBudget::new(100);
+        // Signals when the fast leg's genuine (real-time) localhost round
+        // trip has settled (success or failure), so the test can wait on
+        // that instead of guessing how many scheduler ticks it needs under
+        // load.
+        let fast_done = Arc::new(tokio::sync::Notify::new());
+        let fast_done_for_start = fast_done.clone();
+        let handle = tokio::spawn(async move {
+            collect_external_media(requests, &budget, 4, move |request| {
+                let fast_url = fast_url.clone();
+                let hang_url = hang_url.clone();
+                let fast_done = fast_done_for_start.clone();
+                async move {
+                    if request.index == 0 {
+                        let result = reqwest::Client::new().get(fast_url).send().await;
+                        fast_done.notify_one();
+                        return Ok(result?);
+                    }
+                    // A client without a request timeout, so the hang branch
+                    // is blocked only on real I/O (no tokio timer for
+                    // `advance` to fast-forward past) until the collector's
+                    // own deadline aborts it.
+                    Ok(reqwest::Client::new().get(hang_url).send().await?)
+                }
+            })
+            .await
+        });
+
+        // Wait (in real, unpaused time, so a genuine stall fails fast
+        // instead of hanging the suite) for the fast leg to settle, then a
+        // handful of ticks for its (already-buffered, one-byte) body read.
+        // Only once that is done do we freeze the clock and jump past the
+        // deadline: `time::advance` itself only yields once, and jumping
+        // past the deadline before the fast response is fully collected
+        // would abort it too, alongside the hang leg it is meant to cut off.
+        tokio::time::timeout(std::time::Duration::from_secs(10), fast_done.notified())
+            .await
+            .expect("fast leg should settle quickly over real localhost I/O");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::pause();
+        tokio::time::advance(
+            EXTERNAL_MEDIA_COLLECTION_TIMEOUT + std::time::Duration::from_millis(1),
+        )
+        .await;
+        let files = handle.await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].bytes(), b"x");
+        fast.join().unwrap();
+        // The hang worker unblocks once the collector aborts the connection
+        // above; it is not joined here to keep the test from depending on
+        // that abort tearing down the socket promptly.
+        drop(hang_worker);
+    }
+
+    #[test]
+    fn collector_logs_and_skips_failed_images() {
+        // `tracing`'s per-callsite interest cache is process-global: under
+        // `cargo test`'s default parallelism another thread's callsite can
+        // race the rebuild `capture_json_events` triggers when it installs
+        // its subscriber, so a run can (rarely) capture nothing even though
+        // the `warn!` genuinely fired. Retry a few times rather than flake.
+        let mut events = Vec::new();
+        for _ in 0..5 {
+            events = crate::utils::log_capture::capture_json_events(|| {
+                // `warn!` is captured only on the thread the subscriber was
+                // installed on, so this must poll on the current thread
+                // rather than a multi-threaded runtime's worker threads.
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let server = TestServer::single_status("GET", "/media", 500);
+                    let url = server.url("/media");
+                    let requests = vec![ExternalMediaRequest {
+                        index: 0,
+                        url: "https://telegra.ph/file/0.jpg".to_string(),
+                        kind: ExternalMediaKind::Image,
+                        source: MediaSource::Telegraph,
+                        thumbnail_url: None,
+                    }];
+                    let budget = ExternalMediaBudget::new(100);
+                    // A client built fresh on this dedicated runtime: the
+                    // shared `get_http_client_no_redirect()` client is
+                    // lazily bound to whichever runtime first touches it,
+                    // which may be a different test's, and reusing it here
+                    // hangs on checkout.
+                    let client = reqwest::Client::new();
+                    let files = collect_external_media(requests, &budget, 4, move |_request| {
+                        let url = url.clone();
+                        let client = client.clone();
+                        async move { Ok(client.get(url).send().await?) }
+                    })
+                    .await;
+                    assert!(files.is_empty());
+                    server.join().unwrap();
+                });
+            });
+            if events
+                .iter()
+                .any(|event| event["fields"]["message"] == "Skipping image that failed to download")
+            {
+                break;
+            }
+        }
+
+        // The http client's own connection-pool bookkeeping also emits trace
+        // events on this subscriber; find our own warning among them rather
+        // than assuming it is the only event captured.
+        let warning = events
+            .iter()
+            .find(|event| event["fields"]["message"] == "Skipping image that failed to download")
+            .unwrap_or_else(|| panic!("expected a download-failure warning; got {events:?}"));
+        assert_eq!(warning["level"], "WARN");
+        assert_eq!(warning["fields"]["source"], "telegraph");
+        assert_eq!(
+            warning["fields"]["media_url"],
+            "https://telegra.ph/file/0.jpg"
+        );
+        assert!(warning["fields"]["error"].as_str().unwrap().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn collector_refunds_budget_on_overflow() {
+        let server = TestServer::single(
+            crate::tools::twitter_extractor::test_support::chunked_response(vec![
+                vec![b'a'; 60],
+                vec![b'b'; 60],
+            ]),
+        );
+        let url = server.url("/media");
+        let requests = vec![ExternalMediaRequest {
+            index: 0,
+            url: "https://telegra.ph/file/big.jpg".to_string(),
+            kind: ExternalMediaKind::Image,
+            source: MediaSource::Telegraph,
+            thumbnail_url: None,
+        }];
+        let budget = ExternalMediaBudget::new(100);
+        let files = collect_external_media(requests, &budget, 4, move |_request| {
+            let url = url.clone();
+            async move { Ok(get_http_client_no_redirect().get(url).send().await?) }
+        })
+        .await;
+        assert!(files.is_empty());
+        assert_eq!(
+            budget.remaining(),
+            100,
+            "a mid-stream overflow must refund its partial reservation"
+        );
+        server.join().unwrap();
     }
 
     #[test]

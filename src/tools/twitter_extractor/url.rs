@@ -1,52 +1,3 @@
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_identity_canonicalizes_supported_variants() {
-        for raw in [
-            "https://x.com/alice/status/123456?s=20",
-            "https://mobile.twitter.com/alice/status/123456/photo/1",
-            "https://fxtwitter.com/alice/status/123456#fragment",
-        ] {
-            let identity = parse_status_identity(raw).unwrap();
-            assert_eq!(identity.id, "123456");
-            assert_eq!(
-                identity.canonical_url.as_str(),
-                "https://x.com/i/status/123456"
-            );
-            assert_eq!(canonical_status_key(raw).unwrap(), "123456");
-        }
-    }
-
-    #[test]
-    fn status_identity_rejects_suffix_confusion_and_non_numeric_ids() {
-        for raw in [
-            "https://evilx.com/alice/status/123456",
-            "https://eviltwitter.com/alice/status/123456",
-            "https://x.com/alice/status/not-a-number",
-            "https://x.com/alice/not-status/123456",
-        ] {
-            assert!(parse_status_identity(raw).is_err(), "accepted {raw}");
-        }
-    }
-
-    #[test]
-    fn status_identity_accepts_case_insensitive_http_schemes_and_schemeless_urls() {
-        for raw in [
-            "HTTPS://x.com/alice/status/123456",
-            "HtTp://x.com/alice/status/123456",
-            "x.com/alice/status/123456",
-        ] {
-            assert_eq!(
-                canonical_status_key(raw).unwrap(),
-                "123456",
-                "rejected {raw}"
-            );
-        }
-        assert!(parse_status_identity("ftp://x.com/alice/status/123456").is_err());
-    }
-}
 use ::url::Url;
 use anyhow::{anyhow, Result};
 
@@ -121,4 +72,54 @@ pub(crate) fn canonical_status_key(raw_url: &str) -> Result<String> {
 
 pub(crate) fn is_supported_status_url(raw_url: &str) -> bool {
     parse_status_identity(raw_url).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_identity_canonicalizes_supported_variants() {
+        for raw in [
+            "https://x.com/alice/status/123456?s=20",
+            "https://mobile.twitter.com/alice/status/123456/photo/1",
+            "https://fxtwitter.com/alice/status/123456#fragment",
+        ] {
+            let identity = parse_status_identity(raw).unwrap();
+            assert_eq!(identity.id, "123456");
+            assert_eq!(
+                identity.canonical_url.as_str(),
+                "https://x.com/i/status/123456"
+            );
+            assert_eq!(canonical_status_key(raw).unwrap(), "123456");
+        }
+    }
+
+    #[test]
+    fn status_identity_rejects_suffix_confusion_and_non_numeric_ids() {
+        for raw in [
+            "https://evilx.com/alice/status/123456",
+            "https://eviltwitter.com/alice/status/123456",
+            "https://x.com/alice/status/not-a-number",
+            "https://x.com/alice/not-status/123456",
+        ] {
+            assert!(parse_status_identity(raw).is_err(), "accepted {raw}");
+        }
+    }
+
+    #[test]
+    fn status_identity_accepts_case_insensitive_http_schemes_and_schemeless_urls() {
+        for raw in [
+            "HTTPS://x.com/alice/status/123456",
+            "HtTp://x.com/alice/status/123456",
+            "x.com/alice/status/123456",
+        ] {
+            assert_eq!(
+                canonical_status_key(raw).unwrap(),
+                "123456",
+                "rejected {raw}"
+            );
+        }
+        assert!(parse_status_identity("ftp://x.com/alice/status/123456").is_err());
+    }
 }

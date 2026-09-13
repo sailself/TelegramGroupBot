@@ -1,10 +1,17 @@
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use teloxide::types::Message;
 use tracing::info;
 
 use crate::utils::text::truncate_to_chars;
+
+pub fn now_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 
 #[derive(Debug)]
 pub struct CommandTimer {

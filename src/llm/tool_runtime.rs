@@ -862,10 +862,11 @@ impl ToolRuntime {
                     error
                 }
             })?;
-        let label_map = crate::handlers::build_display_label_map(rows.iter().filter_map(|r| {
-            r.group_user_id
-                .map(|uid| (uid, r.group_key.as_deref().unwrap_or("Anonymous")))
-        }));
+        let label_map =
+            crate::llm::prompting::build_display_label_map(rows.iter().filter_map(|r| {
+                r.group_user_id
+                    .map(|uid| (uid, r.group_key.as_deref().unwrap_or("Anonymous")))
+            }));
         let out: Vec<Value> = rows
             .iter()
             .map(|r| {

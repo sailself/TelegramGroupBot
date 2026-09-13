@@ -5,6 +5,7 @@ use tracing::{info, warn};
 
 use crate::db::database::Database;
 use crate::db::models::LlmRequestInsert;
+use crate::state::AppState;
 use crate::utils::text::truncate_for_log;
 
 pub const LLM_TRIGGER_KIND_AUTO_Q: &str = "auto_q";
@@ -62,6 +63,15 @@ pub async fn create_audit_context_from_message(
             None
         }
     }
+}
+
+pub(crate) async fn create_command_audit_context(
+    state: &AppState,
+    message: &Message,
+    trigger_name: &str,
+) -> Option<LlmAuditContext> {
+    create_audit_context_from_message(&state.db, LLM_TRIGGER_KIND_COMMAND, trigger_name, message)
+        .await
 }
 
 fn json_text(value: Option<&Value>) -> String {

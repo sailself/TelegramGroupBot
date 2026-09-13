@@ -15,12 +15,8 @@ use crate::llm::call_third_party_with_reasoning_config;
 use crate::llm::gemini::call_gemini_model_simple;
 use crate::llm::media::MediaFile;
 use crate::llm::runtime_models::runtime_model_config;
+use crate::llm::text_model::MODEL_GEMINI;
 use crate::llm::LlmAuditContext;
-
-/// Identifier callers use for the built-in Gemini model (mirrors
-/// `handlers::qa::MODEL_GEMINI`; kept local so `agents` does not depend on
-/// `handlers`).
-const GEMINI_MODEL_ID: &str = "gemini";
 
 /// Model used for cheap orchestration steps inside a pipeline.
 #[derive(Debug, Clone)]
@@ -87,7 +83,7 @@ fn resolve_step_model_value(
 
     let explicit = agent_step_model.trim();
     if !explicit.is_empty() {
-        if explicit.eq_ignore_ascii_case(GEMINI_MODEL_ID) {
+        if explicit.eq_ignore_ascii_case(MODEL_GEMINI) {
             if gemini_available {
                 return Ok(StepModel::Gemini {
                     model: pick_gemini_step_model(gemini_lite_model, gemini_model)?,
@@ -127,7 +123,7 @@ fn resolve_step_model_value(
         }
     }
 
-    if final_model_id.eq_ignore_ascii_case(GEMINI_MODEL_ID) {
+    if final_model_id.eq_ignore_ascii_case(MODEL_GEMINI) {
         if gemini_available {
             return Ok(StepModel::Gemini {
                 model: pick_gemini_step_model(gemini_lite_model, gemini_model)?,

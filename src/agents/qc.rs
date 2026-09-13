@@ -16,7 +16,6 @@ use crate::agents::step::{
 };
 use crate::config::CONFIG;
 use crate::db::database::Database;
-use crate::handlers::{neutralize_closing_tag, neutralize_tag};
 use crate::llm::call_third_party;
 use crate::llm::gemini::{call_gemini, call_gemini_with_tool_runtime, GeminiCallRequest};
 use crate::llm::media::MediaFile;
@@ -24,7 +23,7 @@ use crate::llm::third_party::call_third_party_with_tool_runtime;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::LlmAuditContext;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::text::truncate_for_log;
+use crate::utils::text::{neutralize_closing_tag, neutralize_tag, truncate_for_log};
 
 const MAX_PLANNED_QUERIES: usize = 3;
 const MAX_REFLECT_ROUNDS: usize = 2;
@@ -190,7 +189,7 @@ pub(super) async fn compose_final_answer(
     youtube_urls: &[String],
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<(String, Option<String>)> {
-    if model_name == crate::handlers::qa::MODEL_GEMINI {
+    if model_name == crate::llm::text_model::MODEL_GEMINI {
         let use_pro = !media_files.is_empty() || !youtube_urls.is_empty();
         let result = call_gemini(GeminiCallRequest {
             system_prompt,
@@ -320,12 +319,12 @@ async fn run_analytics_lane(
     progress.update_now("Analyzing chat...").await;
     let mut runtime = ToolRuntime::for_analytics(db.clone(), chat_id);
     let runtime_guidance =
-        (model_name == crate::handlers::qa::MODEL_GEMINI).then(|| runtime.tool_limit_guidance());
+        (model_name == crate::llm::text_model::MODEL_GEMINI).then(|| runtime.tool_limit_guidance());
     let gather_sys =
         build_analytics_gather_system_prompt(system_prompt, runtime_guidance.as_deref());
 
     // Gather: let the model run/iterate queries. Its prose is discarded.
-    let gather = if model_name == crate::handlers::qa::MODEL_GEMINI {
+    let gather = if model_name == crate::llm::text_model::MODEL_GEMINI {
         call_gemini_with_tool_runtime(
             &gather_sys,
             query,

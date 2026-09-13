@@ -24,6 +24,9 @@ use crate::utils::http::get_http_client;
 
 pub const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_CODEX_DEFAULT_ISSUER: &str = "https://auth.openai.com";
+/// Codex model-catalog compatibility version sent to `/models` as
+/// `client_version`; also the default for `OPENAI_CODEX_CLIENT_VERSION`.
+pub const CODEX_CLIENT_VERSION: &str = "0.144.0";
 const OPENAI_CODEX_DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 const TOKEN_REFRESH_INTERVAL_DAYS: i64 = 8;
 const ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
@@ -1331,7 +1334,7 @@ pub async fn fetch_usage_snapshot() -> Result<CodexUsageSnapshot> {
 
 pub async fn fetch_models() -> Result<CodexModelList> {
     let version = if CONFIG.openai_codex_client_version.trim().is_empty() {
-        "0.144.0"
+        CODEX_CLIENT_VERSION
     } else {
         CONFIG.openai_codex_client_version.trim()
     };

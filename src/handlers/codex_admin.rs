@@ -14,6 +14,7 @@ use crate::state::{
     ActiveCodexLogin, AppState, PendingCodexModelRequest, PendingCodexReasoningRequest,
 };
 use crate::utils::text::truncate_with_ellipsis;
+use crate::utils::timing::now_unix_seconds;
 use tracing::warn;
 
 pub const CODEX_MODEL_SELECT_CALLBACK_PREFIX: &str = "codex_model_select:";
@@ -22,10 +23,6 @@ pub const CODEX_REASONING_SELECT_CALLBACK_PREFIX: &str = "codex_reasoning_select
 const CODEX_MODEL_PAGE_SIZE: usize = 8;
 const CODEX_CALLBACK_INDEX_PREFIX: &str = "i:";
 const TELEGRAM_CALLBACK_DATA_LIMIT: usize = 64;
-
-fn now_unix_seconds() -> i64 {
-    chrono::Utc::now().timestamp()
-}
 
 fn request_key(chat_id: ChatId, message_id: MessageId) -> String {
     format!("{}_{}", chat_id.0, message_id.0)

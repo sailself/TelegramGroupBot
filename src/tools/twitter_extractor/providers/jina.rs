@@ -4,7 +4,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 use super::{
-    read_limited_body, run_blocking_parser, ProviderError, ProviderErrorKind, TwitterFetchConfig,
+    fetch_and_parse, ProviderError, ProviderErrorKind, ProviderFetch, TwitterFetchConfig,
     TwitterProvider,
 };
 use crate::tools::twitter_extractor::model::{
@@ -135,80 +135,38 @@ pub(crate) async fn fetch(
     identity: &XStatusIdentity,
     timeout: Duration,
 ) -> Result<XPost, ProviderError> {
-    fetch_with_parser(client, config, identity, timeout, |body, identity| {
-        parse(&body, &identity)
-    })
-    .await
-}
-
-async fn fetch_with_parser<F>(
-    client: &NoRedirectClient,
-    config: &TwitterFetchConfig,
-    identity: &XStatusIdentity,
-    timeout: Duration,
-    parser: F,
-) -> Result<XPost, ProviderError>
-where
-    F: FnOnce(Vec<u8>, XStatusIdentity) -> Result<XPost, ProviderError> + Send + 'static,
-{
-    let identity = identity.clone();
-    let future = async {
-        if identity.id.is_empty() || !identity.id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(error(
-                ProviderErrorKind::Incomplete,
-                "requested status ID was invalid",
-                None,
-            ));
-        }
-        let mut endpoint = config.jina_reader_endpoint.clone();
-        let mut path = endpoint.path().trim_end_matches('/').to_owned();
-        path.push('/');
-        path.push_str(identity.canonical_url.as_str());
-        endpoint.set_path(&path);
-        endpoint.set_query(None);
-        endpoint.set_fragment(None);
-        let mut request = client.get(endpoint);
-        if let Some(key) = config
-            .jina_api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty())
-        {
-            request = request.bearer_auth(key);
-        }
-        let response = request.send().await.map_err(|_| {
-            error(
-                ProviderErrorKind::Transport,
-                "provider request failed",
-                None,
-            )
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(error(
-                ProviderErrorKind::HttpStatus,
-                "provider returned a non-success status",
-                Some(status),
-            ));
-        }
-        let body =
-            read_limited_body(TwitterProvider::Jina, response, config.response_max_bytes).await?;
-        run_blocking_parser(move || parser(body, identity))
-            .await
-            .map_err(|_| {
-                error(
-                    ProviderErrorKind::Incomplete,
-                    "provider parser failed",
-                    None,
-                )
-            })?
-    };
-    tokio::time::timeout(timeout, future).await.map_err(|_| {
-        error(
-            ProviderErrorKind::Timeout,
-            "provider request timed out",
+    if identity.id.is_empty() || !identity.id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(error(
+            ProviderErrorKind::Incomplete,
+            "requested status ID was invalid",
             None,
-        )
-    })?
+        ));
+    }
+    let mut endpoint = config.jina_reader_endpoint.clone();
+    let mut path = endpoint.path().trim_end_matches('/').to_owned();
+    path.push('/');
+    path.push_str(identity.canonical_url.as_str());
+    endpoint.set_path(&path);
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    let bearer = config
+        .jina_api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty());
+    let identity = identity.clone();
+    fetch_and_parse(
+        ProviderFetch {
+            url: endpoint,
+            bearer,
+            user_agent: None,
+            client,
+            provider: TwitterProvider::Jina,
+        },
+        config.response_max_bytes,
+        timeout,
+        move |body| parse(body, &identity),
+    )
+    .await
 }
 
 fn looks_like_timestamp(text: &str) -> bool {
@@ -415,15 +373,8 @@ mod tests {
     use super::*;
     use crate::tools::twitter_extractor::model::XMedia;
     use crate::tools::twitter_extractor::test_support::{
-        response_with_content_length, ExpectedRequest, TestServer,
+        identity, response_with_content_length, ExpectedRequest, TestServer,
     };
-
-    fn identity(id: &str) -> XStatusIdentity {
-        XStatusIdentity {
-            id: id.to_owned(),
-            canonical_url: url::Url::parse(&format!("https://x.com/i/status/{id}")).unwrap(),
-        }
-    }
 
     #[test]
     fn parses_jina_photo_fixture_into_normalized_post() {
@@ -551,32 +502,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jina_fetch_times_out_while_blocking_parser_is_running() {
-        let body = include_bytes!("../fixtures/jina_photo.txt");
-        let server = TestServer::new(vec![ExpectedRequest::new(
-            "GET",
-            "/https://x.com/i/status/123",
-            response_with_content_length(body.len(), body.to_vec()),
-        )]);
-        // The parser blocks until the test releases it, so only the timeout
-        // path can make fetch_with_parser return early.
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let started = std::time::Instant::now();
-        let error = fetch_with_parser(
+    async fn jina_fetch_preserves_success_status_for_decode_errors() {
+        // fx/vx already back-filled the HTTP status on a decode failure;
+        // the shared fetch_and_parse now does the same for jina.
+        let server = TestServer::single_json("GET", "/https://x.com/i/status/123", b"no marker");
+        let error = fetch(
             crate::utils::http::get_http_client_no_redirect(),
             &config(server.base_url(), None),
             &identity("123"),
-            Duration::from_millis(20),
-            move |_body, _identity| {
-                let _ = release_rx.recv_timeout(Duration::from_secs(5));
-                Err(error(ProviderErrorKind::Incomplete, "slow parser", None))
-            },
+            Duration::from_secs(1),
         )
         .await
         .unwrap_err();
-        assert_eq!(error.kind, ProviderErrorKind::Timeout);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        let _ = release_tx.send(());
+        assert_eq!(error.kind, ProviderErrorKind::Decode);
+        assert_eq!(error.status, Some(reqwest::StatusCode::OK));
         server.join().unwrap();
     }
 }

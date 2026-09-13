@@ -166,7 +166,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 
 ### Database
 - `DATABASE_URL` - SQLite connection string.
-  - Default: `sqlite+aiosqlite:///bot.db` (normalized to `sqlite:///bot.db`).
+  - Default: `sqlite://bot.db`.
   - Examples:
     - `sqlite:///bot.db` (relative to project root)
     - `sqlite:///D:/Bots/telegram/bot.db` (absolute on Windows)
@@ -182,7 +182,6 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `DEFAULT_TEXT_MODEL` - Default text model for model-selection timeouts, `/tldr`, `/factcheck`, `/profileme`, and the prompt step for `/paintme`/`/portraitme`; it is also the inherited/fallback model for `/qq`. Use `gemini` or a runtime model such as `openai-codex:selected`/`openai-codex`. Default: `gemini`.
 - `DEFAULT_QUICK_TEXT_MODEL` - Optional dedicated `/qq` model. Empty or unset inherits `DEFAULT_TEXT_MODEL`. It accepts configured runtime IDs, `openai-codex:selected`, or an authenticated catalog slug such as `openai-codex:gpt-5.6-terra`; unavailable or incompatible models fall back once to the capable `DEFAULT_TEXT_MODEL` without opening a picker.
 - `QUICK_REASONING_EFFORT` - Per-request reasoning override for OpenAI Codex models used by `/qq`. Default: `low`. Public OpenAI and other providers keep their existing request contracts.
-- `DEFAULT_Q_MODEL` - Deprecated alias used only when `DEFAULT_TEXT_MODEL` is unset.
 - `DEFAULT_IMAGE_MODEL` - Default image model for `/img`, `/image` timeout/default generation, `/tldr` infographics, and `/paintme`/`/portraitme`. Use `gemini` or `codex`. Default: `gemini`.
 - `TELEGRAM_MAX_LENGTH` - Max message length before truncation or Telegraph. Default: `4000`.
 - `USER_HISTORY_MESSAGE_COUNT` - Messages to retain for user history. Default: `200`.
@@ -222,9 +221,9 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 
 ### Gemini settings
 - `ENABLE_GEMINI` - When `false`, Gemini API-backed models and Gemini-only commands (`/vid`, `/mysong`) are disabled and hidden from model/command pickers. `/s` remains available when another ready model with `tools=true` is configured. Default: `true`.
-- `GEMINI_MODEL` - Default Gemini model. Default: `gemini-2.0-flash`.
-- `GEMINI_LITE_MODEL` - Lite fallback model after `GEMINI_MODEL` failures. Default: `gemini-2.0-flash-lite`.
-- `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-2.5-pro-exp-03-25`.
+- `GEMINI_MODEL` - Default Gemini model. Default: `gemini-flash-latest`.
+- `GEMINI_LITE_MODEL` - Lite fallback model after `GEMINI_MODEL` failures. Default: `gemini-flash-lite-latest`.
+- `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-2.5-pro`.
 - `GEMINI_IMAGE_MODEL` - Image model. Default: `gemini-3-pro-image-preview`.
 - `GEMINI_MUSIC_MODEL` - Music model for `/mysong`. Default: `lyria-3-pro-preview`.
 - `GEMINI_VIDEO_MODEL` - Video model. Default: `veo-3.1-generate-preview`.
@@ -240,7 +239,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 
 ### Shared third-party model catalog
 - `THIRD_PARTY_MODELS_CONFIG_PATH` - Path to the mixed-provider model config JSON.
-  - Defaults to `third_party_models.json` or `bot/third_party_models.json` if present.
+  - Defaults to `third_party_models.json`.
 
 ### OpenRouter (optional)
 - `ENABLE_OPENROUTER` - Enable OpenRouter. Default: `true`.
@@ -263,7 +262,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 ### Ollama Cloud (optional)
 - `ENABLE_OLLAMA` - Enable Ollama Cloud via the OpenAI-compatible chat endpoint. Default: `true`.
 - `OLLAMA_API_KEY` - Ollama API key from ollama.com.
-- `OLLAMA_BASE_URL` - Default: `https://ollama.com/v1`.
+- `OLLAMA_BASE_URL` - Must be HTTPS, except a plain `http://` URL is allowed when the host is loopback (`localhost`, `127.0.0.1`, or `::1`) for a local Ollama server, e.g. `http://localhost:11434/v1`. Default: `https://ollama.com/v1`.
 - `OLLAMA_TEMPERATURE` - Default: `0.7`.
 - `OLLAMA_TOP_P` - Default: `0.95`.
 - `OLLAMA_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `60`.
@@ -299,7 +298,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 ### Hidden Img2 image generation (optional)
 - `/img2` is a hidden command: it is callable when enabled, but it is not published with `setMyCommands` and is not shown in `/help`.
 - `ENABLE_IMG2` - Enable the hidden `/img2` command. Default: `false`.
-- `IMG2_BASE_URL` - API base URL. Default: `https://wspark.taild6a660.ts.net:8443`.
+- `IMG2_BASE_URL` - API base URL; must be a valid HTTPS URL when set. Default: empty (`/img2` stays unavailable, see `img2_api_available()`, until this is configured).
 - `IMG2_API_KEY` - API key sent in the `X-API-Key` header. Keep this in `.env` or deployment secrets only.
 - `IMG2_GENERATE_PATH` - Generate endpoint path. Default: `/v1/images/generate`.
 - `IMG2_HEALTH_PATH` - Health endpoint path shown in `/status`. Default: `/v1/health`.

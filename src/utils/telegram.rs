@@ -1,8 +1,11 @@
 use std::future::IntoFuture;
 use std::time::Duration;
 
+use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::ChatAction;
+use teloxide::types::{
+    ChatAction, InlineKeyboardMarkup, MessageEntityRef, MessageId, ParseMode, ReplyParameters,
+};
 use teloxide::RequestError;
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -117,6 +120,104 @@ pub fn build_message_link(chat_id: i64, message_id: i64) -> Option<String> {
     None
 }
 
+pub(crate) fn strip_command_prefix(text: &str, command_prefix: &str) -> String {
+    let Some(stripped) = text.strip_prefix(command_prefix) else {
+        return text.to_string();
+    };
+    // Telegram appends `@botname` to the command when it is addressed to a
+    // specific bot (`/img@MyBot ...`); that mention is not part of the prompt.
+    let stripped = match stripped.strip_prefix('@') {
+        Some(after_at) => {
+            after_at.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => stripped,
+    };
+    stripped.trim().to_string()
+}
+
+pub(crate) fn message_entities_for_text(message: &Message) -> Option<Vec<MessageEntityRef<'_>>> {
+    if message.text().is_some() {
+        message.parse_entities()
+    } else {
+        message.parse_caption_entities()
+    }
+}
+
+pub(crate) fn message_text_or_caption(message: &Message) -> Option<&str> {
+    message.text().or_else(|| message.caption())
+}
+
+pub(crate) async fn send_message_with_retry(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    reply_to: Option<MessageId>,
+) -> Result<Message> {
+    send_message_with_retry_parse_mode(bot, chat_id, text, reply_to, None).await
+}
+
+pub(crate) async fn send_message_with_retry_parse_mode(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    reply_to: Option<MessageId>,
+    parse_mode: Option<ParseMode>,
+) -> Result<Message> {
+    retry_telegram("send_message", || {
+        let mut request = bot.send_message(chat_id, text.to_string());
+        if let Some(reply_to) = reply_to {
+            request = request.reply_parameters(ReplyParameters::new(reply_to));
+        }
+        if let Some(parse_mode) = parse_mode {
+            request = request.parse_mode(parse_mode);
+        }
+        request
+    })
+    .await
+    .map_err(Into::into)
+}
+
+pub(crate) async fn edit_message_text_with_retry(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    text: &str,
+) -> Result<()> {
+    retry_telegram("edit_message_text", || {
+        bot.edit_message_text(chat_id, message_id, text.to_string())
+    })
+    .await?;
+    Ok(())
+}
+
+/// Like [`send_message_with_retry_parse_mode`] but also supports an inline
+/// keyboard reply markup; used by the interactive `/q` flows that attach
+/// model-selection buttons.
+pub(crate) async fn reply_with_retry(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    reply_to: Option<MessageId>,
+    parse_mode: Option<ParseMode>,
+    reply_markup: Option<InlineKeyboardMarkup>,
+) -> Result<Message> {
+    retry_telegram("send_message", || {
+        let mut request = bot.send_message(chat_id, text.to_string());
+        if let Some(reply_to) = reply_to {
+            request = request.reply_parameters(ReplyParameters::new(reply_to));
+        }
+        if let Some(mode) = parse_mode {
+            request = request.parse_mode(mode);
+        }
+        if let Some(markup) = reply_markup.clone() {
+            request = request.reply_markup(markup);
+        }
+        request
+    })
+    .await
+    .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -219,5 +320,21 @@ mod tests {
             build_message_link(351987360, 42),
             Some("tg://openmessage?user_id=351987360&message_id=42".to_string())
         );
+    }
+
+    #[test]
+    fn strip_command_prefix_removes_command_and_attached_bot_mention() {
+        assert_eq!(strip_command_prefix("/img a cat", "/img"), "a cat");
+        assert_eq!(strip_command_prefix("/img@MyBot a cat", "/img"), "a cat");
+        assert_eq!(strip_command_prefix("/image@My_Bot2", "/image"), "");
+    }
+
+    #[test]
+    fn strip_command_prefix_keeps_mentions_inside_the_prompt() {
+        assert_eq!(
+            strip_command_prefix("/img @alice as a knight", "/img"),
+            "@alice as a knight"
+        );
+        assert_eq!(strip_command_prefix("draw a cat", "/img"), "draw a cat");
     }
 }
