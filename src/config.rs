@@ -476,7 +476,7 @@ fn validate_twitter_fetch_limits(
 }
 
 fn validate_https_base(name: &str, value: String) -> Result<String> {
-    crate::utils::http::parse_https_allowlisted(name, &value, None)
+    crate::utils::http::parse_https_endpoint(name, &value)
         .map(|url| url.as_str().trim_end_matches('/').to_string())
 }
 
@@ -1435,6 +1435,7 @@ mod tests {
             "https://api.fxtwitter.com",
             "https://api.vxtwitter.com",
             "https://r.jina.ai/",
+            "https://api.example.com:8443/v1",
         ] {
             assert!(validate_https_base("TEST_ENDPOINT", value.into()).is_ok());
         }
@@ -1443,7 +1444,6 @@ mod tests {
             "https://user@api.fxtwitter.com",
             "https://api.fxtwitter.com?debug=1",
             "https://api.fxtwitter.com/#fragment",
-            "https://api.fxtwitter.com:8443",
         ] {
             assert!(validate_https_base("TEST_ENDPOINT", value.into()).is_err());
         }
@@ -1477,6 +1477,14 @@ mod tests {
         ] {
             assert!(validate_http_base_allowing_loopback("OLLAMA_BASE_URL", value.into()).is_err());
         }
+    }
+
+    #[test]
+    fn config_load_accepts_img2_custom_https_port() {
+        let _lock = lock_env_and_force_config();
+        let _env = set_env_var_for_test("IMG2_BASE_URL", "https://images.example.com:8443/v1/");
+        let config = Config::load().expect("custom HTTPS provider ports should be accepted");
+        assert_eq!(config.img2.base_url, "https://images.example.com:8443/v1");
     }
 
     #[test]

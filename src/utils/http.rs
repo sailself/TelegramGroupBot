@@ -73,7 +73,7 @@ pub fn parse_https_allowlisted(
     value: &str,
     allowed_hosts: Option<&[&str]>,
 ) -> anyhow::Result<url::Url> {
-    parse_https_allowlisted_inner(name, value, allowed_hosts, false)
+    parse_https_allowlisted_inner(name, value, allowed_hosts, false, false)
 }
 
 /// Same as [`parse_https_allowlisted`], but permits a query string. Some
@@ -85,7 +85,13 @@ pub fn parse_https_allowlisted_with_query(
     value: &str,
     allowed_hosts: Option<&[&str]>,
 ) -> anyhow::Result<url::Url> {
-    parse_https_allowlisted_inner(name, value, allowed_hosts, true)
+    parse_https_allowlisted_inner(name, value, allowed_hosts, true, false)
+}
+
+/// Parse an operator-configured HTTPS endpoint, allowing custom service ports.
+/// Credentials, query strings, and fragments remain forbidden.
+pub fn parse_https_endpoint(name: &str, value: &str) -> anyhow::Result<url::Url> {
+    parse_https_allowlisted_inner(name, value, None, false, true)
 }
 
 fn parse_https_allowlisted_inner(
@@ -93,6 +99,7 @@ fn parse_https_allowlisted_inner(
     value: &str,
     allowed_hosts: Option<&[&str]>,
     allow_query: bool,
+    allow_custom_port: bool,
 ) -> anyhow::Result<url::Url> {
     let parsed = url::Url::parse(value.trim())
         .map_err(|err| anyhow::anyhow!("{name} must be a valid HTTPS URL: {err}"))?;
@@ -111,7 +118,7 @@ fn parse_https_allowlisted_inner(
             "{name} must not contain a query or fragment"
         ));
     }
-    if parsed.port().is_some() && parsed.port_or_known_default() != Some(443) {
+    if !allow_custom_port && parsed.port().is_some() {
         return Err(anyhow::anyhow!("{name} must not use a non-default port"));
     }
     if let Some(hosts) = allowed_hosts {

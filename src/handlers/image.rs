@@ -647,19 +647,21 @@ async fn finalize_image_request(
             .edit_message_media(ChatId(request.chat_id), processing_message_id, media)
             .await;
         if edit_result.is_err() {
-            bot.send_photo(ChatId(request.chat_id), InputFile::memory(first_image))
+            retry_telegram("send_photo", || {
+                bot.send_photo(ChatId(request.chat_id), InputFile::memory(first_image.clone()))
                 .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
-                .caption(caption)
+                .caption(caption.clone())
                 .parse_mode(ParseMode::Html)
-                .await?;
-            edit_message_text_with_retry(bot, ChatId(request.chat_id), processing_message_id, "Generated image below.").await?;
+            }).await.map_err(crate::utils::telegram::ImageDeliveryError)?;
+            let _ = edit_message_text_with_retry(bot, ChatId(request.chat_id), processing_message_id, "Generated image below.").await;
         }
     }
 
     for image in image_iter {
-        bot.send_photo(ChatId(request.chat_id), InputFile::memory(image))
+        retry_telegram("send_photo", || {
+            bot.send_photo(ChatId(request.chat_id), InputFile::memory(image.clone()))
             .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
-            .await?;
+        }).await.map_err(crate::utils::telegram::ImageDeliveryError)?;
     }
 
     Ok(())
@@ -1003,11 +1005,14 @@ pub async fn img_handler(
                     .edit_message_media(message.chat.id, processing_message.id, media)
                     .await;
                 if edit_result.is_err() {
-                    bot.send_photo(message.chat.id, InputFile::memory(first_image))
-                        .reply_parameters(ReplyParameters::new(message.id))
-                        .caption(caption)
-                        .parse_mode(ParseMode::Html)
-                        .await?;
+                    retry_telegram("send_photo", || {
+                        bot.send_photo(message.chat.id, InputFile::memory(first_image.clone()))
+                            .reply_parameters(ReplyParameters::new(message.id))
+                            .caption(caption.clone())
+                            .parse_mode(ParseMode::Html)
+                    })
+                    .await
+                    .map_err(crate::utils::telegram::ImageDeliveryError)?;
                     let _ = bot
                         .edit_message_text(
                             message.chat.id,
@@ -1019,9 +1024,12 @@ pub async fn img_handler(
             }
 
             for image in image_iter {
-                bot.send_photo(message.chat.id, InputFile::memory(image))
-                    .reply_parameters(ReplyParameters::new(message.id))
-                    .await?;
+                retry_telegram("send_photo", || {
+                    bot.send_photo(message.chat.id, InputFile::memory(image.clone()))
+                        .reply_parameters(ReplyParameters::new(message.id))
+                })
+                .await
+                .map_err(crate::utils::telegram::ImageDeliveryError)?;
             }
 
             Ok(())
@@ -1124,12 +1132,15 @@ pub async fn img2_handler(
                 .edit_message_media(message.chat.id, processing_message.id, media)
                 .await;
             if edit_result.is_err() {
-                bot.send_photo(message.chat.id, InputFile::file(result.path.clone()))
-                    .reply_parameters(ReplyParameters::new(message.id))
-                    .caption(build_img2_spoiler_caption(&caption))
-                    .parse_mode(ParseMode::Html)
-                    .has_spoiler(true)
-                    .await?;
+                retry_telegram("send_photo", || {
+                    bot.send_photo(message.chat.id, InputFile::file(result.path.clone()))
+                        .reply_parameters(ReplyParameters::new(message.id))
+                        .caption(build_img2_spoiler_caption(&caption))
+                        .parse_mode(ParseMode::Html)
+                        .has_spoiler(true)
+                })
+                .await
+                .map_err(crate::utils::telegram::ImageDeliveryError)?;
                 let _ = bot
                     .edit_message_text(
                         message.chat.id,

@@ -58,6 +58,21 @@ where
     }
 }
 
+/// Generation succeeded, but Telegram did not confirm photo delivery.
+#[derive(Debug, thiserror::Error)]
+#[error("Generated image delivery failed: {0}")]
+pub(crate) struct ImageDeliveryError(#[source] pub RequestError);
+
+impl ImageDeliveryError {
+    fn user_message(&self) -> &'static str {
+        if telegram_error_is_retryable(&self.0) {
+            "Your image was generated, but a network or temporary Telegram error prevented delivery after retries. Please try again later."
+        } else {
+            "Your image was generated, but Telegram rejected its delivery. Please try again later."
+        }
+    }
+}
+
 /// Every post-status operation either completes normally or attempts a terminal
 /// edit. A failed edit must never replace the error that caused the command to fail.
 pub async fn run_with_status_message<T>(
@@ -70,6 +85,8 @@ pub async fn run_with_status_message<T>(
     run_with_status_report(work, |error| {
         let text = if error.is::<crate::utils::timing::OperationDeadlineExceeded>() {
             "This request reached its time limit. Please try a smaller request.".to_string()
+        } else if let Some(delivery_error) = error.downcast_ref::<ImageDeliveryError>() {
+            delivery_error.user_message().to_string()
         } else {
             failure_text.to_string()
         };
@@ -278,6 +295,18 @@ mod tests {
             io::ErrorKind::ConnectionReset,
             "reset",
         )))
+    }
+
+    #[test]
+    fn image_delivery_errors_report_generation_success_and_keep_the_cause() {
+        let error = anyhow::Error::new(ImageDeliveryError(io_error())).context("photo upload");
+        let delivery = error.downcast_ref::<ImageDeliveryError>().unwrap();
+        assert!(delivery.user_message().contains("image was generated"));
+        assert!(delivery.user_message().contains("after retries"));
+        assert!(matches!(delivery.0, RequestError::Io(_)));
+        let rejected = ImageDeliveryError(RequestError::Api(ApiError::MessageNotModified));
+        assert!(rejected.user_message().contains("Telegram rejected"));
+        assert!(!rejected.user_message().contains("after retries"));
     }
 
     #[tokio::test(start_paused = true)]
