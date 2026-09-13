@@ -504,7 +504,7 @@ struct TelegraphCreateResult {
 }
 
 pub async fn create_telegraph_page(title: &str, content: &str) -> Option<String> {
-    if CONFIG.telegraph_access_token.trim().is_empty() {
+    if CONFIG.telegraph.access_token.trim().is_empty() {
         warn!("Telegraph access token missing; skipping page creation");
         return None;
     }
@@ -514,15 +514,15 @@ pub async fn create_telegraph_page(title: &str, content: &str) -> Option<String>
     let form = vec![
         (
             "access_token".to_string(),
-            CONFIG.telegraph_access_token.clone(),
+            CONFIG.telegraph.access_token.clone(),
         ),
         (
             "author_name".to_string(),
-            CONFIG.telegraph_author_name.clone(),
+            CONFIG.telegraph.author_name.clone(),
         ),
         (
             "author_url".to_string(),
-            CONFIG.telegraph_author_url.clone(),
+            CONFIG.telegraph.author_url.clone(),
         ),
         ("title".to_string(), title.to_string()),
         ("content".to_string(), content_json),
@@ -703,7 +703,7 @@ pub async fn extract_telegraph_urls_and_content(
     urls.dedup();
 
     let ordered_urls = urls.into_iter().take(max_urls).collect::<Vec<_>>();
-    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
+    let semaphore = Arc::new(Semaphore::new(CONFIG.external_media.enrich_fanout));
     let mut join_set = JoinSet::new();
     for url in ordered_urls.iter().cloned() {
         let semaphore = semaphore.clone();
@@ -790,7 +790,7 @@ pub async fn extract_twitter_urls_and_content(
     urls.dedup();
 
     let ordered_urls = urls.into_iter().take(max_urls).collect::<Vec<_>>();
-    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
+    let semaphore = Arc::new(Semaphore::new(CONFIG.external_media.enrich_fanout));
     let mut join_set = JoinSet::new();
     for url in ordered_urls.iter().cloned() {
         let semaphore = semaphore.clone();

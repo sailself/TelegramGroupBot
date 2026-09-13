@@ -122,7 +122,7 @@ impl EnrichmentBudget {
             max_chars_per_source: 8_000,
             max_chars_total: 24_000,
             max_media_files: MediaCollectionOptions::for_commands().max_files,
-            media: ExternalMediaBudget::new(CONFIG.external_media_total_max_bytes),
+            media: ExternalMediaBudget::new(CONFIG.external_media.total_max_bytes),
         }
     }
 }
@@ -238,7 +238,7 @@ pub async fn enrich_request(
         return enrichment;
     }
 
-    let semaphore = Arc::new(Semaphore::new(CONFIG.external_enrich_fanout));
+    let semaphore = Arc::new(Semaphore::new(CONFIG.external_media.enrich_fanout));
     let mut join_set = JoinSet::new();
     for (index, (kind, url)) in candidates.into_iter().take(budget.max_sources).enumerate() {
         let semaphore = Arc::clone(&semaphore);

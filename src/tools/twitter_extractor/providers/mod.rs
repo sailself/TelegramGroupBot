@@ -136,7 +136,8 @@ impl TryFrom<&Config> for TwitterFetchConfig {
 
     fn try_from(config: &Config) -> Result<Self> {
         let providers = config
-            .twitter_fetch_providers
+            .twitter
+            .fetch_providers
             .iter()
             .map(|name| TwitterProvider::parse(name))
             .collect::<Result<Vec<_>>>()?;
@@ -147,14 +148,13 @@ impl TryFrom<&Config> for TwitterFetchConfig {
 
         Ok(Self {
             providers,
-            fxtwitter_api_base: parse_endpoint(&config.fxtwitter_api_base)?,
-            vxtwitter_api_base: parse_endpoint(&config.vxtwitter_api_base)?,
-            jina_reader_endpoint: parse_endpoint(&config.jina_reader_endpoint)?,
-            jina_api_key: (!config.jina_ai_api_key.is_empty())
-                .then(|| config.jina_ai_api_key.clone()),
-            total_timeout: Duration::from_secs(config.twitter_fetch_total_timeout_secs),
-            provider_timeout: Duration::from_secs(config.twitter_provider_timeout_secs),
-            response_max_bytes: config.twitter_response_max_bytes,
+            fxtwitter_api_base: parse_endpoint(&config.twitter.fxtwitter_api_base)?,
+            vxtwitter_api_base: parse_endpoint(&config.twitter.vxtwitter_api_base)?,
+            jina_reader_endpoint: parse_endpoint(&config.jina.reader_endpoint)?,
+            jina_api_key: (!config.jina.api_key.is_empty()).then(|| config.jina.api_key.clone()),
+            total_timeout: Duration::from_secs(config.twitter.fetch_total_timeout_secs),
+            provider_timeout: Duration::from_secs(config.twitter.provider_timeout_secs),
+            response_max_bytes: config.twitter.response_max_bytes,
         })
     }
 }
@@ -336,10 +336,10 @@ mod tests {
     #[test]
     fn jina_provider_selection_is_independent_of_jina_mcp_flag() {
         let mut disabled = (*CONFIG).clone();
-        disabled.twitter_fetch_providers = vec!["jina".into()];
-        disabled.enable_jina_mcp = false;
+        disabled.twitter.fetch_providers = vec!["jina".into()];
+        disabled.jina.enable_mcp = false;
         let mut enabled = disabled.clone();
-        enabled.enable_jina_mcp = true;
+        enabled.jina.enable_mcp = true;
 
         assert_eq!(
             TwitterFetchConfig::try_from(&disabled).unwrap().providers,

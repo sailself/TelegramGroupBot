@@ -351,9 +351,12 @@ impl ToolRuntime {
             Some(db),
             chat_id,
             ToolProfile::ChatAnalytics,
-            ToolBudget::new(CONFIG.qc_analytics_max_total_calls)
+            ToolBudget::new(CONFIG.agents.qc_analytics_max_total_calls)
                 .with(ToolKind::ChatContextQuery, 1)
-                .with(ToolKind::ChatAnalytics, CONFIG.qc_analytics_max_query_calls),
+                .with(
+                    ToolKind::ChatAnalytics,
+                    CONFIG.agents.qc_analytics_max_query_calls,
+                ),
         )
     }
 
@@ -1292,7 +1295,7 @@ mod tests {
         assert!(
             analytics.contains(&format!(
                 "chat_analytics at most {} times",
-                CONFIG.qc_analytics_max_query_calls
+                CONFIG.agents.qc_analytics_max_query_calls
             )) || analytics.contains("chat_analytics at most once"),
             "{analytics}"
         );

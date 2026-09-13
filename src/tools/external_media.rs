@@ -331,7 +331,7 @@ async fn process_response(
         }
         let bytes = match read_external_media_response(
             response,
-            CONFIG.external_media_max_bytes,
+            CONFIG.external_media.max_bytes,
             budget,
         )
         .await
@@ -352,7 +352,7 @@ async fn process_response(
 
     let bytes = match read_external_media_response(
         response,
-        CONFIG.external_media_max_bytes,
+        CONFIG.external_media.max_bytes,
         budget,
     )
     .await
@@ -503,7 +503,7 @@ pub async fn download_telegraph_media(
     collect_external_media(
         requests,
         budget,
-        CONFIG.external_enrich_fanout,
+        CONFIG.external_media.enrich_fanout,
         |request| async move { start_request(&request).await },
     )
     .await
@@ -517,7 +517,7 @@ pub async fn download_twitter_media(
     collect_external_media(
         twitter_media_requests(contents, max_files),
         budget,
-        CONFIG.external_enrich_fanout,
+        CONFIG.external_media.enrich_fanout,
         |request| async move { start_request(&request).await },
     )
     .await

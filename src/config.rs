@@ -8,8 +8,6 @@ use serde::Deserialize;
 use std::sync::LazyLock;
 use tracing::{info, warn};
 
-pub use crate::prompts::*;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub enum ThirdPartyProvider {
     #[serde(rename = "openrouter")]
@@ -101,119 +99,209 @@ pub fn parse_third_party_model_id(identifier: &str) -> Option<(ThirdPartyProvide
     }
 }
 
+/// Telegram-facing bot settings: identity, outbound formatting limits, and
+/// the support-command copy.
 #[derive(Debug, Clone)]
-pub struct Config {
+pub struct TelegramConfig {
     pub bot_token: String,
-    pub log_level: String,
-    pub database_url: String,
     pub publish_bot_commands: bool,
     pub enable_bot_to_bot_auto_q: bool,
-    pub enable_gemini: bool,
-    pub gemini_api_key: String,
-    pub gemini_model: String,
-    pub gemini_lite_model: String,
-    pub gemini_pro_model: String,
-    pub gemini_image_model: String,
-    pub gemini_music_model: String,
-    pub gemini_video_model: String,
-    pub gemini_temperature: f32,
-    pub gemini_top_k: i32,
-    pub gemini_top_p: f32,
-    pub gemini_max_output_tokens: i32,
-    pub gemini_thinking_level: String,
-    pub gemini_safety_settings: String,
-    pub gemini_request_timeout_secs: u64,
-    pub gemini_image_request_timeout_secs: u64,
-    pub enable_openrouter: bool,
-    pub openrouter_api_key: String,
-    pub openrouter_base_url: String,
-    pub openrouter_temperature: f32,
-    pub openrouter_top_k: i32,
-    pub openrouter_top_p: f32,
-    pub openrouter_request_timeout_secs: u64,
-    pub enable_nvidia: bool,
-    pub nvidia_api_key: String,
-    pub nvidia_base_url: String,
-    pub nvidia_temperature: f32,
-    pub nvidia_top_p: f32,
-    pub nvidia_request_timeout_secs: u64,
-    pub enable_ollama: bool,
-    pub ollama_api_key: String,
-    pub ollama_base_url: String,
-    pub ollama_temperature: f32,
-    pub ollama_top_p: f32,
-    pub ollama_request_timeout_secs: u64,
-    pub enable_openai: bool,
-    pub openai_api_key: String,
-    pub openai_base_url: String,
-    pub openai_request_timeout_secs: u64,
-    pub enable_openai_codex: bool,
-    pub openai_codex_base_url: String,
-    pub openai_codex_originator: String,
-    pub openai_codex_client_version: String,
-    pub openai_codex_web_search_mode: String,
-    pub openai_codex_web_search_context_size: String,
-    pub openai_codex_web_search_allowed_domains: Vec<String>,
-    pub openai_codex_auth_path: String,
-    pub openai_codex_auth_storage: String,
-    pub openai_codex_model_path: String,
-    pub openai_codex_request_timeout_secs: u64,
-    pub openai_codex_image_responses_model: String,
-    pub openai_codex_image_model: String,
-    pub enable_img2: bool,
-    pub img2_base_url: String,
-    pub img2_api_key: String,
-    pub img2_generate_path: String,
-    pub img2_health_path: String,
-    pub img2_request_timeout_secs: u64,
-    pub img2_media_dir: String,
-    pub img2_width: Option<u32>,
-    pub img2_height: Option<u32>,
-    pub img2_steps: Option<u32>,
-    pub enable_jina_mcp: bool,
-    pub jina_ai_api_key: String,
-    pub jina_search_endpoint: String,
-    pub jina_reader_endpoint: String,
-    pub twitter_fetch_providers: Vec<String>,
+    pub max_length: usize,
+    pub media_group_max_items: usize,
+    pub support_message: String,
+    pub support_link: String,
+}
+
+/// Access control: the admin whitelist file and which commands it gates.
+#[derive(Debug, Clone)]
+pub struct AccessConfig {
+    pub whitelist_file_path: String,
+    pub access_controlled_commands: Vec<String>,
+    pub rate_limit_seconds: u64,
+}
+
+/// SQLite connection and write-queue tuning.
+#[derive(Debug, Clone)]
+pub struct DbConfig {
+    pub url: String,
+    pub max_connections: u32,
+    pub queue_capacity: usize,
+    pub write_batch_size: usize,
+    pub write_flush_ms: u64,
+}
+
+/// Gemini model selection, sampling parameters, and per-call timeouts.
+#[derive(Debug, Clone)]
+pub struct GeminiConfig {
+    pub enabled: bool,
+    pub api_key: String,
+    pub model: String,
+    pub lite_model: String,
+    pub pro_model: String,
+    pub image_model: String,
+    pub music_model: String,
+    pub video_model: String,
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub max_output_tokens: i32,
+    pub thinking_level: String,
+    pub safety_settings: String,
+    pub request_timeout_secs: u64,
+    pub image_request_timeout_secs: u64,
+    pub upload_fanout: usize,
+}
+
+/// Shared shape for the OpenAI-compatible chat providers (OpenRouter,
+/// NVIDIA, Ollama). `top_k` is only ever populated for OpenRouter; NVIDIA and
+/// Ollama have no such knob and always load `None`.
+#[derive(Debug, Clone)]
+pub struct ProviderConfig {
+    pub enabled: bool,
+    pub api_key: String,
+    pub base_url: String,
+    pub temperature: f32,
+    pub top_k: Option<i32>,
+    pub top_p: f32,
+    pub request_timeout_secs: u64,
+}
+
+/// OpenAI Responses API settings (distinct from the ChatGPT Codex backend).
+#[derive(Debug, Clone)]
+pub struct OpenAiConfig {
+    pub enabled: bool,
+    pub api_key: String,
+    pub base_url: String,
+    pub request_timeout_secs: u64,
+}
+
+/// ChatGPT Codex backend settings: auth/model persistence paths, web search
+/// behavior, and the image models it can drive.
+#[derive(Debug, Clone)]
+pub struct CodexConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub originator: String,
+    pub client_version: String,
+    pub web_search_mode: String,
+    pub web_search_context_size: String,
+    pub web_search_allowed_domains: Vec<String>,
+    pub auth_path: String,
+    pub auth_storage: String,
+    pub model_path: String,
+    pub request_timeout_secs: u64,
+    pub image_responses_model: String,
+    pub image_model: String,
+}
+
+/// The self-hosted image generation backend ("img2"), opt-in and unrelated
+/// to Gemini's image model.
+#[derive(Debug, Clone)]
+pub struct Img2Config {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: String,
+    pub generate_path: String,
+    pub health_path: String,
+    pub request_timeout_secs: u64,
+    pub media_dir: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub steps: Option<u32>,
+}
+
+/// Twitter/X link-unfurling: which providers to try, in what order, and
+/// their endpoints/timeouts/byte limits.
+#[derive(Debug, Clone)]
+pub struct TwitterConfig {
+    pub fetch_providers: Vec<String>,
     pub fxtwitter_api_base: String,
     pub vxtwitter_api_base: String,
-    pub twitter_fetch_total_timeout_secs: u64,
-    pub twitter_provider_timeout_secs: u64,
-    pub twitter_response_max_bytes: usize,
-    pub external_media_max_bytes: usize,
-    pub external_media_total_max_bytes: usize,
-    pub enable_brave_search: bool,
-    pub brave_search_api_key: String,
-    pub brave_search_endpoint: String,
-    pub enable_exa_search: bool,
+    pub fetch_total_timeout_secs: u64,
+    pub provider_timeout_secs: u64,
+    pub response_max_bytes: usize,
+}
+
+/// Byte limits and fan-out for enriching links (Twitter and otherwise) with
+/// externally-fetched media.
+#[derive(Debug, Clone)]
+pub struct ExternalMediaConfig {
+    pub max_bytes: usize,
+    pub total_max_bytes: usize,
+    pub enrich_fanout: usize,
+}
+
+/// Web search provider order, per-provider enablement, and result caching.
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    pub providers: Vec<String>,
+    pub enable_brave: bool,
+    pub brave_api_key: String,
+    pub brave_endpoint: String,
+    pub enable_exa: bool,
     pub exa_api_key: String,
-    pub exa_search_endpoint: String,
-    pub web_search_cache_ttl_seconds: u64,
-    pub web_search_cache_max_entries: usize,
-    pub web_search_providers: Vec<String>,
-    pub heavy_command_max_concurrency: usize,
-    pub rate_limit_seconds: u64,
-    pub model_selection_timeout: u64,
-    pub db_max_connections: u32,
-    pub db_queue_capacity: usize,
-    pub db_write_batch_size: usize,
-    pub db_write_flush_ms: u64,
+    pub exa_endpoint: String,
+    pub jina_endpoint: String,
+    pub cache_ttl_seconds: u64,
+    pub cache_max_entries: usize,
+}
+
+/// Jina-specific settings: the MCP toggle (independent of whether Jina is
+/// used as a search/Twitter provider) plus its API key and reader endpoint.
+#[derive(Debug, Clone)]
+pub struct JinaConfig {
+    pub enable_mcp: bool,
+    pub api_key: String,
+    pub reader_endpoint: String,
+}
+
+/// Telegraph publishing identity used when the bot posts long-form content.
+#[derive(Debug, Clone)]
+pub struct TelegraphConfig {
+    pub access_token: String,
+    pub author_name: String,
+    pub author_url: String,
+}
+
+/// CWD.PW image-hosting credential.
+#[derive(Debug, Clone)]
+pub struct CwdPwConfig {
+    pub api_key: String,
+}
+
+/// Default model selection plus the runtime third-party model catalog
+/// loaded from `third_party_models.json`.
+#[derive(Debug, Clone)]
+pub struct ModelDefaults {
     pub default_text_model: String,
     pub default_quick_text_model: String,
     pub quick_reasoning_effort: String,
     pub default_image_model: String,
-    pub telegram_max_length: usize,
-    pub media_group_max_items: usize,
-    pub external_enrich_fanout: usize,
-    pub gemini_upload_fanout: usize,
+    pub third_party_models_config_path: PathBuf,
+    pub third_party_models: Vec<ThirdPartyModelConfig>,
+    pub third_party_models_by_id: HashMap<String, ThirdPartyModelConfig>,
+}
+
+/// Runtime concurrency/timeout knobs that don't belong to any one provider.
+#[derive(Debug, Clone)]
+pub struct RuntimeLimits {
+    pub heavy_command_max_concurrency: usize,
+    pub model_selection_timeout: u64,
     pub max_tool_context_items: usize,
-    pub enable_tldr_infographic: bool,
-    pub agent_step_model: String,
-    pub agent_step_reasoning: String,
+    pub user_history_message_count: i64,
+}
+
+/// Agentic pipeline tuning: the step model/reasoning used by the agent
+/// runtime, and per-pipeline (TL;DR, fact-check, QC analytics) limits.
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    pub step_model: String,
+    pub step_reasoning: String,
+    pub max_wall_clock_secs: u64,
     pub enable_agentic_factcheck: bool,
     pub enable_agentic_qc: bool,
     pub enable_qc_topic_discovery: bool,
-    pub agent_max_wall_clock_secs: u64,
+    pub enable_tldr_infographic: bool,
     pub tldr_map_reduce_threshold: usize,
     pub tldr_chunk_size: usize,
     pub tldr_max_messages: usize,
@@ -223,18 +311,30 @@ pub struct Config {
     pub qc_analytics_max_total_calls: usize,
     pub qc_analytics_max_query_calls: usize,
     pub qc_analytics_query_timeout_secs: u64,
-    pub telegraph_access_token: String,
-    pub telegraph_author_name: String,
-    pub telegraph_author_url: String,
-    pub user_history_message_count: i64,
-    pub cwd_pw_api_key: String,
-    pub support_message: String,
-    pub support_link: String,
-    pub whitelist_file_path: String,
-    pub access_controlled_commands: Vec<String>,
-    pub third_party_models_config_path: PathBuf,
-    pub third_party_models: Vec<ThirdPartyModelConfig>,
-    pub third_party_models_by_id: HashMap<String, ThirdPartyModelConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub log_level: String,
+    pub telegram: TelegramConfig,
+    pub access: AccessConfig,
+    pub db: DbConfig,
+    pub gemini: GeminiConfig,
+    pub openrouter: ProviderConfig,
+    pub nvidia: ProviderConfig,
+    pub ollama: ProviderConfig,
+    pub openai: OpenAiConfig,
+    pub codex: CodexConfig,
+    pub img2: Img2Config,
+    pub twitter: TwitterConfig,
+    pub external_media: ExternalMediaConfig,
+    pub search: SearchConfig,
+    pub jina: JinaConfig,
+    pub telegraph: TelegraphConfig,
+    pub cwd_pw: CwdPwConfig,
+    pub models: ModelDefaults,
+    pub limits: RuntimeLimits,
+    pub agents: AgentConfig,
 }
 
 pub static CONFIG: LazyLock<Config> =
@@ -584,333 +684,458 @@ fn resolve_quick_reasoning_effort_value(value: Option<&str>) -> String {
         .unwrap_or_else(|| "low".to_string())
 }
 
+fn load_telegram() -> Result<TelegramConfig> {
+    let bot_token = env::var("BOT_TOKEN").unwrap_or_else(|_| {
+        if cfg!(test) {
+            "test-bot-token".to_string()
+        } else {
+            String::new()
+        }
+    });
+    if bot_token.trim().is_empty() {
+        return Err(anyhow::anyhow!("BOT_TOKEN is required"));
+    }
+
+    Ok(TelegramConfig {
+        bot_token,
+        publish_bot_commands: env_bool("PUBLISH_BOT_COMMANDS", false),
+        enable_bot_to_bot_auto_q: env_bool("ENABLE_BOT_TO_BOT_AUTO_Q", false),
+        max_length: env_usize("TELEGRAM_MAX_LENGTH", 4000),
+        media_group_max_items: env_usize("MEDIA_GROUP_MAX_ITEMS", 256).max(1),
+        support_message: env_string(
+            "SUPPORT_MESSAGE",
+            "Thanks for supporting the bot! Tap the button below to open the support page.",
+        ),
+        support_link: env_string("SUPPORT_LINK", ""),
+    })
+}
+
+fn load_access() -> AccessConfig {
+    let access_controlled_commands = env::var("ACCESS_CONTROLLED_COMMANDS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    AccessConfig {
+        whitelist_file_path: env_string("WHITELIST_FILE_PATH", "allowed_chat.txt"),
+        access_controlled_commands,
+        rate_limit_seconds: env_u64("RATE_LIMIT_SECONDS", 15),
+    }
+}
+
+fn load_db() -> DbConfig {
+    DbConfig {
+        url: env_string("DATABASE_URL", "sqlite://bot.db"),
+        max_connections: env_u32("DB_MAX_CONNECTIONS", 5).max(1),
+        queue_capacity: env_usize("DB_QUEUE_CAPACITY", 2048).max(1),
+        write_batch_size: env_usize("DB_WRITE_BATCH_SIZE", 32).max(1),
+        write_flush_ms: env_u64("DB_WRITE_FLUSH_MS", 25),
+    }
+}
+
+fn load_gemini() -> GeminiConfig {
+    GeminiConfig {
+        enabled: env_bool("ENABLE_GEMINI", true),
+        api_key: env_string("GEMINI_API_KEY", ""),
+        model: env_string("GEMINI_MODEL", "gemini-flash-latest"),
+        lite_model: env_string("GEMINI_LITE_MODEL", "gemini-flash-lite-latest"),
+        pro_model: env_string("GEMINI_PRO_MODEL", "gemini-2.5-pro"),
+        image_model: env_string("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview"),
+        music_model: env_string("GEMINI_MUSIC_MODEL", "lyria-3-pro-preview"),
+        video_model: env_string("GEMINI_VIDEO_MODEL", "veo-3.1-generate-preview"),
+        temperature: env_f32("GEMINI_TEMPERATURE", 0.7),
+        top_k: env_i32("GEMINI_TOP_K", 40),
+        top_p: env_f32("GEMINI_TOP_P", 0.95),
+        max_output_tokens: env_i32("GEMINI_MAX_OUTPUT_TOKENS", 2048),
+        thinking_level: env_string("GEMINI_THINKING_LEVEL", "high"),
+        safety_settings: normalize_gemini_safety_settings(env_string(
+            "GEMINI_SAFETY_SETTINGS",
+            "permissive",
+        )),
+        request_timeout_secs: env_timeout_secs("GEMINI_REQUEST_TIMEOUT_SECS", 90),
+        image_request_timeout_secs: env_timeout_secs("GEMINI_IMAGE_REQUEST_TIMEOUT_SECS", 300),
+        upload_fanout: env_usize("GEMINI_UPLOAD_FANOUT", 3).max(1),
+    }
+}
+
+fn load_openrouter() -> Result<ProviderConfig> {
+    let base_url = validate_https_base(
+        "OPENROUTER_BASE_URL",
+        env_string("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+    )?;
+    Ok(ProviderConfig {
+        enabled: env_bool("ENABLE_OPENROUTER", true),
+        api_key: env_string("OPENROUTER_API_KEY", ""),
+        base_url,
+        temperature: env_f32("OPENROUTER_TEMPERATURE", 0.7),
+        top_k: Some(env_i32("OPENROUTER_TOP_K", 40)),
+        top_p: env_f32("OPENROUTER_TOP_P", 0.95),
+        request_timeout_secs: env_timeout_secs("OPENROUTER_REQUEST_TIMEOUT_SECS", 60),
+    })
+}
+
+fn load_nvidia() -> Result<ProviderConfig> {
+    let base_url = validate_https_base(
+        "NVIDIA_BASE_URL",
+        env_string("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+    )?;
+    Ok(ProviderConfig {
+        enabled: env_bool("ENABLE_NVIDIA", true),
+        api_key: env_string("NVIDIA_API_KEY", ""),
+        base_url,
+        temperature: env_f32("NVIDIA_TEMPERATURE", 0.7),
+        top_k: None,
+        top_p: env_f32("NVIDIA_TOP_P", 0.95),
+        request_timeout_secs: env_timeout_secs("NVIDIA_REQUEST_TIMEOUT_SECS", 60),
+    })
+}
+
+fn load_ollama() -> Result<ProviderConfig> {
+    let base_url = validate_http_base_allowing_loopback(
+        "OLLAMA_BASE_URL",
+        env_string("OLLAMA_BASE_URL", "https://ollama.com/v1"),
+    )?;
+    Ok(ProviderConfig {
+        enabled: env_bool("ENABLE_OLLAMA", true),
+        api_key: env_string("OLLAMA_API_KEY", ""),
+        base_url,
+        temperature: env_f32("OLLAMA_TEMPERATURE", 0.7),
+        top_k: None,
+        top_p: env_f32("OLLAMA_TOP_P", 0.95),
+        request_timeout_secs: env_timeout_secs("OLLAMA_REQUEST_TIMEOUT_SECS", 60),
+    })
+}
+
+fn load_openai() -> Result<OpenAiConfig> {
+    let base_url = validate_https_base(
+        "OPENAI_BASE_URL",
+        env_string("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    )?;
+    Ok(OpenAiConfig {
+        enabled: env_bool("ENABLE_OPENAI", false),
+        api_key: env_string("OPENAI_API_KEY", ""),
+        base_url,
+        request_timeout_secs: env_timeout_secs("OPENAI_REQUEST_TIMEOUT_SECS", 60),
+    })
+}
+
+fn load_codex() -> Result<CodexConfig> {
+    let base_url = validate_https_base(
+        "OPENAI_CODEX_BASE_URL",
+        env_string(
+            "OPENAI_CODEX_BASE_URL",
+            "https://chatgpt.com/backend-api/codex",
+        ),
+    )?;
+    Ok(CodexConfig {
+        enabled: env_bool("ENABLE_OPENAI_CODEX", true),
+        base_url,
+        originator: env_string("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs"),
+        client_version: env_string(
+            "OPENAI_CODEX_CLIENT_VERSION",
+            crate::llm::openai_codex::CODEX_CLIENT_VERSION,
+        ),
+        web_search_mode: env_string("OPENAI_CODEX_WEB_SEARCH_MODE", "live").to_lowercase(),
+        web_search_context_size: env_string("OPENAI_CODEX_WEB_SEARCH_CONTEXT_SIZE", "")
+            .to_lowercase(),
+        web_search_allowed_domains: env_csv_lowercase(
+            "OPENAI_CODEX_WEB_SEARCH_ALLOWED_DOMAINS",
+            "",
+        ),
+        auth_path: env_string("OPENAI_CODEX_AUTH_PATH", "data/openai_codex_auth.json"),
+        auth_storage: env_string("OPENAI_CODEX_AUTH_STORAGE", "auto").to_lowercase(),
+        model_path: env_string("OPENAI_CODEX_MODEL_PATH", "data/openai_codex_model.json"),
+        request_timeout_secs: env_timeout_secs("OPENAI_CODEX_REQUEST_TIMEOUT_SECS", 300),
+        image_responses_model: env_string("OPENAI_CODEX_IMAGE_RESPONSES_MODEL", "gpt-5.5"),
+        image_model: env_string("OPENAI_CODEX_IMAGE_MODEL", "gpt-image-2"),
+    })
+}
+
+fn load_img2() -> Result<Img2Config> {
+    // No personal default: img2 is opt-in, and any non-empty value must
+    // pass the same https validation as every other provider endpoint.
+    let base_url_raw = env_string("IMG2_BASE_URL", "");
+    let base_url = if base_url_raw.trim().is_empty() {
+        String::new()
+    } else {
+        validate_https_base("IMG2_BASE_URL", base_url_raw)?
+    };
+    Ok(Img2Config {
+        enabled: env_bool("ENABLE_IMG2", false),
+        base_url,
+        api_key: env_string("IMG2_API_KEY", ""),
+        generate_path: env_string("IMG2_GENERATE_PATH", "/v1/images/generate"),
+        health_path: env_string("IMG2_HEALTH_PATH", "/v1/health"),
+        request_timeout_secs: env_timeout_secs("IMG2_REQUEST_TIMEOUT_SECS", 300),
+        media_dir: env_string("IMG2_MEDIA_DIR", "data/media/img2"),
+        width: env_optional_positive_u32("IMG2_WIDTH"),
+        height: env_optional_positive_u32("IMG2_HEIGHT"),
+        steps: env_optional_positive_u32("IMG2_STEPS"),
+    })
+}
+
+fn load_twitter() -> Result<TwitterConfig> {
+    let fetch_providers = normalize_twitter_fetch_providers(env_csv_lowercase(
+        "TWITTER_FETCH_PROVIDERS",
+        "fxtwitter,vxtwitter,jina",
+    ))?;
+    let fxtwitter_api_base = validate_https_base(
+        "FXTWITTER_API_BASE",
+        env_string("FXTWITTER_API_BASE", "https://api.fxtwitter.com"),
+    )?;
+    let vxtwitter_api_base = validate_https_base(
+        "VXTWITTER_API_BASE",
+        env_string("VXTWITTER_API_BASE", "https://api.vxtwitter.com"),
+    )?;
+    Ok(TwitterConfig {
+        fetch_providers,
+        fxtwitter_api_base,
+        vxtwitter_api_base,
+        fetch_total_timeout_secs: env_timeout_secs("TWITTER_FETCH_TOTAL_TIMEOUT_SECS", 20),
+        provider_timeout_secs: env_timeout_secs("TWITTER_PROVIDER_TIMEOUT_SECS", 8),
+        response_max_bytes: env_usize("TWITTER_RESPONSE_MAX_BYTES", 2_097_152),
+    })
+}
+
+fn load_external_media() -> ExternalMediaConfig {
+    ExternalMediaConfig {
+        max_bytes: env_usize("EXTERNAL_MEDIA_MAX_BYTES", 20_971_520),
+        total_max_bytes: env_usize("EXTERNAL_MEDIA_TOTAL_MAX_BYTES", 52_428_800),
+        enrich_fanout: env_usize("EXTERNAL_ENRICH_FANOUT", 4).max(1),
+    }
+}
+
+fn load_search() -> Result<SearchConfig> {
+    let brave_endpoint = validate_https_base(
+        "BRAVE_SEARCH_ENDPOINT",
+        env_string(
+            "BRAVE_SEARCH_ENDPOINT",
+            "https://api.search.brave.com/res/v1/web/search",
+        ),
+    )?;
+    let exa_endpoint = validate_https_base(
+        "EXA_SEARCH_ENDPOINT",
+        env_string("EXA_SEARCH_ENDPOINT", "https://api.exa.ai/search"),
+    )?;
+    let jina_endpoint = validate_https_base(
+        "JINA_SEARCH_ENDPOINT",
+        env_string("JINA_SEARCH_ENDPOINT", "https://s.jina.ai/search"),
+    )?;
+    let mut providers = env_csv_lowercase("WEB_SEARCH_PROVIDERS", "brave,exa,jina");
+    if providers.is_empty() {
+        providers = vec!["brave".to_string(), "exa".to_string(), "jina".to_string()];
+    }
+    Ok(SearchConfig {
+        providers,
+        enable_brave: env_bool("ENABLE_BRAVE_SEARCH", true),
+        brave_api_key: env_string("BRAVE_SEARCH_API_KEY", ""),
+        brave_endpoint,
+        enable_exa: env_bool("ENABLE_EXA_SEARCH", true),
+        exa_api_key: env_string("EXA_API_KEY", ""),
+        exa_endpoint,
+        jina_endpoint,
+        cache_ttl_seconds: env_u64("WEB_SEARCH_CACHE_TTL_SECONDS", 900),
+        cache_max_entries: env_usize("WEB_SEARCH_CACHE_MAX_ENTRIES", 256),
+    })
+}
+
+fn load_jina() -> Result<JinaConfig> {
+    let reader_endpoint = validate_https_base(
+        "JINA_READER_ENDPOINT",
+        env_string("JINA_READER_ENDPOINT", "https://r.jina.ai/"),
+    )?;
+    Ok(JinaConfig {
+        enable_mcp: env_bool("ENABLE_JINA_MCP", false),
+        api_key: env_string("JINA_AI_API_KEY", ""),
+        reader_endpoint,
+    })
+}
+
+fn load_telegraph() -> TelegraphConfig {
+    TelegraphConfig {
+        access_token: env_string("TELEGRAPH_ACCESS_TOKEN", ""),
+        author_name: env_string("TELEGRAPH_AUTHOR_NAME", ""),
+        author_url: env_string("TELEGRAPH_AUTHOR_URL", ""),
+    }
+}
+
+fn load_cwd_pw() -> CwdPwConfig {
+    CwdPwConfig {
+        api_key: env_string("CWD_PW_API_KEY", ""),
+    }
+}
+
+fn load_models() -> ModelDefaults {
+    let third_party_models_config_path = resolve_third_party_models_path();
+    let third_party_models = load_third_party_models(&third_party_models_config_path);
+    let third_party_models_by_id = third_party_models
+        .iter()
+        .cloned()
+        .map(|model| (model.id.clone(), model))
+        .collect::<HashMap<_, _>>();
+
+    let default_text_model =
+        resolve_default_text_model_value(env::var("DEFAULT_TEXT_MODEL").ok().as_deref());
+    let default_quick_text_model = resolve_default_quick_text_model_value(
+        env::var("DEFAULT_QUICK_TEXT_MODEL").ok().as_deref(),
+        &default_text_model,
+    );
+    let quick_reasoning_effort =
+        resolve_quick_reasoning_effort_value(env::var("QUICK_REASONING_EFFORT").ok().as_deref());
+
+    ModelDefaults {
+        default_text_model,
+        default_quick_text_model,
+        quick_reasoning_effort,
+        default_image_model: env_string("DEFAULT_IMAGE_MODEL", "gemini"),
+        third_party_models_config_path,
+        third_party_models,
+        third_party_models_by_id,
+    }
+}
+
+fn load_limits() -> RuntimeLimits {
+    RuntimeLimits {
+        heavy_command_max_concurrency: env_usize("HEAVY_COMMAND_MAX_CONCURRENCY", 5).max(1),
+        model_selection_timeout: env_u64("MODEL_SELECTION_TIMEOUT", 30),
+        max_tool_context_items: env_usize("MAX_TOOL_CONTEXT_ITEMS", 10).max(1),
+        user_history_message_count: env_u64("USER_HISTORY_MESSAGE_COUNT", 200) as i64,
+    }
+}
+
+fn load_agents() -> AgentConfig {
+    AgentConfig {
+        step_model: env_string("AGENT_STEP_MODEL", ""),
+        step_reasoning: env_string("AGENT_STEP_REASONING", "low"),
+        max_wall_clock_secs: env_u64("AGENT_MAX_WALL_CLOCK_SECS", 480).max(30),
+        enable_agentic_factcheck: env_bool("ENABLE_AGENTIC_FACTCHECK", true),
+        enable_agentic_qc: env_bool("ENABLE_AGENTIC_QC", true),
+        enable_qc_topic_discovery: env_bool("ENABLE_QC_TOPIC_DISCOVERY", true),
+        enable_tldr_infographic: env_bool("ENABLE_TLDR_INFOGRAPHIC", false),
+        tldr_map_reduce_threshold: env_usize("TLDR_MAP_REDUCE_THRESHOLD", 150).max(1),
+        tldr_chunk_size: env_usize("TLDR_CHUNK_SIZE", 100).max(20),
+        tldr_max_messages: env_usize("TLDR_MAX_MESSAGES", 2000).max(100),
+        factcheck_max_claims: env_usize("FACTCHECK_MAX_CLAIMS", 5).clamp(1, 8),
+        factcheck_searches_per_claim: env_usize("FACTCHECK_SEARCHES_PER_CLAIM", 2).clamp(1, 3),
+        factcheck_claim_concurrency: env_usize("FACTCHECK_CLAIM_CONCURRENCY", 2).clamp(1, 4),
+        qc_analytics_max_total_calls: env_usize("QC_ANALYTICS_MAX_TOTAL_CALLS", 12).clamp(4, 24),
+        qc_analytics_max_query_calls: env_usize("QC_ANALYTICS_MAX_QUERY_CALLS", 10).clamp(2, 20),
+        qc_analytics_query_timeout_secs: env_u64("QC_ANALYTICS_QUERY_TIMEOUT_SECS", 2).clamp(1, 15),
+    }
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
-        let bot_token = env::var("BOT_TOKEN").unwrap_or_else(|_| {
-            if cfg!(test) {
-                "test-bot-token".to_string()
-            } else {
-                String::new()
-            }
-        });
-        if bot_token.trim().is_empty() {
-            return Err(anyhow::anyhow!("BOT_TOKEN is required"));
-        }
-
-        let third_party_models_config_path = resolve_third_party_models_path();
-        let third_party_models = load_third_party_models(&third_party_models_config_path);
-        let third_party_models_by_id = third_party_models
-            .iter()
-            .cloned()
-            .map(|model| (model.id.clone(), model))
-            .collect::<HashMap<_, _>>();
-
-        let access_controlled_commands = env::var("ACCESS_CONTROLLED_COMMANDS")
-            .ok()
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(|entry| entry.trim().to_string())
-                    .filter(|entry| !entry.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let mut web_search_providers = env_csv_lowercase("WEB_SEARCH_PROVIDERS", "brave,exa,jina");
-        if web_search_providers.is_empty() {
-            web_search_providers = vec!["brave".to_string(), "exa".to_string(), "jina".to_string()];
-        }
-        let default_text_model =
-            resolve_default_text_model_value(env::var("DEFAULT_TEXT_MODEL").ok().as_deref());
-        let default_quick_text_model = resolve_default_quick_text_model_value(
-            env::var("DEFAULT_QUICK_TEXT_MODEL").ok().as_deref(),
-            &default_text_model,
-        );
-        let quick_reasoning_effort = resolve_quick_reasoning_effort_value(
-            env::var("QUICK_REASONING_EFFORT").ok().as_deref(),
-        );
-        let twitter_fetch_providers = normalize_twitter_fetch_providers(env_csv_lowercase(
-            "TWITTER_FETCH_PROVIDERS",
-            "fxtwitter,vxtwitter,jina",
-        ))?;
-        let fxtwitter_api_base = validate_https_base(
-            "FXTWITTER_API_BASE",
-            env_string("FXTWITTER_API_BASE", "https://api.fxtwitter.com"),
-        )?;
-        let vxtwitter_api_base = validate_https_base(
-            "VXTWITTER_API_BASE",
-            env_string("VXTWITTER_API_BASE", "https://api.vxtwitter.com"),
-        )?;
-        let jina_reader_endpoint = validate_https_base(
-            "JINA_READER_ENDPOINT",
-            env_string("JINA_READER_ENDPOINT", "https://r.jina.ai/"),
-        )?;
-        let openrouter_base_url = validate_https_base(
-            "OPENROUTER_BASE_URL",
-            env_string("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-        )?;
-        let nvidia_base_url = validate_https_base(
-            "NVIDIA_BASE_URL",
-            env_string("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
-        )?;
-        let ollama_base_url = validate_http_base_allowing_loopback(
-            "OLLAMA_BASE_URL",
-            env_string("OLLAMA_BASE_URL", "https://ollama.com/v1"),
-        )?;
-        let openai_base_url = validate_https_base(
-            "OPENAI_BASE_URL",
-            env_string("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        )?;
-        let openai_codex_base_url = validate_https_base(
-            "OPENAI_CODEX_BASE_URL",
-            env_string(
-                "OPENAI_CODEX_BASE_URL",
-                "https://chatgpt.com/backend-api/codex",
-            ),
-        )?;
-        let brave_search_endpoint = validate_https_base(
-            "BRAVE_SEARCH_ENDPOINT",
-            env_string(
-                "BRAVE_SEARCH_ENDPOINT",
-                "https://api.search.brave.com/res/v1/web/search",
-            ),
-        )?;
-        let exa_search_endpoint = validate_https_base(
-            "EXA_SEARCH_ENDPOINT",
-            env_string("EXA_SEARCH_ENDPOINT", "https://api.exa.ai/search"),
-        )?;
-        let jina_search_endpoint = validate_https_base(
-            "JINA_SEARCH_ENDPOINT",
-            env_string("JINA_SEARCH_ENDPOINT", "https://s.jina.ai/search"),
-        )?;
-        // No personal default: img2 is opt-in, and any non-empty value must
-        // pass the same https validation as every other provider endpoint.
-        let img2_base_url_raw = env_string("IMG2_BASE_URL", "");
-        let img2_base_url = if img2_base_url_raw.trim().is_empty() {
-            String::new()
-        } else {
-            validate_https_base("IMG2_BASE_URL", img2_base_url_raw)?
-        };
-        let twitter_fetch_total_timeout_secs =
-            env_timeout_secs("TWITTER_FETCH_TOTAL_TIMEOUT_SECS", 20);
-        let twitter_provider_timeout_secs = env_timeout_secs("TWITTER_PROVIDER_TIMEOUT_SECS", 8);
-        let twitter_response_max_bytes = env_usize("TWITTER_RESPONSE_MAX_BYTES", 2_097_152);
-        let external_media_max_bytes = env_usize("EXTERNAL_MEDIA_MAX_BYTES", 20_971_520);
-        let external_media_total_max_bytes =
-            env_usize("EXTERNAL_MEDIA_TOTAL_MAX_BYTES", 52_428_800);
+        let telegram = load_telegram()?;
+        let access = load_access();
+        let db = load_db();
+        let gemini = load_gemini();
+        let openrouter = load_openrouter()?;
+        let nvidia = load_nvidia()?;
+        let ollama = load_ollama()?;
+        let openai = load_openai()?;
+        let codex = load_codex()?;
+        let img2 = load_img2()?;
+        let twitter = load_twitter()?;
+        let external_media = load_external_media();
         validate_twitter_fetch_limits(
-            twitter_fetch_total_timeout_secs,
-            twitter_provider_timeout_secs,
-            twitter_response_max_bytes,
-            external_media_max_bytes,
-            external_media_total_max_bytes,
+            twitter.fetch_total_timeout_secs,
+            twitter.provider_timeout_secs,
+            twitter.response_max_bytes,
+            external_media.max_bytes,
+            external_media.total_max_bytes,
         )?;
+        let search = load_search()?;
+        let jina = load_jina()?;
+        let telegraph = load_telegraph();
+        let cwd_pw = load_cwd_pw();
+        let models = load_models();
+        let limits = load_limits();
+        let agents = load_agents();
 
         Ok(Config {
-            bot_token,
             log_level: env_string("LOG_LEVEL", "info").to_lowercase(),
-            database_url: env_string("DATABASE_URL", "sqlite://bot.db"),
-            publish_bot_commands: env_bool("PUBLISH_BOT_COMMANDS", false),
-            enable_bot_to_bot_auto_q: env_bool("ENABLE_BOT_TO_BOT_AUTO_Q", false),
-            enable_gemini: env_bool("ENABLE_GEMINI", true),
-            gemini_api_key: env_string("GEMINI_API_KEY", ""),
-            gemini_model: env_string("GEMINI_MODEL", "gemini-flash-latest"),
-            gemini_lite_model: env_string("GEMINI_LITE_MODEL", "gemini-flash-lite-latest"),
-            gemini_pro_model: env_string("GEMINI_PRO_MODEL", "gemini-2.5-pro"),
-            gemini_image_model: env_string("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview"),
-            gemini_music_model: env_string("GEMINI_MUSIC_MODEL", "lyria-3-pro-preview"),
-            gemini_video_model: env_string("GEMINI_VIDEO_MODEL", "veo-3.1-generate-preview"),
-            gemini_temperature: env_f32("GEMINI_TEMPERATURE", 0.7),
-            gemini_top_k: env_i32("GEMINI_TOP_K", 40),
-            gemini_top_p: env_f32("GEMINI_TOP_P", 0.95),
-            gemini_max_output_tokens: env_i32("GEMINI_MAX_OUTPUT_TOKENS", 2048),
-            gemini_thinking_level: env_string("GEMINI_THINKING_LEVEL", "high"),
-            gemini_safety_settings: normalize_gemini_safety_settings(env_string(
-                "GEMINI_SAFETY_SETTINGS",
-                "permissive",
-            )),
-            gemini_request_timeout_secs: env_timeout_secs("GEMINI_REQUEST_TIMEOUT_SECS", 90),
-            gemini_image_request_timeout_secs: env_timeout_secs(
-                "GEMINI_IMAGE_REQUEST_TIMEOUT_SECS",
-                300,
-            ),
-            enable_openrouter: env_bool("ENABLE_OPENROUTER", true),
-            openrouter_api_key: env_string("OPENROUTER_API_KEY", ""),
-            openrouter_base_url,
-            openrouter_temperature: env_f32("OPENROUTER_TEMPERATURE", 0.7),
-            openrouter_top_k: env_i32("OPENROUTER_TOP_K", 40),
-            openrouter_top_p: env_f32("OPENROUTER_TOP_P", 0.95),
-            openrouter_request_timeout_secs: env_timeout_secs(
-                "OPENROUTER_REQUEST_TIMEOUT_SECS",
-                60,
-            ),
-            enable_nvidia: env_bool("ENABLE_NVIDIA", true),
-            nvidia_api_key: env_string("NVIDIA_API_KEY", ""),
-            nvidia_base_url,
-            nvidia_temperature: env_f32("NVIDIA_TEMPERATURE", 0.7),
-            nvidia_top_p: env_f32("NVIDIA_TOP_P", 0.95),
-            nvidia_request_timeout_secs: env_timeout_secs("NVIDIA_REQUEST_TIMEOUT_SECS", 60),
-            enable_ollama: env_bool("ENABLE_OLLAMA", true),
-            ollama_api_key: env_string("OLLAMA_API_KEY", ""),
-            ollama_base_url,
-            ollama_temperature: env_f32("OLLAMA_TEMPERATURE", 0.7),
-            ollama_top_p: env_f32("OLLAMA_TOP_P", 0.95),
-            ollama_request_timeout_secs: env_timeout_secs("OLLAMA_REQUEST_TIMEOUT_SECS", 60),
-            enable_openai: env_bool("ENABLE_OPENAI", false),
-            openai_api_key: env_string("OPENAI_API_KEY", ""),
-            openai_base_url,
-            openai_request_timeout_secs: env_timeout_secs("OPENAI_REQUEST_TIMEOUT_SECS", 60),
-            enable_openai_codex: env_bool("ENABLE_OPENAI_CODEX", true),
-            openai_codex_base_url,
-            openai_codex_originator: env_string("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs"),
-            openai_codex_client_version: env_string(
-                "OPENAI_CODEX_CLIENT_VERSION",
-                crate::llm::openai_codex::CODEX_CLIENT_VERSION,
-            ),
-            openai_codex_web_search_mode: env_string("OPENAI_CODEX_WEB_SEARCH_MODE", "live")
-                .to_lowercase(),
-            openai_codex_web_search_context_size: env_string(
-                "OPENAI_CODEX_WEB_SEARCH_CONTEXT_SIZE",
-                "",
-            )
-            .to_lowercase(),
-            openai_codex_web_search_allowed_domains: env_csv_lowercase(
-                "OPENAI_CODEX_WEB_SEARCH_ALLOWED_DOMAINS",
-                "",
-            ),
-            openai_codex_auth_path: env_string(
-                "OPENAI_CODEX_AUTH_PATH",
-                "data/openai_codex_auth.json",
-            ),
-            openai_codex_auth_storage: env_string("OPENAI_CODEX_AUTH_STORAGE", "auto")
-                .to_lowercase(),
-            openai_codex_model_path: env_string(
-                "OPENAI_CODEX_MODEL_PATH",
-                "data/openai_codex_model.json",
-            ),
-            openai_codex_request_timeout_secs: env_timeout_secs(
-                "OPENAI_CODEX_REQUEST_TIMEOUT_SECS",
-                300,
-            ),
-            openai_codex_image_responses_model: env_string(
-                "OPENAI_CODEX_IMAGE_RESPONSES_MODEL",
-                "gpt-5.5",
-            ),
-            openai_codex_image_model: env_string("OPENAI_CODEX_IMAGE_MODEL", "gpt-image-2"),
-            enable_img2: env_bool("ENABLE_IMG2", false),
-            img2_base_url,
-            img2_api_key: env_string("IMG2_API_KEY", ""),
-            img2_generate_path: env_string("IMG2_GENERATE_PATH", "/v1/images/generate"),
-            img2_health_path: env_string("IMG2_HEALTH_PATH", "/v1/health"),
-            img2_request_timeout_secs: env_timeout_secs("IMG2_REQUEST_TIMEOUT_SECS", 300),
-            img2_media_dir: env_string("IMG2_MEDIA_DIR", "data/media/img2"),
-            img2_width: env_optional_positive_u32("IMG2_WIDTH"),
-            img2_height: env_optional_positive_u32("IMG2_HEIGHT"),
-            img2_steps: env_optional_positive_u32("IMG2_STEPS"),
-            enable_jina_mcp: env_bool("ENABLE_JINA_MCP", false),
-            jina_ai_api_key: env_string("JINA_AI_API_KEY", ""),
-            jina_search_endpoint,
-            jina_reader_endpoint,
-            twitter_fetch_providers,
-            fxtwitter_api_base,
-            vxtwitter_api_base,
-            twitter_fetch_total_timeout_secs,
-            twitter_provider_timeout_secs,
-            twitter_response_max_bytes,
-            external_media_max_bytes,
-            external_media_total_max_bytes,
-            enable_brave_search: env_bool("ENABLE_BRAVE_SEARCH", true),
-            brave_search_api_key: env_string("BRAVE_SEARCH_API_KEY", ""),
-            brave_search_endpoint,
-            enable_exa_search: env_bool("ENABLE_EXA_SEARCH", true),
-            exa_api_key: env_string("EXA_API_KEY", ""),
-            exa_search_endpoint,
-            web_search_cache_ttl_seconds: env_u64("WEB_SEARCH_CACHE_TTL_SECONDS", 900),
-            web_search_cache_max_entries: env_usize("WEB_SEARCH_CACHE_MAX_ENTRIES", 256),
-            web_search_providers,
-            heavy_command_max_concurrency: env_usize("HEAVY_COMMAND_MAX_CONCURRENCY", 5).max(1),
-            rate_limit_seconds: env_u64("RATE_LIMIT_SECONDS", 15),
-            model_selection_timeout: env_u64("MODEL_SELECTION_TIMEOUT", 30),
-            db_max_connections: env_u32("DB_MAX_CONNECTIONS", 5).max(1),
-            db_queue_capacity: env_usize("DB_QUEUE_CAPACITY", 2048).max(1),
-            db_write_batch_size: env_usize("DB_WRITE_BATCH_SIZE", 32).max(1),
-            db_write_flush_ms: env_u64("DB_WRITE_FLUSH_MS", 25),
-            default_text_model,
-            default_quick_text_model,
-            quick_reasoning_effort,
-            default_image_model: env_string("DEFAULT_IMAGE_MODEL", "gemini"),
-            telegram_max_length: env_usize("TELEGRAM_MAX_LENGTH", 4000),
-            media_group_max_items: env_usize("MEDIA_GROUP_MAX_ITEMS", 256).max(1),
-            external_enrich_fanout: env_usize("EXTERNAL_ENRICH_FANOUT", 4).max(1),
-            gemini_upload_fanout: env_usize("GEMINI_UPLOAD_FANOUT", 3).max(1),
-            max_tool_context_items: env_usize("MAX_TOOL_CONTEXT_ITEMS", 10).max(1),
-            enable_tldr_infographic: env_bool("ENABLE_TLDR_INFOGRAPHIC", false),
-            agent_step_model: env_string("AGENT_STEP_MODEL", ""),
-            agent_step_reasoning: env_string("AGENT_STEP_REASONING", "low"),
-            enable_agentic_factcheck: env_bool("ENABLE_AGENTIC_FACTCHECK", true),
-            enable_agentic_qc: env_bool("ENABLE_AGENTIC_QC", true),
-            enable_qc_topic_discovery: env_bool("ENABLE_QC_TOPIC_DISCOVERY", true),
-            agent_max_wall_clock_secs: env_u64("AGENT_MAX_WALL_CLOCK_SECS", 480).max(30),
-            tldr_map_reduce_threshold: env_usize("TLDR_MAP_REDUCE_THRESHOLD", 150).max(1),
-            tldr_chunk_size: env_usize("TLDR_CHUNK_SIZE", 100).max(20),
-            tldr_max_messages: env_usize("TLDR_MAX_MESSAGES", 2000).max(100),
-            factcheck_max_claims: env_usize("FACTCHECK_MAX_CLAIMS", 5).clamp(1, 8),
-            factcheck_searches_per_claim: env_usize("FACTCHECK_SEARCHES_PER_CLAIM", 2).clamp(1, 3),
-            factcheck_claim_concurrency: env_usize("FACTCHECK_CLAIM_CONCURRENCY", 2).clamp(1, 4),
-            qc_analytics_max_total_calls: env_usize("QC_ANALYTICS_MAX_TOTAL_CALLS", 12)
-                .clamp(4, 24),
-            qc_analytics_max_query_calls: env_usize("QC_ANALYTICS_MAX_QUERY_CALLS", 10)
-                .clamp(2, 20),
-            qc_analytics_query_timeout_secs: env_u64("QC_ANALYTICS_QUERY_TIMEOUT_SECS", 2)
-                .clamp(1, 15),
-            telegraph_access_token: env_string("TELEGRAPH_ACCESS_TOKEN", ""),
-            telegraph_author_name: env_string("TELEGRAPH_AUTHOR_NAME", ""),
-            telegraph_author_url: env_string("TELEGRAPH_AUTHOR_URL", ""),
-            user_history_message_count: env_u64("USER_HISTORY_MESSAGE_COUNT", 200) as i64,
-            cwd_pw_api_key: env_string("CWD_PW_API_KEY", ""),
-            support_message: env_string(
-                "SUPPORT_MESSAGE",
-                "Thanks for supporting the bot! Tap the button below to open the support page.",
-            ),
-            support_link: env_string("SUPPORT_LINK", ""),
-            whitelist_file_path: env_string("WHITELIST_FILE_PATH", "allowed_chat.txt"),
-            access_controlled_commands,
-            third_party_models_config_path,
-            third_party_models,
-            third_party_models_by_id,
+            telegram,
+            access,
+            db,
+            gemini,
+            openrouter,
+            nvidia,
+            ollama,
+            openai,
+            codex,
+            img2,
+            twitter,
+            external_media,
+            search,
+            jina,
+            telegraph,
+            cwd_pw,
+            models,
+            limits,
+            agents,
         })
     }
 
     pub fn get_third_party_model_config(&self, model_id: &str) -> Option<&ThirdPartyModelConfig> {
-        self.third_party_models_by_id.get(model_id)
+        self.models.third_party_models_by_id.get(model_id)
     }
 
     pub fn is_third_party_provider_ready(&self, provider: ThirdPartyProvider) -> bool {
         match provider {
             ThirdPartyProvider::OpenRouter => {
-                self.enable_openrouter && !self.openrouter_api_key.trim().is_empty()
+                self.openrouter.enabled && !self.openrouter.api_key.trim().is_empty()
             }
             ThirdPartyProvider::Nvidia => {
-                self.enable_nvidia && !self.nvidia_api_key.trim().is_empty()
+                self.nvidia.enabled && !self.nvidia.api_key.trim().is_empty()
             }
             ThirdPartyProvider::Ollama => {
-                self.enable_ollama && !self.ollama_api_key.trim().is_empty()
+                self.ollama.enabled && !self.ollama.api_key.trim().is_empty()
             }
             ThirdPartyProvider::OpenAI => {
-                self.enable_openai && !self.openai_api_key.trim().is_empty()
+                self.openai.enabled && !self.openai.api_key.trim().is_empty()
             }
-            ThirdPartyProvider::OpenAICodex => self.enable_openai_codex,
+            ThirdPartyProvider::OpenAICodex => self.codex.enabled,
         }
     }
 
     pub fn gemini_api_available(&self) -> bool {
-        gemini_api_available_from(self.enable_gemini, &self.gemini_api_key)
+        gemini_api_available_from(self.gemini.enabled, &self.gemini.api_key)
     }
 
     pub fn img2_api_available(&self) -> bool {
-        self.enable_img2
-            && !self.img2_api_key.trim().is_empty()
-            && !self.img2_base_url.trim().is_empty()
+        self.img2.enabled
+            && !self.img2.api_key.trim().is_empty()
+            && !self.img2.base_url.trim().is_empty()
+    }
+
+    /// Every configured credential that must never appear in operator-facing
+    /// output (status/diagnose reports, log tails, etc.).
+    pub fn secret_values(&self) -> Vec<&str> {
+        [
+            self.gemini.api_key.as_str(),
+            self.openrouter.api_key.as_str(),
+            self.nvidia.api_key.as_str(),
+            self.ollama.api_key.as_str(),
+            self.openai.api_key.as_str(),
+            self.img2.api_key.as_str(),
+            self.jina.api_key.as_str(),
+            self.search.brave_api_key.as_str(),
+            self.search.exa_api_key.as_str(),
+            self.telegraph.access_token.as_str(),
+            self.cwd_pw.api_key.as_str(),
+            self.telegram.bot_token.as_str(),
+        ]
+        .into_iter()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect()
     }
 }
 
@@ -1300,6 +1525,18 @@ mod tests {
         let _env = set_env_var_for_test("OLLAMA_BASE_URL", "http://localhost:11434/v1");
         let result = Config::load();
         let config = result.expect("loopback Ollama endpoint should be accepted");
-        assert_eq!(config.ollama_base_url, "http://localhost:11434/v1");
+        assert_eq!(config.ollama.base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn secret_values_include_every_provider_credential() {
+        let mut config = (*CONFIG).clone();
+        config.ollama.api_key = "ollama-secret".to_string();
+        config.img2.api_key = "img2-secret".to_string();
+        config.telegram.bot_token = "bot-secret".to_string();
+        let secrets = config.secret_values();
+        for expected in ["ollama-secret", "img2-secret", "bot-secret"] {
+            assert!(secrets.contains(&expected), "missing {expected}");
+        }
     }
 }

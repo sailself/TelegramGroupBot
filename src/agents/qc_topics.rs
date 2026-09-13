@@ -294,7 +294,7 @@ pub(crate) fn normalize_topic_plan(
             user_id: raw.user_id,
             exclude_commands: raw.exclude_commands.unwrap_or(true),
             exclude_synthetic: raw.exclude_synthetic.unwrap_or(true),
-            limit: CONFIG.tldr_max_messages.min(i64::MAX as usize) as i64,
+            limit: CONFIG.agents.tldr_max_messages.min(i64::MAX as usize) as i64,
         },
         topic_count: raw.topic_count.unwrap_or(5).clamp(3, 10),
         exact_terms,
@@ -634,7 +634,7 @@ async fn map_topic_chunks(
     clock: &WallClock,
 ) -> TopicMapAggregation {
     let chunks: Vec<Vec<MessageRow>> = messages
-        .chunks(CONFIG.tldr_chunk_size.max(1))
+        .chunks(CONFIG.agents.tldr_chunk_size.max(1))
         .map(<[MessageRow]>::to_vec)
         .collect();
     let chunk_lens: Vec<usize> = chunks.iter().map(Vec::len).collect();
@@ -1402,7 +1402,7 @@ mod tests {
         assert_eq!(plan.topic_count, 5);
         assert!(plan.window.exclude_commands);
         assert!(plan.window.exclude_synthetic);
-        assert_eq!(plan.window.limit, CONFIG.tldr_max_messages as i64);
+        assert_eq!(plan.window.limit, CONFIG.agents.tldr_max_messages as i64);
 
         let lower = normalize_topic_plan(
             TopicPlan {

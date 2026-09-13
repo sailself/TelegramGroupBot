@@ -163,7 +163,7 @@ pub(super) fn create_model_selection_keyboard(
     create_model_selection_keyboard_with_models(
         snapshot,
         CONFIG.gemini_api_available(),
-        &CONFIG.default_text_model,
+        &CONFIG.models.default_text_model,
         request,
     )
 }
@@ -267,7 +267,7 @@ pub async fn model_selection_callback(
             &mut pending,
             query_user_id,
             now_unix_seconds(),
-            CONFIG.model_selection_timeout,
+            CONFIG.limits.model_selection_timeout,
             |request| {
                 let summary = summarize_media_files(&request.enrichment.media_files);
                 model_supports_media_for_request(

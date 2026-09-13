@@ -277,7 +277,7 @@ pub(crate) fn resolve_default_text_model_for_request(
     let ready_providers = ready_runtime_providers(&models);
 
     resolve_default_text_model_with_models(
-        &CONFIG.default_text_model,
+        &CONFIG.models.default_text_model,
         &models,
         &ready_providers,
         CONFIG.gemini_api_available(),
@@ -328,7 +328,7 @@ pub(crate) fn default_text_model_display_name(
 ) -> String {
     if model_name == MODEL_GEMINI {
         return gemini_model_used
-            .unwrap_or(CONFIG.gemini_model.as_str())
+            .unwrap_or(CONFIG.gemini.model.as_str())
             .to_string();
     }
 

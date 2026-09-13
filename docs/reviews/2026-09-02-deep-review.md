@@ -418,17 +418,21 @@ Part B — tool loop, search, Codex identity (`refactor/phase2-llm-tools`, 2026-
 
 ### Phase 3: structure
 
-- [ ] Split `commands.rs` -> `handlers/{image,tldr,factcheck,persona,mysong,token_stats,admin,help}.rs`
-- [ ] Split `qa.rs` -> `handlers/qa/{trigger,model_resolution,selection_ui,prompt,chat_search,process,handler,tests}.rs`; `QaModel` enum; `ModelRequestCapabilities` end-to-end; `ModelCatalogSnapshot`
-- [ ] `handlers/enrichment.rs`: one request-prep pipeline for `/q` and `/factcheck`; structured `UntrustedSource`s with budgets and fences; delete `PendingQRequest` content fields
-- [ ] Break `agents` <-> `handlers` cycle: move fencing, `MODEL_GEMINI`, `MediaSummary`, model resolution, `call_configured_text_model` into `llm/` or `prompting/`
-- [ ] `agents/common.rs`: `PipelineOutcome`, `fence`, `map_bounded`, `call_step_json`; `QcRequest` struct; `qc_analytics.rs`
-- [ ] Split `database.rs` -> `db/{schema,writer,messages,search_index,audit}.rs`; versioned migrations
-- [ ] Split `responses_provider.rs` -> `responses/{payload,sse,transport,codex_identity,tool_loop,tests}`
-- [ ] `runtime_models.rs` -> catalog facade + `codex_selected_model.rs`
-- [ ] `config.rs`: grouped sub-structs; `prompts.rs`; warn on unparsable env values; validate all endpoint URLs; `secret_values()`; drop Python-era shims and personal defaults
-- [ ] `external_media.rs` collector simplification; `fetch_provider_body` in `providers/mod.rs`; `utils::http::{parse_https_allowlisted, read_body_capped}`
-- [ ] Migrate remaining `ParseMode::Markdown` to HTML
+Delivered 2026-09-07..10 as three stacked PRs: #12 (`refactor/phase3-structure`: foundation moves, splits, HTML rendering), #13 (`refactor/phase3-semantics`: enrichment, `QaModel`, `agents/common`), #14 (`refactor/phase3-config`: config regroup). Execution plan and ledger: `docs/superpowers/plans/2026-09-07-phase3-structure.md` (local).
+
+- [x] Split `commands.rs` -> `handlers/{image,tldr,factcheck,persona,mysong,token_stats,admin,help}.rs` — #12
+- [x] Split `qa.rs` -> `handlers/qa/{trigger,model_resolution,selection_ui,prompt,chat_search,process,handler,tests}.rs` (#12); `QaModel` enum; `ModelRequestCapabilities` end-to-end; `ModelCatalogSnapshot` (#13)
+- [x] `handlers/enrichment.rs`: one request-prep pipeline for `/q` and `/factcheck`; structured `UntrustedSource`s with budgets and fences; delete `PendingQRequest` content fields — #13
+- [x] Break `agents` <-> `handlers` cycle: `llm/text_model.rs` (model resolution, `MODEL_GEMINI`, `call_configured_text_model`), `llm/prompting.rs` (fencing/formatting), `MediaSummary` in `llm/media.rs` — #12
+- [x] `agents/common.rs`: `PipelineOutcome`, `fence`, `map_bounded` (+ `ProgressHook`), `call_step_json`; `QcRequest` struct; `qc_analytics.rs` — #13
+- [x] Split `database.rs` -> `db/{schema,writer,messages,search_index,audit,test_support}.rs`; versioned migrations via `PRAGMA user_version` (v1 = today's idempotent schema; no `sqlx::migrate!`) — #12
+- [x] Split `responses_provider.rs` -> `llm/responses_provider/{payload,sse,transport,codex_identity,tool_loop,tests}.rs` (directory keeps the module name so callers are unchanged) — #12
+- [x] `runtime_models.rs` -> catalog facade + `codex_selected_model.rs` — #12
+- [x] `config.rs`: `prompts.rs`, warn on unparsable env values, validate all endpoint URLs (Ollama may be plain `http` on loopback), drop Python-era shims and personal defaults (#12); grouped sub-structs, `secret_values()` (#14)
+- [x] `external_media.rs` collector simplification (function-owned `JoinSet`, 60 s total deadline); `fetch_provider_body` in `providers/mod.rs`; `utils::http::{parse_https_allowlisted, parse_https_allowlisted_with_query, read_body_capped}` — #12
+- [x] Migrate remaining `ParseMode::Markdown` to HTML (`utils::markdown::markdown_to_telegram_html`) — #12
+
+Deferred to Phase 4 hygiene (ledgered): `call_configured_text_model`/`call_step_json` parameter structs (one `too_many_arguments` allow each), a Cf-aware fence neutralizer (zero-width characters inside a forged tag), per-tag regex caching in `utils::text`, `image.rs` size (1.6k lines), `RuntimeModelsState` field visibility.
 
 ### Phase 4: search index v2 and tests
 
