@@ -2,10 +2,11 @@
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ParseMode, ReplyParameters};
-use tracing::{error, info};
+use teloxide::types::{ChatAction, ReplyParameters};
+use tracing::info;
 
 use crate::agents::factcheck::{run_factcheck_pipeline, FactcheckOutcome};
+use crate::agents::step::WallClock;
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::enrichment::{
@@ -13,16 +14,15 @@ use crate::handlers::enrichment::{
     SourceCounts, SourceKind,
 };
 use crate::handlers::media::{collect_message_media, MediaCollectionOptions};
-use crate::handlers::responses::send_response;
+use crate::handlers::responses::{send_response, ResponseContent};
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::media::{summarize_media_files, MediaSummary};
-use crate::llm::text_model::call_configured_text_model;
+use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel};
+use crate::llm::text_model::{call_resolved_text_model, ModelRequestCapabilities};
 use crate::prompts::{FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY};
 use crate::state::AppState;
-use crate::utils::markdown::markdown_to_telegram_html;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::telegram::{message_entities_for_text, start_chat_action_heartbeat};
-use crate::utils::text::escape_html;
 
 fn build_factcheck_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -241,102 +241,84 @@ pub async fn factcheck_handler(
         .send_message(message.chat.id, processing_message_text)
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
-    let _chat_action =
-        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-
-    if CONFIG.agents.enable_agentic_factcheck {
-        let mut progress_reporter =
-            ProgressReporter::new(bot.clone(), message.chat.id, processing_message.id);
-        match run_factcheck_pipeline(
-            &statement,
-            &media_files,
-            &media_summary,
-            user_language_code,
-            audit_context.as_ref(),
-            &mut progress_reporter,
-        )
-        .await
-        {
-            Ok(FactcheckOutcome::Answer(crate::agents::common::ModelAnswer {
-                text,
-                model_display,
-            })) => {
-                let response_with_model = format!(
-                    "{}\n\nModel: {}",
-                    markdown_to_telegram_html(&text),
-                    escape_html(&model_display)
-                );
-                send_response(
-                    &bot,
-                    processing_message.chat.id,
-                    processing_message.id,
-                    &response_with_model,
-                    "Fact Check",
-                    ParseMode::Html,
-                )
-                .await?;
-                return Ok(());
-            }
-            Ok(FactcheckOutcome::UseLegacy(reason)) => {
-                info!("Agentic fact-check fell back to the legacy path: {reason}");
-            }
-            Err(err) => {
-                error!("Agentic fact-check failed: {}", err);
-                bot.edit_message_text(
-                    processing_message.chat.id,
-                    processing_message.id,
-                    format!("Failed to fact-check this message.\n\nError: {}", err),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    }
-
-    let system_prompt = build_factcheck_system_prompt(user_language_code);
-    let response = match call_configured_text_model(
-        &system_prompt,
-        &statement,
-        "Fact Check",
-        true,
-        media_summary.total > 0,
-        Some(media_files),
-        Some("FACTCHECK_SYSTEM_PROMPT"),
-        audit_context.as_ref(),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            error!("Fact-check generation failed: {}", err);
-            bot.edit_message_text(
-                processing_message.chat.id,
-                processing_message.id,
-                format!("Failed to fact-check this message.\n\nError: {}", err),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    let (response_text, response_model) = response;
-    let response_with_model = format!(
-        "{}\n\nModel: {}",
-        markdown_to_telegram_html(&response_text),
-        escape_html(&response_model)
-    );
-
-    send_response(
+    crate::utils::telegram::run_with_status_message(
         &bot,
         processing_message.chat.id,
         processing_message.id,
-        &response_with_model,
-        "Fact Check",
-        ParseMode::Html,
-    )
-    .await?;
+        "Failed to fact-check this message. Please try again.",
+        async {
+            let _heavy_permit = _heavy_permit;
+            let _chat_action =
+                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
 
-    Ok(())
+            let clock = WallClock::start();
+            let response = clock
+                .run(async {
+                    let mut snapshot = ModelCatalogSnapshot::load();
+                    let id = snapshot.resolve_default(ModelRequestCapabilities::from_media(
+                        &media_summary,
+                        !CONFIG.agents.enable_agentic_factcheck,
+                    ))?;
+                    let final_model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
+                    if CONFIG.agents.enable_agentic_factcheck {
+                        let mut progress = ProgressReporter::new(
+                            bot.clone(),
+                            message.chat.id,
+                            processing_message.id,
+                        );
+                        match run_factcheck_pipeline(
+                            &statement,
+                            &media_files,
+                            &media_summary,
+                            user_language_code,
+                            audit_context.as_ref(),
+                            &mut progress,
+                            &clock,
+                            &final_model,
+                        )
+                        .await?
+                        {
+                            FactcheckOutcome::Answer(answer) => {
+                                return Ok((answer.text, answer.model_display))
+                            }
+                            FactcheckOutcome::UseLegacy(reason) => {
+                                info!("Agentic fact-check fell back: {reason}")
+                            }
+                        }
+                    }
+                    clock.check()?;
+                    call_resolved_text_model(
+                        &final_model,
+                        &build_factcheck_system_prompt(user_language_code),
+                        &statement,
+                        "Fact Check",
+                        true,
+                        media_summary.total > 0,
+                        Some(media_files),
+                        Some("FACTCHECK_SYSTEM_PROMPT"),
+                        audit_context.as_ref(),
+                    )
+                    .await
+                })
+                .await?;
+
+            let (response_text, response_model) = response;
+            let response_with_model =
+                ResponseContent::new(response_text).with_model(response_model);
+
+            send_response(
+                &bot,
+                processing_message.chat.id,
+                processing_message.id,
+                &response_with_model,
+                "Fact Check",
+            )
+            .await?;
+
+            Ok(())
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

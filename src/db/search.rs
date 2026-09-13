@@ -1,15 +1,16 @@
 use std::collections::BTreeSet;
 
-use crate::utils::text::truncate_with_ellipsis;
+use crate::utils::text::{truncate_to_chars, truncate_with_ellipsis};
 use jieba_rs::Jieba;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use url::Url;
 
-pub const CURRENT_SEARCH_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SEARCH_SCHEMA_VERSION: i64 = 2;
 pub const SEARCH_INDEX_REBUILDING_ERROR: &str = "search_index_rebuilding";
 const MAX_SEARCH_TEXT_CHARS: usize = 4_000;
+const MAX_SEARCH_TOKEN_CHARS: usize = 8_000;
 const MAX_SNIPPET_SOURCE_CHARS: usize = 2_000;
 
 static JIEBA: LazyLock<Jieba> = LazyLock::new(Jieba::new);
@@ -238,7 +239,7 @@ fn normalize_semantic_text(text: &str, is_synthetic_record: bool) -> String {
         .replace_all(&normalized, " ")
         .trim()
         .to_string();
-    truncate_with_ellipsis(&normalized.to_lowercase(), MAX_SEARCH_TEXT_CHARS)
+    truncate_to_chars(&normalized.to_lowercase(), MAX_SEARCH_TEXT_CHARS).to_string()
 }
 
 fn clean_display_text(text: &str, is_synthetic_record: bool) -> String {
@@ -486,14 +487,28 @@ fn flush_han_span(current: &mut String, tokens: &mut Vec<String>, seen: &mut BTr
 
 fn build_search_text(normalized_semantic: &str, semantic_tokens: &[String]) -> Option<String> {
     let semantic = normalized_semantic.trim();
-    let token_block = semantic_tokens.join(" ");
+    // Primary Jieba tokens precede supplemental spans/bigrams. Keep complete
+    // tokens, with an independent budget so a long semantic prefix cannot
+    // erase the segmented Chinese words.
+    let mut token_block = String::new();
+    let mut used = 0;
+    for token in semantic_tokens {
+        let cost = token.chars().count() + usize::from(!token_block.is_empty());
+        if used + cost > MAX_SEARCH_TOKEN_CHARS {
+            continue;
+        }
+        if !token_block.is_empty() {
+            token_block.push(' ');
+        }
+        token_block.push_str(token);
+        used += cost;
+    }
     let combined = match (semantic.is_empty(), token_block.is_empty()) {
         (true, true) => String::new(),
         (false, true) => semantic.to_string(),
         (true, false) => token_block,
         (false, false) => format!("{semantic}\n{token_block}"),
     };
-    let combined = truncate_with_ellipsis(combined.trim(), MAX_SEARCH_TEXT_CHARS);
     (!combined.is_empty()).then_some(combined)
 }
 

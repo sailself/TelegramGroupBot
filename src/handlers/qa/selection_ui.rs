@@ -9,9 +9,7 @@ use tracing::error;
 use crate::config::{ThirdPartyModelConfig, CONFIG};
 use crate::llm::media::summarize_media_files;
 use crate::llm::text_model::{
-    model_supports_media_for_request, normalize_model_identifier,
-    resolve_default_text_model_for_request, resolve_exact_model_identifier_with_models,
-    ModelRequestCapabilities, MODEL_GEMINI,
+    resolve_exact_model_identifier_with_models, ModelRequestCapabilities, MODEL_GEMINI,
 };
 use crate::state::{AppState, PendingEntryGuard, PendingQRequest, QaCommandMode};
 use crate::utils::timing::{complete_command_timer, now_unix_seconds};
@@ -173,14 +171,16 @@ pub(super) async fn process_timed_out_q_request_with_default_model(
     state: &AppState,
     mut request: PendingQRequest,
 ) {
-    let snapshot = ModelCatalogSnapshot::load();
+    let mut snapshot = ModelCatalogSnapshot::load();
     let summary = summarize_media_files(&request.enrichment.media_files);
     let mode = request.mode;
-    let resolved = resolve_default_text_model_for_request(ModelRequestCapabilities::from_media(
+    let resolved = match snapshot.resolve_default(ModelRequestCapabilities::from_media(
         &summary,
         mode.requires_custom_tools(),
-    ))
-    .and_then(|model_id| QaModel::resolve(&model_id, &snapshot, None));
+    )) {
+        Ok(model_id) => QaModel::prepare(&model_id, &mut snapshot, None).await,
+        Err(error) => Err(error),
+    };
     let model = match resolved {
         Ok(model) => model,
         Err(err) => {
@@ -250,9 +250,9 @@ pub async fn model_selection_callback(
     }
 
     let selected_token = data.trim_start_matches(MODEL_CALLBACK_PREFIX);
-    let snapshot = ModelCatalogSnapshot::load();
+    let mut snapshot = ModelCatalogSnapshot::load();
     let selected_model = resolve_model_callback_token_with_models(selected_token, &snapshot.models)
-        .unwrap_or_else(|| normalize_model_identifier(selected_token));
+        .unwrap_or_else(|| selected_token.trim().to_string());
 
     let message = match query.message.clone() {
         Some(msg) => msg,
@@ -270,7 +270,7 @@ pub async fn model_selection_callback(
             CONFIG.limits.model_selection_timeout,
             |request| {
                 let summary = summarize_media_files(&request.enrichment.media_files);
-                model_supports_media_for_request(
+                snapshot.can_select(
                     &selected_model,
                     ModelRequestCapabilities::from_media(
                         &summary,
@@ -292,7 +292,7 @@ pub async fn model_selection_callback(
         | PendingQRequestCallbackAction::InvalidSelection => return Ok(()),
     };
 
-    let model = match QaModel::resolve(&selected_model, &snapshot, None) {
+    let model = match QaModel::prepare(&selected_model, &mut snapshot, None).await {
         Ok(model) => model,
         Err(err) => {
             if let Some(mut timer) = request.command_timer.take() {

@@ -9,139 +9,32 @@ use crate::config::{
 };
 use crate::llm::responses_provider::effective_reasoning_effort;
 use crate::llm::runtime_models::{
-    codex_model_record_for_request, codex_selected_model_label, ensure_explicit_codex_model,
-    runtime_models, selected_codex_model_record, CodexSelectedModelRecord,
+    codex_selected_model_label, ensure_explicit_codex_model, CodexSelectedModelRecord,
     ResolvedExplicitCodexModel, CODEX_SELECTED_MODEL_METADATA_VERSION,
     OPENAI_CODEX_SELECTED_MODEL_ID,
 };
 use crate::llm::text_model::{
     available_third_party_models_for_request, default_text_model_error,
-    normalize_model_identifier_with_models, ready_runtime_providers,
-    resolve_default_text_model_with_models, ModelRequestCapabilities, MODEL_GEMINI,
+    normalize_model_identifier_with_models, resolve_default_text_model_with_models,
+    ModelRequestCapabilities, MODEL_GEMINI,
 };
 use crate::state::QaCommandMode;
-use crate::utils::text::truncate_with_ellipsis;
 
-use super::handler::USER_ERROR_DETAIL_LIMIT;
-
-/// The model catalog as one request sees it. Read once per request, so a
-/// catalog reload between the picker, the resolution and the answer cannot make
-/// them disagree about which models exist.
-pub(super) struct ModelCatalogSnapshot {
-    pub models: Vec<ThirdPartyModelConfig>,
-    pub ready_providers: Vec<ThirdPartyProvider>,
-    pub codex_record: Option<CodexSelectedModelRecord>,
-}
-
-impl ModelCatalogSnapshot {
-    pub fn load() -> Self {
-        let models = runtime_models();
-        let ready_providers = ready_runtime_providers(&models);
-        Self {
-            models,
-            ready_providers,
-            codex_record: selected_codex_model_record(),
-        }
-    }
-
-    /// Config for `id`, resolving the same Codex aliases the runtime catalog
-    /// does: bare `openai-codex`, and an explicit Codex slug that the selected
-    /// record names, both land on the selected-model entry.
-    pub fn config(&self, id: &str) -> Option<&ThirdPartyModelConfig> {
-        let id = id.trim();
-        if id.eq_ignore_ascii_case("openai-codex") {
-            return self.selected_codex_config();
-        }
-        if let Some(config) = self.models.iter().find(|config| config.id == id) {
-            return Some(config);
-        }
-        match parse_third_party_model_id(id) {
-            Some((ThirdPartyProvider::OpenAICodex, slug))
-                if self
-                    .codex_record
-                    .as_ref()
-                    .is_some_and(|record| record.slug == slug) =>
-            {
-                self.selected_codex_config()
-            }
-            _ => None,
-        }
-    }
-
-    fn selected_codex_config(&self) -> Option<&ThirdPartyModelConfig> {
-        self.models
-            .iter()
-            .find(|config| config.id == OPENAI_CODEX_SELECTED_MODEL_ID)
-    }
-
-    pub fn count(&self) -> usize {
-        self.models.len()
-    }
-}
-
-/// The model that answers one `/q`-family request, resolved once against a
-/// [`ModelCatalogSnapshot`] so every later step agrees on its capabilities.
-pub(super) enum QaModel {
-    Gemini,
-    ThirdParty {
-        config: ThirdPartyModelConfig,
-        /// Set when quick mode pinned an explicit Codex model, whose config and
-        /// catalog record the request carries itself. Boxed: the catalog record
-        /// dwarfs every other variant of this enum.
-        explicit_codex: Option<Box<ResolvedExplicitCodexModel>>,
-    },
-}
+pub(super) use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel as QaModel};
 
 impl QaModel {
-    pub fn resolve(
+    #[cfg(test)]
+    pub(super) fn resolve(
         model_name: &str,
         snapshot: &ModelCatalogSnapshot,
         prepared: Option<&PreparedQuickTextModel>,
     ) -> Result<Self> {
-        if model_name == MODEL_GEMINI {
-            return Ok(Self::Gemini);
-        }
-
-        if let Some(explicit) = prepared.and_then(|prepared| prepared.explicit_codex.as_ref()) {
-            if explicit.config.id != model_name {
-                return Err(anyhow!("The explicit Codex model changed"));
-            }
-            return Ok(Self::ThirdParty {
-                config: explicit.config.clone(),
-                explicit_codex: Some(Box::new(explicit.clone())),
-            });
-        }
-
-        let config = snapshot
-            .config(model_name)
-            .ok_or_else(|| anyhow!(default_text_model_error(model_name, "not configured")))?;
-        Ok(Self::ThirdParty {
-            config: config.clone(),
-            explicit_codex: None,
-        })
+        Self::from_snapshot(
+            model_name,
+            snapshot,
+            prepared.and_then(|prepared| prepared.explicit_codex.as_ref()),
+        )
     }
-
-    pub fn model_id(&self) -> &str {
-        match self {
-            QaModel::Gemini => MODEL_GEMINI,
-            QaModel::ThirdParty { config, .. } => config.id.as_str(),
-        }
-    }
-
-    pub fn supports_tools(&self) -> bool {
-        match self {
-            QaModel::Gemini => true,
-            QaModel::ThirdParty { config, .. } => config.tools,
-        }
-    }
-
-    pub fn explicit_codex(&self) -> Option<&ResolvedExplicitCodexModel> {
-        match self {
-            QaModel::Gemini => None,
-            QaModel::ThirdParty { explicit_codex, .. } => explicit_codex.as_deref(),
-        }
-    }
-
     /// Provider whose reasoning conventions this call follows. Gemini has no
     /// third-party provider; the reasoning override it reports is never read.
     pub fn third_party_provider(&self) -> ThirdPartyProvider {
@@ -171,7 +64,7 @@ impl QaModel {
                     Some(&explicit.record),
                     Some(&CONFIG.models.quick_reasoning_effort),
                 ),
-                Some(explicit) => explicit.config.name.clone(),
+                Some(explicit) => codex_selected_model_label(&explicit.record),
                 None => configured_model_display_name(snapshot, &config.id),
             },
         }
@@ -209,10 +102,13 @@ impl QaModel {
 
         if config.provider == ThirdPartyProvider::OpenAICodex {
             if mode == QaCommandMode::Quick {
-                let record = codex_model_record_for_request(config).ok().flatten();
+                let record = snapshot
+                    .codex_record
+                    .as_ref()
+                    .filter(|record| record.slug == config.model);
                 return codex_quick_result_label(
                     config,
-                    record.as_ref(),
+                    record,
                     Some(&CONFIG.models.quick_reasoning_effort),
                 );
             }
@@ -272,60 +168,6 @@ pub(super) fn codex_quick_result_label(
     effective_reasoning_effort(&config.model, record, requested_effort)
         .map(|effort| format!("{} {effort}", config.model))
         .unwrap_or_else(|| config.model.clone())
-}
-
-pub(super) fn format_llm_error_message(
-    model: &QaModel,
-    display_model: &str,
-    err: &anyhow::Error,
-) -> String {
-    let provider = match model {
-        QaModel::Gemini => None,
-        QaModel::ThirdParty { config, .. } => Some(third_party_provider_label(config.provider)),
-    };
-    let err_text = err.to_string();
-
-    let friendly = match provider {
-        Some("OpenRouter") if err_text.contains("OpenRouter request failed") => {
-            if err_text.contains("status 404") || err_text.contains("404 Not Found") {
-                format!(
-                    "Sorry, {display_model} is unavailable on OpenRouter right now. Please pick another model or try again later."
-                )
-            } else {
-                format!(
-                    "Sorry, {display_model} returned an OpenRouter error. Please try again later or choose another model."
-                )
-            }
-        }
-        Some("NVIDIA") if err_text.contains("NVIDIA request failed") => {
-            if err_text.contains("status 404") || err_text.contains("404 Not Found") {
-                format!(
-                    "Sorry, {display_model} is unavailable on NVIDIA right now. Please pick another model or try again later."
-                )
-            } else {
-                format!(
-                    "Sorry, {display_model} returned an NVIDIA error. Please try again later or choose another model."
-                )
-            }
-        }
-        Some("Ollama") if err_text.contains("Ollama request failed") => {
-            if err_text.contains("status 404") || err_text.contains("404 Not Found") {
-                format!(
-                    "Sorry, {display_model} is unavailable on Ollama right now. Please pick another model or try again later."
-                )
-            } else {
-                format!(
-                    "Sorry, {display_model} returned an Ollama error. Please try again later or choose another model."
-                )
-            }
-        }
-        _ => format!(
-            "Sorry, I couldn't process your request with {display_model}. Please try again later."
-        ),
-    };
-
-    let detail = truncate_with_ellipsis(&err_text, USER_ERROR_DETAIL_LIMIT);
-    format!("{friendly}\n\nError: {detail}")
 }
 
 #[derive(Debug, Clone, Copy)]

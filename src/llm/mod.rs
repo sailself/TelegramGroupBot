@@ -10,6 +10,7 @@ pub mod jina_search;
 pub mod media;
 pub mod openai_codex;
 pub mod prompting;
+pub(crate) mod resolved_model;
 pub mod responses_provider;
 pub mod runtime_models;
 pub mod text_model;
@@ -34,7 +35,4 @@ pub use gemini::{
     generate_music_with_lyria, generate_video_with_veo, GeminiCallRequest, GeminiImageConfig,
 };
 pub use img2_image::generate_image_with_img2;
-pub use third_party::{
-    call_third_party, call_third_party_with_reasoning_config, call_third_party_with_tool_runtime,
-    ThirdPartyCallOptions,
-};
+pub use third_party::{call_third_party_with_reasoning_config, ThirdPartyCallOptions};

@@ -6,6 +6,10 @@ use tracing::info;
 
 use crate::utils::text::truncate_to_chars;
 
+#[derive(Debug, thiserror::Error)]
+#[error("The operation exceeded its time budget")]
+pub struct OperationDeadlineExceeded;
+
 pub fn now_unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

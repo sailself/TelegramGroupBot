@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -279,7 +278,6 @@ pub struct ModelDefaults {
     pub default_image_model: String,
     pub third_party_models_config_path: PathBuf,
     pub third_party_models: Vec<ThirdPartyModelConfig>,
-    pub third_party_models_by_id: HashMap<String, ThirdPartyModelConfig>,
 }
 
 /// Runtime concurrency/timeout knobs that don't belong to any one provider.
@@ -974,11 +972,6 @@ fn load_cwd_pw() -> CwdPwConfig {
 fn load_models() -> ModelDefaults {
     let third_party_models_config_path = resolve_third_party_models_path();
     let third_party_models = load_third_party_models(&third_party_models_config_path);
-    let third_party_models_by_id = third_party_models
-        .iter()
-        .cloned()
-        .map(|model| (model.id.clone(), model))
-        .collect::<HashMap<_, _>>();
 
     let default_text_model =
         resolve_default_text_model_value(env::var("DEFAULT_TEXT_MODEL").ok().as_deref());
@@ -996,7 +989,6 @@ fn load_models() -> ModelDefaults {
         default_image_model: env_string("DEFAULT_IMAGE_MODEL", "gemini"),
         third_party_models_config_path,
         third_party_models,
-        third_party_models_by_id,
     }
 }
 
@@ -1083,10 +1075,6 @@ impl Config {
         })
     }
 
-    pub fn get_third_party_model_config(&self, model_id: &str) -> Option<&ThirdPartyModelConfig> {
-        self.models.third_party_models_by_id.get(model_id)
-    }
-
     pub fn is_third_party_provider_ready(&self, provider: ThirdPartyProvider) -> bool {
         match provider {
             ThirdPartyProvider::OpenRouter => {
@@ -1146,6 +1134,7 @@ pub(crate) fn gemini_api_available_from(enable_gemini: bool, api_key: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // Environment variables are process-wide; hold this lock for the whole
     // span of any test that sets/removes one so tests can't race each other.

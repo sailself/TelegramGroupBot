@@ -1,6 +1,35 @@
 //! Character-safe text helpers shared across handlers and providers.
 
+use parking_lot::Mutex;
 use regex::Regex;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+
+struct TagMatchers {
+    closing: Regex,
+    opening: Regex,
+}
+static TAG_MATCHERS: LazyLock<Mutex<HashMap<String, Arc<TagMatchers>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const TAG_CACHE_CAPACITY: usize = 32;
+
+fn tag_matchers(tag: &str) -> Option<Arc<TagMatchers>> {
+    if let Some(matchers) = TAG_MATCHERS.lock().get(tag).cloned() {
+        return Some(matchers);
+    }
+    let escaped = regex::escape(tag);
+    let matchers = Arc::new(TagMatchers {
+        closing: Regex::new(&format!(r"(?i)<(\s*/\s*{}\s*>)", escaped)).ok()?,
+        opening: Regex::new(&format!(r"(?i)<(\s*{})([\s/>])", escaped)).ok()?,
+    });
+    let mut cache = TAG_MATCHERS.lock();
+    if cache.len() < TAG_CACHE_CAPACITY {
+        cache
+            .entry(tag.to_string())
+            .or_insert_with(|| matchers.clone());
+    }
+    Some(matchers)
+}
 
 /// Truncate `text` to at most `max_chars` characters without splitting a
 /// multi-byte UTF-8 sequence. Returns the input unchanged when it already
@@ -42,10 +71,12 @@ pub fn truncate_for_log(text: &str, max_chars: usize) -> String {
 /// re-casing or padding the tag; a longer tag name (`</sources>`) is left
 /// alone.
 pub fn neutralize_closing_tag(content: &str, tag: &str) -> String {
-    let pattern = format!(r"(?i)<(\s*/\s*{}\s*>)", regex::escape(tag));
-    match Regex::new(&pattern) {
-        Ok(re) => re.replace_all(content, "<\u{200b}$1").into_owned(),
-        Err(_) => content.replace(&format!("</{tag}>"), &format!("<\u{200b}/{tag}>")),
+    match tag_matchers(tag) {
+        Some(matchers) => matchers
+            .closing
+            .replace_all(content, "<\u{200b}$1")
+            .into_owned(),
+        None => content.replace(&format!("</{tag}>"), &format!("<\u{200b}/{tag}>")),
     }
 }
 
@@ -57,13 +88,12 @@ pub fn neutralize_closing_tag(content: &str, tag: &str) -> String {
 /// or `>` — while a longer tag name (`<sourcemap>`) is left untouched.
 pub fn neutralize_tag(content: &str, tag: &str) -> String {
     let closing = neutralize_closing_tag(content, tag);
-    // The `regex` crate has no lookahead, so the terminator that marks a real
-    // opening tag (whitespace, `/`, or `>`) is captured and replayed as-is
-    // rather than asserted and discarded.
-    let pattern = format!(r"(?i)<(\s*{})([\s/>])", regex::escape(tag));
-    match Regex::new(&pattern) {
-        Ok(re) => re.replace_all(&closing, "<\u{200b}$1$2").into_owned(),
-        Err(_) => closing.replace(&format!("<{tag}>"), &format!("<\u{200b}{tag}>")),
+    match tag_matchers(tag) {
+        Some(matchers) => matchers
+            .opening
+            .replace_all(&closing, "<\u{200b}$1$2")
+            .into_owned(),
+        None => closing.replace(&format!("<{tag}>"), &format!("<\u{200b}{tag}>")),
     }
 }
 
@@ -255,5 +285,20 @@ mod tests {
             split_for_telegram("abcdef\ng", 3),
             vec!["abcdef".to_string(), "g".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    #[test]
+    fn bounded_cache_keeps_uncached_tags_safe() {
+        for index in 0..40 {
+            let tag = format!("cache_test_{index}");
+            let content = format!("<{tag}>data</{tag}>");
+            let safe = neutralize_tag(&content, &tag);
+            assert!(!safe.contains(&format!("</{tag}>")));
+        }
+        assert!(TAG_MATCHERS.lock().len() <= TAG_CACHE_CAPACITY);
     }
 }

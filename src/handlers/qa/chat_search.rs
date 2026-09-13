@@ -16,7 +16,7 @@ use crate::utils::text::{escape_html, split_for_telegram, truncate_with_ellipsis
 use crate::utils::timing::{now_unix_seconds, CommandTimer};
 use tracing::warn;
 
-use super::model_resolution::{format_llm_error_message, ModelCatalogSnapshot, QaModel};
+use super::model_resolution::{ModelCatalogSnapshot, QaModel};
 use super::process::{dispatch, qa_call_label, QaCall};
 
 const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
@@ -261,20 +261,7 @@ pub(super) async fn process_chat_search_request(
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<()> {
     let (response, runtime) =
-        match run_chat_search_model(state, request, query, model, snapshot, audit_context).await {
-            Ok(response) => response,
-            Err(err) => {
-                let display_model = model.display_name(snapshot, request.mode);
-                let message = format_llm_error_message(model, &display_model, &err);
-                bot.edit_message_text(
-                    ChatId(request.chat_id),
-                    MessageId(request.selection_message_id as i32),
-                    message,
-                )
-                .await?;
-                return Err(err);
-            }
-        };
+        run_chat_search_model(state, request, query, model, snapshot, audit_context).await?;
 
     let max_selected_hits = CONFIG.limits.max_tool_context_items;
     let selection = parse_chat_search_selection(&response.text);

@@ -11,7 +11,6 @@ use crate::agents::qc::{
 };
 use crate::config::CONFIG;
 use crate::llm::gemini::call_gemini_with_tool_runtime;
-use crate::llm::third_party::call_third_party_with_tool_runtime;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::utils::progress::ProgressReporter;
 use crate::utils::text::{neutralize_closing_tag, truncate_for_log};
@@ -110,11 +109,13 @@ fn build_analytics_gather_system_prompt(
 pub(super) async fn run_analytics_lane(
     request: &QcRequest<'_>,
     progress: &mut ProgressReporter,
+    clock: &crate::agents::step::WallClock,
 ) -> Result<QcPipelineResult> {
+    clock.check()?;
     let (chat_id, query, model_name, system_prompt, audit_context) = (
         request.chat_id,
         request.query,
-        request.model_name,
+        request.model.model_id(),
         request.system_prompt,
         request.audit_context,
     );
@@ -142,18 +143,20 @@ pub(super) async fn run_analytics_lane(
         .await
         .map(|r| r.text)
     } else {
-        call_third_party_with_tool_runtime(
+        crate::llm::call_third_party_with_reasoning_config(
             &gather_sys,
             query,
-            model_name,
+            request.model.config().expect("third-party config"),
             "Chat Analytics",
             &[],
-            &mut runtime,
-            crate::llm::ThirdPartyCallOptions::new(
-                audit_context,
-                crate::llm::CodexPromptStyle::TaskSpecific,
-            )
-            .with_reasoning_override(Some(CONFIG.agents.step_reasoning.as_str())),
+            Some(&mut runtime),
+            request.model.options(
+                crate::llm::ThirdPartyCallOptions::new(
+                    audit_context,
+                    crate::llm::CodexPromptStyle::TaskSpecific,
+                )
+                .with_reasoning_override(Some(CONFIG.agents.step_reasoning.as_str())),
+            ),
         )
         .await
     };
@@ -202,8 +205,9 @@ pub(super) async fn run_analytics_lane(
     let user_content = build_analytics_input(query, &block, &examples_block);
 
     let final_sys = format!("{system_prompt}\n\n{QC_ANALYTICS_ADDENDUM}");
+    clock.check()?;
     let (answer, gemini_model_used) = compose_final_answer(
-        model_name,
+        request.model,
         &final_sys,
         &user_content,
         &[],

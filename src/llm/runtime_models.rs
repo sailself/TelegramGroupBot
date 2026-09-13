@@ -2,9 +2,7 @@ use std::collections::HashMap;
 
 use tracing::warn;
 
-use crate::config::{
-    qualify_third_party_model_id, Config, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
-};
+use crate::config::{Config, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
 use crate::llm::codex_selected_model::{
     self, dynamic_codex_model_config, load_selected_codex_model_record,
     selected_model_matches_account, RuntimeModelsState,
@@ -54,10 +52,6 @@ pub fn reload_runtime_models() {
     codex_selected_model::replace_state(build_runtime_models_state());
 }
 
-pub fn runtime_models() -> Vec<ThirdPartyModelConfig> {
-    codex_selected_model::with_state(|state| state.models.clone())
-}
-
 pub fn runtime_model_count() -> usize {
     codex_selected_model::with_state(|state| state.models.len())
 }
@@ -92,26 +86,6 @@ pub fn runtime_model_config(model_id: &str) -> Option<ThirdPartyModelConfig> {
 
         None
     })
-}
-
-pub fn resolve_runtime_model_identifier(identifier: &str) -> Option<String> {
-    let trimmed = identifier.trim();
-    if trimmed.eq_ignore_ascii_case("openai-codex") {
-        return runtime_model_config(OPENAI_CODEX_SELECTED_MODEL_ID)
-            .map(|_| qualify_third_party_model_id(ThirdPartyProvider::OpenAICodex, "selected"));
-    }
-
-    if let Some((provider, slug)) = crate::config::parse_third_party_model_id(trimmed) {
-        if provider == ThirdPartyProvider::OpenAICodex {
-            if let Some(record) = selected_codex_model_record() {
-                if record.slug == slug {
-                    return Some(OPENAI_CODEX_SELECTED_MODEL_ID.to_string());
-                }
-            }
-        }
-    }
-
-    None
 }
 
 fn is_runtime_provider_ready_with(config: &Config, provider: ThirdPartyProvider) -> bool {

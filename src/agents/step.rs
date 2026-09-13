@@ -1,7 +1,8 @@
 //! Step-model resolution and the single-call primitive used by pipeline
 //! phases (claim extraction, query planning, reflection, chunk summaries).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use anyhow::{anyhow, Result};
 use serde::de::DeserializeOwned;
@@ -14,7 +15,8 @@ use crate::config::{
 use crate::llm::call_third_party_with_reasoning_config;
 use crate::llm::gemini::call_gemini_model_simple;
 use crate::llm::media::MediaFile;
-use crate::llm::runtime_models::runtime_model_config;
+use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel};
+use crate::llm::runtime_models::ResolvedExplicitCodexModel;
 use crate::llm::text_model::MODEL_GEMINI;
 use crate::llm::LlmAuditContext;
 
@@ -27,6 +29,7 @@ pub enum StepModel {
     ThirdParty {
         config: ThirdPartyModelConfig,
         reasoning_override: Option<String>,
+        explicit_codex: Option<Box<ResolvedExplicitCodexModel>>,
     },
 }
 
@@ -37,6 +40,7 @@ impl StepModel {
             StepModel::ThirdParty {
                 config,
                 reasoning_override,
+                ..
             } => match reasoning_override {
                 Some(level) => format!("{} {}", config.model, level),
                 None => config.model.clone(),
@@ -50,16 +54,42 @@ impl StepModel {
 /// model is derived: a Codex/OpenAI final model runs steps on itself with the
 /// `AGENT_STEP_REASONING` per-call override, a Gemini final model uses
 /// `GEMINI_LITE_MODEL`, and other providers reuse the final model as-is.
-pub fn resolve_step_model(final_model_id: &str) -> Result<StepModel> {
-    let step_model = resolve_step_model_value(
+pub async fn resolve_step_model(final_model: &ResolvedTextModel) -> Result<StepModel> {
+    let final_model_id = final_model.model_id();
+    let mut snapshot = ModelCatalogSnapshot::load();
+    let mut step_model = resolve_step_model_value(
         &CONFIG.agents.step_model,
         &CONFIG.agents.step_reasoning,
         final_model_id,
         &CONFIG.gemini.lite_model,
         &CONFIG.gemini.model,
         CONFIG.gemini_api_available(),
-        runtime_model_config,
+        |id| {
+            if id == final_model_id {
+                final_model.config().cloned()
+            } else {
+                snapshot.config(id).cloned()
+            }
+        },
     )?;
+    if let StepModel::ThirdParty {
+        config,
+        explicit_codex,
+        ..
+    } = &mut step_model
+    {
+        if config.id == final_model_id {
+            *explicit_codex = final_model.explicit_codex().cloned().map(Box::new);
+        } else if snapshot.config(&config.id).is_some() {
+            let resolved = ResolvedTextModel::prepare(&config.id, &mut snapshot, None).await?;
+            *config = resolved
+                .config()
+                .expect("resolved third-party step config")
+                .clone();
+            *explicit_codex = resolved.explicit_codex().cloned().map(Box::new);
+        }
+    }
+
     debug!(
         "agent step model resolved: {} (final model {})",
         step_model.display_name(),
@@ -95,6 +125,7 @@ fn resolve_step_model_value(
             return Ok(StepModel::ThirdParty {
                 config,
                 reasoning_override,
+                explicit_codex: None,
             });
         } else if let Some((ThirdPartyProvider::OpenAICodex, slug)) =
             parse_third_party_model_id(explicit)
@@ -114,6 +145,7 @@ fn resolve_step_model_value(
                     tools: false,
                 },
                 reasoning_override: reasoning,
+                explicit_codex: None,
             });
         } else {
             warn!(
@@ -139,6 +171,7 @@ fn resolve_step_model_value(
         return Ok(StepModel::ThirdParty {
             config,
             reasoning_override,
+            explicit_codex: None,
         });
     }
 
@@ -217,6 +250,7 @@ pub async fn call_step_text(
         StepModel::ThirdParty {
             config,
             reasoning_override,
+            explicit_codex,
         } => {
             let system_prompt = match json_schema {
                 Some(schema) => {
@@ -235,7 +269,9 @@ pub async fn call_step_text(
                     audit_context,
                     crate::llm::CodexPromptStyle::TaskSpecific,
                 )
-                .with_reasoning_override(reasoning_override.as_deref()),
+                .with_reasoning_override(reasoning_override.as_deref())
+                .with_explicit_codex_model(explicit_codex.as_deref())
+                .with_pinned_codex_metadata(),
             )
             .await
         }
@@ -268,33 +304,46 @@ pub fn parse_lenient_json<T: DeserializeOwned>(text: &str) -> Option<T> {
         .and_then(|candidate| serde_json::from_str::<T>(candidate).ok())
 }
 
-/// Wall-clock budget for a whole pipeline run, checked between phases — the
-/// pipeline never aborts mid-phase, it just stops starting new work.
+/// One absolute deadline, shared by every phase and legacy fallback.
+#[derive(Clone, Copy)]
 pub struct WallClock {
-    started: Instant,
-    budget: Duration,
+    deadline: Instant,
 }
-
 impl WallClock {
     pub fn start() -> Self {
         Self {
-            started: Instant::now(),
-            budget: Duration::from_secs(CONFIG.agents.max_wall_clock_secs),
+            deadline: Instant::now() + Duration::from_secs(CONFIG.agents.max_wall_clock_secs),
         }
     }
-
-    /// Test-only constructor for an explicit budget, bypassing `CONFIG` so
-    /// tests can exercise an already-exceeded or generously long clock.
     #[cfg(test)]
     pub(crate) fn for_budget(budget: Duration) -> Self {
         Self {
-            started: Instant::now(),
-            budget,
+            deadline: Instant::now() + budget,
         }
     }
-
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
     pub fn exceeded(&self) -> bool {
-        self.started.elapsed() >= self.budget
+        self.remaining().is_zero()
+    }
+    pub fn check(&self) -> Result<()> {
+        if self.exceeded() {
+            return Err(crate::utils::timing::OperationDeadlineExceeded.into());
+        }
+        Ok(())
+    }
+    pub async fn run<T>(&self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        if self.exceeded() {
+            return Err(crate::utils::timing::OperationDeadlineExceeded.into());
+        }
+        let result = tokio::time::timeout_at(self.deadline, work)
+            .await
+            .map_err(|_| anyhow::Error::from(crate::utils::timing::OperationDeadlineExceeded))?;
+        if self.exceeded() {
+            return Err(crate::utils::timing::OperationDeadlineExceeded.into());
+        }
+        result
     }
 }
 
@@ -360,6 +409,7 @@ mod tests {
             StepModel::ThirdParty {
                 config,
                 reasoning_override,
+                ..
             } => {
                 assert_eq!(config.model, "gpt-5.5");
                 assert_eq!(reasoning_override.as_deref(), Some("low"));
@@ -426,6 +476,7 @@ mod tests {
             StepModel::ThirdParty {
                 config,
                 reasoning_override,
+                ..
             } => {
                 assert_eq!(config.provider, ThirdPartyProvider::OpenAICodex);
                 assert_eq!(config.model, "gpt-5.4-mini");
@@ -440,5 +491,37 @@ mod tests {
         let result =
             resolve_step_model_value("", "low", "openrouter:not-loaded", "", "", false, |_| None);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn fallback_inherits_remaining_deadline() {
+        let clock = WallClock::for_budget(Duration::from_secs(10));
+        let error = clock
+            .run(async {
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                assert_eq!(clock.remaining(), Duration::from_secs(3));
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(error.is::<crate::utils::timing::OperationDeadlineExceeded>());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn expired_deadline_does_not_start_fallback() {
+        let clock = WallClock::for_budget(Duration::ZERO);
+        let mut started = false;
+        assert!(clock
+            .run(async {
+                started = true;
+                Ok(())
+            })
+            .await
+            .is_err());
+        assert!(!started);
     }
 }

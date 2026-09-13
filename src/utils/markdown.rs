@@ -262,6 +262,38 @@ fn allowed_link_scheme(url: &str) -> bool {
     }
 }
 
+/// Plain text for fallback; omit destinations when measuring visible text.
+pub fn markdown_to_plain_text(input: &str, include_link_destinations: bool) -> String {
+    let mut out = String::new();
+    for event in Parser::new_ext(
+        input,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
+    ) {
+        match event {
+            Event::Text(text) | Event::Code(text) | Event::Html(text) => out.push_str(&text),
+            Event::SoftBreak | Event::HardBreak => out.push('\n'),
+            Event::Start(Tag::Item) => out.push_str("• "),
+            Event::End(Tag::Link(_, url, _)) if include_link_destinations => {
+                out.push_str(&format!(" ({url})"))
+            }
+            Event::End(
+                Tag::Paragraph
+                | Tag::Heading(..)
+                | Tag::CodeBlock(_)
+                | Tag::BlockQuote
+                | Tag::List(_)
+                | Tag::Table(_),
+            ) => out.push_str("\n\n"),
+            Event::End(Tag::Item | Tag::TableHead | Tag::TableRow) => out.push('\n'),
+            Event::End(Tag::TableCell) => out.push_str(" | "),
+            Event::Rule => out.push_str("\n———\n"),
+            Event::TaskListMarker(checked) => out.push_str(if checked { "[x] " } else { "[ ] " }),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
 /// Render a Markdown table as a monospace, `|`-aligned grid meant to sit
 /// inside a `<pre>` block (Telegram has no native table markup).
 fn render_table(rows: &[Vec<String>]) -> String {

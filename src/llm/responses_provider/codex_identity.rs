@@ -22,6 +22,20 @@ pub(crate) struct CodexRequestIdentity {
 }
 
 impl CodexRequestIdentity {
+    /// The execution snapshot is authoritative even when it has no metadata.
+    pub(crate) fn resolve_pinned(
+        model_config: &ThirdPartyModelConfig,
+        record: Option<&CodexSelectedModelRecord>,
+        reasoning_override: Option<&str>,
+    ) -> Result<Option<Self>> {
+        if model_config.provider != ThirdPartyProvider::OpenAICodex {
+            return Ok(None);
+        }
+        let account_id = crate::llm::runtime_models::current_codex_account_id()
+            .ok_or_else(|| anyhow!("Codex auth token does not include a ChatGPT account id"))?;
+        Self::resolve_with(model_config, record, None, &account_id, reasoning_override).map(Some)
+    }
+
     /// Resolve against the active login. `explicit_record` is the catalog
     /// record for an explicit Codex slug the caller already resolved (the
     /// Quick path); it must name this model and belong to the active account.

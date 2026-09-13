@@ -209,6 +209,7 @@ where
         let request = match build_request(context).await {
             Ok(request) => request,
             Err(err) => {
+                let err = err.sanitized(|text| call.redact(text));
                 call.fail(&err).await;
                 return Err(err);
             }
@@ -217,7 +218,8 @@ where
         let response = match request.send().await {
             Ok(response) => response,
             Err(err) => {
-                let error = ProviderError::transport(provider, &err, call.redact(&err.to_string()));
+                let error = ProviderError::transport(provider, &err, err.to_string())
+                    .sanitized(|text| call.redact(text));
                 let retrying = error.is_retryable() && policy.allows_retry(attempt);
                 let message = format!(
                     "{provider} request failed to send: model={model}, attempt={attempt}/{}, timeout={}, connect={}, retrying={retrying}, error={}",
@@ -262,10 +264,11 @@ where
             let error = ProviderError::http(
                 provider,
                 status,
-                summary.message.map(|message| call.redact(&message)),
-                call.redact(&summary.snippet),
+                summary.message,
+                summary.snippet.clone(),
                 retry_after,
-            );
+            )
+            .sanitized(|text| call.redact(text));
             let retrying = error.is_retryable() && policy.allows_retry(attempt);
             let message = format!(
                 "{provider} API error: model={model}, status={status}, attempt={attempt}/{}, retry_after={retry_after:?}, retrying={retrying}, body={}",
@@ -288,6 +291,7 @@ where
                 return Ok(value);
             }
             Err(error) => {
+                let error = error.sanitized(|text| call.redact(text));
                 let retrying = error.is_retryable() && policy.allows_retry(attempt);
                 let message = format!(
                     "{provider} response rejected: model={model}, attempt={attempt}/{}, retrying={retrying}, error={error}",
@@ -700,5 +704,166 @@ mod tests {
             .expect("100 bytes fit a 100-byte limit");
         assert_eq!(bytes.len(), 100);
         server.join().expect("two requests were served");
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use crate::tools::twitter_extractor::test_support::{response_with_content_length, TestServer};
+    use std::time::Duration;
+
+    fn redact(text: &str) -> String {
+        text.replace("SYNTHETIC_SECRET", "[redacted]")
+    }
+
+    #[tokio::test]
+    async fn decoder_and_builder_errors_are_sanitized_at_boundary() {
+        let body = b"invalid SYNTHETIC_SECRET";
+        let server = TestServer::single(response_with_content_length(body.len(), body.to_vec()));
+        let url = server.url("/decode");
+        let call = LlmCall::untracked("probe", "decode").with_redaction(redact);
+        let policy = RetryPolicy::linear(1, Duration::ZERO);
+        let result = call_with_retry(
+            &call,
+            &policy,
+            |_| async { Ok(reqwest::Client::new().get(url.clone())) },
+            |_| {},
+            |response| read_json::<Value>(response, "probe"),
+            |_| LlmUsageRecord::default(),
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("[redacted]"));
+        assert!(!error.contains("SYNTHETIC_SECRET"));
+        server.join().unwrap();
+        let result = call_with_retry(
+            &call,
+            &policy,
+            |_| async { Err(ProviderError::rejected("SYNTHETIC_SECRET")) },
+            |_| {},
+            |response| read_json::<Value>(response, "probe"),
+            |_| LlmUsageRecord::default(),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), "[redacted]");
+    }
+
+    #[test]
+    fn sanitization_preserves_retry_metadata() {
+        let error = ProviderError::http(
+            "SYNTHETIC_SECRET",
+            StatusCode::TOO_MANY_REQUESTS,
+            Some("SYNTHETIC_SECRET".into()),
+            "SYNTHETIC_SECRET".into(),
+            Some(Duration::from_secs(3)),
+        )
+        .sanitized(redact);
+        assert!(error.is_retryable());
+        assert_eq!(error.status(), Some(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!format!("{error:?}").contains("SYNTHETIC_SECRET"));
+        assert!(
+            matches!(error, ProviderError::Http { retry_after: Some(wait), .. } if wait == Duration::from_secs(3))
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_redaction_tests {
+    use super::*;
+    use crate::db::models::LlmInvocationInsert;
+    use crate::db::test_support::init_test_db;
+    use crate::tools::twitter_extractor::test_support::{response_with_headers, TestServer};
+    use crate::utils::log_capture::capture_json_events_async;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn all_error_origins_are_redacted_in_logs_audit_and_return_values() {
+        let db = init_test_db("transport-redaction").await;
+        for origin in ["builder", "decoder", "reader", "http", "send"] {
+            let invocation_id = db
+                .insert_llm_invocation(LlmInvocationInsert {
+                    trigger_kind: "command".into(),
+                    trigger_name: "q".into(),
+                    chat_id: -100,
+                    user_id: Some(1),
+                    username: None,
+                    message_id: 1,
+                    reply_to_message_id: None,
+                    message_text: Some("test".into()),
+                    created_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+            let context = LlmAuditContext::new(db.clone(), invocation_id);
+            let needs_server = !matches!(origin, "builder" | "send");
+            let server = needs_server.then(|| {
+                TestServer::single(response_with_headers(
+                    if origin == "http" { 403 } else { 200 },
+                    &[],
+                    b"SYNTHETIC_SECRET".to_vec(),
+                ))
+            });
+            let url = server
+                .as_ref()
+                .map(|server| server.url("/failure").to_string());
+            let (result, events) = capture_json_events_async(async {
+                let call = LlmCall::begin("test", "model", origin, Some(&context), None)
+                    .with_redaction(|text| text.replace("SYNTHETIC_SECRET", "[redacted]"));
+                call_with_retry(
+                    &call,
+                    &RetryPolicy::linear(1, Duration::ZERO),
+                    |_| {
+                        let url = url.clone();
+                        async move {
+                            if origin == "builder" {
+                                return Err(ProviderError::rejected("SYNTHETIC_SECRET"));
+                            }
+                            Ok(reqwest::Client::new()
+                                .get(url.unwrap_or_else(|| "SYNTHETIC_SECRET://bad".to_string())))
+                        }
+                    },
+                    |_| {},
+                    |response| async move {
+                        if origin == "reader" {
+                            Err(ProviderError::decode("test", "SYNTHETIC_SECRET", true))
+                        } else {
+                            read_json::<Value>(response, "test").await
+                        }
+                    },
+                    |_| LlmUsageRecord::default(),
+                )
+                .await
+            })
+            .await;
+            let error = result.unwrap_err();
+            assert!(
+                !format!("{error:?}").contains("SYNTHETIC_SECRET"),
+                "{origin}: {error}"
+            );
+            let rendered_logs = serde_json::to_string(&events).unwrap();
+            assert!(
+                !rendered_logs.contains("SYNTHETIC_SECRET"),
+                "{origin}: {rendered_logs}"
+            );
+            assert!(events
+                .iter()
+                .any(|event| event["fields"]["status"] == "error"));
+            let stored: String = sqlx::query_scalar(
+                "SELECT error_summary FROM llm_requests WHERE invocation_id = ?",
+            )
+            .bind(invocation_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert!(!stored.contains("SYNTHETIC_SECRET"), "{origin}: {stored}");
+            if origin != "send" {
+                assert!(stored.contains("[redacted]"), "{origin}: {stored}");
+            }
+            if let Some(server) = server {
+                server.join().unwrap();
+            }
+        }
+        db.shutdown().await;
     }
 }

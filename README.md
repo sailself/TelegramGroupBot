@@ -44,12 +44,13 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `src/main.rs` - Bot entry point and dispatcher wiring.
 - `src/config.rs` - Environment loading and defaults.
 - `src/handlers/` - Command handlers, access control, and response logic.
-- `src/llm/` - Gemini and third-party model clients, tool orchestration, media helpers.
+- `src/llm/` - Gemini and third-party clients, resolved model snapshots, tool orchestration, media helpers.
+- `src/agents/` - Bounded fact-check, chat-context, analytics, topic, and summary pipelines.
 - `src/db/` - SQLite access and background writer queue.
 - `src/utils/` - Logging, timing, and HTTP helpers.
 
 ## Setup (local)
-1. Install Rust (1.78+ recommended).
+1. Install Rust 1.88 or newer (the Docker build uses Rust 1.92).
 2. Create a `.env` file in the project root (see below).
 3. Optional: create `allowed_chat.txt` if you want to restrict access.
 4. Run the bot.
@@ -199,9 +200,9 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `ENABLE_AGENTIC_FACTCHECK` - When `false`, `/factcheck` reverts to the legacy single-call flow. The legacy flow is also the automatic fallback when claim extraction fails or finds nothing check-worthy. Default: `true`.
 - `ENABLE_AGENTIC_QC` - When `false`, `/qc` reverts to the legacy monolithic tool loop. In agentic mode, malformed lane classification takes the recall path; analytics and topic-discovery failures fail closed instead of silently using the legacy loop. Default: `true`.
 - `ENABLE_QC_TOPIC_DISCOVERY` - Enables semantic topic discovery for `/qc`. Default: `true`. Topic discovery analyzes at most `TLDR_MAX_MESSAGES` newest eligible stored text messages in the requested UTC range, using `TLDR_CHUNK_SIZE` chunks and up to four concurrent map calls. Results disclose capped and partial coverage and are LLM-assisted classifications, not exact semantic counts.
-- `AGENT_STEP_MODEL` - Model for cheap pipeline steps (claim extraction, query planning, reflection, chunk summaries). Accepts `gemini` or a runtime model id; `openai-codex:<slug>` works even for slugs not in the catalog (e.g. `openai-codex:gpt-5.4-mini`). Empty = derive automatically: a Codex final model runs steps on itself at `AGENT_STEP_REASONING`; a public OpenAI final model runs steps on itself without a per-call reasoning override; a Gemini final model uses `GEMINI_LITE_MODEL`. Default: empty.
-- `AGENT_STEP_REASONING` - Per-call reasoning effort for OpenAI Codex cheap pipeline steps and internal `/s` selection or `/qc` analytics gathering. It is ignored by public OpenAI and other providers, validated against the selected Codex model's supported levels, and does not replace the user's selected Codex reasoning level for final answers. Default: `low`.
-- `AGENT_MAX_WALL_CLOCK_SECS` - Soft time budget per pipeline run, checked between phases; when exceeded the pipeline stops gathering more evidence and answers with what it has. Default: `480`.
+- `AGENT_STEP_MODEL` - Model for cheap pipeline steps (claim extraction, query planning, reflection, chunk summaries). Accepts `gemini` or a runtime model id; `openai-codex:<slug>` works even for slugs not in the catalog (e.g. `openai-codex:gpt-5.4-mini`). Empty = derive automatically: a Codex final model runs steps on itself at `AGENT_STEP_REASONING`; a public OpenAI final model runs steps on itself at `AGENT_STEP_REASONING`; a Gemini final model uses `GEMINI_LITE_MODEL`. Default: empty.
+- `AGENT_STEP_REASONING` - Per-call reasoning effort for Responses-provider cheap pipeline steps and internal `/s` selection or `/qc` analytics gathering. It applies to public OpenAI and Codex, is ignored by other providers, and is validated against available Codex metadata; it does not replace the user's selected Codex reasoning level for final answers. Default: `low`.
+- `AGENT_MAX_WALL_CLOCK_SECS` - Absolute time budget for `/qc`, `/factcheck`, and `/tldr` text generation, including all pipeline phases and any legacy fallback. Expiry cancels local work and reports a timeout; fallback never resets the budget. Preparation, final delivery, and the optional TLDR infographic are outside this budget. Default: `480`.
 - `TLDR_MAP_REDUCE_THRESHOLD` - `/tldr` switches to map-reduce above this many messages; at or below it the original single-call path runs unchanged. Default: `150`.
 - `TLDR_CHUNK_SIZE` - Messages per map-reduce chunk (chunks are summarized sequentially to keep memory flat). Default: `100`.
 - `TLDR_MAX_MESSAGES` - Hard cap on messages fetched for `/tldr`, including the previously unbounded reply-anchored variant. Default: `2000`.
@@ -409,3 +410,13 @@ IMG2_API_KEY=
 - Webhook mode is not implemented in this port yet; polling only.
 - Video generation can take a few minutes and returns an MP4 when the Veo operation completes.
 - If `TELEGRAPH_ACCESS_TOKEN` is not set, long messages will be truncated instead of published.
+
+## Search normalization and request consistency
+
+Search normalization version 2 retains the first 4,000 semantic characters and separately budgets up to 8,000 characters of complete tokens. This keeps segmented Chinese words searchable in long messages. The derived index can therefore be larger; stored messages are unchanged. Startup backfill resumes completed rows, advances by row ID, and retries transient SQLite locks. `/s` and `/qc` report that the index is rebuilding until completion. The SQLite database format remains at `PRAGMA user_version = 1`.
+
+A normalization-only upgrade does not drop the FTS table. A missing FTS table is reconstructed transactionally. Rolling back to a binary using normalization version 1 can trigger its own full derived-index rebuild and temporarily disable search; original message and audit records do not need to be rolled back. Test changes with a database copy before deployment, and keep a consistent database backup for operational rollback.
+
+Model pickers revalidate against the current catalog when answered or timed out. Once execution starts, provider configuration and Codex metadata are fixed for that request; legacy metadata is refreshed before being fixed, and authentication still checks that the active account matches. External media request headers overlap, but body reads and byte-budget admission follow input order so a faster later attachment cannot displace an earlier one.
+
+Answers retain original Markdown until delivery. Telegram receives HTML, Telegraph receives nodes built from the original Markdown, and failed formatting/publishing falls back to readable bounded text with link destinations. Model labels are rendered separately as literal metadata.

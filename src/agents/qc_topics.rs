@@ -800,23 +800,18 @@ pub async fn run_topic_discovery_lane(
     progress: &mut ProgressReporter,
     clock: &WallClock,
 ) -> Result<QcPipelineResult> {
-    let (chat_id, query, model_name, system_prompt, audit_context) = (
+    let (chat_id, query, system_prompt, audit_context) = (
         request.chat_id,
         request.query,
-        request.model_name,
         request.system_prompt,
         request.audit_context,
     );
 
+    clock.check()?;
     progress.update("Planning topic analysis...").await;
     let plan = plan_topic_request(step_model, query, audit_context).await?;
 
-    if clock.exceeded() {
-        warn!("/qc topic discovery: wall-clock budget exhausted before message selection; using legacy loop");
-        return Ok(QcPipelineResult::UseLegacy(
-            "wall-clock budget exhausted before message selection",
-        ));
-    }
+    clock.check()?;
 
     progress.update("Selecting chat messages...").await;
     let window = request
@@ -848,6 +843,7 @@ pub async fn run_topic_discovery_lane(
             }
         }
     } else {
+        clock.check()?;
         progress.update_now("Clustering topics...").await;
         reduce_topic_candidates(
             step_model,
@@ -859,6 +855,7 @@ pub async fn run_topic_discovery_lane(
         .await?
     };
 
+    clock.check()?;
     let literal_substring_results =
         run_literal_substring_analytics(request.db, chat_id, &plan).await;
     let evidence = build_topic_evidence(
@@ -878,11 +875,12 @@ pub async fn run_topic_discovery_lane(
         &literal_substring_results,
     );
 
+    clock.check()?;
     progress.update_now("Composing topic answer...").await;
     let final_system_prompt = format!("{system_prompt}\n\n{TOPIC_COMPOSE_ADDENDUM}");
     let user_content = format_topic_composition_input(&evidence);
     let (answer, gemini_model_used) = compose_final_answer(
-        model_name,
+        request.model,
         &final_system_prompt,
         &user_content,
         &[],

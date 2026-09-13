@@ -5,17 +5,15 @@ use teloxide::prelude::*;
 use teloxide::types::{
     ChatAction, InputFile, InputMedia, InputMediaPhoto, ParseMode, ReplyParameters,
 };
-use tracing::error;
 
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::image::{build_image_caption, generate_image_with_configured_default};
-use crate::handlers::responses::send_response;
+use crate::handlers::responses::{send_response, ResponseContent};
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::text_model::call_configured_text_model;
 use crate::prompts::{PAINTME_SYSTEM_PROMPT, PORTRAIT_SYSTEM_PROMPT, PROFILEME_SYSTEM_PROMPT};
 use crate::state::AppState;
-use crate::utils::markdown::markdown_to_telegram_html;
 use crate::utils::telegram::start_chat_action_heartbeat;
 
 /// Best-effort extraction of the raw JSON object a prompt model was asked to
@@ -93,80 +91,80 @@ pub async fn profileme_handler(
         .send_message(message.chat.id, "Generating your profile...")
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
-    let _chat_action =
-        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-    let history = state
-        .db
-        .select_messages_by_user(
-            message.chat.id.0,
-            user_id,
-            CONFIG.limits.user_history_message_count,
-            true,
-        )
-        .await?;
-
-    if history.is_empty() {
-        bot.edit_message_text(
-            message.chat.id,
-            processing_message.id,
-            "I don't have enough of your messages in this chat yet.",
-        )
-        .await?;
-        return Ok(());
-    }
-    let audit_context = create_command_audit_context(&state, &message, "profileme").await;
-
-    let mut history_lines = String::new();
-    for msg in history {
-        let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
-        let text = msg.text.unwrap_or_default();
-        history_lines.push_str(&format!("{}: {}\n", timestamp, text));
-    }
-    let formatted_history = format!(
-        "Here is the user's recent chat history in this group:\n\n{}",
-        crate::llm::prompting::wrap_chat_history(&history_lines)
-    );
-
-    let (system_prompt, user_content) =
-        build_profileme_prompts(style.as_deref(), &formatted_history);
-
-    let response = match call_configured_text_model(
-        &system_prompt,
-        &user_content,
-        "Your User Profile",
-        false,
-        false,
-        None,
-        Some("PROFILEME_SYSTEM_PROMPT"),
-        audit_context.as_ref(),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            error!("Profile generation failed: {}", err);
-            bot.edit_message_text(
-                processing_message.chat.id,
-                processing_message.id,
-                format!("Failed to generate your profile.\n\nError: {}", err),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    let (response_text, _response_model) = response;
-    send_response(
+    crate::utils::telegram::run_with_status_message(
         &bot,
         processing_message.chat.id,
         processing_message.id,
-        &markdown_to_telegram_html(&response_text),
-        "Your User Profile",
-        ParseMode::Html,
-    )
-    .await?;
+        "Failed to generate your profile. Please try again.",
+        async {
+            let _heavy_permit = _heavy_permit;
+            let _chat_action =
+                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
+            let history = state
+                .db
+                .select_messages_by_user(
+                    message.chat.id.0,
+                    user_id,
+                    CONFIG.limits.user_history_message_count,
+                    true,
+                )
+                .await?;
 
-    Ok(())
+            if history.is_empty() {
+                bot.edit_message_text(
+                    message.chat.id,
+                    processing_message.id,
+                    "I don't have enough of your messages in this chat yet.",
+                )
+                .await?;
+                return Ok(());
+            }
+            let audit_context = create_command_audit_context(&state, &message, "profileme").await;
+
+            let mut history_lines = String::new();
+            for msg in history {
+                let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
+                let text = msg.text.unwrap_or_default();
+                history_lines.push_str(&format!("{}: {}\n", timestamp, text));
+            }
+            let formatted_history = format!(
+                "Here is the user's recent chat history in this group:\n\n{}",
+                crate::llm::prompting::wrap_chat_history(&history_lines)
+            );
+
+            let (system_prompt, user_content) =
+                build_profileme_prompts(style.as_deref(), &formatted_history);
+
+            let response = match call_configured_text_model(
+                &system_prompt,
+                &user_content,
+                "Your User Profile",
+                false,
+                false,
+                None,
+                Some("PROFILEME_SYSTEM_PROMPT"),
+                audit_context.as_ref(),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => return Err(err),
+            };
+
+            let (response_text, _response_model) = response;
+            send_response(
+                &bot,
+                processing_message.chat.id,
+                processing_message.id,
+                &ResponseContent::new(response_text),
+                "Your User Profile",
+            )
+            .await?;
+
+            Ok(())
+        },
+    )
+    .await
 }
 
 pub async fn paintme_handler(
@@ -199,162 +197,153 @@ pub async fn paintme_handler(
         .send_message(message.chat.id, "Creating your image prompt...")
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
-    let typing_chat_action =
-        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-    let history = state
-        .db
-        .select_messages_by_user(
-            message.chat.id.0,
-            user_id,
-            CONFIG.limits.user_history_message_count,
-            true,
-        )
-        .await?;
-
-    if history.is_empty() {
-        bot.edit_message_text(
-            message.chat.id,
-            processing_message.id,
-            "I don't have enough of your messages in this chat yet.",
-        )
-        .await?;
-        return Ok(());
-    }
-    let audit_context = create_command_audit_context(
-        &state,
-        &message,
-        if portrait { "portraitme" } else { "paintme" },
-    )
-    .await;
-
-    let mut history_lines = String::new();
-    for msg in history {
-        let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
-        let text = msg.text.unwrap_or_default();
-        history_lines.push_str(&format!("{}: {}\n", timestamp, text));
-    }
-    let formatted_history = format!(
-        "Here is the user's recent chat history in this group:\n\n{}",
-        crate::llm::prompting::wrap_chat_history(&history_lines)
-    );
-
-    let prompt_system = if portrait {
-        PORTRAIT_SYSTEM_PROMPT
-    } else {
-        PAINTME_SYSTEM_PROMPT
-    };
-
-    let (prompt, _prompt_model) = match call_configured_text_model(
-        prompt_system,
-        &formatted_history,
-        if portrait {
-            "Portrait Prompt"
-        } else {
-            "Paint Prompt"
-        },
-        false,
-        false,
-        None,
-        Some(if portrait {
-            "PORTRAIT_SYSTEM_PROMPT"
-        } else {
-            "PAINTME_SYSTEM_PROMPT"
-        }),
-        audit_context.as_ref(),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            error!("Image prompt generation failed: {}", err);
-            bot.edit_message_text(
-                message.chat.id,
-                processing_message.id,
-                format!("Failed to create your image prompt.\n\nError: {}", err),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    drop(typing_chat_action);
-
-    // The model is asked for raw JSON; defensively unfence/extract before it
-    // reaches the image model so a ```json wrapper or preamble can't corrupt it.
-    let prompt = sanitize_image_prompt_json(&prompt);
-
-    let status_text = if portrait {
-        "Generating your portrait..."
-    } else {
-        "Generating your image..."
-    };
-    let _ = bot
-        .edit_message_text(message.chat.id, processing_message.id, status_text)
-        .await;
-    let _photo_chat_action =
-        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
-
-    let (model_name, image_result) = generate_image_with_configured_default(
-        &prompt,
-        &[],
-        None,
-        None,
-        !CONFIG.cwd_pw.api_key.is_empty(),
-        audit_context.as_ref(),
-    )
-    .await;
-
-    let images = match image_result {
-        Ok(images) => images,
-        Err(err) => {
-            error!(
-                model = model_name.as_str(),
-                "Image generation failed: {}", err.0
-            );
-            let error_text = format!(
-                "Sorry, I couldn't generate the image using {}.\n\nError: {}",
-                model_name, err.0
-            );
-            let _ = bot
-                .edit_message_text(message.chat.id, processing_message.id, error_text)
-                .await;
-            return Ok(());
-        }
-    };
-    let caption = build_image_caption(&model_name, &prompt).await;
-
-    let mut image_iter = images.into_iter();
-    if let Some(first_image) = image_iter.next() {
-        let media = InputMedia::Photo(
-            InputMediaPhoto::new(InputFile::memory(first_image.clone()))
-                .caption(caption.clone())
-                .parse_mode(ParseMode::Html),
-        );
-        let edit_result = bot
-            .edit_message_media(message.chat.id, processing_message.id, media)
-            .await;
-        if edit_result.is_err() {
-            bot.send_photo(message.chat.id, InputFile::memory(first_image))
-                .reply_parameters(ReplyParameters::new(message.id))
-                .caption(caption)
-                .parse_mode(ParseMode::Html)
+    crate::utils::telegram::run_with_status_message(
+        &bot,
+        processing_message.chat.id,
+        processing_message.id,
+        "Failed to generate your image. Please try again.",
+        async {
+            let _heavy_permit = _heavy_permit;
+            let typing_chat_action =
+                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
+            let history = state
+                .db
+                .select_messages_by_user(
+                    message.chat.id.0,
+                    user_id,
+                    CONFIG.limits.user_history_message_count,
+                    true,
+                )
                 .await?;
-            let _ = bot
-                .edit_message_text(
+
+            if history.is_empty() {
+                bot.edit_message_text(
                     message.chat.id,
                     processing_message.id,
-                    "Generated image below.",
+                    "I don't have enough of your messages in this chat yet.",
                 )
+                .await?;
+                return Ok(());
+            }
+            let audit_context = create_command_audit_context(
+                &state,
+                &message,
+                if portrait { "portraitme" } else { "paintme" },
+            )
+            .await;
+
+            let mut history_lines = String::new();
+            for msg in history {
+                let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
+                let text = msg.text.unwrap_or_default();
+                history_lines.push_str(&format!("{}: {}\n", timestamp, text));
+            }
+            let formatted_history = format!(
+                "Here is the user's recent chat history in this group:\n\n{}",
+                crate::llm::prompting::wrap_chat_history(&history_lines)
+            );
+
+            let prompt_system = if portrait {
+                PORTRAIT_SYSTEM_PROMPT
+            } else {
+                PAINTME_SYSTEM_PROMPT
+            };
+
+            let (prompt, _prompt_model) = match call_configured_text_model(
+                prompt_system,
+                &formatted_history,
+                if portrait {
+                    "Portrait Prompt"
+                } else {
+                    "Paint Prompt"
+                },
+                false,
+                false,
+                None,
+                Some(if portrait {
+                    "PORTRAIT_SYSTEM_PROMPT"
+                } else {
+                    "PAINTME_SYSTEM_PROMPT"
+                }),
+                audit_context.as_ref(),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => return Err(err),
+            };
+            drop(typing_chat_action);
+
+            // The model is asked for raw JSON; defensively unfence/extract before it
+            // reaches the image model so a ```json wrapper or preamble can't corrupt it.
+            let prompt = sanitize_image_prompt_json(&prompt);
+
+            let status_text = if portrait {
+                "Generating your portrait..."
+            } else {
+                "Generating your image..."
+            };
+            let _ = bot
+                .edit_message_text(message.chat.id, processing_message.id, status_text)
                 .await;
-        }
-    }
+            let _photo_chat_action =
+                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
 
-    for image in image_iter {
-        bot.send_photo(message.chat.id, InputFile::memory(image))
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
-    }
+            let (model_name, image_result) = generate_image_with_configured_default(
+                &prompt,
+                &[],
+                None,
+                None,
+                !CONFIG.cwd_pw.api_key.is_empty(),
+                audit_context.as_ref(),
+            )
+            .await;
 
-    Ok(())
+            let images = match image_result {
+                Ok(images) => images,
+                Err(err) => return Err(anyhow::anyhow!(err.0)),
+            };
+            let caption = build_image_caption(&model_name, &prompt).await;
+
+            if images.is_empty() {
+                return Err(anyhow::anyhow!("Image generation returned no images"));
+            }
+            let mut image_iter = images.into_iter();
+            if let Some(first_image) = image_iter.next() {
+                let media = InputMedia::Photo(
+                    InputMediaPhoto::new(InputFile::memory(first_image.clone()))
+                        .caption(caption.clone())
+                        .parse_mode(ParseMode::Html),
+                );
+                let edit_result = bot
+                    .edit_message_media(message.chat.id, processing_message.id, media)
+                    .await;
+                if edit_result.is_err() {
+                    bot.send_photo(message.chat.id, InputFile::memory(first_image))
+                        .reply_parameters(ReplyParameters::new(message.id))
+                        .caption(caption)
+                        .parse_mode(ParseMode::Html)
+                        .await?;
+                    let _ = bot
+                        .edit_message_text(
+                            message.chat.id,
+                            processing_message.id,
+                            "Generated image below.",
+                        )
+                        .await;
+                }
+            }
+
+            for image in image_iter {
+                bot.send_photo(message.chat.id, InputFile::memory(image))
+                    .reply_parameters(ReplyParameters::new(message.id))
+                    .await?;
+            }
+
+            Ok(())
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
