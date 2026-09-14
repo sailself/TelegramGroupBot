@@ -1252,6 +1252,20 @@ fn gemini_tool_call(function_call: &Value) -> ToolCall {
     }
 }
 
+fn decode_gemini_turn(response: &Value) -> Result<ModelTurn<Value>> {
+    let content = extract_candidate_content(response)
+        .ok_or_else(|| anyhow!("Gemini tool response did not include candidate content"))?;
+    let tool_calls = extract_function_calls(&content)
+        .iter()
+        .map(gemini_tool_call)
+        .collect();
+    Ok(ModelTurn {
+        text: extract_text_from_response_value(response),
+        tool_calls,
+        transcript: vec![content],
+    })
+}
+
 /// Gemini half of the shared tool loop.
 struct GeminiProtocol<'a> {
     model: &'a str,
@@ -1304,17 +1318,7 @@ impl ToolProtocol for GeminiProtocol<'_> {
                 "call_gemini_with_tool_runtime",
             )
             .await?;
-            let content = extract_candidate_content(&response)
-                .ok_or_else(|| anyhow!("Gemini tool response did not include candidate content"))?;
-            let tool_calls = extract_function_calls(&content)
-                .iter()
-                .map(gemini_tool_call)
-                .collect();
-            Ok(ModelTurn {
-                text: extract_text_from_response_value(&response),
-                tool_calls,
-                transcript: vec![content],
-            })
+            decode_gemini_turn(&response)
         })
     }
 
@@ -2036,6 +2040,39 @@ mod tests {
             retryable,
         }
         .into()
+    }
+
+    #[tokio::test]
+    async fn gemini_adapter_tool_call_result_and_final_answer() {
+        let protocol = GeminiProtocol {
+            model: "test",
+            system_prompt: "system",
+            system_prompt_label: None,
+            final_response_json_schema: None,
+            audit_context: None,
+            final_pass: false,
+        };
+        let response = json!({"candidates":[{"content":{"role":"model","parts":[{"thoughtSignature":"preserve-signature","functionCall":{"id":"call17","name":"chat_context_query","args":{"operation":"search","query":"needle"}}}]}}]});
+        let turn = decode_gemini_turn(&response).unwrap();
+        assert_eq!(
+            turn.transcript[0]["parts"][0]["thoughtSignature"],
+            "preserve-signature"
+        );
+        let (db, mut runtime) = crate::test_support::chat_tool_fixture().await;
+        let call = turn.tool_calls.into_iter().next().unwrap();
+        let output = runtime.execute_tool(&call.name, &call.arguments).await;
+        let results = protocol.tool_results(vec![(call, output)]);
+        assert_eq!(results[0]["parts"][0]["functionResponse"]["id"], "call17");
+        assert_eq!(
+            results[0]["parts"][0]["functionResponse"]["name"],
+            "chat_context_query"
+        );
+        assert!(results[0].to_string().contains("needle evidence"));
+        assert_eq!(runtime.accumulated_message_ids(), vec![17]);
+        let answer = decode_gemini_turn(&json!({"candidates":[{"content":{"role":"model","parts":[{"text":"grounded final"}]}}]})).unwrap();
+        assert!(answer.tool_calls.is_empty());
+        assert_eq!(answer.text, "grounded final");
+        db.shutdown().await;
     }
 
     #[tokio::test]

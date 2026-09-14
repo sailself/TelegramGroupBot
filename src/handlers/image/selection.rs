@@ -233,9 +233,12 @@ pub async fn image_selection_callback(
     let Some((_, payload)) = data.split_once(':') else {
         return Ok(());
     };
-    let Some((key, _)) = payload.split_once('|') else {
+    let Some((key, value)) = payload.split_once('|') else {
         return Ok(());
     };
+    if value.contains('|') {
+        return Ok(());
+    }
     let gate = {
         let entry = state.pending_image_requests.entry(key);
         entry.get().map(|r| r.selection_gate.clone())
@@ -461,4 +464,149 @@ pub async fn image_selection_callback(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
+    fn request(stage: ImageSelectionStage) -> PendingImageRequest {
+        PendingImageRequest {
+            selection_gate: Default::default(),
+            stage,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+            user_id: 1,
+            chat_id: 2,
+            message_id: 3,
+            command: PendingImageCommand::Image,
+            prompt: "prompt".into(),
+            image_urls: vec![],
+            telegraph_contents: vec![],
+            selection_message_id: 4,
+            llm_invocation_id: None,
+            model: Some(ImageGenerationModel::Gemini),
+            codex_size: None,
+            resolution: Some("4K".into()),
+            aspect_ratio: None,
+        }
+    }
+    fn callback(data: &str, user: i64, message: i32) -> CallbackQuery {
+        serde_json::from_value(serde_json::json!({"id":"callback","from":{"id":user,"is_bot":false,"first_name":"fixture"},"message":{"message_id":message,"date":1,"chat":{"id":2,"type":"private"},"text":"picker"},"chat_instance":"test","data":data})).unwrap()
+    }
+    fn acknowledgement() -> ExpectedRequest {
+        ExpectedRequest::new(
+            "POST",
+            "/bot123:test/AnswerCallbackQuery",
+            response_with_status(200, br#"{"ok":true,"result":true}"#.to_vec()),
+        )
+    }
+
+    #[tokio::test]
+    async fn callbacks_do_not_redraw_unauthorized_expired_duplicate_or_missing_menus() {
+        let mut expected = (0..6).map(|_| acknowledgement()).collect::<Vec<_>>();
+        expected.push(ExpectedRequest::new("POST","/bot123:test/EditMessageText",response_with_status(200,br#"{"ok":true,"result":{"message_id":4,"date":1,"chat":{"id":2,"type":"private"}}}"#.to_vec())));
+        expected.extend((0..2).map(|_| acknowledgement()));
+        let server = TestServer::new(expected);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        let db = crate::db::test_support::init_test_db("image-callbacks").await;
+        let state = AppState::new(db.clone(), 123, "test".into());
+        state
+            .pending_image_requests
+            .insert("req".into(), request(ImageSelectionStage::Resolution));
+        for (data, user, message) in [
+            ("image_aspect:req|1:1", 1, 4),
+            ("image_res:req|4K", 9, 4),
+            ("image_res:req|4K", 1, 9),
+            ("image_res:req|invalid", 1, 4),
+        ] {
+            image_selection_callback(bot.clone(), state.clone(), callback(data, user, message))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            state
+                .pending_image_requests
+                .entry("req")
+                .get()
+                .unwrap()
+                .stage,
+            ImageSelectionStage::Resolution
+        );
+        state
+            .pending_image_requests
+            .entry("req")
+            .get_mut()
+            .unwrap()
+            .deadline = tokio::time::Instant::now();
+        image_selection_callback(
+            bot.clone(),
+            state.clone(),
+            callback("image_res:req|4K", 1, 4),
+        )
+        .await
+        .unwrap();
+        state
+            .pending_image_requests
+            .entry("req")
+            .get_mut()
+            .unwrap()
+            .deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        image_selection_callback(
+            bot.clone(),
+            state.clone(),
+            callback("image_res:req|4K", 1, 4),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .pending_image_requests
+                .entry("req")
+                .get()
+                .unwrap()
+                .stage,
+            ImageSelectionStage::AspectRatio
+        );
+        image_selection_callback(
+            bot.clone(),
+            state.clone(),
+            callback("image_res:req|1K", 1, 4),
+        )
+        .await
+        .unwrap();
+        let saved = state.pending_image_requests.entry("req").take().unwrap();
+        assert_eq!(saved.resolution.as_deref(), Some("4K"));
+        image_selection_callback(bot, state, callback("image_res:req|4K", 1, 4))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        db.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_picker_stage_times_out_once_with_saved_choices() {
+        for stage in [
+            ImageSelectionStage::Model,
+            ImageSelectionStage::Resolution,
+            ImageSelectionStage::AspectRatio,
+            ImageSelectionStage::CodexSize,
+        ] {
+            let pending = crate::state::PendingRequests::new();
+            let (send, receive) = tokio::sync::oneshot::channel();
+            pending.insert_with_deadline(
+                "req".into(),
+                request(stage),
+                |r| r.deadline,
+                move |r| async move {
+                    send.send(r).unwrap();
+                },
+            );
+            tokio::time::advance(Duration::from_secs(11)).await;
+            let expired = receive.await.unwrap();
+            assert_eq!(expired.stage, stage);
+            assert_eq!(expired.resolution.as_deref(), Some("4K"));
+            assert_eq!(pending.count(), 0);
+            assert!(pending.entry("req").take().is_none());
+        }
+    }
 }

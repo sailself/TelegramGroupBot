@@ -166,6 +166,31 @@ pub async fn profileme_handler(
     .await
 }
 
+struct PersonaImagePrompt {
+    audit_label: &'static str,
+    system_prompt: &'static str,
+    title: &'static str,
+    prompt_label: &'static str,
+}
+
+fn persona_image_prompt(portrait: bool) -> PersonaImagePrompt {
+    if portrait {
+        PersonaImagePrompt {
+            audit_label: "portraitme",
+            system_prompt: PORTRAIT_SYSTEM_PROMPT,
+            title: "Portrait Prompt",
+            prompt_label: "PORTRAIT_SYSTEM_PROMPT",
+        }
+    } else {
+        PersonaImagePrompt {
+            audit_label: "paintme",
+            system_prompt: PAINTME_SYSTEM_PROMPT,
+            title: "Paint Prompt",
+            prompt_label: "PAINTME_SYSTEM_PROMPT",
+        }
+    }
+}
+
 pub async fn paintme_handler(
     bot: Bot,
     state: AppState,
@@ -224,12 +249,9 @@ pub async fn paintme_handler(
                 .await?;
                 return Ok(());
             }
-            let audit_context = create_command_audit_context(
-                &state,
-                &message,
-                if portrait { "portraitme" } else { "paintme" },
-            )
-            .await;
+            let persona = persona_image_prompt(portrait);
+            let audit_context =
+                create_command_audit_context(&state, &message, persona.audit_label).await;
 
             let mut history_lines = String::new();
             for msg in history {
@@ -242,29 +264,15 @@ pub async fn paintme_handler(
                 crate::llm::prompting::wrap_chat_history(&history_lines)
             );
 
-            let prompt_system = if portrait {
-                PORTRAIT_SYSTEM_PROMPT
-            } else {
-                PAINTME_SYSTEM_PROMPT
-            };
-
             let (prompt, _prompt_model) =
                 match call_configured_text_model(crate::llm::text_model::TextCallRequest {
-                    system_prompt: prompt_system,
+                    system_prompt: persona.system_prompt,
                     user_content: &formatted_history,
-                    response_title: if portrait {
-                        "Portrait Prompt"
-                    } else {
-                        "Paint Prompt"
-                    },
+                    response_title: persona.title,
                     tools_enabled: false,
                     use_pro: false,
                     media_files: None,
-                    prompt_name: Some(if portrait {
-                        "PORTRAIT_SYSTEM_PROMPT"
-                    } else {
-                        "PAINTME_SYSTEM_PROMPT"
-                    }),
+                    prompt_name: Some(persona.prompt_label),
                     audit_context: audit_context.as_ref(),
                 })
                 .await
@@ -325,6 +333,19 @@ pub async fn paintme_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paintme_and_portraitme_keep_distinct_prompts_and_audit_labels() {
+        let paint = persona_image_prompt(false);
+        let portrait = persona_image_prompt(true);
+        assert_eq!(paint.audit_label, "paintme");
+        assert_eq!(portrait.audit_label, "portraitme");
+        assert_eq!(paint.system_prompt, PAINTME_SYSTEM_PROMPT);
+        assert_eq!(portrait.system_prompt, PORTRAIT_SYSTEM_PROMPT);
+        assert_ne!(paint.system_prompt, portrait.system_prompt);
+        assert_eq!(paint.prompt_label, "PAINTME_SYSTEM_PROMPT");
+        assert_eq!(portrait.prompt_label, "PORTRAIT_SYSTEM_PROMPT");
+    }
 
     #[test]
     fn sanitize_image_prompt_json_unfences_and_extracts() {

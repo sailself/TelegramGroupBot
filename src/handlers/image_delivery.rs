@@ -33,13 +33,16 @@ pub(super) async fn deliver_generated_images(
                 photo = photo.spoiler();
             }
             let media = InputMedia::Photo(photo);
-            if retry_telegram("edit generated image", || {
+            match retry_telegram("edit generated image", || {
                 bot.edit_message_media(chat, status, media.clone())
             })
             .await
-            .is_ok()
             {
-                continue;
+                Ok(_)
+                | Err(teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)) => {
+                    continue
+                }
+                Err(_) => {}
             }
         }
         retry_telegram("send generated image", || {
@@ -99,6 +102,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiple_images_keep_their_generation_order() {
+        let server = TestServer::new(vec![
+            ExpectedRequest::new(
+                "POST",
+                "/bot123:test/EditMessageMedia",
+                response(true, false),
+            )
+            .with_body_fragment(b"FIRST_IMAGE"),
+            ExpectedRequest::new("POST", "/bot123:test/SendPhoto", response(true, false))
+                .with_body_fragment(b"SECOND_IMAGE"),
+            ExpectedRequest::new("POST", "/bot123:test/SendPhoto", response(true, false))
+                .with_body_fragment(b"THIRD_IMAGE"),
+        ]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        let files = [b"FIRST_IMAGE".as_slice(), b"SECOND_IMAGE", b"THIRD_IMAGE"]
+            .into_iter()
+            .map(|bytes| InputFile::memory(bytes.to_vec()))
+            .collect();
+        deliver_generated_images(
+            &bot,
+            ChatId(1),
+            MessageId(2),
+            MessageId(3),
+            files,
+            "caption",
+            false,
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn already_applied_edit_does_not_send_a_duplicate_photo() {
+        let unchanged=response_with_status(400,br#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"}"#.to_vec());
+        let server = TestServer::new(vec![
+            photo_request("EditMessageMedia", false, true),
+            ExpectedRequest::new("POST", "/bot123:test/EditMessageMedia", unchanged)
+                .with_body_fragment(b"GENERATED_IMAGE_BYTES"),
+        ]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        deliver_generated_images(
+            &bot,
+            ChatId(1),
+            MessageId(2),
+            MessageId(3),
+            vec![InputFile::memory(b"GENERATED_IMAGE_BYTES".to_vec())],
+            "caption",
+            false,
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_edit_recovers_without_duplicate_send() {
+        let server = TestServer::new(vec![
+            photo_request("EditMessageMedia", false, true),
+            photo_request("EditMessageMedia", true, false),
+        ]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        deliver_generated_images(
+            &bot,
+            ChatId(1),
+            MessageId(2),
+            MessageId(3),
+            vec![InputFile::memory(b"GENERATED_IMAGE_BYTES".to_vec())],
+            "caption",
+            false,
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn img2_file_retries_preserve_bytes_and_spoiler() {
+        let path = crate::db::test_support::test_db_path("img2-payload").with_extension("png");
+        std::fs::write(&path, b"GENERATED_IMAGE_BYTES").unwrap();
+        let server = TestServer::new(vec![
+            photo_request("EditMessageMedia", false, false),
+            photo_request("SendPhoto", false, true).with_body_fragment(b"has_spoiler"),
+            photo_request("SendPhoto", true, false)
+                .with_body_fragment(b"has_spoiler")
+                .with_body_fragment(b"\r\n\r\ntrue\r\n")
+                .with_body_fragment(b"<tg-spoiler>caption</tg-spoiler>"),
+            ExpectedRequest::new(
+                "POST",
+                "/bot123:test/EditMessageText",
+                response(true, false),
+            ),
+        ]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        deliver_generated_images(
+            &bot,
+            ChatId(1),
+            MessageId(2),
+            MessageId(3),
+            vec![InputFile::file(path.clone())],
+            "caption",
+            true,
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn all_image_command_delivery_modes_preserve_payload_caption_and_retry() {
         for command in ["img", "image", "img2", "paintme", "portraitme"] {
             let caption = if command == "img2" {
@@ -121,17 +234,24 @@ mod tests {
                 ),
             ]);
             let bot = Bot::new("123:test").set_api_url(server.base_url());
+            let generations = std::sync::atomic::AtomicUsize::new(0);
+            let generated = async {
+                generations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vec![InputFile::memory(b"GENERATED_IMAGE_BYTES".to_vec())]
+            }
+            .await;
             deliver_generated_images(
                 &bot,
                 ChatId(1),
                 MessageId(2),
                 MessageId(3),
-                vec![InputFile::memory(b"GENERATED_IMAGE_BYTES".to_vec())],
+                generated,
                 "caption",
                 command == "img2",
             )
             .await
             .unwrap();
+            assert_eq!(generations.load(std::sync::atomic::Ordering::SeqCst), 1);
             server.join().unwrap();
         }
     }

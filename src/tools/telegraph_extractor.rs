@@ -245,3 +245,20 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
 
     Ok(content)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn extractor_rejects_non_telegraph_hosts_before_network_access() {
+        for url in [
+            "https://example.test/page",
+            "https://telegra.ph.example.test/page",
+            "https://t.me/c/123/1",
+            "http://telegra.ph/page",
+            "https://user:password@telegra.ph/page",
+        ] {
+            assert!(extract_telegraph_content(url).await.is_err(), "{url}");
+        }
+    }
+}

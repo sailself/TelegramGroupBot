@@ -2,7 +2,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::CONFIG;
@@ -80,9 +80,36 @@ impl Database {
     }
 }
 
-pub(super) async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<WriterCommand>) {
-    let flush_deadline = Duration::from_millis(CONFIG.db.write_flush_ms);
-    let batch_size = CONFIG.db.write_batch_size.max(1);
+struct WriterSettings {
+    flush_deadline: Duration,
+    batch_size: usize,
+    dead_letter_path: PathBuf,
+    #[cfg(test)]
+    batch_written: Option<mpsc::UnboundedSender<usize>>,
+}
+
+pub(super) async fn db_writer(pool: SqlitePool, receiver: mpsc::Receiver<WriterCommand>) {
+    run_writer(
+        pool,
+        receiver,
+        WriterSettings {
+            flush_deadline: Duration::from_millis(CONFIG.db.write_flush_ms),
+            batch_size: CONFIG.db.write_batch_size.max(1),
+            dead_letter_path: PathBuf::from(DB_WRITE_DEAD_LETTER_PATH),
+            #[cfg(test)]
+            batch_written: None,
+        },
+    )
+    .await;
+}
+
+async fn run_writer(
+    pool: SqlitePool,
+    mut receiver: mpsc::Receiver<WriterCommand>,
+    settings: WriterSettings,
+) {
+    let batch_size = settings.batch_size;
+    let flush_deadline = settings.flush_deadline;
     let mut buffer = Vec::with_capacity(batch_size);
     let mut shutting_down = false;
 
@@ -140,14 +167,17 @@ pub(super) async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<Wri
         }
 
         let result =
-            write_message_batch_with_recovery(&pool, &buffer, Path::new(DB_WRITE_DEAD_LETTER_PATH))
-                .await;
+            write_message_batch_with_recovery(&pool, &buffer, &settings.dead_letter_path).await;
         if let Err(err) = &result {
             error!("Error in db_writer batch after recovery attempts: {err}");
         }
         #[cfg(test)]
         for acknowledgement in acknowledgements {
             let _ = acknowledgement.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+        }
+        #[cfg(test)]
+        if let Some(observer) = &settings.batch_written {
+            let _ = observer.send(buffer.len());
         }
         buffer.clear();
     }
@@ -330,6 +360,166 @@ mod tests {
     use crate::db::test_support::{sqlite_url_for_path, test_db_path, wait_for_search_ready};
     use chrono::Utc;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    fn fixture_message(id: i64, text: &str) -> MessageInsert {
+        build_message_insert(
+            Some(1),
+            Some("alice".into()),
+            Some(text.into()),
+            Some("en".into()),
+            Utc::now(),
+            None,
+            Some(-100),
+            Some(id),
+            None,
+            false,
+            None,
+            false,
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn writer_batches_messages_and_flushes_on_deadline() {
+        let db = crate::db::test_support::init_test_db("writer-deadline").await;
+        let (send, recv) = mpsc::channel(10);
+        let (written, mut observed) = mpsc::unbounded_channel();
+        let settings = WriterSettings {
+            flush_deadline: Duration::from_secs(10),
+            batch_size: 3,
+            dead_letter_path: test_db_path("writer-unused").with_extension("jsonl"),
+            batch_written: Some(written),
+        };
+        let task = tokio::spawn(run_writer(db.pool().clone(), recv, settings));
+        send.send(WriterCommand::Insert(fixture_message(1, "one")))
+            .await
+            .unwrap();
+        send.send(WriterCommand::Insert(fixture_message(2, "two")))
+            .await
+            .unwrap();
+        send.send(WriterCommand::Insert(fixture_message(3, "three")))
+            .await
+            .unwrap();
+        assert_eq!(observed.recv().await, Some(3));
+        // Once real SQLite I/O is idle, use paused time only for the batching timer.
+        tokio::time::pause();
+        send.send(WriterCommand::Insert(fixture_message(4, "four")))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(observed.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        assert_eq!(observed.recv().await, Some(1));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 4);
+        send.send(WriterCommand::Shutdown).await.unwrap();
+        task.await.unwrap();
+        db.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_salvages_valid_messages_and_edits_upsert() {
+        let db = crate::db::test_support::init_test_db("writer-salvage").await;
+        sqlx::query("CREATE TRIGGER reject_fixture BEFORE INSERT ON messages WHEN NEW.message_id=2 BEGIN SELECT RAISE(ABORT,'invalid fixture'); END").execute(db.pool()).await.unwrap();
+        let path = test_db_path("writer-mixed").with_extension("jsonl");
+        let batch = vec![
+            fixture_message(1, "original"),
+            fixture_message(2, "invalid"),
+            fixture_message(3, "valid"),
+        ];
+        assert!(write_message_batch_with_recovery(db.pool(), &batch, &path)
+            .await
+            .is_err());
+        let ids: Vec<i64> =
+            sqlx::query_scalar("SELECT message_id FROM messages ORDER BY message_id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let row_id: i64 = sqlx::query_scalar("SELECT id FROM messages WHERE message_id=1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        write_message_batch(db.pool(), &[fixture_message(1, "edited")])
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT id FROM messages WHERE message_id=1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            row_id
+        );
+        assert!(db
+            .search_chat_messages(-100, "original", 10, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.search_chat_messages(-100, "edited", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn writer_retry_succeeds_after_observed_lock_failure() {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use std::str::FromStr;
+        let path = test_db_path("writer-retry");
+        let url = sqlite_url_for_path(&path);
+        let db = Database::init(&url).await.unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&url)
+                    .unwrap()
+                    .busy_timeout(Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        let mut lock = db.pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(10), seen.notified())
+                .await
+                .expect("writer must report the retry before releasing the lock");
+            sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+        };
+        let batch = [fixture_message(1, "retry recovered")];
+        let dead_letter = path.with_extension("jsonl");
+        let work = crate::utils::log_capture::capture_json_events_on(
+            write_message_batch_with_recovery(&pool, &batch, &dead_letter),
+            "retrying once",
+            seen.clone(),
+        );
+        let ((result, _), ()) = tokio::join!(work, release);
+        result.unwrap();
+        assert!(!dead_letter.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        drop(lock);
+        pool.close().await;
+        db.shutdown().await;
+    }
 
     #[tokio::test]
     async fn shutdown_flushes_queued_inserts_before_returning() {

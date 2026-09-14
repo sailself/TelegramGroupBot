@@ -376,12 +376,8 @@ pub async fn run_qc_pipeline(
     // Phase D: final answer over curated evidence with the selected model.
     progress.update_now("Composing answer...").await;
     let final_system_prompt = format!("{}\n\n{QC_EVIDENCE_ADDENDUM}", request.system_prompt);
-    if search_status.successes == 0 && search_status.failures > 0 {
-        return Ok(QcPipelineResult::Answer(QcAgentOutcome {
-            answer: "Chat search is temporarily unavailable. Please try again later.".to_string(),
-            gemini_model_used: None,
-            valid_message_ids: Vec::new(),
-        }));
+    if let Some(outcome) = search_status.failure_outcome() {
+        return Ok(QcPipelineResult::Answer(outcome));
     }
     let mut user_content = build_final_input(request.query, &hits, &web_evidence);
     if search_status.failures > 0 {
@@ -411,16 +407,16 @@ async fn plan_queries(
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<Vec<String>> {
     let input = truncate_for_log(query, PLANNER_INPUT_MAX_CHARS);
-    let plan: QcPlan = call_step_json(
+    let plan: QcPlan = call_step_json(crate::agents::step::StepCallRequest {
         step_model,
-        QC_PLAN_PROMPT,
-        &input,
-        &[],
-        &plan_schema(),
-        "Chat QC Plan",
-        "planner",
+        system_prompt: QC_PLAN_PROMPT,
+        user_content: &input,
+        media_files: &[],
+        json_schema: Some(&plan_schema()),
+        response_title: "Chat QC Plan",
+        system_prompt_label: Some("planner"),
         audit_context,
-    )
+    })
     .await?;
     Ok(normalize_queries(plan.queries, MAX_PLANNED_QUERIES))
 }
@@ -451,16 +447,16 @@ async fn reflect(
         ));
     }
 
-    call_step_json(
+    call_step_json(crate::agents::step::StepCallRequest {
         step_model,
-        QC_REFLECT_PROMPT,
-        &input,
-        &[],
-        &reflect_schema(),
-        "Chat QC Reflect",
-        "reflect",
+        system_prompt: QC_REFLECT_PROMPT,
+        user_content: &input,
+        media_files: &[],
+        json_schema: Some(&reflect_schema()),
+        response_title: "Chat QC Reflect",
+        system_prompt_label: Some("reflect"),
         audit_context,
-    )
+    })
     .await
 }
 
@@ -468,6 +464,31 @@ async fn reflect(
 struct SearchStatus {
     successes: usize,
     failures: usize,
+}
+
+impl SearchStatus {
+    fn record(&mut self, query: &str, hits: &mut Vec<EvidenceHit>, result: Result<Value>) {
+        match result {
+            Ok(value) => {
+                if merge_hits(hits, value) {
+                    self.successes += 1;
+                } else {
+                    self.failures += 1;
+                }
+            }
+            Err(error) => {
+                self.failures += 1;
+                warn!("agentic /qc chat search '{query}' failed: {error}");
+            }
+        }
+    }
+    fn failure_outcome(&self) -> Option<QcAgentOutcome> {
+        (self.successes == 0 && self.failures > 0).then(|| QcAgentOutcome {
+            answer: "Chat search is temporarily unavailable. Please try again later.".to_string(),
+            gemini_model_used: None,
+            valid_message_ids: Vec::new(),
+        })
+    }
 }
 
 /// Execute one chat search through the runtime, deduplicating hits by id.
@@ -486,19 +507,11 @@ async fn run_chat_search(
     }
     executed_queries.push(query.to_string());
 
-    match runtime.run_search_query(query, None, 0, 0).await {
-        Ok(value) => {
-            if merge_hits(hits, value) {
-                status.successes += 1;
-            } else {
-                status.failures += 1;
-            }
-        }
-        Err(err) => {
-            status.failures += 1;
-            warn!("agentic /qc chat search '{query}' failed: {err}");
-        }
-    }
+    status.record(
+        query,
+        hits,
+        runtime.run_search_query(query, None, 0, 0).await,
+    );
 }
 
 fn merge_hits(hits: &mut Vec<EvidenceHit>, search_result: Value) -> bool {
@@ -646,6 +659,30 @@ fn reflect_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_failed_searches_report_temporary_failure_but_successful_empty_searches_do_not() {
+        let mut status = SearchStatus::default();
+        let mut hits = Vec::new();
+        status.record(
+            "fixture",
+            &mut hits,
+            Err(anyhow::anyhow!("synthetic DB failure")),
+        );
+        status.record(
+            "fixture",
+            &mut hits,
+            Ok(json!({"unexpected":"decode failure"})),
+        );
+        let outcome = status.failure_outcome().unwrap();
+        assert!(outcome.answer.contains("temporarily unavailable"));
+        assert!(!outcome.answer.contains("no matching"));
+        assert!(outcome.valid_message_ids.is_empty());
+        assert_eq!((status.successes, status.failures), (0, 2));
+        status.record("fixture", &mut hits, Ok(json!({"results":[]})));
+        assert!(status.failure_outcome().is_none());
+        assert_eq!((status.successes, status.failures), (1, 2));
+    }
 
     #[test]
     fn failed_or_malformed_searches_do_not_erase_available_evidence() {

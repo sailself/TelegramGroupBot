@@ -1499,16 +1499,9 @@ mod tests {
         db.queue_message_insert(insert)
             .await
             .expect("message insert should queue");
-        // Wait for the async write queue to flush the row before querying it.
-        for _ in 0..200 {
-            if let Ok(Some(rows)) = db.get_message_window(chat_id, message_id, 0, 0).await {
-                if !rows.is_empty() {
-                    return;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        panic!("message {message_id} was not persisted in time");
+        db.flush_for_test()
+            .await
+            .expect("writer flush acknowledgement");
     }
 
     #[test]
@@ -1728,16 +1721,9 @@ mod tests {
         db.queue_message_insert(insert)
             .await
             .expect("message insert should queue");
-        // Wait for the async write queue to flush the row.
-        for _ in 0..200 {
-            if let Ok(Some(rows)) = db.get_message_window(chat_id, message_id, 0, 0).await {
-                if !rows.is_empty() {
-                    return;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        panic!("message {message_id} was not persisted in time");
+        db.flush_for_test()
+            .await
+            .expect("writer flush acknowledgement");
     }
 
     #[test]

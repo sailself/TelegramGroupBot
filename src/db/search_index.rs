@@ -955,3 +955,122 @@ mod lock_recovery_tests {
         db.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod performance_measurement {
+    use super::*;
+    use crate::db::test_support::{sqlite_url_for_path, test_db_path};
+    use sqlx::Row;
+
+    /// Explicit opt-in: identical harness also runs on the 99621bf baseline.
+    #[tokio::test]
+    #[ignore = "synthetic performance measurement; run explicitly and serially"]
+    async fn synthetic_search_measurement() {
+        let path = test_db_path("search-measurement");
+        let url = sqlite_url_for_path(&path);
+        let db = Database::init(&url).await.unwrap();
+        let date = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut corpus = Vec::new();
+        for chat in 1..=200 {
+            for id in 1..=160 {
+                let text = format!(
+                    "alpha beta 计算机科学 café bitcoin Telegram multilingual message {id} {}",
+                    "中文讨论 Rust search 日本語 français ".repeat((id % 5 + 1) as usize)
+                );
+                corpus.push(crate::db::messages::build_message_insert(
+                    Some(id % 17),
+                    Some(format!("user{}", id % 17)),
+                    Some(text),
+                    Some("mixed".into()),
+                    date,
+                    None,
+                    Some(-1000 - chat),
+                    Some(id),
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                ));
+            }
+        }
+        let started = std::time::Instant::now();
+        for message in corpus {
+            db.queue_message_insert(message).await.unwrap();
+        }
+        db.shutdown().await;
+        let insert_seconds = started.elapsed().as_secs_f64();
+        let db = Database::init(&url).await.unwrap();
+        assert!(db.is_search_ready());
+        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let freelist: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let mut query_metrics = Vec::new();
+        for query in [
+            "alpha beta",
+            "计算机",
+            "bitcoin",
+            "café",
+            "bitco",
+            "missingterm",
+        ] {
+            let mut samples = Vec::new();
+            let mut ids = Vec::new();
+            for round in 0..27 {
+                let started = std::time::Instant::now();
+                let hits = db.search_chat_messages(-1001, query, 20, 40).await.unwrap();
+                if round >= 2 {
+                    samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                ids = hits.iter().map(|hit| hit.message_id).collect();
+                assert!(hits.iter().all(|hit| hit.chat_id == -1001));
+            }
+            samples.sort_by(f64::total_cmp);
+            query_metrics.push(serde_json::json!({"query":query,"median_ms":samples[12],"p95_ms":samples[23],"returned_ids":ids}));
+        }
+        let expression = if CURRENT_SEARCH_SCHEMA_VERSION >= 3 {
+            "search_tags : chatn1001 AND (search_text : bitcoin)"
+        } else {
+            "search_text : bitcoin"
+        };
+        let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT m.message_id FROM messages_fts JOIN messages m ON m.id=messages_fts.rowid WHERE m.chat_id=? AND messages_fts MATCH ? ORDER BY bm25(messages_fts,1.0,0.2),m.date DESC,m.message_id DESC LIMIT 60").bind(-1001_i64).bind(expression).fetch_all(db.pool()).await.unwrap().iter().map(|row| row.get::<String,_>("detail")).collect::<Vec<_>>();
+        sqlx::query("DROP TABLE messages_fts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        crate::db::schema::prepare_search_fts(db.pool())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        rebuild_search_index(db.pool().clone(), db.search_ready.clone())
+            .await
+            .unwrap();
+        let rebuild_seconds = started.elapsed().as_secs_f64();
+        let integrity = if CURRENT_SEARCH_SCHEMA_VERSION >= 3 {
+            "INSERT INTO messages_fts(messages_fts,rank) VALUES('integrity-check',1)"
+        } else {
+            "INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')"
+        };
+        sqlx::query(integrity).execute(db.pool()).await.unwrap();
+        let report = serde_json::json!({"normalization":CURRENT_SEARCH_SCHEMA_VERSION,"rows":32000,"chats":200,"samples_per_query":25,"insert_seconds":insert_seconds,"rows_per_second":32000.0/insert_seconds,"rebuild_seconds":rebuild_seconds,"page_count":page_count,"freelist_pages":freelist,"allocated_pages":page_count-freelist,"page_size":page_size,"query_plan":plan,"queries":query_metrics});
+        std::fs::create_dir_all("agent_logs").unwrap();
+        std::fs::write(
+            "agent_logs/search_measurement.json",
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!("SEARCH_MEASUREMENT {report}");
+        db.shutdown().await;
+    }
+}

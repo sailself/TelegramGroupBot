@@ -601,16 +601,16 @@ async fn plan_topic_request(
         let input = build_topic_plan_input(query, now, validation_error.as_deref());
         let schema = topic_plan_schema();
         let result: Result<NormalizedTopicPlan> = async {
-            let plan: TopicPlan = call_step_json(
+            let plan: TopicPlan = call_step_json(crate::agents::step::StepCallRequest {
                 step_model,
-                TOPIC_PLAN_PROMPT,
-                &input,
-                &[],
-                &schema,
-                "Chat QC Topic Plan",
-                "planner",
+                system_prompt: TOPIC_PLAN_PROMPT,
+                user_content: &input,
+                media_files: &[],
+                json_schema: Some(&schema),
+                response_title: "Chat QC Topic Plan",
+                system_prompt_label: Some("planner"),
                 audit_context,
-            )
+            })
             .await?;
             normalize_topic_plan(plan, now)
         }
@@ -659,17 +659,18 @@ async fn map_topic_chunks(
                     .collect::<BTreeSet<_>>();
                 let input = format_topic_chunk(&chunk);
                 let schema = topic_map_schema();
-                let response: TopicMapResponse = call_step_json(
-                    &step_model,
-                    TOPIC_MAP_PROMPT,
-                    &input,
-                    &[],
-                    &schema,
-                    "Chat QC Topic Map",
-                    "topic map",
-                    audit_context.as_ref(),
-                )
-                .await?;
+                let response: TopicMapResponse =
+                    call_step_json(crate::agents::step::StepCallRequest {
+                        step_model: &step_model,
+                        system_prompt: TOPIC_MAP_PROMPT,
+                        user_content: &input,
+                        media_files: &[],
+                        json_schema: Some(&schema),
+                        response_title: "Chat QC Topic Map",
+                        system_prompt_label: Some("topic map"),
+                        audit_context: audit_context.as_ref(),
+                    })
+                    .await?;
                 require_valid_topic_candidates(chunk_index, response, &allowed)
             }
         },
@@ -694,16 +695,16 @@ async fn reduce_topic_candidates(
 ) -> Result<(Vec<FinalTopicEvidence>, Vec<i64>)> {
     let input = format_topic_candidates(candidates);
     let schema = topic_reduce_schema();
-    let response: TopicReduceResponse = call_step_json(
+    let response: TopicReduceResponse = call_step_json(crate::agents::step::StepCallRequest {
         step_model,
-        TOPIC_REDUCE_PROMPT,
-        &input,
-        &[],
-        &schema,
-        "Chat QC Topic Reduce",
-        "topic reducer",
+        system_prompt: TOPIC_REDUCE_PROMPT,
+        user_content: &input,
+        media_files: &[],
+        json_schema: Some(&schema),
+        response_title: "Chat QC Topic Reduce",
+        system_prompt_label: Some("topic reducer"),
         audit_context,
-    )
+    })
     .await?;
     let (topics, valid_message_ids) =
         validate_reduce_response(response, candidates, selected_messages, topic_count);

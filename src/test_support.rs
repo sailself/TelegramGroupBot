@@ -380,6 +380,25 @@ impl std::fmt::Display for RequestError {
     }
 }
 
+fn read_more_body(stream: &mut TcpStream, bytes: &mut Vec<u8>) -> Result<(), RequestError> {
+    let mut chunk = [0; 8192];
+    let read = stream
+        .read(&mut chunk)
+        .map_err(|error| RequestError::ClientDisconnect(error.to_string()))?;
+    if read == 0 {
+        return Err(RequestError::ClientDisconnect(
+            "chunked request ended early".into(),
+        ));
+    }
+    if bytes.len() + read > 32 * 1024 * 1024 {
+        return Err(RequestError::Assertion(
+            "chunked body exceeds test limit".into(),
+        ));
+    }
+    bytes.extend_from_slice(&chunk[..read]);
+    Ok(())
+}
+
 fn read_request(stream: &mut TcpStream) -> Result<Request, RequestError> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
@@ -451,8 +470,43 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestError> {
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
+    let mut body = bytes[header_end..].to_vec();
+    if headers
+        .iter()
+        .any(|(name, value)| name == "transfer-encoding" && value.eq_ignore_ascii_case("chunked"))
+    {
+        let mut decoded = Vec::new();
+        let mut position = 0;
+        loop {
+            let line_end = loop {
+                if let Some(offset) = body[position..].windows(2).position(|w| w == b"\r\n") {
+                    break position + offset;
+                }
+                read_more_body(stream, &mut body)?;
+            };
+            let raw_size = std::str::from_utf8(&body[position..line_end])
+                .map_err(|_| RequestError::Assertion("invalid chunk length".into()))?;
+            let size = usize::from_str_radix(raw_size.split(';').next().unwrap(), 16)
+                .map_err(|_| RequestError::Assertion("invalid chunk length".into()))?;
+            if size == 0 {
+                break;
+            }
+            position = line_end + 2;
+            if size > 16 * 1024 * 1024 || decoded.len() + size > 16 * 1024 * 1024 {
+                return Err(RequestError::Assertion(
+                    "chunked body exceeds test limit".into(),
+                ));
+            }
+            while body.len() < position + size + 2 {
+                read_more_body(stream, &mut body)?;
+            }
+            decoded.extend_from_slice(&body[position..position + size]);
+            position += size + 2;
+        }
+        body = decoded;
+    }
     Ok(Request {
-        body: bytes[header_end..].to_vec(),
+        body,
         method,
         path,
         headers,
@@ -521,6 +575,16 @@ pub(crate) fn chunked_response(chunks: Vec<Vec<u8>>) -> Vec<u8> {
     }
     response.extend_from_slice(b"0\r\n\r\n");
     response
+}
+
+pub(crate) async fn chat_tool_fixture() -> (
+    crate::db::database::Database,
+    crate::llm::tool_runtime::ToolRuntime,
+) {
+    let db = crate::db::test_support::init_test_db("adapter-evidence").await;
+    crate::db::test_support::queue_message(&db, 17, -100123, "alice", "needle evidence").await;
+    let runtime = crate::llm::tool_runtime::ToolRuntime::for_qc(db.clone(), -100123);
+    (db, runtime)
 }
 
 #[cfg(test)]

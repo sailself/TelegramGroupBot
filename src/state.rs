@@ -551,6 +551,38 @@ mod tests {
         assert_eq!(pending.count(), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn callback_and_expiring_timer_claim_execution_exactly_once() {
+        let pending = PendingRequests::new();
+        let claims = Arc::new(AtomicUsize::new(0));
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let timeout_claims = claims.clone();
+        let timeout_send = send.clone();
+        pending.insert_with_deadline(
+            "key".into(),
+            tokio::time::Instant::now(),
+            |r| *r,
+            move |_| async move {
+                timeout_claims.fetch_add(1, Ordering::SeqCst);
+                timeout_send.send(()).unwrap();
+            },
+        );
+        let callback_claims = claims.clone();
+        let callback_pending = pending.clone();
+        let callback = tokio::spawn(async move {
+            if callback_pending.entry("key").take().is_some() {
+                callback_claims.fetch_add(1, Ordering::SeqCst);
+                send.send(()).unwrap();
+            }
+        });
+        callback.await.unwrap();
+        receive.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        assert_eq!(pending.count(), 0);
+        assert!(receive.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn reusing_a_held_permit_does_not_take_a_second_slot() {
         let state = test_state("reuse-permit").await;

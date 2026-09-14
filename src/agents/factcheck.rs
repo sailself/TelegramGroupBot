@@ -162,16 +162,16 @@ async fn extract_claims(
     );
     let input = truncate_for_log(statement, EXTRACTION_INPUT_MAX_CHARS);
 
-    let extraction: ClaimExtraction = call_step_json(
-        &step_model,
-        &prompt,
-        &input,
+    let extraction: ClaimExtraction = call_step_json(crate::agents::step::StepCallRequest {
+        step_model: &step_model,
+        system_prompt: &prompt,
+        user_content: &input,
         media_files,
-        &schema,
-        "Fact Check Claims",
-        "claim extraction",
+        json_schema: Some(&schema),
+        response_title: "Fact Check Claims",
+        system_prompt_label: Some("claim extraction"),
         audit_context,
-    )
+    })
     .await?;
     Ok(normalize_claims(
         extraction.claims,
