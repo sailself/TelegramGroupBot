@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use url::Url;
 
-pub const CURRENT_SEARCH_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SEARCH_SCHEMA_VERSION: i64 = 3;
 pub const SEARCH_INDEX_REBUILDING_ERROR: &str = "search_index_rebuilding";
 const MAX_SEARCH_TEXT_CHARS: usize = 4_000;
 const MAX_SEARCH_TOKEN_CHARS: usize = 8_000;
@@ -123,6 +123,7 @@ pub fn derive_search_provenance(text: &str) -> SearchProvenance {
 }
 
 pub fn normalize_message_document(
+    chat_id: i64,
     raw_text: Option<&str>,
     search_source_text: Option<&str>,
     explicit: &SearchProvenance,
@@ -137,6 +138,7 @@ pub fn normalize_message_document(
     let tag_source = search_source_text.unwrap_or_else(|| raw_text.unwrap_or_default());
     let _ = strip_urls_and_collect_tags(tag_source, &mut tag_tokens);
     add_provenance_tags(&mut tag_tokens, &provenance);
+    tag_tokens.insert(chat_search_token(chat_id));
 
     let semantic_tokens = tokenize_search_text(&normalized_semantic);
     let search_text = build_search_text(&normalized_semantic, &semantic_tokens);
@@ -147,6 +149,22 @@ pub fn normalize_message_document(
         search_tags,
         provenance,
     }
+}
+
+/// A single tokenizer-safe term, including the full signed Telegram ID range.
+pub fn chat_search_token(chat_id: i64) -> String {
+    format!(
+        "chat{}{}",
+        if chat_id < 0 { "n" } else { "p" },
+        chat_id.unsigned_abs()
+    )
+}
+
+pub fn scope_match_expression(chat_id: i64, expression: &str) -> String {
+    format!(
+        "search_tags : {} AND ({expression})",
+        chat_search_token(chat_id)
+    )
 }
 
 pub fn normalize_search_query(query: &str) -> SearchQuery {
@@ -534,6 +552,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_scope_tokens_are_single_and_cover_signed_extremes() {
+        assert_eq!(chat_search_token(i64::MIN), "chatn9223372036854775808");
+        assert_eq!(chat_search_token(i64::MAX), "chatp9223372036854775807");
+        assert_eq!(chat_search_token(0), "chatp0");
+        assert_eq!(
+            scope_match_expression(-1, "alpha OR beta"),
+            "search_tags : chatn1 AND (alpha OR beta)"
+        );
+    }
+
+    #[test]
     fn synthetic_records_drop_bot_wrappers_from_semantic_search_text() {
         let provenance = SearchProvenance {
             asks_ai: true,
@@ -542,6 +571,7 @@ mod tests {
             is_synthetic_record: true,
         };
         let document = normalize_message_document(
+            0,
             Some(
                 "Ask about chat AI bot: Context from replied message: \"\u{65e7}\u{6d88}\u{606f}\"\n\nQuestion: \u{80a1}\u{7968}\u{600e}\u{4e48}\u{4e86}",
             ),
@@ -560,6 +590,7 @@ mod tests {
     #[test]
     fn normalization_extracts_url_tags_and_ai_provenance() {
         let document = normalize_message_document(
+            0,
             Some("/qc look at this https://x.com/example/status/123"),
             None,
             &SearchProvenance::default(),

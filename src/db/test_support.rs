@@ -47,21 +47,20 @@ pub(crate) async fn wait_for_search_ready(db: &Database) {
 }
 
 pub(crate) async fn wait_for_message_row(db: &Database, chat_id: i64, message_id: i64) {
-    for _ in 0..100 {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND message_id = ?",
-        )
-        .bind(chat_id)
-        .bind(message_id)
-        .fetch_one(db.pool())
+    db.flush_for_test()
         .await
-        .expect("message row lookup should succeed");
-        if count > 0 {
-            return;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    panic!("message row did not become visible in time");
+        .expect("writer should flush queued rows");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE chat_id = ? AND message_id = ?")
+            .bind(chat_id)
+            .bind(message_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 1,
+        "queued message should exist after flush acknowledgement"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

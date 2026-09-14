@@ -45,6 +45,7 @@ struct SearchRow {
 #[derive(Debug, Clone, FromRow)]
 struct RebuildRow {
     id: i64,
+    chat_id: i64,
     text: Option<String>,
     asks_ai: bool,
     ai_command: Option<String>,
@@ -226,7 +227,10 @@ impl Database {
              LIMIT ?",
         )
         .bind(chat_id)
-        .bind(stage_query)
+        .bind(crate::db::search::scope_match_expression(
+            chat_id,
+            stage_query,
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -367,6 +371,11 @@ async fn rebuild_search_index(pool: SqlitePool, search_ready: Arc<AtomicBool>) -
                     if count_pending_search_rows(&pool).await? != 0 {
                         return Ok(false);
                     }
+                    sqlx::query(
+                        "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)",
+                    )
+                    .execute(&pool)
+                    .await?;
                     set_search_schema_version(&pool, CURRENT_SEARCH_SCHEMA_VERSION).await?;
                     Ok::<_, anyhow::Error>(true)
                 }
@@ -409,7 +418,7 @@ async fn rebuild_search_batch(
     batch_size: i64,
 ) -> Result<Option<i64>> {
     let rows = sqlx::query_as::<_, RebuildRow>(
-        "SELECT id, text, asks_ai, ai_command, is_command, is_synthetic_record FROM messages \
+        "SELECT id, chat_id, text, asks_ai, ai_command, is_command, is_synthetic_record FROM messages \
          WHERE id > ? AND search_version != ? ORDER BY id ASC LIMIT ?",
     )
     .bind(cursor)
@@ -432,7 +441,7 @@ async fn rebuild_search_batch(
             };
             (
                 row.id,
-                normalize_message_document(row.text.as_deref(), None, &explicit),
+                normalize_message_document(row.chat_id, row.text.as_deref(), None, &explicit),
             )
         })
         .collect::<Vec<_>>();
@@ -706,6 +715,65 @@ mod migration_regressions {
     use super::*;
     use crate::db::test_support::{init_test_db, queue_message, wait_for_search_ready};
     #[tokio::test]
+    async fn interrupted_backfill_survives_writes_edits_and_deletes_without_stale_terms() {
+        let db = init_test_db("external-writer-interleave").await;
+        for id in 1..=4 {
+            queue_message(&db, id, -123, "alice", "obsolete alpha").await;
+        }
+        crate::db::schema::reset_search_versions(db.pool())
+            .await
+            .unwrap();
+        let cursor = rebuild_search_batch(db.pool(), 0, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        queue_message(&db, 1, -123, "alice", "updated beta").await;
+        queue_message(&db, 5, -123, "alice", "inserted gamma").await;
+        // Delete one already indexed row and one not yet indexed row.
+        sqlx::query("DELETE FROM messages WHERE message_id IN (2,5)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(rebuild_search_batch(db.pool(), cursor, 1)
+            .await
+            .unwrap()
+            .is_some());
+        rebuild_search_index(db.pool().clone(), db.search_ready.clone())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let obsolete = db
+            .search_chat_messages(-123, "obsolete", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            obsolete
+                .iter()
+                .map(|hit| hit.message_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [3, 4].into_iter().collect()
+        );
+        assert_eq!(
+            db.search_chat_messages(-123, "beta", 10, 0).await.unwrap()[0].message_id,
+            1
+        );
+        assert!(db
+            .search_chat_messages(-123, "gamma", 10, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .search_chat_messages(123, "beta", 10, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        db.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn normalization_upgrade_resumes_without_resetting_completed_rows() {
         let db = init_test_db("normalization-resume").await;
         for id in 1..=3 {
@@ -748,8 +816,8 @@ mod migration_regressions {
             .await
             .unwrap();
         assert_eq!(
-            schema, 1,
-            "normalization must not change the database format"
+            schema, 2,
+            "external-content migration uses schema version 2"
         );
         // A missing index must rebuild even rows stamped as current.
         sqlx::query("DROP TABLE messages_fts")
@@ -808,8 +876,12 @@ mod writer_race_tests {
             .fetch_one(db.pool())
             .await
             .unwrap();
-        let stale =
-            normalize_message_document(Some("old text"), None, &SearchProvenance::default());
+        let stale = normalize_message_document(
+            -100123,
+            Some("old text"),
+            None,
+            &SearchProvenance::default(),
+        );
         // The normal writer has committed between our snapshot and batch write.
         sqlx::query("UPDATE messages SET text = 'new text', search_text = 'new indexed text', search_version = ?")
             .bind(CURRENT_SEARCH_SCHEMA_VERSION).execute(db.pool()).await.unwrap();
