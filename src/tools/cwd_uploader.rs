@@ -67,14 +67,18 @@ pub async fn upload_image_bytes_to_cwd(
         .await
         .ok()?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        warn!("CWD upload failed with status {}: {}", status, body);
+    let status = response.status();
+    let body = crate::utils::http::read_body_capped("CWD upload", response, 1024 * 1024)
+        .await
+        .ok()?;
+    if !status.is_success() {
+        let excerpt = crate::utils::text::external_failure_excerpt(
+            &String::from_utf8_lossy(&body).replace(api_key, "[REDACTED]"),
+        );
+        warn!("CWD upload failed with status {}: {}", status, excerpt);
         return None;
     }
-
-    let parsed = response.json::<CwdUploadResponse>().await.ok()?;
+    let parsed = serde_json::from_slice::<CwdUploadResponse>(&body).ok()?;
     if parsed.success {
         if let Some(url) = parsed.image_url.clone() {
             info!("Uploaded image to cwd.pw: {}", url);

@@ -1,6 +1,5 @@
-use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -152,17 +151,82 @@ fn find_latest_log_file(base_name: &str) -> io::Result<Option<PathBuf>> {
 }
 
 fn tail_file_lines(path: &Path, max_lines: usize) -> io::Result<Vec<String>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut ring = VecDeque::with_capacity(max_lines);
-
-    for line in reader.lines() {
-        let line = line?;
-        if ring.len() == max_lines {
-            ring.pop_front();
-        }
-        ring.push_back(line);
+    if max_lines == 0 {
+        return Ok(Vec::new());
     }
+    const MAX_SCAN: usize = 256 * 1024;
+    let mut file = File::open(path)?;
+    let mut position = file.metadata()?.len();
+    let mut blocks = Vec::new();
+    let mut scanned = 0;
+    let mut newlines = 0;
+    while position > 0 && scanned < MAX_SCAN && newlines <= max_lines {
+        let count = (position.min(8192) as usize).min(MAX_SCAN - scanned);
+        position -= count as u64;
+        file.seek(SeekFrom::Start(position))?;
+        let mut block = vec![0; count];
+        file.read_exact(&mut block)?;
+        newlines += block.iter().filter(|b| **b == b'\n').count();
+        scanned += count;
+        blocks.push(block);
+    }
+    let bytes: Vec<u8> = blocks.into_iter().rev().flatten().collect();
+    let capped = position > 0 && scanned == MAX_SCAN && newlines <= max_lines;
+    let start = if position > 0 {
+        bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or_else(|| {
+                bytes
+                    .iter()
+                    .position(|b| b & 0xc0 != 0x80)
+                    .unwrap_or(bytes.len())
+            })
+    } else {
+        0
+    };
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let mut lines = text
+        .lines()
+        .rev()
+        .take(max_lines)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    if capped {
+        lines.insert(
+            0,
+            "[log tail truncated: scanned at most 256 KiB]".to_string(),
+        );
+    }
+    Ok(lines)
+}
 
-    Ok(ring.into_iter().collect())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bounded_tail_preserves_text_json_and_utf8() {
+        let path = crate::db::test_support::test_db_path("log-tail").with_extension("log");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\r\nfirst\r\n{{\"message\":\"中文😀\"}}\r\nlast\n",
+                "旧".repeat(200_000)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            tail_file_lines(&path, 2).unwrap(),
+            vec![r#"{"message":"中文😀"}"#.to_string(), "last".to_string()]
+        );
+        assert!(tail_file_lines(&path, 0).unwrap().is_empty());
+        std::fs::write(&path, "中".repeat(200_000)).unwrap();
+        let tail = tail_file_lines(&path, 2).unwrap();
+        assert!(tail[0].contains("truncated"));
+        assert!(tail[1].len() <= 256 * 1024);
+        assert!(!tail[1].contains('�'));
+        std::fs::remove_file(path).unwrap();
+    }
 }

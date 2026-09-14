@@ -371,10 +371,10 @@ fn strip_indices(lines: &[String], indexes: &[Option<usize>]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::twitter_extractor::model::XMedia;
-    use crate::tools::twitter_extractor::test_support::{
+    use crate::test_support::{
         identity, response_with_content_length, ExpectedRequest, TestServer,
     };
+    use crate::tools::twitter_extractor::model::XMedia;
 
     #[test]
     fn parses_jina_photo_fixture_into_normalized_post() {

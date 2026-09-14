@@ -60,15 +60,24 @@ where
 
 /// Generation succeeded, but Telegram did not confirm photo delivery.
 #[derive(Debug, thiserror::Error)]
-#[error("Generated image delivery failed: {0}")]
-pub(crate) struct ImageDeliveryError(#[source] pub RequestError);
+#[error("Generated image delivery failed after {delivered}/{total} images: {source}")]
+pub(crate) struct ImageDeliveryError {
+    #[source]
+    pub source: RequestError,
+    pub delivered: usize,
+    pub total: usize,
+}
 
 impl ImageDeliveryError {
-    fn user_message(&self) -> &'static str {
-        if telegram_error_is_retryable(&self.0) {
-            "Your image was generated, but a network or temporary Telegram error prevented delivery after retries. Please try again later."
+    fn user_message(&self) -> String {
+        if self.delivered > 0 {
+            return format!("Generated {} images; Telegram confirmed delivery of {}. Delivery of the remaining images failed.", self.total, self.delivered);
+        }
+        if telegram_error_is_retryable(&self.source) {
+            "Your image was generated, but a network or temporary Telegram error prevented delivery after retries. Please try again later.".to_string()
         } else {
             "Your image was generated, but Telegram rejected its delivery. Please try again later."
+                .to_string()
         }
     }
 }
@@ -90,11 +99,21 @@ pub async fn run_with_status_message<T>(
         } else {
             failure_text.to_string()
         };
+        let partial_delivery = error
+            .downcast_ref::<ImageDeliveryError>()
+            .is_some_and(|failure| failure.delivered > 0);
         async move {
-            retry_telegram("terminal command status", || {
+            let reported = retry_telegram("terminal command status", || {
                 bot.edit_message_text(chat_id, message_id, text.clone())
             })
-            .await?;
+            .await;
+            if let Err(report_error) = reported {
+                if partial_delivery {
+                    send_message_with_retry(bot, chat_id, &text, Some(message_id)).await?;
+                } else {
+                    return Err(report_error.into());
+                }
+            }
             Ok(())
         }
     })
@@ -299,12 +318,21 @@ mod tests {
 
     #[test]
     fn image_delivery_errors_report_generation_success_and_keep_the_cause() {
-        let error = anyhow::Error::new(ImageDeliveryError(io_error())).context("photo upload");
+        let error = anyhow::Error::new(ImageDeliveryError {
+            source: io_error(),
+            delivered: 0,
+            total: 1,
+        })
+        .context("photo upload");
         let delivery = error.downcast_ref::<ImageDeliveryError>().unwrap();
         assert!(delivery.user_message().contains("image was generated"));
         assert!(delivery.user_message().contains("after retries"));
-        assert!(matches!(delivery.0, RequestError::Io(_)));
-        let rejected = ImageDeliveryError(RequestError::Api(ApiError::MessageNotModified));
+        assert!(matches!(delivery.source, RequestError::Io(_)));
+        let rejected = ImageDeliveryError {
+            source: RequestError::Api(ApiError::MessageNotModified),
+            delivered: 0,
+            total: 1,
+        };
         assert!(rejected.user_message().contains("Telegram rejected"));
         assert!(!rejected.user_message().contains("after retries"));
     }

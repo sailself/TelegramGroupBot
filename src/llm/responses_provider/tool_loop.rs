@@ -48,6 +48,19 @@ pub(super) fn extract_response_tool_calls(output_items: &[Value]) -> Vec<Respons
         .collect()
 }
 
+fn decode_responses_turn(response: &Value) -> ModelTurn<Value> {
+    let output_items = extract_response_output_items(response);
+    let tool_calls = extract_response_tool_calls(&output_items)
+        .into_iter()
+        .map(|call| ToolCall::from_argument_text(call.call_id, call.name, &call.arguments))
+        .collect();
+    ModelTurn {
+        text: extract_response_text(&output_items),
+        tool_calls,
+        transcript: output_items,
+    }
+}
+
 /// OpenAI Responses half of the shared tool loop.
 struct ResponsesProtocol<'a> {
     model_config: &'a ThirdPartyModelConfig,
@@ -100,16 +113,7 @@ impl ToolProtocol for ResponsesProtocol<'_> {
                 &mut self.turn_state,
             )
             .await?;
-            let output_items = extract_response_output_items(&response);
-            let tool_calls = extract_response_tool_calls(&output_items)
-                .into_iter()
-                .map(|call| ToolCall::from_argument_text(call.call_id, call.name, &call.arguments))
-                .collect();
-            Ok(ModelTurn {
-                text: extract_response_text(&output_items),
-                tool_calls,
-                transcript: output_items,
-            })
+            Ok(decode_responses_turn(&response))
         })
     }
 
@@ -161,4 +165,55 @@ pub(super) async fn responses_completion_with_tool_runtime(
         protocol.native_codex_web_search_tool.is_some()
     );
     run_tool_loop(&mut protocol, runtime, input_items, &deadline).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn responses_adapter_tool_call_result_and_final_answer() {
+        let model = ThirdPartyModelConfig {
+            id: "openai:test".into(),
+            provider: crate::config::ThirdPartyProvider::OpenAI,
+            name: "test".into(),
+            model: "test".into(),
+            image: false,
+            video: false,
+            audio: false,
+            tools: true,
+        };
+        let protocol = ResponsesProtocol {
+            model_config: &model,
+            instructions: "system".into(),
+            session_id: "test".into(),
+            turn_state: CodexTurnState::default(),
+            native_codex_web_search_tool: None,
+            audit_context: None,
+            operation: "test",
+            identity: None,
+        };
+        let response = json!({"output":[{"type":"reasoning","id":"reason17","encrypted_content":"preserve-reasoning"},{"type":"function_call","call_id":"call17","name":"chat_context_query","arguments":"{\"operation\":\"search\",\"query\":\"needle\"}"}]});
+        let turn = decode_responses_turn(&response);
+        assert_eq!(
+            turn.transcript[0]["encrypted_content"],
+            "preserve-reasoning"
+        );
+        let (db, mut runtime) = crate::test_support::chat_tool_fixture().await;
+        let call = turn.tool_calls.into_iter().next().unwrap();
+        let output = runtime.execute_tool(&call.name, &call.arguments).await;
+        let results = protocol.tool_results(vec![(call, output)]);
+        assert_eq!(results[0]["call_id"], "call17");
+        assert_eq!(results[0]["type"], "function_call_output");
+        assert!(results[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("needle evidence"));
+        assert_eq!(runtime.accumulated_message_ids(), vec![17]);
+        let answer = decode_responses_turn(
+            &json!({"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"grounded final"}]}]}),
+        );
+        assert!(answer.tool_calls.is_empty());
+        assert_eq!(answer.text, "grounded final");
+        db.shutdown().await;
+    }
 }

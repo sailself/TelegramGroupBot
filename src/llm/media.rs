@@ -149,9 +149,7 @@ pub fn summarize_media_files(files: &[MediaFile]) -> MediaSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::twitter_extractor::test_support::{
-        response_with_status, ExpectedRequest, TestServer,
-    };
+    use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
 
     #[tokio::test]
     async fn download_media_limited_refuses_bodies_over_the_cap() {

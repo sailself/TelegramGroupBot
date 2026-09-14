@@ -121,9 +121,7 @@ async fn exa_search_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::twitter_extractor::test_support::{
-        response_with_headers, ExpectedRequest, TestServer,
-    };
+    use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
 
     #[tokio::test]
     async fn exa_results_are_parsed_with_the_first_available_snippet_field() {

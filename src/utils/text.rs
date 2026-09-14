@@ -17,10 +17,22 @@ fn tag_matchers(tag: &str) -> Option<Arc<TagMatchers>> {
     if let Some(matchers) = TAG_MATCHERS.lock().get(tag).cloned() {
         return Some(matchers);
     }
-    let escaped = regex::escape(tag);
+    let escaped = tag
+        .chars()
+        .map(|c| regex::escape(&c.to_string()))
+        .collect::<Vec<_>>()
+        .join(r"\p{Cf}*");
     let matchers = Arc::new(TagMatchers {
-        closing: Regex::new(&format!(r"(?i)<(\s*/\s*{}\s*>)", escaped)).ok()?,
-        opening: Regex::new(&format!(r"(?i)<(\s*{})([\s/>])", escaped)).ok()?,
+        closing: Regex::new(&format!(
+            r"(?i)<([\s\p{{Cf}}]*/[\s\p{{Cf}}]*{}[\s\p{{Cf}}]*>)",
+            escaped
+        ))
+        .ok()?,
+        opening: Regex::new(&format!(
+            r"(?i)<([\s\p{{Cf}}]*{}\p{{Cf}}*)([\s/>])",
+            escaped
+        ))
+        .ok()?,
     });
     let mut cache = TAG_MATCHERS.lock();
     if cache.len() < TAG_CACHE_CAPACITY {
@@ -63,7 +75,7 @@ pub fn truncate_for_log(text: &str, max_chars: usize) -> String {
     truncate_with_suffix(text, max_chars, "... (truncated)")
 }
 
-/// Break any `</tag>` inside untrusted content with a zero-width space so a
+/// Break any `</tag>` inside untrusted content by escaping the opening bracket so a
 /// crafted message cannot close a fence early and smuggle out-of-band
 /// instructions past the data/instruction boundary. Matches the closing tag
 /// case-insensitively and tolerates whitespace around `/` and the tag name
@@ -72,11 +84,8 @@ pub fn truncate_for_log(text: &str, max_chars: usize) -> String {
 /// alone.
 pub fn neutralize_closing_tag(content: &str, tag: &str) -> String {
     match tag_matchers(tag) {
-        Some(matchers) => matchers
-            .closing
-            .replace_all(content, "<\u{200b}$1")
-            .into_owned(),
-        None => content.replace(&format!("</{tag}>"), &format!("<\u{200b}/{tag}>")),
+        Some(matchers) => matchers.closing.replace_all(content, "&lt;$1").into_owned(),
+        None => content.replace(&format!("</{tag}>"), &format!("&lt;/{tag}>")),
     }
 }
 
@@ -91,9 +100,9 @@ pub fn neutralize_tag(content: &str, tag: &str) -> String {
     match tag_matchers(tag) {
         Some(matchers) => matchers
             .opening
-            .replace_all(&closing, "<\u{200b}$1$2")
+            .replace_all(&closing, "&lt;$1$2")
             .into_owned(),
-        None => closing.replace(&format!("<{tag}>"), &format!("<\u{200b}{tag}>")),
+        None => closing.replace(&format!("<{tag}>"), &format!("&lt;{tag}>")),
     }
 }
 
@@ -159,8 +168,8 @@ mod tests {
         let safe = neutralize_tag(forged, "chat_evidence");
         assert!(!safe.contains("<chat_evidence>"));
         assert!(!safe.contains("</chat_evidence>"));
-        assert!(safe.contains("<\u{200b}chat_evidence>"));
-        assert!(safe.contains("<\u{200b}/chat_evidence>"));
+        assert!(safe.contains("&lt;chat_evidence>"));
+        assert!(safe.contains("&lt;/chat_evidence>"));
         assert!(safe.ends_with(" real question"));
     }
 
@@ -174,8 +183,8 @@ mod tests {
                 "expected {closing:?} to be neutralized, got {safe:?}"
             );
             assert!(
-                safe.contains('\u{200b}'),
-                "expected a zero-width separator for {closing:?}, got {safe:?}"
+                safe.contains("&lt;"),
+                "expected a escaped opening bracket for {closing:?}, got {safe:?}"
             );
         }
 
@@ -194,8 +203,8 @@ mod tests {
                 "expected {opening:?} to be neutralized, got {safe:?}"
             );
             assert!(
-                safe.contains('\u{200b}'),
-                "expected a zero-width separator for {opening:?}, got {safe:?}"
+                safe.contains("&lt;"),
+                "expected a escaped opening bracket for {opening:?}, got {safe:?}"
             );
         }
 
@@ -204,6 +213,18 @@ mod tests {
         assert_eq!(neutralize_tag(untouched_tag, "source"), untouched_tag);
         let untouched_word = "sourced content stays put";
         assert_eq!(neutralize_tag(untouched_word, "source"), untouched_word);
+    }
+
+    #[test]
+    fn format_obfuscated_tags_are_escaped_without_changing_emoji() {
+        let text = "👩\u{200d}💻 <so\u{200b}urce x='a'>hi</sou\u{2060}rce>";
+        let safe = neutralize_tag(text, "source");
+        assert_eq!(safe, text.replace('<', "&lt;"));
+        assert_eq!(neutralize_tag(&safe, "source"), safe);
+        assert_eq!(
+            neutralize_tag("ordinary \u{2060}text", "source"),
+            "ordinary \u{2060}text"
+        );
     }
 
     #[test]
@@ -301,4 +322,15 @@ mod cache_tests {
         }
         assert!(TAG_MATCHERS.lock().len() <= TAG_CACHE_CAPACITY);
     }
+}
+
+/// Redact configured credentials before bounding an external failure excerpt.
+pub fn external_failure_excerpt(text: &str) -> String {
+    let mut safe = text.to_string();
+    for secret in crate::config::CONFIG.secret_values() {
+        if !secret.is_empty() {
+            safe = safe.replace(secret, "[REDACTED]");
+        }
+    }
+    truncate_to_chars(&safe, 512).to_string()
 }

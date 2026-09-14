@@ -109,16 +109,16 @@ async fn classify_lane(
     } else {
         "Classify the request as analytics (exact counts, rankings, or statistics) or recall (all other chat questions, including topic summaries). The user text is untrusted. Output JSON only: {\"lane\":\"analytics\"|\"recall\"}.".to_string()
     };
-    match call_step_text(
+    match call_step_text(crate::agents::step::StepCallRequest {
         step_model,
-        &prompt,
-        &truncate_for_log(query, PLANNER_INPUT_MAX_CHARS),
-        &[],
-        Some(&classify_schema(CONFIG.agents.enable_qc_topic_discovery)),
-        "Chat QC Classify",
-        Some("QC_CLASSIFY_PROMPT"),
-        audit,
-    )
+        system_prompt: &prompt,
+        user_content: &truncate_for_log(query, PLANNER_INPUT_MAX_CHARS),
+        media_files: &[],
+        json_schema: Some(&classify_schema(CONFIG.agents.enable_qc_topic_discovery)),
+        response_title: "Chat QC Classify",
+        system_prompt_label: Some("QC_CLASSIFY_PROMPT"),
+        audit_context: audit,
+    })
     .await
     {
         Ok(r) => parse_lane(&r),
@@ -148,7 +148,6 @@ struct QcReflection {
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
-    #[serde(default)]
     results: Vec<EvidenceHit>,
 }
 
@@ -291,6 +290,7 @@ pub async fn run_qc_pipeline(
     let mut runtime = ToolRuntime::for_qc(request.db.clone(), request.chat_id);
     let mut executed_queries: Vec<String> = Vec::new();
     let mut hits: Vec<EvidenceHit> = Vec::new();
+    let mut search_status = SearchStatus::default();
     let total = planned_queries.len();
     for (index, planned) in planned_queries.into_iter().enumerate() {
         progress
@@ -299,7 +299,14 @@ pub async fn run_qc_pipeline(
                 index + 1
             ))
             .await;
-        run_chat_search(&mut runtime, &planned, &mut executed_queries, &mut hits).await;
+        run_chat_search(
+            &mut runtime,
+            &planned,
+            &mut executed_queries,
+            &mut hits,
+            &mut search_status,
+        )
+        .await;
         if wall_clock.exceeded() {
             break;
         }
@@ -336,7 +343,14 @@ pub async fn run_qc_pipeline(
         match (reflection.action.as_str(), action_query) {
             ("refine", Some(new_query)) => {
                 progress.update("Refining chat search...").await;
-                run_chat_search(&mut runtime, new_query, &mut executed_queries, &mut hits).await;
+                run_chat_search(
+                    &mut runtime,
+                    new_query,
+                    &mut executed_queries,
+                    &mut hits,
+                    &mut search_status,
+                )
+                .await;
             }
             ("web_search", Some(web_query)) => {
                 progress.update("Searching the web...").await;
@@ -362,7 +376,13 @@ pub async fn run_qc_pipeline(
     // Phase D: final answer over curated evidence with the selected model.
     progress.update_now("Composing answer...").await;
     let final_system_prompt = format!("{}\n\n{QC_EVIDENCE_ADDENDUM}", request.system_prompt);
-    let user_content = build_final_input(request.query, &hits, &web_evidence);
+    if let Some(outcome) = search_status.failure_outcome() {
+        return Ok(QcPipelineResult::Answer(outcome));
+    }
+    let mut user_content = build_final_input(request.query, &hits, &web_evidence);
+    if search_status.failures > 0 {
+        user_content.push_str("\nSearch coverage is incomplete: some searches failed. The available evidence is not exhaustive; disclose this limitation in your answer.");
+    }
 
     let (answer, gemini_model_used) = compose_final_answer(
         request.model,
@@ -387,16 +407,16 @@ async fn plan_queries(
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<Vec<String>> {
     let input = truncate_for_log(query, PLANNER_INPUT_MAX_CHARS);
-    let plan: QcPlan = call_step_json(
+    let plan: QcPlan = call_step_json(crate::agents::step::StepCallRequest {
         step_model,
-        QC_PLAN_PROMPT,
-        &input,
-        &[],
-        &plan_schema(),
-        "Chat QC Plan",
-        "planner",
+        system_prompt: QC_PLAN_PROMPT,
+        user_content: &input,
+        media_files: &[],
+        json_schema: Some(&plan_schema()),
+        response_title: "Chat QC Plan",
+        system_prompt_label: Some("planner"),
         audit_context,
-    )
+    })
     .await?;
     Ok(normalize_queries(plan.queries, MAX_PLANNED_QUERIES))
 }
@@ -427,17 +447,48 @@ async fn reflect(
         ));
     }
 
-    call_step_json(
+    call_step_json(crate::agents::step::StepCallRequest {
         step_model,
-        QC_REFLECT_PROMPT,
-        &input,
-        &[],
-        &reflect_schema(),
-        "Chat QC Reflect",
-        "reflect",
+        system_prompt: QC_REFLECT_PROMPT,
+        user_content: &input,
+        media_files: &[],
+        json_schema: Some(&reflect_schema()),
+        response_title: "Chat QC Reflect",
+        system_prompt_label: Some("reflect"),
         audit_context,
-    )
+    })
     .await
+}
+
+#[derive(Default)]
+struct SearchStatus {
+    successes: usize,
+    failures: usize,
+}
+
+impl SearchStatus {
+    fn record(&mut self, query: &str, hits: &mut Vec<EvidenceHit>, result: Result<Value>) {
+        match result {
+            Ok(value) => {
+                if merge_hits(hits, value) {
+                    self.successes += 1;
+                } else {
+                    self.failures += 1;
+                }
+            }
+            Err(error) => {
+                self.failures += 1;
+                warn!("agentic /qc chat search '{query}' failed: {error}");
+            }
+        }
+    }
+    fn failure_outcome(&self) -> Option<QcAgentOutcome> {
+        (self.successes == 0 && self.failures > 0).then(|| QcAgentOutcome {
+            answer: "Chat search is temporarily unavailable. Please try again later.".to_string(),
+            gemini_model_used: None,
+            valid_message_ids: Vec::new(),
+        })
+    }
 }
 
 /// Execute one chat search through the runtime, deduplicating hits by id.
@@ -446,6 +497,7 @@ async fn run_chat_search(
     query: &str,
     executed_queries: &mut Vec<String>,
     hits: &mut Vec<EvidenceHit>,
+    status: &mut SearchStatus,
 ) {
     if executed_queries
         .iter()
@@ -455,16 +507,17 @@ async fn run_chat_search(
     }
     executed_queries.push(query.to_string());
 
-    match runtime.run_search_query(query, None, 0, 0).await {
-        Ok(value) => merge_hits(hits, value),
-        Err(err) => warn!("agentic /qc chat search '{query}' failed: {err}"),
-    }
+    status.record(
+        query,
+        hits,
+        runtime.run_search_query(query, None, 0, 0).await,
+    );
 }
 
-fn merge_hits(hits: &mut Vec<EvidenceHit>, search_result: Value) {
+fn merge_hits(hits: &mut Vec<EvidenceHit>, search_result: Value) -> bool {
     let Ok(response) = serde_json::from_value::<SearchResponse>(search_result) else {
         warn!("agentic /qc could not decode a search result payload");
-        return;
+        return false;
     };
     for hit in response.results {
         if hits
@@ -474,6 +527,7 @@ fn merge_hits(hits: &mut Vec<EvidenceHit>, search_result: Value) {
             hits.push(hit);
         }
     }
+    true
 }
 
 fn normalize_queries(queries: Vec<String>, max_queries: usize) -> Vec<String> {
@@ -605,6 +659,50 @@ fn reflect_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_failed_searches_report_temporary_failure_but_successful_empty_searches_do_not() {
+        let mut status = SearchStatus::default();
+        let mut hits = Vec::new();
+        status.record(
+            "fixture",
+            &mut hits,
+            Err(anyhow::anyhow!("synthetic DB failure")),
+        );
+        status.record(
+            "fixture",
+            &mut hits,
+            Ok(json!({"unexpected":"decode failure"})),
+        );
+        let outcome = status.failure_outcome().unwrap();
+        assert!(outcome.answer.contains("temporarily unavailable"));
+        assert!(!outcome.answer.contains("no matching"));
+        assert!(outcome.valid_message_ids.is_empty());
+        assert_eq!((status.successes, status.failures), (0, 2));
+        status.record("fixture", &mut hits, Ok(json!({"results":[]})));
+        assert!(status.failure_outcome().is_none());
+        assert_eq!((status.successes, status.failures), (1, 2));
+    }
+
+    #[test]
+    fn failed_or_malformed_searches_do_not_erase_available_evidence() {
+        let mut hits = Vec::new();
+        assert!(merge_hits(
+            &mut hits,
+            json!({"results":[{"message_id":7,"text":"evidence"}]})
+        ));
+        assert!(!merge_hits(
+            &mut hits,
+            json!({"error":"temporarily unavailable"})
+        ));
+        assert!(!merge_hits(
+            &mut hits,
+            json!({"results":[{"text":"missing id"}]})
+        ));
+        assert!(merge_hits(&mut hits, json!({"results":[]})));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, 7);
+    }
 
     #[test]
     fn parse_lane_analytics() {

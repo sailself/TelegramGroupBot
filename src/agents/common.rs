@@ -9,13 +9,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use tokio::task::JoinSet;
 use tracing::warn;
 
-use crate::agents::step::{call_step_text, parse_lenient_json, StepModel, WallClock};
-use crate::llm::media::MediaFile;
-use crate::llm::LlmAuditContext;
+use crate::agents::step::{call_step_text, parse_lenient_json, WallClock};
 use crate::utils::progress::ProgressSink;
 use crate::utils::text::neutralize_closing_tag;
 
@@ -145,28 +142,11 @@ fn parse_step_json<T: DeserializeOwned>(response: &str, label: &str) -> Result<T
 /// [`call_step_text`] followed by lenient JSON parsing, with the uniform
 /// error `"{label} output was not valid JSON"` on a parse failure. `label`
 /// also doubles as the step's `system_prompt_label` for audit logging.
-#[allow(clippy::too_many_arguments)]
 pub async fn call_step_json<T: DeserializeOwned>(
-    step_model: &StepModel,
-    system_prompt: &str,
-    user_content: &str,
-    media_files: &[MediaFile],
-    schema: &Value,
-    response_title: &str,
-    label: &str,
-    audit_context: Option<&LlmAuditContext>,
+    request: crate::agents::step::StepCallRequest<'_>,
 ) -> Result<T> {
-    let response = call_step_text(
-        step_model,
-        system_prompt,
-        user_content,
-        media_files,
-        Some(schema),
-        response_title,
-        Some(label),
-        audit_context,
-    )
-    .await?;
+    let label = request.system_prompt_label.unwrap_or("step");
+    let response = call_step_text(request).await?;
     parse_step_json(&response, label)
 }
 

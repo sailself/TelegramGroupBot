@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatAction, FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia,
-    InputMediaPhoto, MessageId, ParseMode, ReplyParameters,
+    ChatAction, FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageId,
+    ReplyParameters,
 };
 
 use crate::config::CONFIG;
@@ -25,7 +25,9 @@ use crate::llm::{
     generate_image_with_img2, generate_video_with_veo, CodexImageConfig, GeminiImageConfig,
     LlmAuditContext,
 };
-use crate::state::{AppState, ImageGenerationModel, PendingImageCommand, PendingImageRequest};
+use crate::state::{
+    AppState, ImageGenerationModel, ImageSelectionStage, PendingImageCommand, PendingImageRequest,
+};
 use crate::utils::telegram::{
     edit_message_text_with_retry, message_entities_for_text, retry_telegram,
     send_message_with_retry, start_chat_action_heartbeat, strip_command_prefix,
@@ -33,17 +35,12 @@ use crate::utils::telegram::{
 use crate::utils::text::{escape_html, truncate_with_ellipsis};
 use tracing::info;
 
-const IMAGE_RESOLUTION_OPTIONS: [&str; 3] = ["2K", "4K", "1K"];
-const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 14] = [
-    "4:3", "3:4", "16:9", "9:16", "1:1", "21:9", "3:2", "2:3", "5:4", "4:5", "4:1", "1:4", "8:1",
-    "1:8",
-];
-pub const IMAGE_RESOLUTION_CALLBACK_PREFIX: &str = "image_res:";
-pub const IMAGE_ASPECT_RATIO_CALLBACK_PREFIX: &str = "image_aspect:";
-pub const IMAGE_MODEL_CALLBACK_PREFIX: &str = "image_model:";
-pub const IMAGE_CODEX_SIZE_CALLBACK_PREFIX: &str = "image_codex_size:";
-const IMAGE_DEFAULT_RESOLUTION: &str = "2K";
-const IMAGE_ASPECT_RATIO_AUTO_CALLBACK: &str = "auto";
+mod selection;
+use selection::*;
+pub use selection::{
+    image_selection_callback, IMAGE_ASPECT_RATIO_CALLBACK_PREFIX, IMAGE_CODEX_SIZE_CALLBACK_PREFIX,
+    IMAGE_MODEL_CALLBACK_PREFIX, IMAGE_RESOLUTION_CALLBACK_PREFIX,
+};
 pub(super) const IMAGE_CAPTION_LIMIT: usize = 1000;
 const IMAGE_CAPTION_PROMPT_PREVIEW: usize = 900;
 #[derive(Debug, Clone)]
@@ -92,19 +89,6 @@ pub(super) async fn build_image_caption(model_name: &str, prompt: &str) -> Strin
     } else {
         base_caption
     }
-}
-
-fn build_img2_spoiler_caption(caption: &str) -> String {
-    format!("<tg-spoiler>{}</tg-spoiler>", caption)
-}
-
-fn build_img2_spoiler_photo_media(input_file: InputFile, caption: &str) -> InputMedia {
-    InputMedia::Photo(
-        InputMediaPhoto::new(input_file)
-            .caption(build_img2_spoiler_caption(caption))
-            .parse_mode(ParseMode::Html)
-            .spoiler(),
-    )
 }
 
 async fn send_video_with_retry(
@@ -241,85 +225,6 @@ async fn prepare_image_request(
     })
 }
 
-fn build_resolution_keyboard(request_key: &str) -> InlineKeyboardMarkup {
-    let buttons = IMAGE_RESOLUTION_OPTIONS
-        .iter()
-        .map(|res| {
-            InlineKeyboardButton::callback(
-                res.to_string(),
-                format!(
-                    "{}{}|{}",
-                    IMAGE_RESOLUTION_CALLBACK_PREFIX, request_key, res
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let rows = buttons
-        .chunks(3)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
-    InlineKeyboardMarkup::new(rows)
-}
-
-fn image_model_callback_data(request_key: &str, model: ImageGenerationModel) -> String {
-    let token = match model {
-        ImageGenerationModel::Gemini => "gemini",
-        ImageGenerationModel::CodexGptImage2 => "codex",
-    };
-    format!("{}{}|{}", IMAGE_MODEL_CALLBACK_PREFIX, request_key, token)
-}
-
-fn parse_image_generation_model(value: &str) -> Option<ImageGenerationModel> {
-    match value.trim() {
-        "gemini" => Some(ImageGenerationModel::Gemini),
-        "codex" => Some(ImageGenerationModel::CodexGptImage2),
-        _ => None,
-    }
-}
-
-fn parse_default_image_generation_model(value: &str) -> Option<ImageGenerationModel> {
-    match value.trim().to_lowercase().as_str() {
-        "gemini" => Some(ImageGenerationModel::Gemini),
-        "codex" | "openai-codex" | "openai-codex:selected" => {
-            Some(ImageGenerationModel::CodexGptImage2)
-        }
-        _ => None,
-    }
-}
-
-fn resolve_default_image_generation_model(
-    default_model: &str,
-    gemini_available: bool,
-    codex_available: bool,
-) -> std::result::Result<ImageGenerationModel, String> {
-    let Some(model) = parse_default_image_generation_model(default_model) else {
-        return Err(format!(
-            "Default image model {} is not supported. Set DEFAULT_IMAGE_MODEL to gemini or codex.",
-            default_model.trim()
-        ));
-    };
-
-    if model == ImageGenerationModel::Gemini && !gemini_available {
-        if codex_available {
-            return Ok(ImageGenerationModel::CodexGptImage2);
-        }
-        return Err(
-            "No image model is configured. Enable Gemini or complete Codex setup with /codexlogin."
-                .to_string(),
-        );
-    }
-
-    if model == ImageGenerationModel::CodexGptImage2 && !codex_available {
-        return Err(format!(
-            "Default image model {} is unavailable. Complete Codex setup with /codexlogin or set DEFAULT_IMAGE_MODEL=gemini.",
-            default_model.trim()
-        ));
-    }
-
-    Ok(model)
-}
-
 pub(super) async fn generate_image_with_configured_default(
     prompt: &str,
     image_urls: &[String],
@@ -372,119 +277,6 @@ pub(super) async fn generate_image_with_configured_default(
             )
         }
     }
-}
-
-fn build_image_model_keyboard(
-    request_key: &str,
-    include_gemini: bool,
-    include_codex: bool,
-    default_model: ImageGenerationModel,
-) -> InlineKeyboardMarkup {
-    let mut buttons = Vec::new();
-    if include_gemini {
-        buttons.push(InlineKeyboardButton::callback(
-            CONFIG.gemini.image_model.clone(),
-            image_model_callback_data(request_key, ImageGenerationModel::Gemini),
-        ));
-    }
-
-    if include_codex {
-        buttons.push(InlineKeyboardButton::callback(
-            crate::llm::codex_image::codex_image_display_model(),
-            image_model_callback_data(request_key, ImageGenerationModel::CodexGptImage2),
-        ));
-    }
-
-    if let Some(default_index) = buttons.iter().position(|button| match default_model {
-        ImageGenerationModel::Gemini => {
-            matches!(
-                &button.kind,
-                teloxide::types::InlineKeyboardButtonKind::CallbackData(data)
-                    if data == &image_model_callback_data(request_key, ImageGenerationModel::Gemini)
-            )
-        }
-        ImageGenerationModel::CodexGptImage2 => {
-            matches!(
-                &button.kind,
-                teloxide::types::InlineKeyboardButtonKind::CallbackData(data)
-                    if data == &image_model_callback_data(request_key, ImageGenerationModel::CodexGptImage2)
-            )
-        }
-    }) {
-        let default_button = buttons.remove(default_index);
-        buttons.insert(0, default_button);
-    }
-
-    InlineKeyboardMarkup::new(vec![buttons])
-}
-
-fn build_aspect_ratio_keyboard(request_key: &str) -> InlineKeyboardMarkup {
-    let mut buttons = vec![InlineKeyboardButton::callback(
-        "Auto",
-        format!(
-            "{}{}|{}",
-            IMAGE_ASPECT_RATIO_CALLBACK_PREFIX, request_key, IMAGE_ASPECT_RATIO_AUTO_CALLBACK
-        ),
-    )];
-    buttons.extend(
-        IMAGE_ASPECT_RATIO_OPTIONS
-            .iter()
-            .map(|aspect| {
-                InlineKeyboardButton::callback(
-                    aspect.to_string(),
-                    format!(
-                        "{}{}|{}",
-                        IMAGE_ASPECT_RATIO_CALLBACK_PREFIX, request_key, aspect
-                    ),
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    let rows = buttons
-        .chunks(3)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
-    InlineKeyboardMarkup::new(rows)
-}
-
-fn build_codex_size_keyboard(request_key: &str) -> InlineKeyboardMarkup {
-    let buttons = crate::llm::codex_image::CODEX_IMAGE_SUPPORTED_SIZES
-        .iter()
-        .map(|size| {
-            InlineKeyboardButton::callback(
-                size.to_string(),
-                format!(
-                    "{}{}|{}",
-                    IMAGE_CODEX_SIZE_CALLBACK_PREFIX, request_key, size
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let rows = buttons
-        .chunks(3)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
-    InlineKeyboardMarkup::new(rows)
-}
-
-fn resolve_image_request_settings(
-    request: &PendingImageRequest,
-    resolution: Option<&str>,
-    aspect_ratio: Option<&str>,
-) -> (String, Option<String>) {
-    let final_resolution = resolution
-        .or(request.resolution.as_deref())
-        .unwrap_or(IMAGE_DEFAULT_RESOLUTION)
-        .to_string();
-    let final_aspect = aspect_ratio
-        .filter(|value| *value != IMAGE_ASPECT_RATIO_AUTO_CALLBACK && !value.trim().is_empty())
-        .or(request.aspect_ratio.as_deref())
-        .filter(|value| *value != IMAGE_ASPECT_RATIO_AUTO_CALLBACK && !value.trim().is_empty())
-        .map(|value| value.to_string());
-
-    (final_resolution, final_aspect)
 }
 
 async fn finalize_image_request(
@@ -635,220 +427,10 @@ async fn finalize_image_request(
     };
     let caption = build_image_caption(&model_name, &prompt).await;
 
-    if images.is_empty() { return Err(anyhow::anyhow!("Image generation returned no images")); }
-    let mut image_iter = images.into_iter();
-    if let Some(first_image) = image_iter.next() {
-        let media = InputMedia::Photo(
-            InputMediaPhoto::new(InputFile::memory(first_image.clone()))
-                .caption(caption.clone())
-                .parse_mode(ParseMode::Html),
-        );
-        let edit_result = bot
-            .edit_message_media(ChatId(request.chat_id), processing_message_id, media)
-            .await;
-        if edit_result.is_err() {
-            retry_telegram("send_photo", || {
-                bot.send_photo(ChatId(request.chat_id), InputFile::memory(first_image.clone()))
-                .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
-                .caption(caption.clone())
-                .parse_mode(ParseMode::Html)
-            }).await.map_err(crate::utils::telegram::ImageDeliveryError)?;
-            let _ = edit_message_text_with_retry(bot, ChatId(request.chat_id), processing_message_id, "Generated image below.").await;
-        }
-    }
-
-    for image in image_iter {
-        retry_telegram("send_photo", || {
-            bot.send_photo(ChatId(request.chat_id), InputFile::memory(image.clone()))
-            .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
-        }).await.map_err(crate::utils::telegram::ImageDeliveryError)?;
-    }
+    super::image_delivery::deliver_generated_images(bot, ChatId(request.chat_id), processing_message_id, MessageId(request.message_id as i32), images.into_iter().map(InputFile::memory).collect(), &caption, false).await?;
 
     Ok(())
     }).await
-}
-
-pub async fn image_selection_callback(
-    bot: Bot,
-    state: AppState,
-    query: CallbackQuery,
-) -> Result<()> {
-    let _ = bot.answer_callback_query(query.id.clone()).await;
-    let Some(data) = &query.data else {
-        return Ok(());
-    };
-    let query_user_id = i64::try_from(query.from.id.0).unwrap_or_default();
-
-    if data.starts_with(IMAGE_MODEL_CALLBACK_PREFIX) {
-        let payload = data.trim_start_matches(IMAGE_MODEL_CALLBACK_PREFIX);
-        let mut parts = payload.split('|');
-        let request_key = parts.next().unwrap_or("");
-        let model_token = parts.next().unwrap_or("");
-        let Some(model) = parse_image_generation_model(model_token) else {
-            return Ok(());
-        };
-        if model == ImageGenerationModel::Gemini && !CONFIG.gemini_api_available() {
-            return Ok(());
-        }
-        if model == ImageGenerationModel::CodexGptImage2
-            && !crate::llm::codex_image::codex_image_available()
-        {
-            return Ok(());
-        }
-
-        let (next_command, ready_request) = {
-            let mut entry = state.pending_image_requests.entry(request_key);
-            let Some(request) = entry.get_mut() else {
-                return Ok(());
-            };
-            if request.user_id != query_user_id {
-                return Ok(());
-            }
-            request.model = Some(model);
-            let command = request.command;
-            // /img has nothing more to ask: take the request now so the
-            // timeout task can no longer race this selection.
-            let ready_request = match command {
-                PendingImageCommand::Img => entry.take(),
-                PendingImageCommand::Image => None,
-            };
-            (command, ready_request)
-        };
-
-        match (next_command, model) {
-            (PendingImageCommand::Img, _) => {
-                if let Some(request) = ready_request {
-                    finalize_image_request(&bot, &state, request, None, None).await?;
-                }
-            }
-            (PendingImageCommand::Image, ImageGenerationModel::Gemini) => {
-                if let Some(message) = &query.message {
-                    bot.edit_message_text(
-                        message.chat().id,
-                        message.id(),
-                        format!(
-                            "Choose a resolution for {} (default: {}).",
-                            CONFIG.gemini.image_model, IMAGE_DEFAULT_RESOLUTION
-                        ),
-                    )
-                    .reply_markup(build_resolution_keyboard(request_key))
-                    .await?;
-                }
-            }
-            (PendingImageCommand::Image, ImageGenerationModel::CodexGptImage2) => {
-                if let Some(message) = &query.message {
-                    bot.edit_message_text(
-                        message.chat().id,
-                        message.id(),
-                        format!(
-                            "Choose a size for {}, or wait to let the model decide.",
-                            crate::llm::codex_image::codex_image_display_model()
-                        ),
-                    )
-                    .reply_markup(build_codex_size_keyboard(request_key))
-                    .await?;
-                }
-            }
-        }
-        return Ok(());
-    }
-
-    if data.starts_with(IMAGE_CODEX_SIZE_CALLBACK_PREFIX) {
-        let payload = data.trim_start_matches(IMAGE_CODEX_SIZE_CALLBACK_PREFIX);
-        let mut parts = payload.split('|');
-        let request_key = parts.next().unwrap_or("");
-        let size = parts.next().unwrap_or("");
-        if !crate::llm::codex_image::is_supported_codex_image_size(size) {
-            return Ok(());
-        }
-
-        let ready_request = {
-            let mut entry = state.pending_image_requests.entry(request_key);
-            match entry.get_mut() {
-                Some(request) if request.user_id != query_user_id => return Ok(()),
-                Some(request) => {
-                    request.model = Some(ImageGenerationModel::CodexGptImage2);
-                    request.codex_size = Some(size.to_string());
-                }
-                None => {}
-            }
-            entry.take()
-        };
-        if let Some(request) = ready_request {
-            finalize_image_request(&bot, &state, request, None, None).await?;
-        }
-        return Ok(());
-    }
-
-    if data.starts_with(IMAGE_RESOLUTION_CALLBACK_PREFIX) {
-        let payload = data.trim_start_matches(IMAGE_RESOLUTION_CALLBACK_PREFIX);
-        let mut parts = payload.split('|');
-        let request_key = parts.next().unwrap_or("");
-        let resolution = parts.next().unwrap_or("");
-        if !IMAGE_RESOLUTION_OPTIONS.contains(&resolution) {
-            return Ok(());
-        }
-
-        if let Some(request) = state.pending_image_requests.entry(request_key).get_mut() {
-            if request.user_id != query_user_id {
-                return Ok(());
-            }
-            request.resolution = Some(resolution.to_string());
-        }
-
-        if let Some(message) = &query.message {
-            bot.edit_message_text(
-                message.chat().id,
-                message.id(),
-                format!(
-                    "Resolution set to {}. Choose an aspect ratio, or Auto to let the model decide.",
-                    resolution
-                ),
-            )
-            .reply_markup(build_aspect_ratio_keyboard(request_key))
-            .await?;
-        }
-        return Ok(());
-    }
-
-    if data.starts_with(IMAGE_ASPECT_RATIO_CALLBACK_PREFIX) {
-        let payload = data.trim_start_matches(IMAGE_ASPECT_RATIO_CALLBACK_PREFIX);
-        let mut parts = payload.split('|');
-        let request_key = parts.next().unwrap_or("");
-        let aspect = parts.next().unwrap_or("");
-        if aspect != IMAGE_ASPECT_RATIO_AUTO_CALLBACK
-            && !IMAGE_ASPECT_RATIO_OPTIONS.contains(&aspect)
-        {
-            return Ok(());
-        }
-
-        let ready_request = {
-            let mut entry = state.pending_image_requests.entry(request_key);
-            match entry.get_mut() {
-                Some(request) if request.user_id != query_user_id => return Ok(()),
-                Some(request) => {
-                    request.aspect_ratio = if aspect == IMAGE_ASPECT_RATIO_AUTO_CALLBACK {
-                        None
-                    } else {
-                        Some(aspect.to_string())
-                    };
-                }
-                None => {}
-            }
-            entry.take()
-        };
-
-        let selected_aspect = if aspect == IMAGE_ASPECT_RATIO_AUTO_CALLBACK {
-            None
-        } else {
-            Some(aspect)
-        };
-        if let Some(request) = ready_request {
-            finalize_image_request(&bot, &state, request, None, selected_aspect).await?;
-        }
-    }
-
-    Ok(())
 }
 
 pub async fn img_handler(
@@ -922,6 +504,10 @@ pub async fn img_handler(
             ))
             .await?;
         let pending = PendingImageRequest {
+            selection_gate: Default::default(),
+            stage: ImageSelectionStage::Model,
+            deadline: tokio::time::Instant::now()
+                + Duration::from_secs(CONFIG.limits.model_selection_timeout),
             user_id,
             chat_id: message.chat.id.0,
             message_id: message.id.0 as i64,
@@ -938,11 +524,13 @@ pub async fn img_handler(
         };
         let timeout_bot = bot.clone();
         let timeout_state = state.clone();
-        state.pending_image_requests.insert_with_timeout(
+        state.pending_image_requests.insert_with_deadline(
             request_key,
             pending,
-            Duration::from_secs(CONFIG.limits.model_selection_timeout),
+            |request| request.deadline,
             move |request| async move {
+                let gate = request.selection_gate.clone();
+                let _selection_guard = gate.lock().await;
                 let _ =
                     finalize_image_request(&timeout_bot, &timeout_state, request, None, None).await;
             },
@@ -991,46 +579,16 @@ pub async fn img_handler(
             };
 
             let caption = build_image_caption(&model_name, &prompt_text).await;
-            if images.is_empty() {
-                return Err(anyhow::anyhow!("Image generation returned no images"));
-            }
-            let mut image_iter = images.into_iter();
-            if let Some(first_image) = image_iter.next() {
-                let media = InputMedia::Photo(
-                    InputMediaPhoto::new(InputFile::memory(first_image.clone()))
-                        .caption(caption.clone())
-                        .parse_mode(ParseMode::Html),
-                );
-                let edit_result = bot
-                    .edit_message_media(message.chat.id, processing_message.id, media)
-                    .await;
-                if edit_result.is_err() {
-                    retry_telegram("send_photo", || {
-                        bot.send_photo(message.chat.id, InputFile::memory(first_image.clone()))
-                            .reply_parameters(ReplyParameters::new(message.id))
-                            .caption(caption.clone())
-                            .parse_mode(ParseMode::Html)
-                    })
-                    .await
-                    .map_err(crate::utils::telegram::ImageDeliveryError)?;
-                    let _ = bot
-                        .edit_message_text(
-                            message.chat.id,
-                            processing_message.id,
-                            "Generated image below.",
-                        )
-                        .await;
-                }
-            }
-
-            for image in image_iter {
-                retry_telegram("send_photo", || {
-                    bot.send_photo(message.chat.id, InputFile::memory(image.clone()))
-                        .reply_parameters(ReplyParameters::new(message.id))
-                })
-                .await
-                .map_err(crate::utils::telegram::ImageDeliveryError)?;
-            }
+            super::image_delivery::deliver_generated_images(
+                &bot,
+                message.chat.id,
+                processing_message.id,
+                message.id,
+                images.into_iter().map(InputFile::memory).collect(),
+                &caption,
+                false,
+            )
+            .await?;
 
             Ok(())
         },
@@ -1126,29 +684,16 @@ pub async fn img2_handler(
         result.path.display()
     );
             let caption = build_image_caption("img2", &prompt_text).await;
-            let media =
-                build_img2_spoiler_photo_media(InputFile::file(result.path.clone()), &caption);
-            let edit_result = bot
-                .edit_message_media(message.chat.id, processing_message.id, media)
-                .await;
-            if edit_result.is_err() {
-                retry_telegram("send_photo", || {
-                    bot.send_photo(message.chat.id, InputFile::file(result.path.clone()))
-                        .reply_parameters(ReplyParameters::new(message.id))
-                        .caption(build_img2_spoiler_caption(&caption))
-                        .parse_mode(ParseMode::Html)
-                        .has_spoiler(true)
-                })
-                .await
-                .map_err(crate::utils::telegram::ImageDeliveryError)?;
-                let _ = bot
-                    .edit_message_text(
-                        message.chat.id,
-                        processing_message.id,
-                        "Generated image below.",
-                    )
-                    .await;
-            }
+            super::image_delivery::deliver_generated_images(
+                &bot,
+                message.chat.id,
+                processing_message.id,
+                message.id,
+                vec![InputFile::file(result.path)],
+                &caption,
+                true,
+            )
+            .await?;
 
             Ok(())
         },
@@ -1247,6 +792,9 @@ pub async fn image_handler(
         .reply_markup(selection_keyboard)
         .await?;
     let pending = PendingImageRequest {
+        selection_gate: Default::default(),
+        deadline: tokio::time::Instant::now()
+            + Duration::from_secs(CONFIG.limits.model_selection_timeout),
         user_id,
         chat_id: message.chat.id.0,
         message_id: message.id.0 as i64,
@@ -1256,6 +804,11 @@ pub async fn image_handler(
         telegraph_contents: context.telegraph_contents,
         selection_message_id: selection_message.id.0 as i64,
         llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
+        stage: match initial_model {
+            None => ImageSelectionStage::Model,
+            Some(ImageGenerationModel::Gemini) => ImageSelectionStage::Resolution,
+            Some(ImageGenerationModel::CodexGptImage2) => ImageSelectionStage::CodexSize,
+        },
         model: initial_model,
         codex_size: None,
         resolution: None,
@@ -1264,34 +817,14 @@ pub async fn image_handler(
 
     let timeout_bot = bot.clone();
     let timeout_state = state.clone();
-    let timeout_key = request_key.clone();
-    state.pending_image_requests.insert_with_timeout(
+    state.pending_image_requests.insert_with_deadline(
         request_key,
         pending,
-        Duration::from_secs(CONFIG.limits.model_selection_timeout),
+        |request| request.deadline,
         move |request| async move {
-            let should_finalize = match request.model {
-                None => true,
-                Some(ImageGenerationModel::Gemini) => request.resolution.is_none(),
-                Some(ImageGenerationModel::CodexGptImage2) => request.codex_size.is_none(),
-            };
-            if should_finalize {
-                let _ = finalize_image_request(
-                    &timeout_bot,
-                    &timeout_state,
-                    request,
-                    Some(IMAGE_DEFAULT_RESOLUTION),
-                    None,
-                )
-                .await;
-            } else {
-                // The user already picked a resolution and is choosing an
-                // aspect ratio; keep waiting for that click (no deadline, as
-                // before).
-                timeout_state
-                    .pending_image_requests
-                    .insert(timeout_key, request);
-            }
+            let gate = request.selection_gate.clone();
+            let _selection_guard = gate.lock().await;
+            let _ = finalize_image_request(&timeout_bot, &timeout_state, request, None, None).await;
         },
     );
 
@@ -1416,6 +949,51 @@ pub async fn vid_handler(
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn picker_validation_checks_owner_message_stage_and_expiry() {
+        for stage in [
+            ImageSelectionStage::Model,
+            ImageSelectionStage::Resolution,
+            ImageSelectionStage::AspectRatio,
+            ImageSelectionStage::CodexSize,
+        ] {
+            let request = PendingImageRequest {
+                selection_gate: Default::default(),
+                stage,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+                user_id: 1,
+                chat_id: 2,
+                message_id: 3,
+                command: PendingImageCommand::Image,
+                prompt: String::new(),
+                image_urls: vec![],
+                telegraph_contents: vec![],
+                selection_message_id: 4,
+                llm_invocation_id: None,
+                model: None,
+                codex_size: None,
+                resolution: None,
+                aspect_ratio: None,
+            };
+            assert!(valid_selection(&request, 1, 2, 4, stage));
+            assert!(!valid_selection(&request, 9, 2, 4, stage));
+            assert!(!valid_selection(&request, 1, 9, 4, stage));
+            assert!(!valid_selection(&request, 1, 2, 9, stage));
+            for wrong in [
+                ImageSelectionStage::Model,
+                ImageSelectionStage::Resolution,
+                ImageSelectionStage::AspectRatio,
+                ImageSelectionStage::CodexSize,
+            ] {
+                if wrong != stage {
+                    assert!(!valid_selection(&request, 1, 2, 4, wrong));
+                }
+            }
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert!(!valid_selection(&request, 1, 2, 4, stage));
+        }
+    }
+
     #[test]
     fn default_image_model_accepts_gemini_and_codex_aliases() {
         assert_eq!(
@@ -1471,6 +1049,10 @@ mod tests {
     #[test]
     fn resolve_image_request_settings_prefers_saved_resolution_and_aspect_ratio() {
         let request = PendingImageRequest {
+            selection_gate: Default::default(),
+            stage: ImageSelectionStage::Model,
+            deadline: tokio::time::Instant::now()
+                + Duration::from_secs(CONFIG.limits.model_selection_timeout),
             user_id: 1,
             chat_id: 2,
             message_id: 3,
@@ -1496,6 +1078,10 @@ mod tests {
     #[test]
     fn resolve_image_request_settings_omits_default_aspect_ratio() {
         let request = PendingImageRequest {
+            selection_gate: Default::default(),
+            stage: ImageSelectionStage::Model,
+            deadline: tokio::time::Instant::now()
+                + Duration::from_secs(CONFIG.limits.model_selection_timeout),
             user_id: 1,
             chat_id: 2,
             message_id: 3,
@@ -1516,29 +1102,6 @@ mod tests {
 
         assert_eq!(final_resolution, "2K");
         assert_eq!(final_aspect, None);
-    }
-
-    #[test]
-    fn img2_caption_is_wrapped_in_html_spoiler() {
-        assert_eq!(
-            build_img2_spoiler_caption("Generated by img2"),
-            "<tg-spoiler>Generated by img2</tg-spoiler>"
-        );
-    }
-
-    #[test]
-    fn img2_photo_media_uses_spoiler_flag_and_spoiler_caption() {
-        let media = build_img2_spoiler_photo_media(InputFile::file("img2.png"), "caption");
-
-        let InputMedia::Photo(photo) = media else {
-            panic!("img2 should use photo media");
-        };
-        assert!(photo.has_spoiler);
-        assert_eq!(
-            photo.caption.as_deref(),
-            Some("<tg-spoiler>caption</tg-spoiler>")
-        );
-        assert_eq!(photo.parse_mode, Some(ParseMode::Html));
     }
 
     #[test]

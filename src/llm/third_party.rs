@@ -501,6 +501,31 @@ fn extract_tool_calls(message: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn decode_chat_turn(
+    model_config: &ThirdPartyModelConfig,
+    display_name: &str,
+    response: &Value,
+) -> ModelTurn<Value> {
+    let message = extract_response_message(response);
+    let content = extract_message_content(&message);
+    let tool_calls = extract_tool_calls(&message)
+        .iter()
+        .map(chat_tool_call)
+        .collect::<Vec<_>>();
+    if tool_calls.is_empty() && content.trim().is_empty() {
+        warn!(
+            "{} response had empty content and no tool calls: {}",
+            display_name,
+            truncate_for_log(&response.to_string(), 2000)
+        );
+    }
+    ModelTurn {
+        text: parse_third_party_response(model_config, &content),
+        tool_calls,
+        transcript: vec![message],
+    }
+}
+
 /// Chat Completions half of the shared tool loop.
 struct ChatCompletionsProtocol<'a> {
     model_config: &'a ThirdPartyModelConfig,
@@ -531,24 +556,11 @@ impl ToolProtocol for ChatCompletionsProtocol<'_> {
             details.request_timeout_secs =
                 clamp_request_timeout_secs(details.request_timeout_secs, request_timeout);
             let response = call_provider_api(&details, self.audit_context, self.operation).await?;
-            let message = extract_response_message(&response);
-            let content = extract_message_content(&message);
-            let tool_calls = extract_tool_calls(&message)
-                .iter()
-                .map(chat_tool_call)
-                .collect::<Vec<_>>();
-            if tool_calls.is_empty() && content.trim().is_empty() {
-                warn!(
-                    "{} response had empty content and no tool calls: {}",
-                    details.display_name,
-                    truncate_for_log(&response.to_string(), 2000)
-                );
-            }
-            Ok(ModelTurn {
-                text: parse_third_party_response(self.model_config, &content),
-                tool_calls,
-                transcript: vec![message],
-            })
+            Ok(decode_chat_turn(
+                self.model_config,
+                details.display_name,
+                &response,
+            ))
         })
     }
 
@@ -704,10 +716,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_api_retries_transient_failures_and_sends_provider_headers() {
-        use crate::tools::twitter_extractor::test_support::{
-            response_with_headers, ExpectedRequest, TestServer,
+    async fn chat_adapter_tool_call_result_and_final_answer() {
+        let model = model(ThirdPartyProvider::OpenRouter, "Test", "vendor/model");
+        let protocol = ChatCompletionsProtocol {
+            model_config: &model,
+            audit_context: None,
+            operation: "test",
         };
+        let response = json!({"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call17","type":"function","function":{"name":"chat_context_query","arguments":"{\"operation\":\"search\",\"query\":\"needle\"}"}}]}}]});
+        let turn = decode_chat_turn(&model, "test", &response);
+        assert_eq!(turn.transcript[0]["tool_calls"][0]["id"], "call17");
+        let (db, mut runtime) = crate::test_support::chat_tool_fixture().await;
+        let call = turn.tool_calls.into_iter().next().unwrap();
+        let output = runtime.execute_tool(&call.name, &call.arguments).await;
+        let results = protocol.tool_results(vec![(call, output)]);
+        assert_eq!(results[0]["tool_call_id"], "call17");
+        assert_eq!(results[0]["role"], "tool");
+        assert!(results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("needle evidence"));
+        assert_eq!(runtime.accumulated_message_ids(), vec![17]);
+        let answer = decode_chat_turn(
+            &model,
+            "test",
+            &json!({"choices":[{"message":{"role":"assistant","content":"grounded final"}}]}),
+        );
+        assert!(answer.tool_calls.is_empty());
+        assert_eq!(answer.text, "grounded final");
+        db.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_api_retries_transient_failures_and_sends_provider_headers() {
+        use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
         let server = TestServer::new(vec![
             ExpectedRequest::new(
                 "POST",
@@ -745,9 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_api_decode_failures_name_the_content_type_and_body() {
-        use crate::tools::twitter_extractor::test_support::{
-            response_with_headers, ExpectedRequest, TestServer,
-        };
+        use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
         let server = TestServer::new(vec![ExpectedRequest::new(
             "POST",
             "/chat/completions",

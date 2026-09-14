@@ -207,6 +207,50 @@ impl Database {
         Ok(rows.into_iter().rev().collect())
     }
 
+    /// One parameterized round trip. Results follow requested IDs (including duplicates)
+    /// and each window follows message-ID order; missing centers return None.
+    pub async fn get_message_windows(
+        &self,
+        chat_id: i64,
+        message_ids: &[i64],
+        context_before: i64,
+        context_after: i64,
+    ) -> Result<Vec<Option<Vec<MessageRow>>>> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[derive(sqlx::FromRow)]
+        struct WindowRow {
+            ordinal: i64,
+            #[sqlx(flatten)]
+            message: MessageRow,
+        }
+        let mut query =
+            sqlx::QueryBuilder::<sqlx::Sqlite>::new("WITH requested(ordinal, message_id) AS (");
+        query.push_values(message_ids.iter().enumerate(), |mut row, (ordinal, id)| {
+            row.push_bind(ordinal as i64).push_bind(*id);
+        });
+        query.push("), centers AS (SELECT r.ordinal, m.id, m.message_id FROM requested r JOIN messages m ON m.message_id = r.message_id WHERE m.chat_id = ").push_bind(chat_id).push(" AND m.text IS NOT NULL), neighbors AS (SELECT ordinal, id FROM centers");
+        for (comparison, order, count) in
+            [("<", "DESC", context_before), (">", "ASC", context_after)]
+        {
+            query.push(" UNION ALL SELECT c.ordinal, m.id FROM centers c JOIN messages m ON m.id IN (SELECT n.id FROM messages n WHERE n.chat_id = ").push_bind(chat_id)
+                .push(" AND n.text IS NOT NULL AND n.message_id ").push(comparison).push(" c.message_id ORDER BY n.message_id ").push(order).push(" LIMIT ").push_bind(count.clamp(0, WINDOW_LIMIT_MAX)).push(")");
+        }
+        query.push(") SELECT n.ordinal, m.* FROM neighbors n JOIN messages m ON m.id = n.id ORDER BY n.ordinal, m.message_id");
+        let rows = query
+            .build_query_as::<WindowRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        let mut windows: Vec<Option<Vec<MessageRow>>> = vec![None; message_ids.len()];
+        for row in rows {
+            windows[row.ordinal as usize]
+                .get_or_insert_with(Vec::new)
+                .push(row.message);
+        }
+        Ok(windows)
+    }
+
     pub async fn get_message_window(
         &self,
         chat_id: i64,
@@ -214,52 +258,11 @@ impl Database {
         context_before: i64,
         context_after: i64,
     ) -> Result<Option<Vec<MessageRow>>> {
-        let context_before = context_before.clamp(0, WINDOW_LIMIT_MAX);
-        let context_after = context_after.clamp(0, WINDOW_LIMIT_MAX);
-
-        let center = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, message_id, chat_id, user_id, username, text, language, date, reply_to_message_id, asks_ai, ai_command, is_synthetic_record \
-             FROM messages \
-             WHERE chat_id = ? AND message_id = ? AND text IS NOT NULL",
-        )
-        .bind(chat_id)
-        .bind(message_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let Some(center) = center else {
-            return Ok(None);
-        };
-
-        let mut before = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, message_id, chat_id, user_id, username, text, language, date, reply_to_message_id, asks_ai, ai_command, is_synthetic_record \
-             FROM messages \
-             WHERE chat_id = ? AND message_id < ? AND text IS NOT NULL \
-             ORDER BY message_id DESC LIMIT ?",
-        )
-        .bind(chat_id)
-        .bind(message_id)
-        .bind(context_before)
-        .fetch_all(&self.pool)
-        .await?;
-        before.reverse();
-
-        let after = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, message_id, chat_id, user_id, username, text, language, date, reply_to_message_id, asks_ai, ai_command, is_synthetic_record \
-             FROM messages \
-             WHERE chat_id = ? AND message_id > ? AND text IS NOT NULL \
-             ORDER BY message_id ASC LIMIT ?",
-        )
-        .bind(chat_id)
-        .bind(message_id)
-        .bind(context_after)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut messages = before;
-        messages.push(center);
-        messages.extend(after);
-        Ok(Some(messages))
+        Ok(self
+            .get_message_windows(chat_id, &[message_id], context_before, context_after)
+            .await?
+            .pop()
+            .flatten())
     }
 }
 
@@ -305,6 +308,34 @@ mod tests {
     use crate::db::test_support::{
         at, init_test_db, insert_count_message, queue_message, queue_message_with_user,
     };
+
+    #[tokio::test]
+    async fn batched_windows_preserve_order_duplicates_clamping_and_missing_centers() {
+        let db = crate::db::test_support::init_test_db("batched-windows").await;
+        for id in 1..=15 {
+            crate::db::test_support::queue_message(&db, id, -123, "alice", "context").await;
+        }
+        crate::db::test_support::queue_message(&db, 99, 123, "other", "outside").await;
+        let windows = db
+            .get_message_windows(-123, &[8, 1, 99, 8], 999, -5)
+            .await
+            .unwrap();
+        let ids = |window: &Option<Vec<MessageRow>>| {
+            window
+                .as_ref()
+                .map(|rows| rows.iter().map(|row| row.message_id).collect::<Vec<_>>())
+        };
+        assert_eq!(ids(&windows[0]), Some(vec![3, 4, 5, 6, 7, 8]));
+        assert_eq!(ids(&windows[1]), Some(vec![1]));
+        assert_eq!(ids(&windows[2]), None);
+        assert_eq!(ids(&windows[3]), ids(&windows[0]));
+        assert!(db
+            .get_message_windows(-123, &[], 1, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        db.shutdown().await;
+    }
 
     #[tokio::test]
     async fn get_message_window_rejects_cross_chat_requests() {

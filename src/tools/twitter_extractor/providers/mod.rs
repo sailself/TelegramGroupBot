@@ -267,7 +267,7 @@ where
 mod tests {
     use super::*;
     use crate::config::CONFIG;
-    use crate::tools::twitter_extractor::test_support::{
+    use crate::test_support::{
         chunked_response, response_with_content_length, ExpectedRequest, TestServer,
     };
 

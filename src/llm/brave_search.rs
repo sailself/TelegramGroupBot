@@ -121,9 +121,7 @@ async fn brave_search_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::twitter_extractor::test_support::{
-        response_with_headers, ExpectedRequest, TestServer,
-    };
+    use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
 
     #[tokio::test]
     async fn brave_results_are_parsed_and_a_failure_is_not_retried() {

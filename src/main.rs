@@ -17,6 +17,8 @@ mod handlers;
 mod llm;
 mod prompts;
 mod state;
+#[cfg(test)]
+mod test_support;
 mod tools;
 mod utils;
 

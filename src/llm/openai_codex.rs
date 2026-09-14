@@ -1831,9 +1831,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_refresh_token_marks_the_login_expired_until_the_operator_logs_in_again() {
-        use crate::tools::twitter_extractor::test_support::{
-            response_with_headers, ExpectedRequest, TestServer,
-        };
+        use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
         let _serial = AUTH_MARKER_TEST_LOCK.lock().await;
         let server = TestServer::new(vec![ExpectedRequest::new(
             "POST",

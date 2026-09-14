@@ -289,14 +289,16 @@ pub async fn factcheck_handler(
                     clock.check()?;
                     call_resolved_text_model(
                         &final_model,
-                        &build_factcheck_system_prompt(user_language_code),
-                        &statement,
-                        "Fact Check",
-                        true,
-                        media_summary.total > 0,
-                        Some(media_files),
-                        Some("FACTCHECK_SYSTEM_PROMPT"),
-                        audit_context.as_ref(),
+                        crate::llm::text_model::TextCallRequest {
+                            system_prompt: &build_factcheck_system_prompt(user_language_code),
+                            user_content: &statement,
+                            response_title: "Fact Check",
+                            tools_enabled: true,
+                            use_pro: media_summary.total > 0,
+                            media_files: Some(media_files),
+                            prompt_name: Some("FACTCHECK_SYSTEM_PROMPT"),
+                            audit_context: audit_context.as_ref(),
+                        },
                     )
                     .await
                 })

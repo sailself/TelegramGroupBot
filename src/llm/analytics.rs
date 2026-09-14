@@ -241,7 +241,10 @@ pub fn compile(spec: &QuerySpec, chat_id: i64) -> (String, Vec<Bind>) {
         sql.push_str(
             " AND m.id IN (SELECT messages_fts.rowid FROM messages_fts WHERE messages_fts MATCH ?)",
         );
-        binds.push(Bind::Text(expression));
+        binds.push(Bind::Text(crate::db::search::scope_match_expression(
+            chat_id,
+            &expression,
+        )));
     }
     if let Some(text) = nonempty(&spec.filters.text_contains) {
         sql.push_str(" AND m.text LIKE ? ESCAPE '\\'");
@@ -380,7 +383,10 @@ mod tests {
         let (_, binds) = compile(&normalized, 1);
         assert_eq!(
             binds[1],
-            Bind::Text("search_text : bitcoin AND search_text : rally".to_string())
+            Bind::Text(
+                "search_tags : chatp1 AND (search_text : bitcoin AND search_text : rally)"
+                    .to_string()
+            )
         );
     }
     #[test]

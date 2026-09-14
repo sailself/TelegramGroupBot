@@ -2,9 +2,7 @@
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::{
-    ChatAction, InputFile, InputMedia, InputMediaPhoto, ParseMode, ReplyParameters,
-};
+use teloxide::types::{ChatAction, InputFile, ReplyParameters};
 
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
@@ -135,21 +133,22 @@ pub async fn profileme_handler(
             let (system_prompt, user_content) =
                 build_profileme_prompts(style.as_deref(), &formatted_history);
 
-            let response = match call_configured_text_model(
-                &system_prompt,
-                &user_content,
-                "Your User Profile",
-                false,
-                false,
-                None,
-                Some("PROFILEME_SYSTEM_PROMPT"),
-                audit_context.as_ref(),
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => return Err(err),
-            };
+            let response =
+                match call_configured_text_model(crate::llm::text_model::TextCallRequest {
+                    system_prompt: &system_prompt,
+                    user_content: &user_content,
+                    response_title: "Your User Profile",
+                    tools_enabled: false,
+                    use_pro: false,
+                    media_files: None,
+                    prompt_name: Some("PROFILEME_SYSTEM_PROMPT"),
+                    audit_context: audit_context.as_ref(),
+                })
+                .await
+                {
+                    Ok(response) => response,
+                    Err(err) => return Err(err),
+                };
 
             let (response_text, _response_model) = response;
             send_response(
@@ -165,6 +164,31 @@ pub async fn profileme_handler(
         },
     )
     .await
+}
+
+struct PersonaImagePrompt {
+    audit_label: &'static str,
+    system_prompt: &'static str,
+    title: &'static str,
+    prompt_label: &'static str,
+}
+
+fn persona_image_prompt(portrait: bool) -> PersonaImagePrompt {
+    if portrait {
+        PersonaImagePrompt {
+            audit_label: "portraitme",
+            system_prompt: PORTRAIT_SYSTEM_PROMPT,
+            title: "Portrait Prompt",
+            prompt_label: "PORTRAIT_SYSTEM_PROMPT",
+        }
+    } else {
+        PersonaImagePrompt {
+            audit_label: "paintme",
+            system_prompt: PAINTME_SYSTEM_PROMPT,
+            title: "Paint Prompt",
+            prompt_label: "PAINTME_SYSTEM_PROMPT",
+        }
+    }
 }
 
 pub async fn paintme_handler(
@@ -225,12 +249,9 @@ pub async fn paintme_handler(
                 .await?;
                 return Ok(());
             }
-            let audit_context = create_command_audit_context(
-                &state,
-                &message,
-                if portrait { "portraitme" } else { "paintme" },
-            )
-            .await;
+            let persona = persona_image_prompt(portrait);
+            let audit_context =
+                create_command_audit_context(&state, &message, persona.audit_label).await;
 
             let mut history_lines = String::new();
             for msg in history {
@@ -243,35 +264,22 @@ pub async fn paintme_handler(
                 crate::llm::prompting::wrap_chat_history(&history_lines)
             );
 
-            let prompt_system = if portrait {
-                PORTRAIT_SYSTEM_PROMPT
-            } else {
-                PAINTME_SYSTEM_PROMPT
-            };
-
-            let (prompt, _prompt_model) = match call_configured_text_model(
-                prompt_system,
-                &formatted_history,
-                if portrait {
-                    "Portrait Prompt"
-                } else {
-                    "Paint Prompt"
-                },
-                false,
-                false,
-                None,
-                Some(if portrait {
-                    "PORTRAIT_SYSTEM_PROMPT"
-                } else {
-                    "PAINTME_SYSTEM_PROMPT"
-                }),
-                audit_context.as_ref(),
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => return Err(err),
-            };
+            let (prompt, _prompt_model) =
+                match call_configured_text_model(crate::llm::text_model::TextCallRequest {
+                    system_prompt: persona.system_prompt,
+                    user_content: &formatted_history,
+                    response_title: persona.title,
+                    tools_enabled: false,
+                    use_pro: false,
+                    media_files: None,
+                    prompt_name: Some(persona.prompt_label),
+                    audit_context: audit_context.as_ref(),
+                })
+                .await
+                {
+                    Ok(response) => response,
+                    Err(err) => return Err(err),
+                };
             drop(typing_chat_action);
 
             // The model is asked for raw JSON; defensively unfence/extract before it
@@ -305,40 +313,16 @@ pub async fn paintme_handler(
             };
             let caption = build_image_caption(&model_name, &prompt).await;
 
-            if images.is_empty() {
-                return Err(anyhow::anyhow!("Image generation returned no images"));
-            }
-            let mut image_iter = images.into_iter();
-            if let Some(first_image) = image_iter.next() {
-                let media = InputMedia::Photo(
-                    InputMediaPhoto::new(InputFile::memory(first_image.clone()))
-                        .caption(caption.clone())
-                        .parse_mode(ParseMode::Html),
-                );
-                let edit_result = bot
-                    .edit_message_media(message.chat.id, processing_message.id, media)
-                    .await;
-                if edit_result.is_err() {
-                    bot.send_photo(message.chat.id, InputFile::memory(first_image))
-                        .reply_parameters(ReplyParameters::new(message.id))
-                        .caption(caption)
-                        .parse_mode(ParseMode::Html)
-                        .await?;
-                    let _ = bot
-                        .edit_message_text(
-                            message.chat.id,
-                            processing_message.id,
-                            "Generated image below.",
-                        )
-                        .await;
-                }
-            }
-
-            for image in image_iter {
-                bot.send_photo(message.chat.id, InputFile::memory(image))
-                    .reply_parameters(ReplyParameters::new(message.id))
-                    .await?;
-            }
+            super::image_delivery::deliver_generated_images(
+                &bot,
+                message.chat.id,
+                processing_message.id,
+                message.id,
+                images.into_iter().map(InputFile::memory).collect(),
+                &caption,
+                false,
+            )
+            .await?;
 
             Ok(())
         },
@@ -349,6 +333,19 @@ pub async fn paintme_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paintme_and_portraitme_keep_distinct_prompts_and_audit_labels() {
+        let paint = persona_image_prompt(false);
+        let portrait = persona_image_prompt(true);
+        assert_eq!(paint.audit_label, "paintme");
+        assert_eq!(portrait.audit_label, "portraitme");
+        assert_eq!(paint.system_prompt, PAINTME_SYSTEM_PROMPT);
+        assert_eq!(portrait.system_prompt, PORTRAIT_SYSTEM_PROMPT);
+        assert_ne!(paint.system_prompt, portrait.system_prompt);
+        assert_eq!(paint.prompt_label, "PAINTME_SYSTEM_PROMPT");
+        assert_eq!(portrait.prompt_label, "PORTRAIT_SYSTEM_PROMPT");
+    }
 
     #[test]
     fn sanitize_image_prompt_json_unfences_and_extracts() {

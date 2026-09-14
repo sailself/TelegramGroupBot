@@ -184,9 +184,7 @@ pub async fn read_body_capped(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::twitter_extractor::test_support::{
-        chunked_response, response_with_content_length, TestServer,
-    };
+    use crate::test_support::{chunked_response, response_with_content_length, TestServer};
 
     #[test]
     fn https_allowlist_accepts_default_port_and_rejects_everything_else() {

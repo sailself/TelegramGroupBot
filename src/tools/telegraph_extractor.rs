@@ -3,7 +3,6 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use tracing::info;
-use url::Url;
 
 use crate::utils::http::get_http_client;
 
@@ -28,7 +27,11 @@ pub struct TelegraphContent {
 
 pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
     info!("Starting Telegraph extraction for url: {}", url);
-    let parsed = Url::parse(url)?;
+    let parsed = crate::utils::http::parse_https_allowlisted(
+        "Telegraph",
+        url,
+        Some(&["telegra.ph", "graph.org"]),
+    )?;
     let path = parsed.path().trim_start_matches('/');
     if path.is_empty() {
         return Err(anyhow!("Invalid Telegraph URL: Missing path component"));
@@ -52,11 +55,14 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
         ));
     }
 
-    let data = response.json::<TelegraphResponse>().await?;
+    let body = crate::utils::http::read_body_capped("Telegraph", response, 2 * 1024 * 1024).await?;
+    let data = serde_json::from_slice::<TelegraphResponse>(&body)?;
     if !data.ok {
         return Err(anyhow!(
             "Telegraph API error: {}",
-            data.error.unwrap_or_else(|| "Unknown error".to_string())
+            crate::utils::text::external_failure_excerpt(
+                &data.error.unwrap_or_else(|| "Unknown error".to_string())
+            )
         ));
     }
 
@@ -238,4 +244,21 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
             .to_string();
 
     Ok(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn extractor_rejects_non_telegraph_hosts_before_network_access() {
+        for url in [
+            "https://example.test/page",
+            "https://telegra.ph.example.test/page",
+            "https://t.me/c/123/1",
+            "http://telegra.ph/page",
+            "https://user:password@telegra.ph/page",
+        ] {
+            assert!(extract_telegraph_content(url).await.is_err(), "{url}");
+        }
+    }
 }

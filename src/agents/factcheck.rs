@@ -100,14 +100,16 @@ pub async fn run_factcheck_pipeline(
     let user_content = build_synthesis_input(statement, &evidence);
     let (text, model_display) = call_resolved_text_model(
         final_model,
-        &system_prompt,
-        &user_content,
-        "Fact Check",
-        false,
-        media_summary.total > 0,
-        (!media_files.is_empty()).then(|| media_files.to_vec()),
-        Some("FACTCHECK_SYNTHESIS_PROMPT"),
-        audit_context,
+        crate::llm::text_model::TextCallRequest {
+            system_prompt: &system_prompt,
+            user_content: &user_content,
+            response_title: "Fact Check",
+            tools_enabled: false,
+            use_pro: media_summary.total > 0,
+            media_files: (!media_files.is_empty()).then(|| media_files.to_vec()),
+            prompt_name: Some("FACTCHECK_SYNTHESIS_PROMPT"),
+            audit_context,
+        },
     )
     .await?;
 
@@ -160,16 +162,16 @@ async fn extract_claims(
     );
     let input = truncate_for_log(statement, EXTRACTION_INPUT_MAX_CHARS);
 
-    let extraction: ClaimExtraction = call_step_json(
-        &step_model,
-        &prompt,
-        &input,
+    let extraction: ClaimExtraction = call_step_json(crate::agents::step::StepCallRequest {
+        step_model: &step_model,
+        system_prompt: &prompt,
+        user_content: &input,
         media_files,
-        &schema,
-        "Fact Check Claims",
-        "claim extraction",
+        json_schema: Some(&schema),
+        response_title: "Fact Check Claims",
+        system_prompt_label: Some("claim extraction"),
         audit_context,
-    )
+    })
     .await?;
     Ok(normalize_claims(
         extraction.claims,

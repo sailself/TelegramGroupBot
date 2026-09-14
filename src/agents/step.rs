@@ -221,17 +221,28 @@ fn json_output_instruction(schema: &Value) -> String {
 /// Run one bounded step call (no tools). With a schema, Gemini gets a native
 /// `responseJsonSchema` while Responses/chat providers get a prompt-level JSON
 /// instruction; parse the result with [`parse_lenient_json`] either way.
-#[allow(clippy::too_many_arguments)]
-pub async fn call_step_text(
-    step_model: &StepModel,
-    system_prompt: &str,
-    user_content: &str,
-    media_files: &[MediaFile],
-    json_schema: Option<&Value>,
-    response_title: &str,
-    system_prompt_label: Option<&str>,
-    audit_context: Option<&LlmAuditContext>,
-) -> Result<String> {
+pub struct StepCallRequest<'a> {
+    pub step_model: &'a StepModel,
+    pub system_prompt: &'a str,
+    pub user_content: &'a str,
+    pub media_files: &'a [MediaFile],
+    pub json_schema: Option<&'a Value>,
+    pub response_title: &'a str,
+    pub system_prompt_label: Option<&'a str>,
+    pub audit_context: Option<&'a LlmAuditContext>,
+}
+
+pub async fn call_step_text(request: StepCallRequest<'_>) -> Result<String> {
+    let StepCallRequest {
+        step_model,
+        system_prompt,
+        user_content,
+        media_files,
+        json_schema,
+        response_title,
+        system_prompt_label,
+        audit_context,
+    } = request;
     match step_model {
         StepModel::Gemini { model } => {
             let result = call_gemini_model_simple(

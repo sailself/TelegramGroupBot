@@ -45,6 +45,7 @@ struct SearchRow {
 #[derive(Debug, Clone, FromRow)]
 struct RebuildRow {
     id: i64,
+    chat_id: i64,
     text: Option<String>,
     asks_ai: bool,
     ai_command: Option<String>,
@@ -226,7 +227,10 @@ impl Database {
              LIMIT ?",
         )
         .bind(chat_id)
-        .bind(stage_query)
+        .bind(crate::db::search::scope_match_expression(
+            chat_id,
+            stage_query,
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -367,6 +371,11 @@ async fn rebuild_search_index(pool: SqlitePool, search_ready: Arc<AtomicBool>) -
                     if count_pending_search_rows(&pool).await? != 0 {
                         return Ok(false);
                     }
+                    sqlx::query(
+                        "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)",
+                    )
+                    .execute(&pool)
+                    .await?;
                     set_search_schema_version(&pool, CURRENT_SEARCH_SCHEMA_VERSION).await?;
                     Ok::<_, anyhow::Error>(true)
                 }
@@ -409,7 +418,7 @@ async fn rebuild_search_batch(
     batch_size: i64,
 ) -> Result<Option<i64>> {
     let rows = sqlx::query_as::<_, RebuildRow>(
-        "SELECT id, text, asks_ai, ai_command, is_command, is_synthetic_record FROM messages \
+        "SELECT id, chat_id, text, asks_ai, ai_command, is_command, is_synthetic_record FROM messages \
          WHERE id > ? AND search_version != ? ORDER BY id ASC LIMIT ?",
     )
     .bind(cursor)
@@ -432,7 +441,7 @@ async fn rebuild_search_batch(
             };
             (
                 row.id,
-                normalize_message_document(row.text.as_deref(), None, &explicit),
+                normalize_message_document(row.chat_id, row.text.as_deref(), None, &explicit),
             )
         })
         .collect::<Vec<_>>();
@@ -706,6 +715,65 @@ mod migration_regressions {
     use super::*;
     use crate::db::test_support::{init_test_db, queue_message, wait_for_search_ready};
     #[tokio::test]
+    async fn interrupted_backfill_survives_writes_edits_and_deletes_without_stale_terms() {
+        let db = init_test_db("external-writer-interleave").await;
+        for id in 1..=4 {
+            queue_message(&db, id, -123, "alice", "obsolete alpha").await;
+        }
+        crate::db::schema::reset_search_versions(db.pool())
+            .await
+            .unwrap();
+        let cursor = rebuild_search_batch(db.pool(), 0, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        queue_message(&db, 1, -123, "alice", "updated beta").await;
+        queue_message(&db, 5, -123, "alice", "inserted gamma").await;
+        // Delete one already indexed row and one not yet indexed row.
+        sqlx::query("DELETE FROM messages WHERE message_id IN (2,5)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(rebuild_search_batch(db.pool(), cursor, 1)
+            .await
+            .unwrap()
+            .is_some());
+        rebuild_search_index(db.pool().clone(), db.search_ready.clone())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let obsolete = db
+            .search_chat_messages(-123, "obsolete", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            obsolete
+                .iter()
+                .map(|hit| hit.message_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [3, 4].into_iter().collect()
+        );
+        assert_eq!(
+            db.search_chat_messages(-123, "beta", 10, 0).await.unwrap()[0].message_id,
+            1
+        );
+        assert!(db
+            .search_chat_messages(-123, "gamma", 10, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .search_chat_messages(123, "beta", 10, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        db.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn normalization_upgrade_resumes_without_resetting_completed_rows() {
         let db = init_test_db("normalization-resume").await;
         for id in 1..=3 {
@@ -748,8 +816,8 @@ mod migration_regressions {
             .await
             .unwrap();
         assert_eq!(
-            schema, 1,
-            "normalization must not change the database format"
+            schema, 2,
+            "external-content migration uses schema version 2"
         );
         // A missing index must rebuild even rows stamped as current.
         sqlx::query("DROP TABLE messages_fts")
@@ -808,8 +876,12 @@ mod writer_race_tests {
             .fetch_one(db.pool())
             .await
             .unwrap();
-        let stale =
-            normalize_message_document(Some("old text"), None, &SearchProvenance::default());
+        let stale = normalize_message_document(
+            -100123,
+            Some("old text"),
+            None,
+            &SearchProvenance::default(),
+        );
         // The normal writer has committed between our snapshot and batch write.
         sqlx::query("UPDATE messages SET text = 'new text', search_text = 'new indexed text', search_version = ?")
             .bind(CURRENT_SEARCH_SCHEMA_VERSION).execute(db.pool()).await.unwrap();
@@ -880,6 +952,125 @@ mod lock_recovery_tests {
             .contains("retrying batch"));
         drop(lock);
         rebuild_pool.close().await;
+        db.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod performance_measurement {
+    use super::*;
+    use crate::db::test_support::{sqlite_url_for_path, test_db_path};
+    use sqlx::Row;
+
+    /// Explicit opt-in: identical harness also runs on the 99621bf baseline.
+    #[tokio::test]
+    #[ignore = "synthetic performance measurement; run explicitly and serially"]
+    async fn synthetic_search_measurement() {
+        let path = test_db_path("search-measurement");
+        let url = sqlite_url_for_path(&path);
+        let db = Database::init(&url).await.unwrap();
+        let date = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut corpus = Vec::new();
+        for chat in 1..=200 {
+            for id in 1..=160 {
+                let text = format!(
+                    "alpha beta 计算机科学 café bitcoin Telegram multilingual message {id} {}",
+                    "中文讨论 Rust search 日本語 français ".repeat((id % 5 + 1) as usize)
+                );
+                corpus.push(crate::db::messages::build_message_insert(
+                    Some(id % 17),
+                    Some(format!("user{}", id % 17)),
+                    Some(text),
+                    Some("mixed".into()),
+                    date,
+                    None,
+                    Some(-1000 - chat),
+                    Some(id),
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                ));
+            }
+        }
+        let started = std::time::Instant::now();
+        for message in corpus {
+            db.queue_message_insert(message).await.unwrap();
+        }
+        db.shutdown().await;
+        let insert_seconds = started.elapsed().as_secs_f64();
+        let db = Database::init(&url).await.unwrap();
+        assert!(db.is_search_ready());
+        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let freelist: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let mut query_metrics = Vec::new();
+        for query in [
+            "alpha beta",
+            "计算机",
+            "bitcoin",
+            "café",
+            "bitco",
+            "missingterm",
+        ] {
+            let mut samples = Vec::new();
+            let mut ids = Vec::new();
+            for round in 0..27 {
+                let started = std::time::Instant::now();
+                let hits = db.search_chat_messages(-1001, query, 20, 40).await.unwrap();
+                if round >= 2 {
+                    samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                ids = hits.iter().map(|hit| hit.message_id).collect();
+                assert!(hits.iter().all(|hit| hit.chat_id == -1001));
+            }
+            samples.sort_by(f64::total_cmp);
+            query_metrics.push(serde_json::json!({"query":query,"median_ms":samples[12],"p95_ms":samples[23],"returned_ids":ids}));
+        }
+        let expression = if CURRENT_SEARCH_SCHEMA_VERSION >= 3 {
+            "search_tags : chatn1001 AND (search_text : bitcoin)"
+        } else {
+            "search_text : bitcoin"
+        };
+        let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT m.message_id FROM messages_fts JOIN messages m ON m.id=messages_fts.rowid WHERE m.chat_id=? AND messages_fts MATCH ? ORDER BY bm25(messages_fts,1.0,0.2),m.date DESC,m.message_id DESC LIMIT 60").bind(-1001_i64).bind(expression).fetch_all(db.pool()).await.unwrap().iter().map(|row| row.get::<String,_>("detail")).collect::<Vec<_>>();
+        sqlx::query("DROP TABLE messages_fts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        crate::db::schema::prepare_search_fts(db.pool())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        rebuild_search_index(db.pool().clone(), db.search_ready.clone())
+            .await
+            .unwrap();
+        let rebuild_seconds = started.elapsed().as_secs_f64();
+        let integrity = if CURRENT_SEARCH_SCHEMA_VERSION >= 3 {
+            "INSERT INTO messages_fts(messages_fts,rank) VALUES('integrity-check',1)"
+        } else {
+            "INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')"
+        };
+        sqlx::query(integrity).execute(db.pool()).await.unwrap();
+        let report = serde_json::json!({"normalization":CURRENT_SEARCH_SCHEMA_VERSION,"rows":32000,"chats":200,"samples_per_query":25,"insert_seconds":insert_seconds,"rows_per_second":32000.0/insert_seconds,"rebuild_seconds":rebuild_seconds,"page_count":page_count,"freelist_pages":freelist,"allocated_pages":page_count-freelist,"page_size":page_size,"query_plan":plan,"queries":query_metrics});
+        std::fs::create_dir_all("agent_logs").unwrap();
+        std::fs::write(
+            "agent_logs/search_measurement.json",
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!("SEARCH_MEASUREMENT {report}");
         db.shutdown().await;
     }
 }

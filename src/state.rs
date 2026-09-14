@@ -64,8 +64,20 @@ pub enum PendingImageCommand {
     Image,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSelectionStage {
+    Model,
+    Resolution,
+    AspectRatio,
+    CodexSize,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingImageRequest {
+    pub selection_gate: Arc<AsyncMutex<()>>,
+    pub stage: ImageSelectionStage,
+    pub deadline: tokio::time::Instant,
+
     pub user_id: i64,
     pub chat_id: i64,
     pub message_id: i64,
@@ -116,6 +128,7 @@ pub struct ActiveCodexLogin {
 }
 
 struct PendingEntry<T> {
+    generation: Arc<()>,
     request: T,
     /// Handle of the timeout task armed by [`PendingRequests::insert_with_timeout`].
     timeout: Option<AbortHandle>,
@@ -162,10 +175,12 @@ impl<T> PendingRequests<T> {
 
     /// Store `request` under `key` with no deadline. Replaces (and cancels the
     /// timeout of) any request already stored under the same key.
+    #[cfg(test)]
     pub fn insert(&self, key: String, request: T) {
         let previous = self.entries.lock().insert(
             key,
             PendingEntry {
+                generation: Arc::new(()),
                 request,
                 timeout: None,
             },
@@ -194,19 +209,28 @@ impl<T> PendingRequests<T> {
         let previous = entries.insert(
             key.clone(),
             PendingEntry {
+                generation: Arc::new(()),
                 request,
                 timeout: None,
             },
         );
+        let generation = entries.get(&key).unwrap().generation.clone();
         let timeout_entries = Arc::clone(&self.entries);
         let timeout_key = key.clone();
         let task = tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
             // This *is* the timeout task, so remove without cancelling.
-            let expired = timeout_entries
-                .lock()
-                .remove(&timeout_key)
-                .map(|entry| entry.request);
+            let expired = {
+                let mut entries = timeout_entries.lock();
+                if entries
+                    .get(&timeout_key)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.generation, &generation))
+                {
+                    entries.remove(&timeout_key).map(|entry| entry.request)
+                } else {
+                    None
+                }
+            };
             if let Some(request) = expired {
                 on_timeout(request).await;
             }
@@ -218,6 +242,65 @@ impl<T> PendingRequests<T> {
         if let Some(previous) = previous {
             previous.cancel_timeout();
         }
+    }
+
+    pub fn insert_with_deadline<F, Fut>(
+        &self,
+        key: String,
+        request: T,
+        deadline: fn(&T) -> tokio::time::Instant,
+        on_timeout: F,
+    ) where
+        T: Send + 'static,
+        F: FnOnce(T) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let generation = Arc::new(());
+        let mut entries = self.entries.lock();
+        if let Some(previous) = entries.insert(
+            key.clone(),
+            PendingEntry {
+                generation: generation.clone(),
+                request,
+                timeout: None,
+            },
+        ) {
+            previous.cancel_timeout();
+        }
+        let shared = self.entries.clone();
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let next = {
+                    let entries = shared.lock();
+                    match entries.get(&task_key) {
+                        Some(entry) if Arc::ptr_eq(&entry.generation, &generation) => {
+                            deadline(&entry.request)
+                        }
+                        _ => return,
+                    }
+                };
+                tokio::time::sleep_until(next).await;
+                let expired = {
+                    let mut entries = shared.lock();
+                    match entries.get(&task_key) {
+                        Some(entry) if Arc::ptr_eq(&entry.generation, &generation) => {
+                            if deadline(&entry.request) <= tokio::time::Instant::now() {
+                                entries.remove(&task_key).map(|entry| entry.request)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => return,
+                    }
+                };
+                if let Some(request) = expired {
+                    on_timeout(request).await;
+                    return;
+                }
+            }
+        });
+        entries.get_mut(&key).unwrap().timeout = Some(task.abort_handle());
     }
 
     /// Lock the entry under `key` for inspection, mutation, or removal.
@@ -414,6 +497,90 @@ mod tests {
             .await
             .expect("test database should initialize");
         AppState::new(db, 1, "test_bot".to_string())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_deadlines_keep_saved_choices_and_replacements() {
+        let pending = PendingRequests::new();
+        let (send, mut recv) = tokio::sync::mpsc::unbounded_channel();
+        let now = tokio::time::Instant::now();
+        let output = send.clone();
+        pending.insert_with_deadline(
+            "key".into(),
+            (now + Duration::from_secs(10), 1),
+            |r| r.0,
+            move |r| async move {
+                output.send(r.1).unwrap();
+            },
+        );
+        tokio::time::advance(Duration::from_secs(9)).await;
+        pending.entry("key").get_mut().unwrap().0 = now + Duration::from_secs(19);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(pending.count(), 1);
+        let output = send.clone();
+        pending.insert_with_deadline(
+            "key".into(),
+            (now + Duration::from_secs(25), 2),
+            |r| r.0,
+            move |r| async move {
+                output.send(r.1).unwrap();
+            },
+        );
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert_eq!(pending.count(), 1);
+        assert!(recv.try_recv().is_err());
+        assert_eq!(recv.recv().await, Some(2));
+        assert_eq!(pending.count(), 0);
+        assert!(recv.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_deadline_callback_claim_cancels_execution() {
+        let pending = PendingRequests::new();
+        pending.insert_with_deadline(
+            "key".into(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            |r| *r,
+            |_| async {
+                panic!("callback already claimed request");
+            },
+        );
+        assert!(pending.entry("key").take().is_some());
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(pending.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_and_expiring_timer_claim_execution_exactly_once() {
+        let pending = PendingRequests::new();
+        let claims = Arc::new(AtomicUsize::new(0));
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let timeout_claims = claims.clone();
+        let timeout_send = send.clone();
+        pending.insert_with_deadline(
+            "key".into(),
+            tokio::time::Instant::now(),
+            |r| *r,
+            move |_| async move {
+                timeout_claims.fetch_add(1, Ordering::SeqCst);
+                timeout_send.send(()).unwrap();
+            },
+        );
+        let callback_claims = claims.clone();
+        let callback_pending = pending.clone();
+        let callback = tokio::spawn(async move {
+            if callback_pending.entry("key").take().is_some() {
+                callback_claims.fetch_add(1, Ordering::SeqCst);
+                send.send(()).unwrap();
+            }
+        });
+        callback.await.unwrap();
+        receive.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
+        assert_eq!(pending.count(), 0);
+        assert!(receive.try_recv().is_err());
     }
 
     #[tokio::test]
