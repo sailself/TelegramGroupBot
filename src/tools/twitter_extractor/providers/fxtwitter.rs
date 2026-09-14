@@ -327,10 +327,10 @@ pub(crate) async fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::twitter_extractor::model::XMedia;
-    use crate::tools::twitter_extractor::test_support::{
+    use crate::test_support::{
         identity, redirect_response, response_with_content_length, ExpectedRequest, TestServer,
     };
+    use crate::tools::twitter_extractor::model::XMedia;
 
     #[test]
     fn parses_fxtwitter_photo_quote_fixture() {

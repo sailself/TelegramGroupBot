@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatAction, FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia,
-    InputMediaPhoto, MessageId, ParseMode, ReplyParameters,
+    ChatAction, FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageId,
+    ReplyParameters,
 };
 
 use crate::config::CONFIG;
@@ -25,7 +25,9 @@ use crate::llm::{
     generate_image_with_img2, generate_video_with_veo, CodexImageConfig, GeminiImageConfig,
     LlmAuditContext,
 };
-use crate::state::{AppState, ImageGenerationModel, PendingImageCommand, PendingImageRequest};
+use crate::state::{
+    AppState, ImageGenerationModel, ImageSelectionStage, PendingImageCommand, PendingImageRequest,
+};
 use crate::utils::telegram::{
     edit_message_text_with_retry, message_entities_for_text, retry_telegram,
     send_message_with_retry, start_chat_action_heartbeat, strip_command_prefix,
@@ -92,19 +94,6 @@ pub(super) async fn build_image_caption(model_name: &str, prompt: &str) -> Strin
     } else {
         base_caption
     }
-}
-
-fn build_img2_spoiler_caption(caption: &str) -> String {
-    format!("<tg-spoiler>{}</tg-spoiler>", caption)
-}
-
-fn build_img2_spoiler_photo_media(input_file: InputFile, caption: &str) -> InputMedia {
-    InputMedia::Photo(
-        InputMediaPhoto::new(input_file)
-            .caption(build_img2_spoiler_caption(caption))
-            .parse_mode(ParseMode::Html)
-            .spoiler(),
-    )
 }
 
 async fn send_video_with_retry(
@@ -635,37 +624,24 @@ async fn finalize_image_request(
     };
     let caption = build_image_caption(&model_name, &prompt).await;
 
-    if images.is_empty() { return Err(anyhow::anyhow!("Image generation returned no images")); }
-    let mut image_iter = images.into_iter();
-    if let Some(first_image) = image_iter.next() {
-        let media = InputMedia::Photo(
-            InputMediaPhoto::new(InputFile::memory(first_image.clone()))
-                .caption(caption.clone())
-                .parse_mode(ParseMode::Html),
-        );
-        let edit_result = bot
-            .edit_message_media(ChatId(request.chat_id), processing_message_id, media)
-            .await;
-        if edit_result.is_err() {
-            retry_telegram("send_photo", || {
-                bot.send_photo(ChatId(request.chat_id), InputFile::memory(first_image.clone()))
-                .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
-                .caption(caption.clone())
-                .parse_mode(ParseMode::Html)
-            }).await.map_err(crate::utils::telegram::ImageDeliveryError)?;
-            let _ = edit_message_text_with_retry(bot, ChatId(request.chat_id), processing_message_id, "Generated image below.").await;
-        }
-    }
-
-    for image in image_iter {
-        retry_telegram("send_photo", || {
-            bot.send_photo(ChatId(request.chat_id), InputFile::memory(image.clone()))
-            .reply_parameters(ReplyParameters::new(MessageId(request.message_id as i32)))
-        }).await.map_err(crate::utils::telegram::ImageDeliveryError)?;
-    }
+    super::image_delivery::deliver_generated_images(bot, ChatId(request.chat_id), processing_message_id, MessageId(request.message_id as i32), images.into_iter().map(InputFile::memory).collect(), &caption, false).await?;
 
     Ok(())
     }).await
+}
+
+fn valid_selection(
+    request: &PendingImageRequest,
+    user: i64,
+    chat: i64,
+    message: i32,
+    stage: ImageSelectionStage,
+) -> bool {
+    request.user_id == user
+        && request.chat_id == chat
+        && request.selection_message_id == i64::from(message)
+        && request.stage == stage
+        && request.deadline > tokio::time::Instant::now()
 }
 
 pub async fn image_selection_callback(
@@ -677,7 +653,24 @@ pub async fn image_selection_callback(
     let Some(data) = &query.data else {
         return Ok(());
     };
+    let Some(selection_message) = query.message.as_ref() else {
+        return Ok(());
+    };
     let query_user_id = i64::try_from(query.from.id.0).unwrap_or_default();
+    let Some((_, payload)) = data.split_once(':') else {
+        return Ok(());
+    };
+    let Some((key, _)) = payload.split_once('|') else {
+        return Ok(());
+    };
+    let gate = {
+        let entry = state.pending_image_requests.entry(key);
+        entry.get().map(|r| r.selection_gate.clone())
+    };
+    let Some(gate) = gate else {
+        return Ok(());
+    };
+    let selection_guard = gate.lock().await;
 
     if data.starts_with(IMAGE_MODEL_CALLBACK_PREFIX) {
         let payload = data.trim_start_matches(IMAGE_MODEL_CALLBACK_PREFIX);
@@ -701,10 +694,22 @@ pub async fn image_selection_callback(
             let Some(request) = entry.get_mut() else {
                 return Ok(());
             };
-            if request.user_id != query_user_id {
+            if !valid_selection(
+                request,
+                query_user_id,
+                selection_message.chat().id.0,
+                selection_message.id().0,
+                ImageSelectionStage::Model,
+            ) {
                 return Ok(());
             }
             request.model = Some(model);
+            request.stage = match model {
+                ImageGenerationModel::Gemini => ImageSelectionStage::Resolution,
+                ImageGenerationModel::CodexGptImage2 => ImageSelectionStage::CodexSize,
+            };
+            request.deadline = tokio::time::Instant::now()
+                + Duration::from_secs(CONFIG.limits.model_selection_timeout);
             let command = request.command;
             // /img has nothing more to ask: take the request now so the
             // timeout task can no longer race this selection.
@@ -718,6 +723,7 @@ pub async fn image_selection_callback(
         match (next_command, model) {
             (PendingImageCommand::Img, _) => {
                 if let Some(request) = ready_request {
+                    drop(selection_guard);
                     finalize_image_request(&bot, &state, request, None, None).await?;
                 }
             }
@@ -765,7 +771,17 @@ pub async fn image_selection_callback(
         let ready_request = {
             let mut entry = state.pending_image_requests.entry(request_key);
             match entry.get_mut() {
-                Some(request) if request.user_id != query_user_id => return Ok(()),
+                Some(request)
+                    if !valid_selection(
+                        request,
+                        query_user_id,
+                        selection_message.chat().id.0,
+                        selection_message.id().0,
+                        ImageSelectionStage::CodexSize,
+                    ) =>
+                {
+                    return Ok(())
+                }
                 Some(request) => {
                     request.model = Some(ImageGenerationModel::CodexGptImage2);
                     request.codex_size = Some(size.to_string());
@@ -775,6 +791,7 @@ pub async fn image_selection_callback(
             entry.take()
         };
         if let Some(request) = ready_request {
+            drop(selection_guard);
             finalize_image_request(&bot, &state, request, None, None).await?;
         }
         return Ok(());
@@ -790,10 +807,21 @@ pub async fn image_selection_callback(
         }
 
         if let Some(request) = state.pending_image_requests.entry(request_key).get_mut() {
-            if request.user_id != query_user_id {
+            if !valid_selection(
+                request,
+                query_user_id,
+                selection_message.chat().id.0,
+                selection_message.id().0,
+                ImageSelectionStage::Resolution,
+            ) {
                 return Ok(());
             }
             request.resolution = Some(resolution.to_string());
+            request.stage = ImageSelectionStage::AspectRatio;
+            request.deadline = tokio::time::Instant::now()
+                + Duration::from_secs(CONFIG.limits.model_selection_timeout);
+        } else {
+            return Ok(());
         }
 
         if let Some(message) = &query.message {
@@ -825,7 +853,17 @@ pub async fn image_selection_callback(
         let ready_request = {
             let mut entry = state.pending_image_requests.entry(request_key);
             match entry.get_mut() {
-                Some(request) if request.user_id != query_user_id => return Ok(()),
+                Some(request)
+                    if !valid_selection(
+                        request,
+                        query_user_id,
+                        selection_message.chat().id.0,
+                        selection_message.id().0,
+                        ImageSelectionStage::AspectRatio,
+                    ) =>
+                {
+                    return Ok(())
+                }
                 Some(request) => {
                     request.aspect_ratio = if aspect == IMAGE_ASPECT_RATIO_AUTO_CALLBACK {
                         None
@@ -844,6 +882,7 @@ pub async fn image_selection_callback(
             Some(aspect)
         };
         if let Some(request) = ready_request {
+            drop(selection_guard);
             finalize_image_request(&bot, &state, request, None, selected_aspect).await?;
         }
     }
@@ -922,6 +961,10 @@ pub async fn img_handler(
             ))
             .await?;
         let pending = PendingImageRequest {
+            selection_gate: Default::default(),
+            stage: ImageSelectionStage::Model,
+            deadline: tokio::time::Instant::now()
+                + Duration::from_secs(CONFIG.limits.model_selection_timeout),
             user_id,
             chat_id: message.chat.id.0,
             message_id: message.id.0 as i64,
@@ -938,11 +981,13 @@ pub async fn img_handler(
         };
         let timeout_bot = bot.clone();
         let timeout_state = state.clone();
-        state.pending_image_requests.insert_with_timeout(
+        state.pending_image_requests.insert_with_deadline(
             request_key,
             pending,
-            Duration::from_secs(CONFIG.limits.model_selection_timeout),
+            |request| request.deadline,
             move |request| async move {
+                let gate = request.selection_gate.clone();
+                let _selection_guard = gate.lock().await;
                 let _ =
                     finalize_image_request(&timeout_bot, &timeout_state, request, None, None).await;
             },
@@ -991,46 +1036,16 @@ pub async fn img_handler(
             };
 
             let caption = build_image_caption(&model_name, &prompt_text).await;
-            if images.is_empty() {
-                return Err(anyhow::anyhow!("Image generation returned no images"));
-            }
-            let mut image_iter = images.into_iter();
-            if let Some(first_image) = image_iter.next() {
-                let media = InputMedia::Photo(
-                    InputMediaPhoto::new(InputFile::memory(first_image.clone()))
-                        .caption(caption.clone())
-                        .parse_mode(ParseMode::Html),
-                );
-                let edit_result = bot
-                    .edit_message_media(message.chat.id, processing_message.id, media)
-                    .await;
-                if edit_result.is_err() {
-                    retry_telegram("send_photo", || {
-                        bot.send_photo(message.chat.id, InputFile::memory(first_image.clone()))
-                            .reply_parameters(ReplyParameters::new(message.id))
-                            .caption(caption.clone())
-                            .parse_mode(ParseMode::Html)
-                    })
-                    .await
-                    .map_err(crate::utils::telegram::ImageDeliveryError)?;
-                    let _ = bot
-                        .edit_message_text(
-                            message.chat.id,
-                            processing_message.id,
-                            "Generated image below.",
-                        )
-                        .await;
-                }
-            }
-
-            for image in image_iter {
-                retry_telegram("send_photo", || {
-                    bot.send_photo(message.chat.id, InputFile::memory(image.clone()))
-                        .reply_parameters(ReplyParameters::new(message.id))
-                })
-                .await
-                .map_err(crate::utils::telegram::ImageDeliveryError)?;
-            }
+            super::image_delivery::deliver_generated_images(
+                &bot,
+                message.chat.id,
+                processing_message.id,
+                message.id,
+                images.into_iter().map(InputFile::memory).collect(),
+                &caption,
+                false,
+            )
+            .await?;
 
             Ok(())
         },
@@ -1126,29 +1141,16 @@ pub async fn img2_handler(
         result.path.display()
     );
             let caption = build_image_caption("img2", &prompt_text).await;
-            let media =
-                build_img2_spoiler_photo_media(InputFile::file(result.path.clone()), &caption);
-            let edit_result = bot
-                .edit_message_media(message.chat.id, processing_message.id, media)
-                .await;
-            if edit_result.is_err() {
-                retry_telegram("send_photo", || {
-                    bot.send_photo(message.chat.id, InputFile::file(result.path.clone()))
-                        .reply_parameters(ReplyParameters::new(message.id))
-                        .caption(build_img2_spoiler_caption(&caption))
-                        .parse_mode(ParseMode::Html)
-                        .has_spoiler(true)
-                })
-                .await
-                .map_err(crate::utils::telegram::ImageDeliveryError)?;
-                let _ = bot
-                    .edit_message_text(
-                        message.chat.id,
-                        processing_message.id,
-                        "Generated image below.",
-                    )
-                    .await;
-            }
+            super::image_delivery::deliver_generated_images(
+                &bot,
+                message.chat.id,
+                processing_message.id,
+                message.id,
+                vec![InputFile::file(result.path)],
+                &caption,
+                true,
+            )
+            .await?;
 
             Ok(())
         },
@@ -1247,6 +1249,9 @@ pub async fn image_handler(
         .reply_markup(selection_keyboard)
         .await?;
     let pending = PendingImageRequest {
+        selection_gate: Default::default(),
+        deadline: tokio::time::Instant::now()
+            + Duration::from_secs(CONFIG.limits.model_selection_timeout),
         user_id,
         chat_id: message.chat.id.0,
         message_id: message.id.0 as i64,
@@ -1256,6 +1261,11 @@ pub async fn image_handler(
         telegraph_contents: context.telegraph_contents,
         selection_message_id: selection_message.id.0 as i64,
         llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
+        stage: match initial_model {
+            None => ImageSelectionStage::Model,
+            Some(ImageGenerationModel::Gemini) => ImageSelectionStage::Resolution,
+            Some(ImageGenerationModel::CodexGptImage2) => ImageSelectionStage::CodexSize,
+        },
         model: initial_model,
         codex_size: None,
         resolution: None,
@@ -1264,34 +1274,14 @@ pub async fn image_handler(
 
     let timeout_bot = bot.clone();
     let timeout_state = state.clone();
-    let timeout_key = request_key.clone();
-    state.pending_image_requests.insert_with_timeout(
+    state.pending_image_requests.insert_with_deadline(
         request_key,
         pending,
-        Duration::from_secs(CONFIG.limits.model_selection_timeout),
+        |request| request.deadline,
         move |request| async move {
-            let should_finalize = match request.model {
-                None => true,
-                Some(ImageGenerationModel::Gemini) => request.resolution.is_none(),
-                Some(ImageGenerationModel::CodexGptImage2) => request.codex_size.is_none(),
-            };
-            if should_finalize {
-                let _ = finalize_image_request(
-                    &timeout_bot,
-                    &timeout_state,
-                    request,
-                    Some(IMAGE_DEFAULT_RESOLUTION),
-                    None,
-                )
-                .await;
-            } else {
-                // The user already picked a resolution and is choosing an
-                // aspect ratio; keep waiting for that click (no deadline, as
-                // before).
-                timeout_state
-                    .pending_image_requests
-                    .insert(timeout_key, request);
-            }
+            let gate = request.selection_gate.clone();
+            let _selection_guard = gate.lock().await;
+            let _ = finalize_image_request(&timeout_bot, &timeout_state, request, None, None).await;
         },
     );
 
@@ -1416,6 +1406,51 @@ pub async fn vid_handler(
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn picker_validation_checks_owner_message_stage_and_expiry() {
+        for stage in [
+            ImageSelectionStage::Model,
+            ImageSelectionStage::Resolution,
+            ImageSelectionStage::AspectRatio,
+            ImageSelectionStage::CodexSize,
+        ] {
+            let request = PendingImageRequest {
+                selection_gate: Default::default(),
+                stage,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+                user_id: 1,
+                chat_id: 2,
+                message_id: 3,
+                command: PendingImageCommand::Image,
+                prompt: String::new(),
+                image_urls: vec![],
+                telegraph_contents: vec![],
+                selection_message_id: 4,
+                llm_invocation_id: None,
+                model: None,
+                codex_size: None,
+                resolution: None,
+                aspect_ratio: None,
+            };
+            assert!(valid_selection(&request, 1, 2, 4, stage));
+            assert!(!valid_selection(&request, 9, 2, 4, stage));
+            assert!(!valid_selection(&request, 1, 9, 4, stage));
+            assert!(!valid_selection(&request, 1, 2, 9, stage));
+            for wrong in [
+                ImageSelectionStage::Model,
+                ImageSelectionStage::Resolution,
+                ImageSelectionStage::AspectRatio,
+                ImageSelectionStage::CodexSize,
+            ] {
+                if wrong != stage {
+                    assert!(!valid_selection(&request, 1, 2, 4, wrong));
+                }
+            }
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert!(!valid_selection(&request, 1, 2, 4, stage));
+        }
+    }
+
     #[test]
     fn default_image_model_accepts_gemini_and_codex_aliases() {
         assert_eq!(
@@ -1471,6 +1506,10 @@ mod tests {
     #[test]
     fn resolve_image_request_settings_prefers_saved_resolution_and_aspect_ratio() {
         let request = PendingImageRequest {
+            selection_gate: Default::default(),
+            stage: ImageSelectionStage::Model,
+            deadline: tokio::time::Instant::now()
+                + Duration::from_secs(CONFIG.limits.model_selection_timeout),
             user_id: 1,
             chat_id: 2,
             message_id: 3,
@@ -1496,6 +1535,10 @@ mod tests {
     #[test]
     fn resolve_image_request_settings_omits_default_aspect_ratio() {
         let request = PendingImageRequest {
+            selection_gate: Default::default(),
+            stage: ImageSelectionStage::Model,
+            deadline: tokio::time::Instant::now()
+                + Duration::from_secs(CONFIG.limits.model_selection_timeout),
             user_id: 1,
             chat_id: 2,
             message_id: 3,
@@ -1516,29 +1559,6 @@ mod tests {
 
         assert_eq!(final_resolution, "2K");
         assert_eq!(final_aspect, None);
-    }
-
-    #[test]
-    fn img2_caption_is_wrapped_in_html_spoiler() {
-        assert_eq!(
-            build_img2_spoiler_caption("Generated by img2"),
-            "<tg-spoiler>Generated by img2</tg-spoiler>"
-        );
-    }
-
-    #[test]
-    fn img2_photo_media_uses_spoiler_flag_and_spoiler_caption() {
-        let media = build_img2_spoiler_photo_media(InputFile::file("img2.png"), "caption");
-
-        let InputMedia::Photo(photo) = media else {
-            panic!("img2 should use photo media");
-        };
-        assert!(photo.has_spoiler);
-        assert_eq!(
-            photo.caption.as_deref(),
-            Some("<tg-spoiler>caption</tg-spoiler>")
-        );
-        assert_eq!(photo.parse_mode, Some(ParseMode::Html));
     }
 
     #[test]

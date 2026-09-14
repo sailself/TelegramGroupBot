@@ -319,9 +319,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::tools::twitter_extractor::test_support::{
-        response_with_headers, ExpectedRequest, TestServer,
-    };
+    use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
     use crate::utils::http::get_http_client;
 
     fn raw_response(status: u16, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
@@ -710,7 +708,7 @@ mod tests {
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
-    use crate::tools::twitter_extractor::test_support::{response_with_content_length, TestServer};
+    use crate::test_support::{response_with_content_length, TestServer};
     use std::time::Duration;
 
     fn redact(text: &str) -> String {
@@ -773,7 +771,7 @@ mod audit_redaction_tests {
     use super::*;
     use crate::db::models::LlmInvocationInsert;
     use crate::db::test_support::init_test_db;
-    use crate::tools::twitter_extractor::test_support::{response_with_headers, TestServer};
+    use crate::test_support::{response_with_headers, TestServer};
     use crate::utils::log_capture::capture_json_events_async;
     use std::time::Duration;
 

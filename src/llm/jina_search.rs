@@ -152,7 +152,7 @@ async fn search_jina_web_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::twitter_extractor::test_support::{response_with_status, TestServer};
+    use crate::test_support::{response_with_status, TestServer};
 
     #[tokio::test]
     async fn rejects_non_success_status_instead_of_returning_empty_results() {

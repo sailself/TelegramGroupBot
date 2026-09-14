@@ -2016,9 +2016,7 @@ async fn veo_download_video(
 mod tests {
     use super::*;
 
-    use crate::tools::twitter_extractor::test_support::{
-        response_with_headers, ExpectedRequest, TestServer,
-    };
+    use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
 
     fn http_error(status: u16) -> anyhow::Error {
         ProviderError::http(

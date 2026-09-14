@@ -45,30 +45,33 @@ enum TokenStatsView {
 }
 
 fn format_compact_token_count(tokens: i64) -> String {
-    if tokens.abs() < 1_000 {
+    let magnitude = tokens.unsigned_abs();
+    if magnitude < 1_000 {
         return tokens.to_string();
     }
-
-    let thresholds = [
-        (1_000_000_000_000_f64, "T"),
-        (1_000_000_000_f64, "B"),
-        (1_000_000_f64, "M"),
-        (1_000_f64, "k"),
-    ];
-    let abs_tokens = tokens.abs() as f64;
-
-    for (divisor, suffix) in thresholds {
-        if abs_tokens >= divisor {
-            let scaled = tokens as f64 / divisor;
-            let formatted = if scaled.abs() >= 10.0 {
-                format!("{scaled:.0}")
-            } else {
-                format!("{scaled:.1}")
-            };
-            return format!("{}{}", formatted.trim_end_matches(".0"), suffix);
+    let sign = if tokens < 0 { "-" } else { "" };
+    for (divisor, suffix) in [
+        (1_000_000_000_000_u64, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "k"),
+    ] {
+        if magnitude >= divisor - divisor / 2_000 {
+            let tenths = ((u128::from(magnitude) * 10 + u128::from(divisor / 2))
+                / u128::from(divisor)) as u64;
+            if tenths < 100 {
+                return if tenths.is_multiple_of(10) {
+                    format!("{sign}{}{suffix}", tenths / 10)
+                } else {
+                    format!("{sign}{}.{digit}{suffix}", tenths / 10, digit = tenths % 10)
+                };
+            }
+            return format!(
+                "{sign}{}{suffix}",
+                (u128::from(magnitude) + u128::from(divisor / 2)) / u128::from(divisor)
+            );
         }
     }
-
     tokens.to_string()
 }
 
@@ -420,6 +423,11 @@ mod tests {
     #[test]
     fn compact_token_count_formats_thresholds() {
         assert_eq!(format_compact_token_count(999), "999");
+        assert_eq!(format_compact_token_count(10_000), "10k");
+        assert_eq!(format_compact_token_count(999_500), "1M");
+        assert_eq!(format_compact_token_count(-999_500), "-1M");
+        assert_eq!(format_compact_token_count(i64::MIN), "-9223372T");
+        assert_eq!(format_compact_token_count(i64::MAX), "9223372T");
         assert_eq!(format_compact_token_count(1_000), "1k");
         assert_eq!(format_compact_token_count(1_200_000), "1.2M");
         assert_eq!(format_compact_token_count(1_000_000_000), "1B");

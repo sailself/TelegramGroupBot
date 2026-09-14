@@ -179,7 +179,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 ### Telegram runtime
 - `HEAVY_COMMAND_MAX_CONCURRENCY` - Max number of heavy commands (`/q`, `/qc`, `/tldr`, generation commands, etc.) running at once. Default: `5`.
 - `RATE_LIMIT_SECONDS` - Per-user cooldown in seconds. Default: `15`.
-- `MODEL_SELECTION_TIMEOUT` - Model selection UI timeout seconds. Default: `30`.
+- `MODEL_SELECTION_TIMEOUT` - Model selection UI timeout seconds. Image pickers receive a fresh timeout for each step; unfinished choices use defaults while preserving saved choices. Default: `30`.
 - `DEFAULT_TEXT_MODEL` - Default text model for model-selection timeouts, `/tldr`, `/factcheck`, `/profileme`, and the prompt step for `/paintme`/`/portraitme`; it is also the inherited/fallback model for `/qq`. Use `gemini` or a runtime model such as `openai-codex:selected`/`openai-codex`. Default: `gemini`.
 - `DEFAULT_QUICK_TEXT_MODEL` - Optional dedicated `/qq` model. Empty or unset inherits `DEFAULT_TEXT_MODEL`. It accepts configured runtime IDs, `openai-codex:selected`, or an authenticated catalog slug such as `openai-codex:gpt-5.6-terra`; unavailable or incompatible models fall back once to the capable `DEFAULT_TEXT_MODEL` without opening a picker.
 - `QUICK_REASONING_EFFORT` - Per-request reasoning override for OpenAI Codex models used by `/qq`. Default: `low`. Public OpenAI and other providers keep their existing request contracts.
@@ -420,3 +420,5 @@ A normalization-only upgrade does not drop the FTS table. A missing FTS table is
 Model pickers revalidate against the current catalog when answered or timed out. Once execution starts, provider configuration and Codex metadata are fixed for that request; legacy metadata is refreshed before being fixed, and authentication still checks that the active account matches. External media request headers overlap, but body reads and byte-budget admission follow input order so a faster later attachment cannot displace an earlier one.
 
 Answers retain original Markdown until delivery. Telegram receives HTML, Telegraph receives nodes built from the original Markdown, and failed formatting/publishing falls back to readable bounded text with link destinations. Model labels are rendered separately as literal metadata.
+
+Generated-image delivery for `/img`, `/image`, `/img2`, `/paintme`, and `/portraitme` retries transient Telegram failures without repeating generation. Partial delivery reports the number confirmed by Telegram; persona prompts and audit labels remain distinct.

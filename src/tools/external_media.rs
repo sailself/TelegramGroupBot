@@ -264,6 +264,7 @@ fn video_mime_from_url(url: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn resolve_video_mime_type(url: &str, _content_type: Option<&str>, bytes: &[u8]) -> String {
     video_mime_from_url(url)
         .map(ToString::to_string)
@@ -317,39 +318,22 @@ async fn process_response(
                 .trim()
                 .to_ascii_lowercase()
         });
-    if let ExternalMediaKind::Image = request.kind {
-        let source = request.source.as_str();
-        let content_type =
-            content_type.or_else(|| image_mime_from_url(&request.url).map(ToString::to_string));
-        let Some(content_type) = content_type else {
-            warn!(source, media_url = %redact_url_for_log(&request.url), "Skipping image without Content-Type or URL MIME hint");
-            return None;
-        };
-        if !content_type.starts_with("image/") || content_type == "image/svg+xml" {
-            warn!(source, media_url = %redact_url_for_log(&request.url), content_type = %content_type, "Skipping non-image external media");
-            return None;
+    let allowed = |mime: &str| match request.kind {
+        ExternalMediaKind::Image => matches!(
+            mime,
+            "image/jpeg" | "image/png" | "image/webp" | "image/gif" | "image/heic" | "image/heif"
+        ),
+        ExternalMediaKind::Video => {
+            mime.starts_with("video/")
+                || matches!(mime, "application/x-mpegurl" | "application/dash+xml")
         }
-        let bytes = match read_external_media_response(
-            response,
-            CONFIG.external_media.max_bytes,
-            budget,
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!(source, media_url = %redact_url_for_log(&request.url), error = %err, "Skipping image that failed to download");
-                return None;
-            }
-        };
-        return Some(MediaFile::new(
-            bytes,
-            content_type,
-            MediaKind::Image,
-            display_name_from_url(&request.url),
-        ));
+    };
+    if content_type
+        .as_deref()
+        .is_some_and(|mime| mime != "application/octet-stream" && !allowed(mime))
+    {
+        return None;
     }
-
     let bytes = match read_external_media_response(
         response,
         CONFIG.external_media.max_bytes,
@@ -359,15 +343,41 @@ async fn process_response(
     {
         Ok(bytes) => bytes,
         Err(err) => {
-            debug!(media_url = %redact_url_for_log(&request.url), error = %err, "External video download failed");
+            match request.kind {
+                ExternalMediaKind::Image => {
+                    let source = request.source.as_str();
+                    warn!(source, media_url = %redact_url_for_log(&request.url), error = %err, "Skipping image that failed to download");
+                }
+                ExternalMediaKind::Video => {
+                    debug!(media_url = %redact_url_for_log(&request.url), error = %err, "External video download failed")
+                }
+            }
             return None;
         }
     };
-    let mime_type = resolve_video_mime_type(&request.url, content_type.as_deref(), &bytes);
+    let mime = if content_type.as_deref() == Some("application/octet-stream") {
+        detect_mime_type(&bytes).filter(|mime| allowed(mime))?
+    } else if let Some(mime) = content_type {
+        mime
+    } else {
+        detect_mime_type(&bytes)
+            .filter(|mime| allowed(mime))
+            .or_else(|| match request.kind {
+                ExternalMediaKind::Image => {
+                    image_mime_from_url(&request.url).map(ToString::to_string)
+                }
+                ExternalMediaKind::Video => {
+                    video_mime_from_url(&request.url).map(ToString::to_string)
+                }
+            })?
+    };
     Some(MediaFile::new(
         bytes,
-        mime_type,
-        MediaKind::Video,
+        mime,
+        match request.kind {
+            ExternalMediaKind::Image => MediaKind::Image,
+            ExternalMediaKind::Video => MediaKind::Video,
+        },
         display_name_from_url(&request.url),
     ))
 }
@@ -582,8 +592,8 @@ mod tests {
     use std::thread::JoinHandle;
 
     use super::*;
+    use crate::test_support::{redirect_response, TestServer};
     use crate::tools::twitter_extractor::model::{build_twitter_content, XMedia, XPost};
-    use crate::tools::twitter_extractor::test_support::{redirect_response, TestServer};
     use crate::tools::twitter_extractor::url::XStatusIdentity;
     use crate::utils::http::get_http_client_no_redirect;
 
@@ -646,14 +656,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn twitter_media_fetch_rejects_redirect_without_following_location() {
-        let server = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
-                "GET",
-                "/media",
-                redirect_response("/private"),
+    async fn explicit_non_media_types_are_rejected_and_octet_stream_requires_detection() {
+        for (kind, mime, body, accepted) in [
+            (
+                ExternalMediaKind::Video,
+                "text/html",
+                b"<html>error</html>".as_slice(),
+                false,
             ),
-        ]);
+            (
+                ExternalMediaKind::Image,
+                "application/octet-stream",
+                b"not an image".as_slice(),
+                false,
+            ),
+            (
+                ExternalMediaKind::Video,
+                "application/octet-stream",
+                b"not a video".as_slice(),
+                false,
+            ),
+            (
+                ExternalMediaKind::Image,
+                "application/octet-stream",
+                b"\x89PNG\r\n\x1a\nxxxxxxxxxxxxxxxx".as_slice(),
+                true,
+            ),
+        ] {
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes().into_iter().chain(body.iter().copied()).collect();
+            let server = TestServer::single(response);
+            let response = reqwest::Client::new()
+                .get(server.url("/file.jpg"))
+                .send()
+                .await
+                .unwrap();
+            let request = ExternalMediaRequest {
+                index: 0,
+                url: "https://telegra.ph/file.jpg".into(),
+                kind,
+                source: MediaSource::Telegraph,
+                thumbnail_url: None,
+            };
+            assert_eq!(
+                process_response(&request, response, &ExternalMediaBudget::new(1024))
+                    .await
+                    .is_some(),
+                accepted
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn twitter_media_fetch_rejects_redirect_without_following_location() {
+        let server = TestServer::new(vec![crate::test_support::ExpectedRequest::new(
+            "GET",
+            "/media",
+            redirect_response("/private"),
+        )]);
         let budget = ExternalMediaBudget::new(1_024);
         let response = get_http_client_no_redirect()
             .get(server.url("/media"))
@@ -700,12 +760,10 @@ mod tests {
 
     #[tokio::test]
     async fn declared_per_file_overflow_is_rejected_before_read_and_keeps_budget() {
-        let server = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                101,
-                vec![b'x'; 101],
-            ),
-        );
+        let server = TestServer::single(crate::test_support::response_with_content_length(
+            101,
+            vec![b'x'; 101],
+        ));
         let budget = ExternalMediaBudget::new(200);
         let response = get_http_client_no_redirect()
             .get(server.url("/media"))
@@ -721,12 +779,10 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_per_file_overflow_refunds_partial_reservation() {
-        let server = TestServer::single(
-            crate::tools::twitter_extractor::test_support::chunked_response(vec![
-                vec![b'a'; 60],
-                vec![b'b'; 60],
-            ]),
-        );
+        let server = TestServer::single(crate::test_support::chunked_response(vec![
+            vec![b'a'; 60],
+            vec![b'b'; 60],
+        ]));
         let budget = ExternalMediaBudget::new(200);
         let response = get_http_client_no_redirect()
             .get(server.url("/media"))
@@ -780,12 +836,10 @@ mod tests {
         assert_eq!(budget.remaining(), 50);
         first_worker.join().unwrap();
 
-        let second = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                50,
-                vec![b'b'; 50],
-            ),
-        );
+        let second = TestServer::single(crate::test_support::response_with_content_length(
+            50,
+            vec![b'b'; 50],
+        ));
         let response = get_http_client_no_redirect()
             .get(second.url("/media"))
             .send()
@@ -805,17 +859,12 @@ mod tests {
     #[tokio::test]
     async fn failed_video_control_path_fetches_thumbnail_at_same_index_without_extra_slot() {
         let server = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_status(
-                    500,
-                    Vec::new(),
-                ),
-            ),
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_content_length(
-                    3,
-                    b"abc".to_vec(),
-                ),
+            crate::test_support::ExpectedRequest::any(crate::test_support::response_with_status(
+                500,
+                Vec::new(),
+            )),
+            crate::test_support::ExpectedRequest::any(
+                crate::test_support::response_with_content_length(3, b"abc".to_vec()),
             ),
         ]);
         let direct_url = server.url("/direct");
@@ -850,17 +899,12 @@ mod tests {
     #[tokio::test]
     async fn thumbnail_fallback_does_not_make_prompt_claim_video_was_attached() {
         let server = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_status(
-                    500,
-                    Vec::new(),
-                ),
-            ),
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_content_length(
-                    3,
-                    b"img".to_vec(),
-                ),
+            crate::test_support::ExpectedRequest::any(crate::test_support::response_with_status(
+                500,
+                Vec::new(),
+            )),
+            crate::test_support::ExpectedRequest::any(
+                crate::test_support::response_with_content_length(3, b"img".to_vec()),
             ),
         ]);
         let content =
@@ -895,12 +939,10 @@ mod tests {
 
     #[tokio::test]
     async fn successful_direct_video_download_keeps_pre_download_prompt_truthful() {
-        let server = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                3,
-                b"vid".to_vec(),
-            ),
-        );
+        let server = TestServer::single(crate::test_support::response_with_content_length(
+            3,
+            b"vid".to_vec(),
+        ));
         let content = twitter_content_with_video(None);
         let request = twitter_video_request(0, &content.video_urls[0], None);
         let direct = get_http_client_no_redirect()
@@ -941,18 +983,14 @@ mod tests {
 
     #[tokio::test]
     async fn shared_budget_carries_committed_telegraph_bytes_into_twitter_stage() {
-        let telegraph = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                60,
-                vec![b't'; 60],
-            ),
-        );
-        let twitter = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                41,
-                vec![b'x'; 41],
-            ),
-        );
+        let telegraph = TestServer::single(crate::test_support::response_with_content_length(
+            60,
+            vec![b't'; 60],
+        ));
+        let twitter = TestServer::single(crate::test_support::response_with_content_length(
+            41,
+            vec![b'x'; 41],
+        ));
         let telegraph_url = telegraph.url("/media");
         let twitter_url = twitter.url("/media");
         let budget = ExternalMediaBudget::new(100);
@@ -999,21 +1037,14 @@ mod tests {
 
     #[tokio::test]
     async fn collector_preserves_input_order() {
-        let slow = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_content_length(
-                    1,
-                    b"0".to_vec(),
-                ),
-            )
-            .delayed(std::time::Duration::from_millis(40)),
-        ]);
-        let fast = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                1,
-                b"1".to_vec(),
-            ),
-        );
+        let slow = TestServer::new(vec![crate::test_support::ExpectedRequest::any(
+            crate::test_support::response_with_content_length(1, b"0".to_vec()),
+        )
+        .delayed(std::time::Duration::from_millis(40))]);
+        let fast = TestServer::single(crate::test_support::response_with_content_length(
+            1,
+            b"1".to_vec(),
+        ));
         let requests = vec![
             ExternalMediaRequest {
                 index: 0,
@@ -1058,21 +1089,14 @@ mod tests {
 
     #[tokio::test]
     async fn collector_preserves_input_priority_under_tight_budget() {
-        let slow = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                crate::tools::twitter_extractor::test_support::response_with_content_length(
-                    1,
-                    b"0".to_vec(),
-                ),
-            )
-            .delayed(std::time::Duration::from_millis(40)),
-        ]);
-        let fast = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                1,
-                b"1".to_vec(),
-            ),
-        );
+        let slow = TestServer::new(vec![crate::test_support::ExpectedRequest::any(
+            crate::test_support::response_with_content_length(1, b"0".to_vec()),
+        )
+        .delayed(std::time::Duration::from_millis(40))]);
+        let fast = TestServer::single(crate::test_support::response_with_content_length(
+            1,
+            b"1".to_vec(),
+        ));
         let requests = vec![
             ExternalMediaRequest {
                 index: 0,
@@ -1120,11 +1144,8 @@ mod tests {
         const REQUEST_COUNT: usize = 5;
         let responses = (0..REQUEST_COUNT)
             .map(|i| {
-                crate::tools::twitter_extractor::test_support::ExpectedRequest::any(
-                    crate::tools::twitter_extractor::test_support::response_with_content_length(
-                        1,
-                        vec![b'a' + i as u8],
-                    ),
+                crate::test_support::ExpectedRequest::any(
+                    crate::test_support::response_with_content_length(1, vec![b'a' + i as u8]),
                 )
                 .delayed(std::time::Duration::from_millis(30))
             })
@@ -1181,12 +1202,10 @@ mod tests {
         // headers arrive.
         let (slow_url, mut body_ready, release_body, slow_worker) =
             controlled_thirty_chunk_server();
-        let fast = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                1,
-                b"1".to_vec(),
-            ),
-        );
+        let fast = TestServer::single(crate::test_support::response_with_content_length(
+            1,
+            b"1".to_vec(),
+        ));
         let fast_url = fast.url("/media");
         let started = Arc::new(AtomicUsize::new(0));
         let started_for_start = started.clone();
@@ -1255,12 +1274,10 @@ mod tests {
         // answers over genuine (instant, real-time) localhost I/O, and the
         // hang one never answers, standing in for a provider that never
         // completes.
-        let fast = TestServer::single(
-            crate::tools::twitter_extractor::test_support::response_with_content_length(
-                1,
-                b"x".to_vec(),
-            ),
-        );
+        let fast = TestServer::single(crate::test_support::response_with_content_length(
+            1,
+            b"x".to_vec(),
+        ));
         let hang_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let hang_addr = hang_listener.local_addr().unwrap();
         let hang_worker = std::thread::spawn(move || {
@@ -1425,12 +1442,10 @@ mod tests {
 
     #[tokio::test]
     async fn collector_refunds_budget_on_overflow() {
-        let server = TestServer::single(
-            crate::tools::twitter_extractor::test_support::chunked_response(vec![
-                vec![b'a'; 60],
-                vec![b'b'; 60],
-            ]),
-        );
+        let server = TestServer::single(crate::test_support::chunked_response(vec![
+            vec![b'a'; 60],
+            vec![b'b'; 60],
+        ]));
         let url = server.url("/media");
         let requests = vec![ExternalMediaRequest {
             index: 0,

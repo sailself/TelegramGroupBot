@@ -390,7 +390,7 @@ mod tests {
         assert!(rendered.contains("<source kind=\"telegraph\" url=\"https://telegra.ph/page\">"));
         assert_eq!(rendered.matches("</source>").count(), 1);
         // The quoted text stays readable, only separated by the zero-width mark.
-        assert!(rendered.contains("Intro <\u{200b}SOURCE kind=\"twitter\""));
+        assert!(rendered.contains("Intro &lt;SOURCE kind=\"twitter\""));
         assert!(rendered.contains("fake"));
         assert!(rendered.contains("outro"));
     }

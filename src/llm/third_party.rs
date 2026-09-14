@@ -705,9 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_api_retries_transient_failures_and_sends_provider_headers() {
-        use crate::tools::twitter_extractor::test_support::{
-            response_with_headers, ExpectedRequest, TestServer,
-        };
+        use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
         let server = TestServer::new(vec![
             ExpectedRequest::new(
                 "POST",
@@ -745,9 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_api_decode_failures_name_the_content_type_and_body() {
-        use crate::tools::twitter_extractor::test_support::{
-            response_with_headers, ExpectedRequest, TestServer,
-        };
+        use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
         let server = TestServer::new(vec![ExpectedRequest::new(
             "POST",
             "/chat/completions",

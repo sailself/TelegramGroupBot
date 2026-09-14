@@ -392,7 +392,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::twitter_extractor::test_support::identity;
+    use crate::test_support::identity;
 
     fn author(name: &str, handle: &str) -> XAuthor {
         XAuthor {

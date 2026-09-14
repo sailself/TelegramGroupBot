@@ -422,9 +422,7 @@ pub async fn generate_image_with_img2(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::twitter_extractor::test_support::{
-        response_with_headers, ExpectedRequest, TestServer,
-    };
+    use crate::test_support::{response_with_headers, ExpectedRequest, TestServer};
 
     #[tokio::test]
     async fn fetch_img2_image_retries_a_transient_failure_and_returns_the_png() {

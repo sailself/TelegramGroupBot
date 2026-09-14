@@ -132,8 +132,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::test_support::{response_with_status, TestServer};
     use crate::tools::twitter_extractor::providers::{TwitterFetchConfig, TwitterProvider};
-    use crate::tools::twitter_extractor::test_support::{response_with_status, TestServer};
 
     fn test_chain_config(fx: ::url::Url, vx: ::url::Url, jina: ::url::Url) -> TwitterFetchConfig {
         TwitterFetchConfig {
@@ -254,13 +254,11 @@ mod tests {
         let fx = TestServer::single_status("GET", "/i/status/123", 503);
         let vx = TestServer::single_status("GET", "/Twitter/status/123", 503);
         let body = include_bytes!("twitter_extractor/fixtures/jina_photo.txt");
-        let jina = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
-                "GET",
-                "/https://x.com/i/status/123",
-                response_with_status(200, body.to_vec()),
-            ),
-        ]);
+        let jina = TestServer::new(vec![crate::test_support::ExpectedRequest::new(
+            "GET",
+            "/https://x.com/i/status/123",
+            response_with_status(200, body.to_vec()),
+        )]);
         let extractor = TwitterExtractor::new(
             get_http_client_no_redirect(),
             test_chain_config(fx.base_url(), vx.base_url(), jina.base_url()),
@@ -282,13 +280,11 @@ mod tests {
         let fx = TestServer::expect_no_requests();
         let vx = TestServer::expect_no_requests();
         let body = include_bytes!("twitter_extractor/fixtures/jina_photo.txt");
-        let jina = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
-                "GET",
-                "/https://x.com/i/status/123",
-                response_with_status(200, body.to_vec()),
-            ),
-        ]);
+        let jina = TestServer::new(vec![crate::test_support::ExpectedRequest::new(
+            "GET",
+            "/https://x.com/i/status/123",
+            response_with_status(200, body.to_vec()),
+        )]);
         let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
         config.providers = vec![TwitterProvider::Jina];
         let extractor = TwitterExtractor::new(get_http_client_no_redirect(), config);
@@ -331,27 +327,21 @@ mod tests {
     #[tokio::test]
     async fn extractor_error_does_not_expose_response_body_or_endpoint() {
         let secret_body = b"response body secret".to_vec();
-        let fx = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
-                "GET",
-                "/i/status/123",
-                response_with_status(503, secret_body.clone()),
-            ),
-        ]);
-        let vx = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
-                "GET",
-                "/Twitter/status/123",
-                response_with_status(503, secret_body),
-            ),
-        ]);
-        let jina = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
-                "GET",
-                "/custom-endpoint-secret/https://x.com/i/status/123",
-                response_with_status(503, b"jina body secret".to_vec()),
-            ),
-        ]);
+        let fx = TestServer::new(vec![crate::test_support::ExpectedRequest::new(
+            "GET",
+            "/i/status/123",
+            response_with_status(503, secret_body.clone()),
+        )]);
+        let vx = TestServer::new(vec![crate::test_support::ExpectedRequest::new(
+            "GET",
+            "/Twitter/status/123",
+            response_with_status(503, secret_body),
+        )]);
+        let jina = TestServer::new(vec![crate::test_support::ExpectedRequest::new(
+            "GET",
+            "/custom-endpoint-secret/https://x.com/i/status/123",
+            response_with_status(503, b"jina body secret".to_vec()),
+        )]);
         let mut config = test_chain_config(fx.base_url(), vx.base_url(), jina.base_url());
         config.jina_reader_endpoint = jina.base_url().join("custom-endpoint-secret").unwrap();
         config.jina_api_key = Some("secret-bearer-value".to_string());
@@ -420,13 +410,11 @@ mod tests {
 
     #[tokio::test]
     async fn extractor_falls_back_after_fxtwitter_transport_failure() {
-        let fx = TestServer::new(vec![
-            crate::tools::twitter_extractor::test_support::ExpectedRequest::new(
-                "GET",
-                "/i/status/123",
-                Vec::new(),
-            ),
-        ]);
+        let fx = TestServer::new(vec![crate::test_support::ExpectedRequest::new(
+            "GET",
+            "/i/status/123",
+            Vec::new(),
+        )]);
         let vx = TestServer::single_json(
             "GET",
             "/Twitter/status/123",

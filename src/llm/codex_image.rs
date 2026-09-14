@@ -76,9 +76,7 @@ fn codex_image_responses_model() -> String {
 }
 
 pub fn codex_image_available() -> bool {
-    CONFIG.codex.enabled
-        && openai_codex::is_auth_ready()
-        && crate::llm::runtime_models::selected_codex_model_record().is_some()
+    CONFIG.codex.enabled && openai_codex::is_auth_ready()
 }
 
 pub fn is_supported_codex_image_size(size: &str) -> bool {

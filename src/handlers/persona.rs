@@ -2,9 +2,7 @@
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::{
-    ChatAction, InputFile, InputMedia, InputMediaPhoto, ParseMode, ReplyParameters,
-};
+use teloxide::types::{ChatAction, InputFile, ReplyParameters};
 
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
@@ -305,40 +303,16 @@ pub async fn paintme_handler(
             };
             let caption = build_image_caption(&model_name, &prompt).await;
 
-            if images.is_empty() {
-                return Err(anyhow::anyhow!("Image generation returned no images"));
-            }
-            let mut image_iter = images.into_iter();
-            if let Some(first_image) = image_iter.next() {
-                let media = InputMedia::Photo(
-                    InputMediaPhoto::new(InputFile::memory(first_image.clone()))
-                        .caption(caption.clone())
-                        .parse_mode(ParseMode::Html),
-                );
-                let edit_result = bot
-                    .edit_message_media(message.chat.id, processing_message.id, media)
-                    .await;
-                if edit_result.is_err() {
-                    bot.send_photo(message.chat.id, InputFile::memory(first_image))
-                        .reply_parameters(ReplyParameters::new(message.id))
-                        .caption(caption)
-                        .parse_mode(ParseMode::Html)
-                        .await?;
-                    let _ = bot
-                        .edit_message_text(
-                            message.chat.id,
-                            processing_message.id,
-                            "Generated image below.",
-                        )
-                        .await;
-                }
-            }
-
-            for image in image_iter {
-                bot.send_photo(message.chat.id, InputFile::memory(image))
-                    .reply_parameters(ReplyParameters::new(message.id))
-                    .await?;
-            }
+            super::image_delivery::deliver_generated_images(
+                &bot,
+                message.chat.id,
+                processing_message.id,
+                message.id,
+                images.into_iter().map(InputFile::memory).collect(),
+                &caption,
+                false,
+            )
+            .await?;
 
             Ok(())
         },
