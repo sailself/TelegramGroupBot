@@ -100,14 +100,16 @@ pub async fn run_factcheck_pipeline(
     let user_content = build_synthesis_input(statement, &evidence);
     let (text, model_display) = call_resolved_text_model(
         final_model,
-        &system_prompt,
-        &user_content,
-        "Fact Check",
-        false,
-        media_summary.total > 0,
-        (!media_files.is_empty()).then(|| media_files.to_vec()),
-        Some("FACTCHECK_SYNTHESIS_PROMPT"),
-        audit_context,
+        crate::llm::text_model::TextCallRequest {
+            system_prompt: &system_prompt,
+            user_content: &user_content,
+            response_title: "Fact Check",
+            tools_enabled: false,
+            use_pro: media_summary.total > 0,
+            media_files: (!media_files.is_empty()).then(|| media_files.to_vec()),
+            prompt_name: Some("FACTCHECK_SYNTHESIS_PROMPT"),
+            audit_context,
+        },
     )
     .await?;
 

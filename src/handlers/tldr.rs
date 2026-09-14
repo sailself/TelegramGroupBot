@@ -36,14 +36,16 @@ async fn tldr_single_call(
     let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph.author_name);
     call_resolved_text_model(
         model,
-        &system_prompt,
-        &chat_content,
-        "Message Summary",
-        true,
-        true,
-        None,
-        Some("TLDR_SYSTEM_PROMPT"),
-        audit_context,
+        crate::llm::text_model::TextCallRequest {
+            system_prompt: &system_prompt,
+            user_content: &chat_content,
+            response_title: "Message Summary",
+            tools_enabled: true,
+            use_pro: true,
+            media_files: None,
+            prompt_name: Some("TLDR_SYSTEM_PROMPT"),
+            audit_context,
+        },
     )
     .await
 }

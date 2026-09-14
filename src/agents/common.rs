@@ -156,16 +156,16 @@ pub async fn call_step_json<T: DeserializeOwned>(
     label: &str,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<T> {
-    let response = call_step_text(
+    let response = call_step_text(crate::agents::step::StepCallRequest {
         step_model,
         system_prompt,
         user_content,
         media_files,
-        Some(schema),
+        json_schema: Some(schema),
         response_title,
-        Some(label),
+        system_prompt_label: Some(label),
         audit_context,
-    )
+    })
     .await?;
     parse_step_json(&response, label)
 }

@@ -104,14 +104,16 @@ pub async fn summarize_messages_map_reduce(
     let system_prompt = TLDR_MERGE_PROMPT.replace("{bot_name}", &CONFIG.telegraph.author_name);
     let (text, model_display) = call_resolved_text_model(
         final_model,
-        &system_prompt,
-        &merge_input,
-        "Message Summary",
-        true,
-        true,
-        None,
-        Some("TLDR_MERGE_PROMPT"),
-        audit_context,
+        crate::llm::text_model::TextCallRequest {
+            system_prompt: &system_prompt,
+            user_content: &merge_input,
+            response_title: "Message Summary",
+            tools_enabled: true,
+            use_pro: true,
+            media_files: None,
+            prompt_name: Some("TLDR_MERGE_PROMPT"),
+            audit_context,
+        },
     )
     .await?;
 
@@ -133,16 +135,16 @@ async fn summarize_chunk(
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(CHUNK_RETRY_DELAY_MS)).await;
         }
-        match call_step_text(
+        match call_step_text(crate::agents::step::StepCallRequest {
             step_model,
-            TLDR_CHUNK_PROMPT,
-            &content,
-            &[],
-            None,
-            "Message Summary Chunk",
-            Some("TLDR_CHUNK_PROMPT"),
+            system_prompt: TLDR_CHUNK_PROMPT,
+            user_content: &content,
+            media_files: &[],
+            json_schema: None,
+            response_title: "Message Summary Chunk",
+            system_prompt_label: Some("TLDR_CHUNK_PROMPT"),
             audit_context,
-        )
+        })
         .await
         {
             Ok(text) if !text.trim().is_empty() => {

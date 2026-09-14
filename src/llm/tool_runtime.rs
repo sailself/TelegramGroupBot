@@ -273,6 +273,8 @@ enum ChatContextQueryArgs {
 
 #[derive(Debug, Serialize)]
 struct ToolMessage {
+    text_truncated: bool,
+    original_text_chars: usize,
     message_id: i64,
     username: Option<String>,
     date_utc: String,
@@ -285,6 +287,8 @@ struct ToolMessage {
 
 #[derive(Debug, Serialize)]
 struct ToolSearchHit {
+    text_truncated: bool,
+    original_text_chars: usize,
     message_id: i64,
     username: Option<String>,
     date_utc: String,
@@ -297,6 +301,53 @@ struct ToolSearchHit {
     ai_command: Option<String>,
     is_synthetic_record: bool,
     context_messages: Vec<ToolMessage>,
+}
+
+const CONTEXT_MESSAGE_CHARS: usize = 4_000;
+const CONTEXT_RESULT_CHARS: usize = 32_000;
+
+struct ContextTextBudget {
+    remaining: usize,
+    truncated: usize,
+    omitted: usize,
+}
+impl ContextTextBudget {
+    fn new() -> Self {
+        Self {
+            remaining: CONTEXT_RESULT_CHARS,
+            truncated: 0,
+            omitted: 0,
+        }
+    }
+    fn text(&mut self, text: &mut String, limit: usize) -> bool {
+        let bounded = crate::utils::text::truncate_to_chars(text, limit.min(self.remaining));
+        self.remaining -= bounded.chars().count();
+        let truncated = bounded.len() < text.len();
+        if truncated {
+            *text = bounded.to_string();
+            self.truncated += 1;
+        }
+        truncated
+    }
+    fn message(&mut self, message: &mut ToolMessage) -> bool {
+        if self.remaining == 0 {
+            self.omitted += 1;
+            return false;
+        }
+        message.text_truncated = self.text(&mut message.text, CONTEXT_MESSAGE_CHARS);
+        bound_context_metadata(&mut message.username, &mut message.ai_command);
+        true
+    }
+    fn metadata(&self) -> Value {
+        json!({"text_character_limit":CONTEXT_RESULT_CHARS,"message_text_character_limit":CONTEXT_MESSAGE_CHARS,"text_characters":CONTEXT_RESULT_CHARS-self.remaining,"truncated_fields":self.truncated,"omitted_messages":self.omitted})
+    }
+}
+fn bound_context_metadata(username: &mut Option<String>, command: &mut Option<String>) {
+    for (field, max) in [(username, 128), (command, 64)] {
+        if let Some(value) = field {
+            value.truncate(crate::utils::text::truncate_to_chars(value, max).len());
+        }
+    }
 }
 
 impl ToolRuntime {
@@ -742,39 +793,54 @@ impl ToolRuntime {
                     .chat_db()?
                     .search_chat_messages(self.chat_id, query, limit as i64, offset as i64)
                     .await?;
-                for hit in &hits {
-                    self.accumulated_hits.insert(hit.message_id, hit.clone());
-                    self.returned_message_ids.insert(hit.message_id);
-                }
-
+                let windows = if context_before > 0 || context_after > 0 {
+                    self.chat_db()?
+                        .get_message_windows(
+                            self.chat_id,
+                            &hits.iter().map(|h| h.message_id).collect::<Vec<_>>(),
+                            context_before as i64,
+                            context_after as i64,
+                        )
+                        .await?
+                } else {
+                    vec![None; hits.len()]
+                };
+                let mut budget = ContextTextBudget::new();
                 let mut results = Vec::new();
+                let mut seen: BTreeSet<i64> = hits.iter().map(|hit| hit.message_id).collect();
+                // Spend the budget on ranked matches before any neighboring messages.
                 for hit in hits {
-                    let context_messages: Vec<ToolMessage> =
-                        if context_before > 0 || context_after > 0 {
-                            self.chat_db()?
-                                .get_message_window(
-                                    self.chat_id,
-                                    hit.message_id,
-                                    context_before as i64,
-                                    context_after as i64,
-                                )
-                                .await?
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(message_row_to_tool_message)
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                    for message in &context_messages {
-                        self.returned_message_ids.insert(message.message_id);
+                    if budget.remaining == 0 {
+                        budget.omitted += 1;
+                        continue;
                     }
-                    results.push(hit_to_tool_search_hit(hit, context_messages));
+                    let raw_hit = hit.clone();
+                    let mut result = hit_to_tool_search_hit(hit, Vec::new());
+                    result.text_truncated = budget.text(&mut result.text, CONTEXT_MESSAGE_CHARS);
+                    budget.text(&mut result.snippet, 140);
+                    bound_context_metadata(&mut result.username, &mut result.ai_command);
+                    self.accumulated_hits.insert(result.message_id, raw_hit);
+                    self.returned_message_ids.insert(result.message_id);
+                    results.push(result);
+                }
+                for (result, window) in results.iter_mut().zip(windows) {
+                    for row in window.unwrap_or_default() {
+                        if !seen.insert(row.message_id) {
+                            continue;
+                        }
+                        let mut message = message_row_to_tool_message(row);
+                        if budget.message(&mut message) {
+                            self.returned_message_ids.insert(message.message_id);
+                            result.context_messages.push(message);
+                        }
+                    }
                 }
 
                 Ok(json!({
                     "operation": "search",
-                    "query": query,
+                    "query": crate::utils::text::truncate_to_chars(query, 4_000),
+                    "query_truncated": query.chars().count() > 4_000,
+                    "truncation": budget.metadata(),
                     "limit": limit,
                     "offset": offset,
                     "result_count": results.len(),
@@ -807,16 +873,22 @@ impl ToolRuntime {
                     ));
                 };
 
-                let messages = messages
+                let mut messages = messages
                     .into_iter()
                     .map(message_row_to_tool_message)
                     .collect::<Vec<_>>();
+                let mut budget = ContextTextBudget::new();
+                // Protect the requested center before budgeting neighbors, then restore order.
+                messages.sort_by_key(|message| message.message_id != message_id);
+                messages.retain_mut(|message| budget.message(message));
+                messages.sort_by_key(|message| message.message_id);
                 for message in &messages {
                     self.returned_message_ids.insert(message.message_id);
                 }
 
                 Ok(json!({
                     "operation": "window",
+                    "truncation": budget.metadata(),
                     "message_id": message_id,
                     "result_count": messages.len(),
                     "messages": messages,
@@ -991,6 +1063,8 @@ fn join_naturally(items: &[String]) -> String {
 
 fn message_row_to_tool_message(row: MessageRow) -> ToolMessage {
     ToolMessage {
+        text_truncated: false,
+        original_text_chars: row.text.as_deref().unwrap_or_default().chars().count(),
         message_id: row.message_id,
         username: row.username,
         date_utc: row.date.to_rfc3339(),
@@ -1004,6 +1078,8 @@ fn message_row_to_tool_message(row: MessageRow) -> ToolMessage {
 
 fn hit_to_tool_search_hit(hit: ChatSearchHit, context_messages: Vec<ToolMessage>) -> ToolSearchHit {
     ToolSearchHit {
+        text_truncated: false,
+        original_text_chars: hit.text.chars().count(),
         message_id: hit.message_id,
         username: hit.username,
         date_utc: hit.date.to_rfc3339(),
@@ -1059,6 +1135,73 @@ mod tests {
     use crate::db::database::Database;
     use chrono::Utc;
     use tokio::runtime::Runtime;
+
+    #[tokio::test]
+    async fn context_budget_prioritizes_hits_and_registers_only_returned_ids() {
+        let db = crate::db::test_support::init_test_db("tool-context-budget").await;
+        for id in 1..=12 {
+            crate::db::test_support::queue_message(
+                &db,
+                id,
+                -100123,
+                "alice",
+                &format!("needle {}", "文😀\"".repeat(2000)),
+            )
+            .await;
+        }
+        let mut runtime = ToolRuntime::for_qc(db.clone(), -100123);
+        let result = runtime
+            .run_chat_context_query(ChatContextQueryArgs::Search {
+                query: "needle".into(),
+                limit: Some(12),
+                offset: None,
+                context_before: Some(5),
+                context_after: Some(5),
+            })
+            .await
+            .unwrap();
+        let serialized = serde_json::to_string(&result).unwrap();
+        let parsed: Value = serde_json::from_str(&serialized).unwrap();
+        let mut text_chars = 0;
+        let mut ids = BTreeSet::new();
+        for hit in parsed["results"].as_array().unwrap() {
+            ids.insert(hit["message_id"].as_i64().unwrap());
+            assert!(hit["text"].as_str().unwrap().chars().count() <= 4_000);
+            text_chars += hit["text"].as_str().unwrap().chars().count()
+                + hit["snippet"].as_str().unwrap().chars().count();
+            assert_eq!(hit["text_truncated"], true);
+            assert!(hit["context_messages"].as_array().unwrap().is_empty());
+            assert!(hit["link"].as_str().unwrap().contains("t.me"));
+        }
+        assert!(text_chars <= 32_000);
+        assert!(parsed["truncation"]["omitted_messages"].as_u64().unwrap() > 0);
+        assert_eq!(ids, runtime.accumulated_message_ids().into_iter().collect());
+        db.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn window_budget_retains_requested_center_before_neighbors() {
+        let db = crate::db::test_support::init_test_db("tool-window-budget").await;
+        for id in 1..=11 {
+            crate::db::test_support::queue_message(&db, id, -100123, "alice", &"文".repeat(6000))
+                .await;
+        }
+        let mut runtime = ToolRuntime::for_qc(db.clone(), -100123);
+        let result = runtime
+            .run_chat_context_query(ChatContextQueryArgs::Window {
+                message_id: 6,
+                context_before: Some(5),
+                context_after: Some(5),
+            })
+            .await
+            .unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|message| message["message_id"] == 6));
+        assert_eq!(messages.len(), 8);
+        assert_eq!(runtime.accumulated_message_ids().len(), 8);
+        assert_eq!(result["truncation"]["text_characters"], 32_000);
+        db.shutdown().await;
+    }
 
     #[tokio::test]
     async fn model_driven_tool_results_are_fenced_as_untrusted_data() {

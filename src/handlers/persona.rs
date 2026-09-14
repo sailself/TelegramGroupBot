@@ -133,21 +133,22 @@ pub async fn profileme_handler(
             let (system_prompt, user_content) =
                 build_profileme_prompts(style.as_deref(), &formatted_history);
 
-            let response = match call_configured_text_model(
-                &system_prompt,
-                &user_content,
-                "Your User Profile",
-                false,
-                false,
-                None,
-                Some("PROFILEME_SYSTEM_PROMPT"),
-                audit_context.as_ref(),
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => return Err(err),
-            };
+            let response =
+                match call_configured_text_model(crate::llm::text_model::TextCallRequest {
+                    system_prompt: &system_prompt,
+                    user_content: &user_content,
+                    response_title: "Your User Profile",
+                    tools_enabled: false,
+                    use_pro: false,
+                    media_files: None,
+                    prompt_name: Some("PROFILEME_SYSTEM_PROMPT"),
+                    audit_context: audit_context.as_ref(),
+                })
+                .await
+                {
+                    Ok(response) => response,
+                    Err(err) => return Err(err),
+                };
 
             let (response_text, _response_model) = response;
             send_response(
@@ -247,29 +248,30 @@ pub async fn paintme_handler(
                 PAINTME_SYSTEM_PROMPT
             };
 
-            let (prompt, _prompt_model) = match call_configured_text_model(
-                prompt_system,
-                &formatted_history,
-                if portrait {
-                    "Portrait Prompt"
-                } else {
-                    "Paint Prompt"
-                },
-                false,
-                false,
-                None,
-                Some(if portrait {
-                    "PORTRAIT_SYSTEM_PROMPT"
-                } else {
-                    "PAINTME_SYSTEM_PROMPT"
-                }),
-                audit_context.as_ref(),
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => return Err(err),
-            };
+            let (prompt, _prompt_model) =
+                match call_configured_text_model(crate::llm::text_model::TextCallRequest {
+                    system_prompt: prompt_system,
+                    user_content: &formatted_history,
+                    response_title: if portrait {
+                        "Portrait Prompt"
+                    } else {
+                        "Paint Prompt"
+                    },
+                    tools_enabled: false,
+                    use_pro: false,
+                    media_files: None,
+                    prompt_name: Some(if portrait {
+                        "PORTRAIT_SYSTEM_PROMPT"
+                    } else {
+                        "PAINTME_SYSTEM_PROMPT"
+                    }),
+                    audit_context: audit_context.as_ref(),
+                })
+                .await
+                {
+                    Ok(response) => response,
+                    Err(err) => return Err(err),
+                };
             drop(typing_chat_action);
 
             // The model is asked for raw JSON; defensively unfence/extract before it

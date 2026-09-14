@@ -67,12 +67,12 @@ pub struct ResolvedExplicitCodexModel {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RuntimeModelsState {
-    pub(crate) models: Vec<ThirdPartyModelConfig>,
-    pub(crate) models_by_id: HashMap<String, ThirdPartyModelConfig>,
-    pub(crate) codex_selected_model: Option<CodexSelectedModelRecord>,
-    pub(crate) explicit_codex_configs_by_id: HashMap<String, ThirdPartyModelConfig>,
-    pub(crate) explicit_codex_records_by_id: HashMap<String, CodexSelectedModelRecord>,
+pub(super) struct RuntimeModelsState {
+    pub(super) models: Vec<ThirdPartyModelConfig>,
+    pub(super) models_by_id: HashMap<String, ThirdPartyModelConfig>,
+    pub(super) codex_selected_model: Option<CodexSelectedModelRecord>,
+    pub(super) explicit_codex_configs_by_id: HashMap<String, ThirdPartyModelConfig>,
+    pub(super) explicit_codex_records_by_id: HashMap<String, CodexSelectedModelRecord>,
 }
 
 static RUNTIME_MODELS: LazyLock<RwLock<RuntimeModelsState>> =
@@ -86,12 +86,12 @@ static CODEX_MODEL_TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const CODEX_MODEL_REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Read the current catalog+Codex snapshot without touching the lock directly.
-pub(crate) fn with_state<R>(f: impl FnOnce(&RuntimeModelsState) -> R) -> R {
+pub(super) fn with_state<R>(f: impl FnOnce(&RuntimeModelsState) -> R) -> R {
     f(&RUNTIME_MODELS.read())
 }
 
 /// Replace the current catalog+Codex snapshot without touching the lock directly.
-pub(crate) fn replace_state(state: RuntimeModelsState) {
+pub(super) fn replace_state(state: RuntimeModelsState) {
     *RUNTIME_MODELS.write() = state;
 }
 

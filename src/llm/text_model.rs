@@ -231,17 +231,30 @@ pub(crate) fn available_third_party_models_for_request<'a>(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct TextCallRequest<'a> {
+    pub system_prompt: &'a str,
+    pub user_content: &'a str,
+    pub response_title: &'a str,
+    pub tools_enabled: bool,
+    pub use_pro: bool,
+    pub media_files: Option<Vec<crate::llm::media::MediaFile>>,
+    pub prompt_name: Option<&'a str>,
+    pub audit_context: Option<&'a LlmAuditContext>,
+}
+
 pub(crate) async fn call_configured_text_model(
-    system_prompt: &str,
-    user_content: &str,
-    response_title: &str,
-    tools_enabled: bool,
-    use_pro: bool,
-    media_files: Option<Vec<crate::llm::media::MediaFile>>,
-    prompt_name: Option<&str>,
-    audit_context: Option<&LlmAuditContext>,
+    request: TextCallRequest<'_>,
 ) -> Result<(String, String)> {
+    let TextCallRequest {
+        system_prompt,
+        user_content,
+        response_title,
+        tools_enabled,
+        use_pro,
+        media_files,
+        prompt_name,
+        audit_context,
+    } = request;
     let media_summary = media_files
         .as_ref()
         .map(|files| summarize_media_files(files))
@@ -254,6 +267,25 @@ pub(crate) async fn call_configured_text_model(
     let model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
     call_resolved_text_model(
         &model,
+        crate::llm::text_model::TextCallRequest {
+            system_prompt,
+            user_content,
+            response_title,
+            tools_enabled,
+            use_pro,
+            media_files,
+            prompt_name,
+            audit_context,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn call_resolved_text_model(
+    model: &ResolvedTextModel,
+    request: TextCallRequest<'_>,
+) -> Result<(String, String)> {
+    let TextCallRequest {
         system_prompt,
         user_content,
         response_title,
@@ -262,22 +294,7 @@ pub(crate) async fn call_configured_text_model(
         media_files,
         prompt_name,
         audit_context,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_resolved_text_model(
-    model: &ResolvedTextModel,
-    system_prompt: &str,
-    user_content: &str,
-    response_title: &str,
-    tools_enabled: bool,
-    use_pro: bool,
-    media_files: Option<Vec<crate::llm::media::MediaFile>>,
-    prompt_name: Option<&str>,
-    audit_context: Option<&LlmAuditContext>,
-) -> Result<(String, String)> {
+    } = request;
     if let Some(config) = model.config() {
         let summary = media_files
             .as_ref()

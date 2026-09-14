@@ -424,3 +424,5 @@ Model pickers revalidate against the current catalog when answered or timed out.
 Answers retain original Markdown until delivery. Telegram receives HTML, Telegraph receives nodes built from the original Markdown, and failed formatting/publishing falls back to readable bounded text with link destinations. Model labels are rendered separately as literal metadata.
 
 Generated-image delivery for `/img`, `/image`, `/img2`, `/paintme`, and `/portraitme` retries transient Telegram failures without repeating generation. Partial delivery reports the number confirmed by Telegram; persona prompts and audit labels remain distinct.
+
+Chat-context tools batch neighboring-message retrieval into one database query. Message text is capped at 4,000 characters per message and 32,000 characters per tool result (including snippets); matched messages take priority over surrounding context. Results include truncation/omission metadata and only returned message IDs are registered for citations. Diagnostic log tails scan backward from the end through at most 256 KiB and mark incomplete tails.
