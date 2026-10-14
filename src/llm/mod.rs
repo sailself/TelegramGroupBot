@@ -19,6 +19,7 @@ pub mod tool_loop;
 pub mod tool_prompts;
 pub mod tool_runtime;
 pub mod transport;
+pub mod vid2_video;
 pub mod web_search;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

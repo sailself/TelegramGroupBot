@@ -89,6 +89,19 @@ external_media_total_max_bytes: {}\n",
     )
 }
 
+fn format_vid2_diagnostics(config: &Config) -> String {
+    format!(
+        "vid2_ready: {}\n\
+vid2_base_url: {}\n\
+vid2_seconds: {}\n\
+vid2_media_dir: {}\n",
+        bool_label(config.vid2_api_available()),
+        config.vid2.base_url,
+        config.vid2.seconds,
+        config.vid2.media_dir,
+    )
+}
+
 async fn build_status_report(state: &AppState) -> String {
     let db_result = state.db.health_check().await;
     let db_status = if db_result.is_ok() { "ok" } else { "error" };
@@ -182,6 +195,7 @@ async fn build_status_report(state: &AppState) -> String {
         crate::llm::img2_image::img2_health_url()
     ));
     report.push_str(&format!("img2_media_dir: {}\n", CONFIG.img2.media_dir));
+    report.push_str(&format_vid2_diagnostics(&CONFIG));
     report.push_str(&format!(
         "openai_codex_ready: {}\n",
         bool_label(codex_ready)
@@ -453,5 +467,35 @@ external_media_total_max_bytes: 52428800\n"
             redact_secrets("key=abc token=xyz other=abc", &secrets),
             "key=[REDACTED] token=[REDACTED] other=[REDACTED]"
         );
+    }
+
+    #[test]
+    fn vid2_diagnostics_show_readiness_without_credentials_and_redact_log_secrets() {
+        let mut config = (*CONFIG).clone();
+        config.vid2.enabled = true;
+        config.vid2.base_url = "https://videos.example.com:8443".to_string();
+        config.vid2.api_key = "seeded-vid2-secret".to_string();
+        config.vid2.seconds = 5;
+        config.vid2.media_dir = "data/media/vid2".to_string();
+        let report = format_vid2_diagnostics(&config);
+        assert_eq!(
+            report,
+            "vid2_ready: yes\n\
+vid2_base_url: https://videos.example.com:8443\n\
+vid2_seconds: 5\n\
+vid2_media_dir: data/media/vid2\n"
+        );
+        assert!(!report.contains("seeded-vid2-secret"));
+        let secrets = config
+            .secret_values()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            redact_secrets("X-API-Key: seeded-vid2-secret", &secrets),
+            "X-API-Key: [REDACTED]"
+        );
+        config.vid2.enabled = false;
+        assert!(format_vid2_diagnostics(&config).starts_with("vid2_ready: no\n"));
     }
 }

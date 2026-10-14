@@ -82,6 +82,23 @@ impl ImageDeliveryError {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Generated video delivery failed: {source}")]
+pub(crate) struct VideoDeliveryError {
+    #[source]
+    pub source: RequestError,
+}
+
+impl VideoDeliveryError {
+    fn user_message(&self) -> &'static str {
+        if telegram_error_is_retryable(&self.source) {
+            "Your video was generated and saved locally, but a temporary Telegram error prevented delivery after retries."
+        } else {
+            "Your video was generated and saved locally, but Telegram rejected its delivery."
+        }
+    }
+}
+
 /// Every post-status operation either completes normally or attempts a terminal
 /// edit. A failed edit must never replace the error that caused the command to fail.
 pub async fn run_with_status_message<T>(
@@ -96,6 +113,19 @@ pub async fn run_with_status_message<T>(
             "This request reached its time limit. Please try a smaller request.".to_string()
         } else if let Some(delivery_error) = error.downcast_ref::<ImageDeliveryError>() {
             delivery_error.user_message().to_string()
+        } else if let Some(delivery_error) = error.downcast_ref::<VideoDeliveryError>() {
+            delivery_error.user_message().to_string()
+        } else if let Some(video_error) = error.downcast_ref::<crate::llm::vid2_video::Vid2Error>()
+        {
+            match video_error {
+                crate::llm::vid2_video::Vid2Error::Timeout => {
+                    "Video generation reached its time limit. The server job may still be running."
+                        .to_string()
+                }
+                crate::llm::vid2_video::Vid2Error::Generation(detail) => {
+                    format!("Failed to generate your video: {detail}.")
+                }
+            }
         } else {
             failure_text.to_string()
         };
@@ -462,6 +492,44 @@ mod status_tests {
                 .await
                 .unwrap();
         assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn video_status_distinguishes_generation_timeout_and_delivery_failures() {
+        use crate::llm::vid2_video::Vid2Error;
+        use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
+        let cases: [(anyhow::Error, &str); 3] = [
+            (
+                Vid2Error::Generation("first frame download failed".into()).into(),
+                "Failed to generate your video: first frame download failed.",
+            ),
+            (
+                Vid2Error::Timeout.into(),
+                "Video generation reached its time limit. The server job may still be running.",
+            ),
+            (
+                VideoDeliveryError {
+                    source: RequestError::Api(teloxide::ApiError::MessageNotModified),
+                }
+                .into(),
+                "Your video was generated and saved locally, but Telegram rejected its delivery.",
+            ),
+        ];
+        for (error, expected_text) in cases {
+            let server = TestServer::new(vec![ExpectedRequest::new(
+                "POST", "/bot123:test/EditMessageText",
+                response_with_status(200, br#"{"ok":true,"result":{"message_id":9,"date":0,"chat":{"id":1,"type":"private"}}}"#.to_vec()),
+            ).with_body_fragment(expected_text.as_bytes())]);
+            let bot = Bot::new("123:test").set_api_url(server.base_url());
+            let original = error.to_string();
+            let result =
+                run_with_status_message(&bot, ChatId(1), MessageId(9), "generic failure", async {
+                    Err::<(), _>(error)
+                })
+                .await;
+            assert_eq!(result.unwrap_err().to_string(), original);
+            server.join().unwrap();
+        }
     }
 }
 

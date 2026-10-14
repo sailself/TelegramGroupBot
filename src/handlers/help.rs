@@ -180,7 +180,8 @@ mod tests {
     }
 
     #[test]
-    fn help_text_keeps_img2_hidden() {
+    fn help_text_keeps_img2_and_vid2_hidden() {
         assert!(!command_help_text().contains("/img2"));
+        assert!(!command_help_text().contains("/vid2"));
     }
 }

@@ -209,6 +209,19 @@ pub struct Img2Config {
     pub steps: Option<u32>,
 }
 
+/// The self-hosted asynchronous video generation backend ("vid2").
+#[derive(Debug, Clone)]
+pub struct Vid2Config {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: String,
+    pub seconds: u64,
+    pub request_timeout_secs: u64,
+    pub generation_timeout_secs: u64,
+    pub poll_interval_secs: u64,
+    pub media_dir: String,
+}
+
 /// Twitter/X link-unfurling: which providers to try, in what order, and
 /// their endpoints/timeouts/byte limits.
 #[derive(Debug, Clone)]
@@ -324,6 +337,7 @@ pub struct Config {
     pub openai: OpenAiConfig,
     pub codex: CodexConfig,
     pub img2: Img2Config,
+    pub vid2: Vid2Config,
     pub twitter: TwitterConfig,
     pub external_media: ExternalMediaConfig,
     pub search: SearchConfig,
@@ -403,6 +417,19 @@ fn env_optional_positive_u32(name: &str) -> Option<u32> {
 
 fn env_u64(name: &str, default: u64) -> u64 {
     env_parsed(name, default)
+}
+
+fn env_positive_u64(name: &str, default: u64) -> u64 {
+    let value = env_u64(name, default);
+    if value == 0 {
+        warn!(
+            env = name,
+            value, "value must be positive, using the default"
+        );
+        default
+    } else {
+        value
+    }
 }
 
 fn env_timeout_secs(name: &str, default: u64) -> u64 {
@@ -878,6 +905,26 @@ fn load_img2() -> Result<Img2Config> {
     })
 }
 
+fn load_vid2() -> Result<Vid2Config> {
+    let enabled = env_bool("ENABLE_VID2", false);
+    let base_url_raw = env_string("VID2_BASE_URL", "");
+    let base_url = if base_url_raw.trim().is_empty() {
+        String::new()
+    } else {
+        validate_https_base("VID2_BASE_URL", base_url_raw)?
+    };
+    Ok(Vid2Config {
+        enabled,
+        base_url,
+        api_key: env_string("VID2_API_KEY", ""),
+        seconds: env_positive_u64("VID2_SECONDS", 5),
+        request_timeout_secs: env_positive_u64("VID2_REQUEST_TIMEOUT_SECS", 120),
+        generation_timeout_secs: env_positive_u64("VID2_GENERATION_TIMEOUT_SECS", 1800),
+        poll_interval_secs: env_positive_u64("VID2_POLL_INTERVAL_SECS", 5),
+        media_dir: env_string("VID2_MEDIA_DIR", "data/media/vid2"),
+    })
+}
+
 fn load_twitter() -> Result<TwitterConfig> {
     let fetch_providers = normalize_twitter_fetch_providers(env_csv_lowercase(
         "TWITTER_FETCH_PROVIDERS",
@@ -1034,6 +1081,7 @@ impl Config {
         let openai = load_openai()?;
         let codex = load_codex()?;
         let img2 = load_img2()?;
+        let vid2 = load_vid2()?;
         let twitter = load_twitter()?;
         let external_media = load_external_media();
         validate_twitter_fetch_limits(
@@ -1063,6 +1111,7 @@ impl Config {
             openai,
             codex,
             img2,
+            vid2,
             twitter,
             external_media,
             search,
@@ -1103,6 +1152,12 @@ impl Config {
             && !self.img2.base_url.trim().is_empty()
     }
 
+    pub fn vid2_api_available(&self) -> bool {
+        self.vid2.enabled
+            && !self.vid2.api_key.trim().is_empty()
+            && !self.vid2.base_url.trim().is_empty()
+    }
+
     /// Every configured credential that must never appear in operator-facing
     /// output (status/diagnose reports, log tails, etc.).
     pub fn secret_values(&self) -> Vec<&str> {
@@ -1113,6 +1168,7 @@ impl Config {
             self.ollama.api_key.as_str(),
             self.openai.api_key.as_str(),
             self.img2.api_key.as_str(),
+            self.vid2.api_key.as_str(),
             self.jina.api_key.as_str(),
             self.search.brave_api_key.as_str(),
             self.search.exa_api_key.as_str(),
@@ -1488,6 +1544,124 @@ mod tests {
     }
 
     #[test]
+    fn vid2_load_accepts_disabled_empty_url_and_default_settings() {
+        let _lock = lock_env_and_force_config();
+        let _env = [
+            set_env_var_for_test("ENABLE_VID2", "false"),
+            set_env_var_for_test("VID2_BASE_URL", ""),
+            set_env_var_for_test("VID2_API_KEY", ""),
+            set_env_var_for_test("VID2_SECONDS", ""),
+            set_env_var_for_test("VID2_REQUEST_TIMEOUT_SECS", ""),
+            set_env_var_for_test("VID2_GENERATION_TIMEOUT_SECS", ""),
+            set_env_var_for_test("VID2_POLL_INTERVAL_SECS", ""),
+            set_env_var_for_test("VID2_MEDIA_DIR", "data/media/vid2"),
+        ];
+        let config = load_vid2().expect("disabled vid2 does not require an endpoint");
+        assert!(!config.enabled);
+        assert!(config.base_url.is_empty());
+        assert!(config.api_key.is_empty());
+        assert_eq!(config.seconds, 5);
+        assert_eq!(config.request_timeout_secs, 120);
+        assert_eq!(config.generation_timeout_secs, 1800);
+        assert_eq!(config.poll_interval_secs, 5);
+        assert_eq!(config.media_dir, "data/media/vid2");
+    }
+
+    #[test]
+    fn config_load_accepts_vid2_custom_https_port() {
+        let _lock = lock_env_and_force_config();
+        let _env = [
+            set_env_var_for_test("ENABLE_VID2", "true"),
+            set_env_var_for_test("VID2_BASE_URL", "https://videos.example.com:8443/api/"),
+            set_env_var_for_test("VID2_API_KEY", "test-vid2-key"),
+        ];
+        let config = Config::load().expect("custom HTTPS video provider ports should be accepted");
+        assert_eq!(config.vid2.base_url, "https://videos.example.com:8443/api");
+        assert!(config.vid2_api_available());
+    }
+
+    #[test]
+    fn vid2_load_allows_enabled_empty_url_without_readiness() {
+        let _lock = lock_env_and_force_config();
+        let _env = [
+            set_env_var_for_test("ENABLE_VID2", "true"),
+            set_env_var_for_test("VID2_BASE_URL", ""),
+            set_env_var_for_test("VID2_API_KEY", "test-vid2-key"),
+        ];
+        let config =
+            Config::load().expect("an unconfigured vid2 endpoint does not prevent startup");
+        assert!(config.vid2.enabled);
+        assert!(config.vid2.base_url.is_empty());
+        assert!(!config.vid2_api_available());
+    }
+
+    #[test]
+    fn vid2_load_rejects_unsafe_nonempty_endpoints() {
+        let _lock = lock_env_and_force_config();
+        let _enabled = set_env_var_for_test("ENABLE_VID2", "true");
+        for endpoint in [
+            "http://videos.example.com:8443",
+            "https://user@videos.example.com",
+            "https://videos.example.com?debug=1",
+            "https://videos.example.com/#fragment",
+        ] {
+            let _endpoint = set_env_var_for_test("VID2_BASE_URL", endpoint);
+            let err = load_vid2().expect_err("nonempty vid2 endpoints must use safe HTTPS");
+            assert!(err.to_string().contains("VID2_BASE_URL"), "{err}");
+        }
+    }
+
+    #[test]
+    fn vid2_positive_settings_warn_and_fall_back_on_zero_or_unparsable_values() {
+        let _lock = lock_env_and_force_config();
+        let _env = [
+            set_env_var_for_test("ENABLE_VID2", "false"),
+            set_env_var_for_test("VID2_BASE_URL", ""),
+            set_env_var_for_test("VID2_SECONDS", "0"),
+            set_env_var_for_test("VID2_REQUEST_TIMEOUT_SECS", "slow"),
+            set_env_var_for_test("VID2_GENERATION_TIMEOUT_SECS", "0"),
+            set_env_var_for_test("VID2_POLL_INTERVAL_SECS", "-1"),
+        ];
+        let events = crate::utils::log_capture::capture_json_events(|| {
+            let config = load_vid2().expect("invalid numeric settings use safe defaults");
+            assert_eq!(config.seconds, 5);
+            assert_eq!(config.request_timeout_secs, 120);
+            assert_eq!(config.generation_timeout_secs, 1800);
+            assert_eq!(config.poll_interval_secs, 5);
+        });
+        assert_eq!(events.len(), 4, "{events:?}");
+        let names = events
+            .iter()
+            .map(|event| event["fields"]["env"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "VID2_SECONDS",
+                "VID2_REQUEST_TIMEOUT_SECS",
+                "VID2_GENERATION_TIMEOUT_SECS",
+                "VID2_POLL_INTERVAL_SECS",
+            ]
+        );
+    }
+
+    #[test]
+    fn vid2_api_available_requires_enabled_endpoint_and_key() {
+        let mut config = (*CONFIG).clone();
+        config.vid2.enabled = false;
+        config.vid2.base_url = "https://videos.example.com".to_string();
+        config.vid2.api_key = "vid2-test-key".to_string();
+        assert!(!config.vid2_api_available());
+        config.vid2.enabled = true;
+        assert!(config.vid2_api_available());
+        config.vid2.api_key = "  ".to_string();
+        assert!(!config.vid2_api_available());
+        config.vid2.api_key = "vid2-test-key".to_string();
+        config.vid2.base_url = "  ".to_string();
+        assert!(!config.vid2_api_available());
+    }
+
+    #[test]
     fn config_load_rejects_plain_http_provider_endpoints() {
         let _lock = lock_env_and_force_config();
         for name in [
@@ -1499,6 +1673,7 @@ mod tests {
             "EXA_SEARCH_ENDPOINT",
             "JINA_SEARCH_ENDPOINT",
             "IMG2_BASE_URL",
+            "VID2_BASE_URL",
         ] {
             let _env = set_env_var_for_test(name, "http://example.com");
             let result = Config::load();
@@ -1530,9 +1705,10 @@ mod tests {
         let mut config = (*CONFIG).clone();
         config.ollama.api_key = "ollama-secret".to_string();
         config.img2.api_key = "img2-secret".to_string();
+        config.vid2.api_key = "vid2-secret".to_string();
         config.telegram.bot_token = "bot-secret".to_string();
         let secrets = config.secret_values();
-        for expected in ["ollama-secret", "img2-secret", "bot-secret"] {
+        for expected in ["ollama-secret", "img2-secret", "vid2-secret", "bot-secret"] {
             assert!(secrets.contains(&expected), "missing {expected}");
         }
     }

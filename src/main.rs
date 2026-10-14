@@ -80,6 +80,8 @@ enum Command {
     Image(String),
     #[command(description = "用 Veo 生成视频")]
     Vid(String),
+    #[command(description = "hidden video generation command")]
+    Vid2(String),
     #[command(description = "基于你在本群的聊天记录生成你的主题歌")]
     Mysong(String),
     #[command(description = "基于你在本群的聊天记录生成个人简介")]
@@ -115,8 +117,9 @@ type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 /// Commands that parse and appear in `/help` but are never published to
 /// Telegram's default-scope menu: hidden aliases and admin-only tooling.
-const UNPUBLISHED_BOT_COMMANDS: [&str; 9] = [
+const UNPUBLISHED_BOT_COMMANDS: [&str; 10] = [
     "img2",
+    "vid2",
     "status",
     "diagnose",
     "token_stats",
@@ -357,6 +360,12 @@ async fn handle_command(
                 handlers::image::vid_handler(bot, state, message, optional_arg(arg)),
             );
         }
+        Command::Vid2(arg) => {
+            spawn_logged(
+                "vid2",
+                handlers::video::vid2_handler(bot, state, message, optional_arg(arg)),
+            );
+        }
         Command::Mysong(arg) => {
             spawn_logged(
                 "mysong",
@@ -585,6 +594,19 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!commands.iter().any(|command| command == "img2"));
+    }
+
+    #[test]
+    fn vid2_command_parses_but_is_hidden_even_without_gemini() {
+        assert!(matches!(
+            <Command as BotCommands>::parse("/vid2@test_bot a fox", "test_bot"),
+            Ok(Command::Vid2(prompt)) if prompt == "a fox"
+        ));
+        for gemini_available in [true, false] {
+            assert!(!published_bot_commands(gemini_available)
+                .iter()
+                .any(|command| command.command == "vid2"));
+        }
     }
 
     #[test]

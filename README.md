@@ -309,6 +309,21 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `/img2` sends only `prompt`, optional first replied source image, and the configured optional `width`/`height`/`steps` fields. It does not upload generated files to cwd.pw.
 - In Docker, the existing `./data:/app/data` mount persists the default `data/media/img2` folder.
 
+### Hidden Vid2 video generation (optional)
+- `/vid2` is a hidden command: it is callable when enabled, but is not published with `setMyCommands` or shown in `/help`. Use `/vid2 <prompt>` for text-to-video, or attach/reply to a photo or a JPEG, PNG, or WebP document for image-to-video. The prompt can be in the attached image's caption; an empty command falls back to replied text/caption. An attached image takes precedence over a replied image, and albums use the particular attached/replied item. An invalid or unavailable selected image fails the request.
+- `ENABLE_VID2` - Enable the hidden `/vid2` command. Default: `false`.
+- `VID2_BASE_URL` - HTTPS API base URL, for example `https://video-service.example.com:8443`. Default: empty; `/vid2` stays unavailable until both URL and key are configured, even when enabled. Custom HTTPS ports are accepted; credentials, query strings, and fragments are rejected.
+- `VID2_API_KEY` - API key sent in the `X-API-Key` header on submission, status, and download requests. Keep this in `.env` or deployment secrets only. `/vid2` is ready only when enabled with both URL and key; `/status` reports this configuration readiness.
+- `VID2_SECONDS` - Configured video duration sent with every generation request. Default: `5` seconds.
+- `VID2_REQUEST_TIMEOUT_SECS` - Timeout for each HTTP request. Default: `120`.
+- `VID2_GENERATION_TIMEOUT_SECS` - Deadline covering first-frame retrieval, submission, polling, and video download. Default: `1800`. Semaphore waiting, local persistence, and Telegram delivery are separate.
+- `VID2_POLL_INTERVAL_SECS` - Delay between status polls. Default: `5`.
+- `VID2_MEDIA_DIR` - Local folder for downloaded MP4 files. Default: `data/media/vid2`. Downloads are limited to 50,000,000 bytes and must contain an MP4 container. Completed files are retained, including when Telegram delivery fails; in Docker, the existing `./data:/app/data` mount persists this default folder.
+- Duration and timeout/poll values must be positive integers. Zero or invalid values warn and fall back to their defaults.
+- The service contract is `POST <base>/v1/videos/generate` with multipart `prompt`, `seconds`, and optional `first_frame` image, returning an `id`. The bot polls `GET <base>/v1/videos/<id>` for `status` (`queued`, `running`, `success`, or `error`), then downloads the MP4 from `GET <base>/v1/videos/<id>/file` after `success`. Redirects are disabled for these authenticated requests.
+- Observed server responses include `status: queued` and a `params` object on submission, and `status: running`/`success`, `duration`, and nullable `error` while polling. The bot ignores these additional fields; duration stays controlled by `VID2_SECONDS`, and server quality/dimensions/seed use the service defaults.
+- The bot host or container must be able to reach the service, including its tailnet address when applicable, and trust its HTTPS certificate. Timeout stops the bot's wait without cancelling the remote job. Pending jobs are not recovered after a bot restart.
+
 Example `third_party_models.json`:
 ```json
 {

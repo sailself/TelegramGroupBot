@@ -13,5 +13,6 @@ pub mod qa;
 pub mod responses;
 pub mod tldr;
 pub mod token_stats;
+pub mod video;
 
 mod image_delivery;
