@@ -4,11 +4,13 @@ use std::future::Future;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::time::Duration;
 
+use regex::Regex;
 use reqwest::multipart::{Form, Part};
 use serde_json::{json, Value};
-use tracing::info;
+use tracing::{error, info};
 use url::Url;
 
 use crate::config::{Vid2Config, CONFIG};
@@ -17,13 +19,14 @@ use crate::llm::transport::{
     call_with_retry, read_body_limited, LlmCall, ProviderError, RetryPolicy,
 };
 use crate::utils::http::get_http_client_no_redirect;
+use crate::utils::text::truncate_to_chars;
 
 const PROVIDER: &str = "vid2";
 const JSON_MAX_BYTES: usize = 64 * 1024;
 const VIDEO_MAX_BYTES: usize = 50_000_000;
 const SOURCE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const REJECTION_REASON_MAX_CHARS: usize = 512;
 const GET_POLICY: RetryPolicy = RetryPolicy::exponential(3, Duration::from_millis(400));
-const POST_POLICY: RetryPolicy = RetryPolicy::linear(1, Duration::ZERO);
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +104,81 @@ fn omit_transport_detail(_: &str) -> String {
     "external request details omitted".to_string()
 }
 
+fn structured_rejection_reason(value: &Value) -> Option<String> {
+    match value {
+        Value::String(message) if !message.trim().is_empty() => Some(message.trim().to_string()),
+        Value::Object(object) => {
+            let reason = ["detail", "error", "message", "msg"]
+                .into_iter()
+                .find_map(|field| object.get(field).and_then(structured_rejection_reason))?;
+            // Keep useful FastAPI field locations, but never arbitrary input
+            // values or caller-provided strings from the validation object.
+            let field = object
+                .get("loc")
+                .and_then(Value::as_array)
+                .and_then(|location| location.last())
+                .and_then(Value::as_str)
+                .filter(|field| {
+                    matches!(
+                        *field,
+                        "width" | "height" | "seconds" | "prompt" | "first_frame"
+                    )
+                });
+            Some(field.map_or(reason.clone(), |field| format!("{field}: {reason}")))
+        }
+        Value::Array(entries) => {
+            let messages = entries
+                .iter()
+                .take(4)
+                .filter_map(structured_rejection_reason)
+                .collect::<Vec<_>>();
+            (!messages.is_empty()).then(|| messages.join("; "))
+        }
+        _ => None,
+    }
+}
+
+fn redact_rejection_reason(reason: &str, active_key: &str, prompt: &str) -> String {
+    // Parse/select JSON messages before this boundary, never validation input
+    // objects. URLs/data URIs may contain credentials or source-media content.
+    static PRIVATE_REFERENCES: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)\b(?:https?://|data:image/)(?:<REDACTED>|[^\s<>"'])+"#)
+            .expect("valid private reference regex")
+    });
+    let mut safe = reason.to_string();
+    let mut secrets = CONFIG.secret_values();
+    secrets.extend([active_key.trim(), prompt]);
+    secrets.retain(|secret| !secret.is_empty());
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    for secret in secrets {
+        safe = safe.replace(secret, "<REDACTED>");
+    }
+    // Whole prompts can themselves contain URLs: remove them before altering
+    // URL substrings, then scrub remaining URLs including redacted tokens.
+    let safe = PRIVATE_REFERENCES.replace_all(&safe, "<REDACTED_URL>");
+    // Scrub complete credentials BEFORE bounding output, including a key
+    // whose raw value straddles the cutoff. Keep messages single-line.
+    let safe = safe
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    truncate_to_chars(&safe, REJECTION_REASON_MAX_CHARS).to_string()
+}
+
+async fn rejection_reason(response: reqwest::Response, active_key: &str, prompt: &str) -> String {
+    let reason = match read_body_limited(response, PROVIDER, JSON_MAX_BYTES).await {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| structured_rejection_reason(&value))
+            .unwrap_or_else(|| "server returned no structured error reason".to_string()),
+        Err(ProviderError::BodyTooLarge { .. }) => {
+            "error response exceeded the 65536-byte diagnostic limit".to_string()
+        }
+        Err(_) => "error response could not be read".to_string(),
+    };
+    redact_rejection_reason(&reason, active_key, prompt)
+}
+
 fn transport_error(error: ProviderError, phase: &str) -> Vid2Error {
     let detail = match error {
         ProviderError::Http { status, .. } => format!("{phase}: HTTP {status}"),
@@ -173,30 +251,62 @@ async fn submit(
     source: Option<Vid2SourceImage>,
 ) -> Result<String, Vid2Error> {
     let url = endpoint(&settings.base_url, None, false)?;
-    let mut form = Some(build_form(prompt, settings.seconds, resolution, source)?);
-    let call = LlmCall::untracked(PROVIDER, "submit").with_redaction(omit_transport_detail);
-    let value = call_with_retry(
-        &call,
-        &POST_POLICY,
-        |_| {
-            // The single-attempt policy is mandatory: the API has no
-            // idempotency key, and even a lost response may have created a job.
-            let form = form.take();
-            let url = url.clone();
-            async move {
-                Ok(get_http_client_no_redirect()
-                    .post(url)
-                    .timeout(Duration::from_secs(settings.request_timeout_secs))
-                    .header("X-API-Key", settings.api_key.trim())
-                    .multipart(form.ok_or_else(|| ProviderError::rejected("submission repeated"))?))
-            }
-        },
-        |_| {},
-        read_json,
-        |_| LlmUsageRecord::default(),
-    )
-    .await
-    .map_err(|error| transport_error(error, "submission"))?;
+    let source_image = source.is_some();
+    let source_mime = source.as_ref().map(|image| image.mime_type);
+    let source_bytes = source.as_ref().map(|image| image.bytes.len());
+    let source_width = source.as_ref().map(|image| image.resolution.width);
+    let source_height = source.as_ref().map(|image| image.resolution.height);
+    info!(
+        source_image,
+        source_mime,
+        source_bytes,
+        source_width,
+        source_height,
+        target_width = resolution.width,
+        target_height = resolution.height,
+        seconds = settings.seconds,
+        "Submitting Vid2 video"
+    );
+    let form = build_form(prompt, settings.seconds, resolution, source)?;
+    // Send exactly once. The API has no idempotency key, so even a lost
+    // response must never trigger a second submission or fallback request.
+    let response = get_http_client_no_redirect()
+        .post(url)
+        .timeout(Duration::from_secs(settings.request_timeout_secs))
+        .header("X-API-Key", settings.api_key.trim())
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| {
+            error!(
+                timeout = error.is_timeout(),
+                connect = error.is_connect(),
+                "Vid2 submission transport failed; request details omitted"
+            );
+            generation_error("submission: request failed")
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let reason = rejection_reason(response, &settings.api_key, prompt).await;
+        error!(
+            status = status.as_u16(),
+            reason,
+            source_image,
+            source_mime,
+            source_bytes,
+            source_width,
+            source_height,
+            target_width = resolution.width,
+            target_height = resolution.height,
+            seconds = settings.seconds,
+            "Vid2 submission rejected"
+        );
+        return Err(generation_error(format!("submission: HTTP {status}")));
+    }
+    let value = read_json(response).await.map_err(|error| {
+        error!("Vid2 submission returned an invalid job response");
+        transport_error(error, "submission")
+    })?;
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -819,6 +929,159 @@ mod tests {
             assert!(!logs.contains("private detail"));
             server.join().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn submit_rejection_logs_structured_reason_with_secrets_redacted_and_bounded() {
+        const ACTIONABLE: &str = "Synthetic first_frame validation failure";
+        const PROMPT: &str = "PRIVATE_TEST_PROMPT_DO_NOT_LOG https://private.example.test/input KEEP_THIS_PROMPT_TAIL_PRIVATE";
+        const ACTIVE_KEY: &str = "active-submit-test-key";
+        let configured_secret = CONFIG.telegram.bot_token.trim();
+        let private_url =
+            format!("https://api.telegram.org/file/bot{configured_secret}/private.jpg");
+        let mut message = format!(
+            "{ACTIONABLE}; configured={configured_secret}; prompt={PROMPT}; source={private_url}; "
+        );
+        message.push_str(&"x".repeat(500usize.saturating_sub(message.chars().count())));
+        message.push_str(ACTIVE_KEY);
+        message.push_str(&"z".repeat(2048));
+        let source_bytes = png_at_resolution(1600, 1000);
+        let private_image =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &source_bytes);
+        for body in [
+            json!({"detail": message, "input": {"prompt": PROMPT, "first_frame": private_image}}),
+            json!({"error": {"message": message, "input": private_image}}),
+            json!({"message": message, "prompt": PROMPT}),
+            json!({"detail": [{"loc": ["body", "first_frame"], "msg": message, "input": {"prompt": PROMPT, "first_frame": private_image}}]}),
+        ] {
+            let server = TestServer::new(vec![ExpectedRequest::new(
+                "POST",
+                "/v1/videos/generate",
+                response_with_status(400, serde_json::to_vec(&body).unwrap()),
+            )
+            .with_header("x-api-key", ACTIVE_KEY)]);
+            let mut config = settings(&server);
+            config.api_key = format!(" {ACTIVE_KEY} ");
+            let source = validate_source_image(source_bytes.clone()).unwrap();
+            let (result, events) = crate::utils::log_capture::capture_json_events_async(submit(
+                &config,
+                PROMPT,
+                VideoResolution {
+                    width: 1344,
+                    height: 840,
+                },
+                Some(source),
+            ))
+            .await;
+            server.join().unwrap();
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("400"));
+            assert!(!error.contains(ACTIONABLE), "user error stays generic");
+            let reason = events
+                .iter()
+                .find_map(|event| event["fields"]["reason"].as_str());
+            assert!(
+                reason.is_some_and(|reason| reason.contains(ACTIONABLE)),
+                "submission400 must expose its structured operator reason"
+            );
+            assert!(reason.unwrap().chars().count() <= 512);
+            assert!(events.iter().any(|event| event["level"] == "ERROR"
+                && event["fields"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(ACTIONABLE))));
+            assert!(events
+                .iter()
+                .any(|event| event["fields"]["source_width"] == 1600
+                    && event["fields"]["source_height"] == 1000
+                    && event["fields"]["target_width"] == 1344
+                    && event["fields"]["target_height"] == 840
+                    && event["fields"]["source_mime"] == "image/png"
+                    && event["fields"]["source_bytes"] == source_bytes.len()));
+            let logs = serde_json::to_string(&events).unwrap();
+            assert!(!logs.contains(ACTIVE_KEY));
+            assert!(
+                !logs.contains("active-submit"),
+                "partial credentials must not leak across truncation"
+            );
+            assert!(!logs.contains(configured_secret));
+            assert!(!logs.contains(PROMPT));
+            assert!(!logs.contains("PRIVATE_TEST_PROMPT_DO_NOT_LOG"));
+            assert!(!logs.contains("KEEP_THIS_PROMPT_TAIL_PRIVATE"));
+            assert!(!logs.contains("api.telegram.org/file"));
+            assert!(!logs.contains("private.jpg"));
+            assert!(!logs.contains(&private_image));
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_rejections_bound_body_reads_and_never_log_unstructured_input() {
+        let oversized = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            JSON_MAX_BYTES + 1
+        )
+        .into_bytes();
+        for (response, expected_reason) in [
+            (oversized, "diagnostic limit"),
+            (
+                response_with_status(400, b"PRIVATE_UNSTRUCTURED_INPUT".to_vec()),
+                "no structured error reason",
+            ),
+            (
+                response_with_status(
+                    400,
+                    br#"{"detail":{"input":"PRIVATE_VALIDATION_INPUT"}}"#.to_vec(),
+                ),
+                "no structured error reason",
+            ),
+        ] {
+            let server = TestServer::new(vec![ExpectedRequest::new(
+                "POST",
+                "/v1/videos/generate",
+                response,
+            )]);
+            let config = settings(&server);
+            let (result, events) = crate::utils::log_capture::capture_json_events_async(submit(
+                &config,
+                "private prompt",
+                VideoResolution {
+                    width: 1344,
+                    height: 768,
+                },
+                None,
+            ))
+            .await;
+            server.join().unwrap();
+            assert!(result.unwrap_err().to_string().contains("400"));
+            let reason = events
+                .iter()
+                .find_map(|event| event["fields"]["reason"].as_str())
+                .unwrap();
+            assert!(reason.contains(expected_reason));
+            assert!(reason.chars().count() <= 512);
+            let logs = serde_json::to_string(&events).unwrap();
+            assert!(!logs.contains("PRIVATE_UNSTRUCTURED_INPUT"));
+            assert!(!logs.contains("PRIVATE_VALIDATION_INPUT"));
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_timeout_never_repeats_the_creation_request() {
+        let server = TestServer::new(vec![submission().delayed(Duration::from_millis(1200))]);
+        let mut config = settings(&server);
+        config.request_timeout_secs = 1;
+        let error = submit(
+            &config,
+            request().prompt,
+            VideoResolution {
+                width: 1344,
+                height: 768,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("submission: request failed"));
+        server.join_allowing_client_disconnect().unwrap();
     }
 
     #[tokio::test]
