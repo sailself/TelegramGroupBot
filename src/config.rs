@@ -215,6 +215,8 @@ pub struct Vid2Config {
     pub enabled: bool,
     pub base_url: String,
     pub api_key: String,
+    pub width: u32,
+    pub height: u32,
     pub seconds: u64,
     pub request_timeout_secs: u64,
     pub generation_timeout_secs: u64,
@@ -399,6 +401,19 @@ fn env_i32(name: &str, default: i32) -> i32 {
 
 fn env_u32(name: &str, default: u32) -> u32 {
     env_parsed(name, default)
+}
+
+fn env_positive_u32(name: &str, default: u32) -> u32 {
+    let value = env_u32(name, default);
+    if value == 0 {
+        warn!(
+            env = name,
+            value, "value must be positive, using the default"
+        );
+        default
+    } else {
+        value
+    }
 }
 
 fn parse_optional_positive_u32(value: &str) -> Option<u32> {
@@ -917,6 +932,8 @@ fn load_vid2() -> Result<Vid2Config> {
         enabled,
         base_url,
         api_key: env_string("VID2_API_KEY", ""),
+        width: env_positive_u32("VID2_WIDTH", 1344),
+        height: env_positive_u32("VID2_HEIGHT", 768),
         seconds: env_positive_u64("VID2_SECONDS", 5),
         request_timeout_secs: env_positive_u64("VID2_REQUEST_TIMEOUT_SECS", 120),
         generation_timeout_secs: env_positive_u64("VID2_GENERATION_TIMEOUT_SECS", 1800),
@@ -1550,6 +1567,8 @@ mod tests {
             set_env_var_for_test("ENABLE_VID2", "false"),
             set_env_var_for_test("VID2_BASE_URL", ""),
             set_env_var_for_test("VID2_API_KEY", ""),
+            set_env_var_for_test("VID2_WIDTH", ""),
+            set_env_var_for_test("VID2_HEIGHT", ""),
             set_env_var_for_test("VID2_SECONDS", ""),
             set_env_var_for_test("VID2_REQUEST_TIMEOUT_SECS", ""),
             set_env_var_for_test("VID2_GENERATION_TIMEOUT_SECS", ""),
@@ -1560,6 +1579,8 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.base_url.is_empty());
         assert!(config.api_key.is_empty());
+        assert_eq!(config.width, 1344);
+        assert_eq!(config.height, 768);
         assert_eq!(config.seconds, 5);
         assert_eq!(config.request_timeout_secs, 120);
         assert_eq!(config.generation_timeout_secs, 1800);
@@ -1617,6 +1638,8 @@ mod tests {
         let _env = [
             set_env_var_for_test("ENABLE_VID2", "false"),
             set_env_var_for_test("VID2_BASE_URL", ""),
+            set_env_var_for_test("VID2_WIDTH", "0"),
+            set_env_var_for_test("VID2_HEIGHT", "4294967296"),
             set_env_var_for_test("VID2_SECONDS", "0"),
             set_env_var_for_test("VID2_REQUEST_TIMEOUT_SECS", "slow"),
             set_env_var_for_test("VID2_GENERATION_TIMEOUT_SECS", "0"),
@@ -1624,12 +1647,14 @@ mod tests {
         ];
         let events = crate::utils::log_capture::capture_json_events(|| {
             let config = load_vid2().expect("invalid numeric settings use safe defaults");
+            assert_eq!(config.width, 1344);
+            assert_eq!(config.height, 768);
             assert_eq!(config.seconds, 5);
             assert_eq!(config.request_timeout_secs, 120);
             assert_eq!(config.generation_timeout_secs, 1800);
             assert_eq!(config.poll_interval_secs, 5);
         });
-        assert_eq!(events.len(), 4, "{events:?}");
+        assert_eq!(events.len(), 6, "{events:?}");
         let names = events
             .iter()
             .map(|event| event["fields"]["env"].as_str().unwrap())
@@ -1637,12 +1662,54 @@ mod tests {
         assert_eq!(
             names,
             [
+                "VID2_WIDTH",
+                "VID2_HEIGHT",
                 "VID2_SECONDS",
                 "VID2_REQUEST_TIMEOUT_SECS",
                 "VID2_GENERATION_TIMEOUT_SECS",
                 "VID2_POLL_INTERVAL_SECS",
             ]
         );
+    }
+
+    #[test]
+    fn vid2_dimensions_fall_back_for_invalid_u32_and_accept_portrait_defaults() {
+        let _lock = lock_env_and_force_config();
+        let _env = [
+            set_env_var_for_test("ENABLE_VID2", "false"),
+            set_env_var_for_test("VID2_BASE_URL", ""),
+        ];
+        for (width, height) in [
+            ("0", "-1"),
+            ("wide", "768.5"),
+            ("4294967296", "4294967296"),
+            ("", ""),
+        ] {
+            let _dimensions = [
+                set_env_var_for_test("VID2_WIDTH", width),
+                set_env_var_for_test("VID2_HEIGHT", height),
+            ];
+            let events = crate::utils::log_capture::capture_json_events(|| {
+                let config = load_vid2().unwrap();
+                assert_eq!((config.width, config.height), (1344, 768));
+            });
+            if width.is_empty() && height.is_empty() {
+                assert!(
+                    events.is_empty(),
+                    "blank values use defaults without warnings"
+                );
+            } else {
+                for name in ["VID2_WIDTH", "VID2_HEIGHT"] {
+                    assert!(events.iter().any(|event| event["fields"]["env"] == name));
+                }
+            }
+        }
+        let _dimensions = [
+            set_env_var_for_test("VID2_WIDTH", " 768 "),
+            set_env_var_for_test("VID2_HEIGHT", "1344"),
+        ];
+        let config = load_vid2().unwrap();
+        assert_eq!((config.width, config.height), (768, 1344));
     }
 
     #[test]

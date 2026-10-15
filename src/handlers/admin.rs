@@ -94,10 +94,13 @@ fn format_vid2_diagnostics(config: &Config) -> String {
         "vid2_ready: {}\n\
 vid2_base_url: {}\n\
 vid2_seconds: {}\n\
+vid2_resolution: {}x{}\n\
 vid2_media_dir: {}\n",
         bool_label(config.vid2_api_available()),
         config.vid2.base_url,
         config.vid2.seconds,
+        config.vid2.width,
+        config.vid2.height,
         config.vid2.media_dir,
     )
 }
@@ -476,6 +479,8 @@ external_media_total_max_bytes: 52428800\n"
         config.vid2.base_url = "https://videos.example.com:8443".to_string();
         config.vid2.api_key = "seeded-vid2-secret".to_string();
         config.vid2.seconds = 5;
+        config.vid2.width = 1344;
+        config.vid2.height = 768;
         config.vid2.media_dir = "data/media/vid2".to_string();
         let report = format_vid2_diagnostics(&config);
         assert_eq!(
@@ -483,6 +488,7 @@ external_media_total_max_bytes: 52428800\n"
             "vid2_ready: yes\n\
 vid2_base_url: https://videos.example.com:8443\n\
 vid2_seconds: 5\n\
+vid2_resolution: 1344x768\n\
 vid2_media_dir: data/media/vid2\n"
         );
         assert!(!report.contains("seeded-vid2-secret"));

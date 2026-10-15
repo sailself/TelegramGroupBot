@@ -61,6 +61,34 @@ pub struct Vid2SourceImage {
     bytes: Vec<u8>,
     mime_type: &'static str,
     file_name: &'static str,
+    resolution: VideoResolution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VideoResolution {
+    width: u32,
+    height: u32,
+}
+
+fn video_resolution(defaults: VideoResolution, source: Option<VideoResolution>) -> VideoResolution {
+    let Some(source) = source else {
+        return defaults;
+    };
+    let cap = defaults.width.max(defaults.height);
+    let long_edge = source.width.max(source.height);
+    if long_edge <= cap {
+        return source;
+    }
+    // Integer rounding keeps the long edge exact and the other edge within
+    // half a pixel of the source ratio. A very narrow image still needs 1px.
+    let scaled = |edge: u32| {
+        ((u64::from(edge) * u64::from(cap) + u64::from(long_edge) / 2) / u64::from(long_edge))
+            .max(1) as u32
+    };
+    VideoResolution {
+        width: scaled(source.width),
+        height: scaled(source.height),
+    }
 }
 
 fn generation_error(message: impl Into<String>) -> Vid2Error {
@@ -114,11 +142,14 @@ fn endpoint(base: &str, job_id: Option<&str>, file: bool) -> Result<Url, Vid2Err
 fn build_form(
     prompt: &str,
     seconds: u64,
+    resolution: VideoResolution,
     source: Option<Vid2SourceImage>,
 ) -> Result<Form, Vid2Error> {
     let mut form = Form::new()
         .text("prompt", prompt.to_string())
-        .text("seconds", seconds.to_string());
+        .text("seconds", seconds.to_string())
+        .text("width", resolution.width.to_string())
+        .text("height", resolution.height.to_string());
     if let Some(source) = source {
         let part = Part::bytes(source.bytes)
             .file_name(source.file_name)
@@ -138,10 +169,11 @@ async fn read_json(response: reqwest::Response) -> Result<Value, ProviderError> 
 async fn submit(
     settings: &Vid2Config,
     prompt: &str,
+    resolution: VideoResolution,
     source: Option<Vid2SourceImage>,
 ) -> Result<String, Vid2Error> {
     let url = endpoint(&settings.base_url, None, false)?;
-    let mut form = Some(build_form(prompt, settings.seconds, source)?);
+    let mut form = Some(build_form(prompt, settings.seconds, resolution, source)?);
     let call = LlmCall::untracked(PROVIDER, "submit").with_redaction(omit_transport_detail);
     let value = call_with_retry(
         &call,
@@ -348,13 +380,17 @@ fn validate_source_image(bytes: Vec<u8>) -> Result<Vid2SourceImage, Vid2Error> {
     limits.max_image_height = Some(8192);
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
-    reader
+    let decoded = reader
         .decode()
         .map_err(|_| generation_error("first frame is invalid or too large"))?;
     Ok(Vid2SourceImage {
         bytes,
         mime_type,
         file_name,
+        resolution: VideoResolution {
+            width: decoded.width(),
+            height: decoded.height(),
+        },
     })
 }
 
@@ -389,15 +425,24 @@ async fn generate_with_settings(
         "generate_video_with_vid2",
         audit,
         Some(
-            &json!({"seconds": settings.seconds, "timeout_secs": settings.generation_timeout_secs}),
+            &json!({"seconds": settings.seconds, "default_width": settings.width, "default_height": settings.height, "timeout_secs": settings.generation_timeout_secs}),
         ),
     );
     let mut job_id = None;
+    let mut target_resolution = None;
     let started = std::time::Instant::now();
     let work = async {
         let source = load_source.await?;
+        let resolution = video_resolution(
+            VideoResolution {
+                width: settings.width,
+                height: settings.height,
+            },
+            source.as_ref().map(|image| image.resolution),
+        );
+        target_resolution = Some(resolution);
         on_phase(Vid2Phase::Submitting);
-        let id = submit(settings, prompt, source).await?;
+        let id = submit(settings, prompt, resolution, source).await?;
         job_id = Some(id.clone());
         let status_url = endpoint(&settings.base_url, Some(&id), false)?;
         let mut last_phase = None;
@@ -459,7 +504,7 @@ async fn generate_with_settings(
         Ok(video) => {
             call.succeed(LlmUsageRecord {
                 response_id: safe_id.clone(),
-                raw_usage_json: Some(json!({"job_id": safe_id, "seconds": settings.seconds, "bytes": video.byte_len}).to_string()),
+                raw_usage_json: Some(json!({"job_id": safe_id, "seconds": settings.seconds, "width": target_resolution.map(|size| size.width), "height": target_resolution.map(|size| size.height), "bytes": video.byte_len}).to_string()),
                 ..LlmUsageRecord::default()
             }).await;
             info!(
@@ -495,6 +540,8 @@ mod tests {
             enabled: true,
             base_url: server.base_url().to_string(),
             api_key: "synthetic-vid2-key".into(),
+            width: 1344,
+            height: 768,
             seconds: 5,
             request_timeout_secs: 5,
             generation_timeout_secs: 5,
@@ -517,10 +564,16 @@ mod tests {
     }
 
     fn submission() -> ExpectedRequest {
+        submission_at_resolution(1344, 768)
+    }
+
+    fn submission_at_resolution(width: u32, height: u32) -> ExpectedRequest {
         expected("POST", "/v1/videos/generate", 200, br#"{"id":"job-1"}"#)
             .with_body_fragment(b"name=\"prompt\"")
             .with_body_fragment(b"a fox in snow")
             .with_body_fragment(b"name=\"seconds\"\r\n\r\n5")
+            .with_body_fragment(format!("name=\"width\"\r\n\r\n{width}\r\n").as_bytes())
+            .with_body_fragment(format!("name=\"height\"\r\n\r\n{height}\r\n").as_bytes())
     }
 
     fn mp4() -> Vec<u8> {
@@ -528,8 +581,12 @@ mod tests {
     }
 
     fn png() -> Vec<u8> {
+        png_at_resolution(1, 1)
+    }
+
+    fn png_at_resolution(width: u32, height: u32) -> Vec<u8> {
         let mut data = Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(1, 1)
+        image::DynamicImage::new_luma8(width, height)
             .write_to(&mut data, image::ImageFormat::Png)
             .unwrap();
         data.into_inner()
@@ -587,7 +644,9 @@ mod tests {
         let server = TestServer::new(vec![
             expected("POST", "/v1/videos/generate", 200, SUBMITTED)
                 .with_body_fragment(b"name=\"prompt\"")
-                .with_body_fragment(b"name=\"seconds\"\r\n\r\n5"),
+                .with_body_fragment(b"name=\"seconds\"\r\n\r\n5")
+                .with_body_fragment(b"name=\"width\"\r\n\r\n1344\r\n")
+                .with_body_fragment(b"name=\"height\"\r\n\r\n768\r\n"),
             expected("GET", &status_path, 200, RUNNING),
             expected("GET", &status_path, 200, SUCCEEDED),
             expected("GET", &format!("{status_path}/file"), 200, &mp4()),
@@ -609,9 +668,9 @@ mod tests {
 
     #[tokio::test]
     async fn image_video_uses_the_first_frame_multipart_field() {
-        let bytes = png();
+        let bytes = png_at_resolution(320, 200);
         let server = TestServer::new(vec![
-            submission()
+            submission_at_resolution(320, 200)
                 .with_body_fragment(b"name=\"first_frame\"; filename=\"first_frame.png\"")
                 .with_body_fragment(b"Content-Type: image/png")
                 .with_body_fragment(&bytes),
@@ -630,6 +689,107 @@ mod tests {
         .unwrap();
         tokio::fs::remove_file(video.path).await.unwrap();
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_video_uses_decoded_dimensions_and_preserves_original_first_frame_bytes() {
+        for (width, height, target_width, target_height) in [
+            (4000, 3000, 1344, 1008),
+            (3000, 4000, 1008, 1344),
+            (1200, 1200, 1200, 1200),
+            (640, 360, 640, 360),
+            (1344, 1000, 1344, 1000),
+            (1500, 1001, 1344, 897),
+        ] {
+            let bytes = png_at_resolution(width, height);
+            let server = TestServer::new(vec![
+                submission_at_resolution(target_width, target_height).with_body_fragment(&bytes),
+                expected("GET", "/v1/videos/job-1", 200, br#"{"status":"success"}"#),
+                expected("GET", "/v1/videos/job-1/file", 200, &mp4()),
+            ]);
+            let source = validate_source_image(bytes).unwrap();
+            let video = generate_with_settings(
+                &settings(&server),
+                request(),
+                async { Ok(Some(source)) },
+                |_| {},
+                None,
+            )
+            .await
+            .unwrap();
+            tokio::fs::remove_file(video.path).await.unwrap();
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn text_video_sends_custom_portrait_default_dimensions() {
+        let server = TestServer::new(vec![
+            submission_at_resolution(720, 1280),
+            expected("GET", "/v1/videos/job-1", 200, br#"{"status":"success"}"#),
+            expected("GET", "/v1/videos/job-1/file", 200, &mp4()),
+        ]);
+        let mut config = settings(&server);
+        config.width = 720;
+        config.height = 1280;
+        let video = generate_with_settings(&config, request(), async { Ok(None) }, |_| {}, None)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(video.path).await.unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn image_video_resolution_caps_long_edge_in_either_default_orientation() {
+        for defaults in [
+            VideoResolution {
+                width: 1344,
+                height: 768,
+            },
+            VideoResolution {
+                width: 768,
+                height: 1344,
+            },
+        ] {
+            assert_eq!(video_resolution(defaults, None), defaults);
+            for ((width, height), (target_width, target_height)) in [
+                ((4000, 3000), (1344, 1008)),
+                ((3000, 4000), (1008, 1344)),
+                ((2000, 2000), (1344, 1344)),
+                ((1200, 1200), (1200, 1200)),
+                ((1344, 1000), (1344, 1000)),
+                ((1000, 1344), (1000, 1344)),
+                ((1500, 1001), (1344, 897)),
+                ((1001, 1500), (897, 1344)),
+                ((8192, 1), (1344, 1)),
+                ((1, 8192), (1, 1344)),
+            ] {
+                assert_eq!(
+                    video_resolution(defaults, Some(VideoResolution { width, height })),
+                    VideoResolution {
+                        width: target_width,
+                        height: target_height
+                    }
+                );
+            }
+        }
+        // Exactly half a pixel rounds upwards, rather than truncating.
+        assert_eq!(
+            video_resolution(
+                VideoResolution {
+                    width: 3,
+                    height: 2
+                },
+                Some(VideoResolution {
+                    width: 4,
+                    height: 2
+                })
+            ),
+            VideoResolution {
+                width: 3,
+                height: 2
+            }
+        );
     }
 
     #[tokio::test]
@@ -972,7 +1132,11 @@ mod tests {
                 .await
                 .unwrap();
             let mut requests = vec![
-                submission(),
+                if success {
+                    submission_at_resolution(1344, 672)
+                } else {
+                    submission()
+                },
                 expected(
                     "GET",
                     "/v1/videos/job-1",
@@ -989,10 +1153,12 @@ mod tests {
             }
             let server = TestServer::new(requests);
             let audit = LlmAuditContext::new(db.clone(), invocation);
+            let source =
+                success.then(|| validate_source_image(png_at_resolution(2000, 1000)).unwrap());
             let result = generate_with_settings(
                 &settings(&server),
                 request(),
-                async { Ok(None) },
+                async { Ok(source) },
                 |_| {},
                 Some(&audit),
             )
@@ -1008,6 +1174,16 @@ mod tests {
             assert!(rows[0].3 >= 0);
             if success {
                 assert_eq!(rows[0].1.as_deref(), Some("job-1"));
+                let raw: String = sqlx::query_scalar(
+                    "SELECT raw_usage_json FROM llm_requests WHERE invocation_id = ?",
+                )
+                .bind(invocation)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                let usage: Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(usage["width"], 1344);
+                assert_eq!(usage["height"], 672);
             } else {
                 assert!(rows[0].4.as_deref().unwrap().contains("job-1"));
             }
