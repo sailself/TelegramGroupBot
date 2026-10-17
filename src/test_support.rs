@@ -10,6 +10,8 @@ use std::thread::{self, JoinHandle};
 
 use url::Url;
 
+type ResponseFromBody = fn(&[u8]) -> Vec<u8>;
+
 pub(crate) struct ExpectedRequest {
     method: Option<String>,
     path: Option<String>,
@@ -17,6 +19,7 @@ pub(crate) struct ExpectedRequest {
     absent_headers: Vec<String>,
     body_fragments: Vec<Vec<u8>>,
     response: Vec<u8>,
+    response_from_body: Option<ResponseFromBody>,
     delay: Option<std::time::Duration>,
 }
 
@@ -29,6 +32,7 @@ impl ExpectedRequest {
             absent_headers: Vec::new(),
             body_fragments: Vec::new(),
             response,
+            response_from_body: None,
             delay: None,
         }
     }
@@ -41,12 +45,18 @@ impl ExpectedRequest {
             absent_headers: Vec::new(),
             body_fragments: Vec::new(),
             response,
+            response_from_body: None,
             delay: None,
         }
     }
 
     pub(crate) fn with_body_fragment(mut self, fragment: &[u8]) -> Self {
         self.body_fragments.push(fragment.to_vec());
+        self
+    }
+
+    pub(crate) fn with_response_from_body(mut self, respond: ResponseFromBody) -> Self {
+        self.response_from_body = Some(respond);
         self
     }
 
@@ -198,11 +208,15 @@ fn serve(
         let expectation = expected.pop_front();
         match expectation {
             Some(expectation) => {
+                let mut dynamic_response = None;
                 match request {
                     Ok(request) => {
                         if let Err(error) = expectation.verify(&request) {
                             record_error(&mut first_error, ServerError::Assertion(error));
                         }
+                        dynamic_response = expectation
+                            .response_from_body
+                            .map(|respond| respond(&request.body));
                     }
                     Err(error) => {
                         let error = match error {
@@ -218,7 +232,7 @@ fn serve(
                     thread::sleep(delay);
                 }
                 if let Err(error) = stream
-                    .write_all(&expectation.response)
+                    .write_all(dynamic_response.as_deref().unwrap_or(&expectation.response))
                     .and_then(|_| stream.flush())
                 {
                     if expectation.delay.is_some() && is_client_disconnect_kind(error.kind()) {

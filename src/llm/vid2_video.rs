@@ -26,6 +26,9 @@ const JSON_MAX_BYTES: usize = 64 * 1024;
 const VIDEO_MAX_BYTES: usize = 50_000_000;
 const SOURCE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const REJECTION_REASON_MAX_CHARS: usize = 512;
+const VIDEO_DIMENSION_STEP: u32 = 32;
+const VIDEO_MIN_EDGE: u32 = 256;
+const VIDEO_MAX_PIXELS: u64 = 1344 * 768;
 const GET_POLICY: RetryPolicy = RetryPolicy::exponential(3, Duration::from_millis(400));
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -73,25 +76,78 @@ struct VideoResolution {
     height: u32,
 }
 
-fn video_resolution(defaults: VideoResolution, source: Option<VideoResolution>) -> VideoResolution {
+fn service_accepts_resolution(resolution: VideoResolution) -> bool {
+    resolution.width >= VIDEO_MIN_EDGE
+        && resolution.height >= VIDEO_MIN_EDGE
+        && resolution.width.is_multiple_of(VIDEO_DIMENSION_STEP)
+        && resolution.height.is_multiple_of(VIDEO_DIMENSION_STEP)
+        && u64::from(resolution.width) * u64::from(resolution.height) <= VIDEO_MAX_PIXELS
+}
+
+fn video_resolution(
+    defaults: VideoResolution,
+    source: Option<VideoResolution>,
+) -> Result<VideoResolution, Vid2Error> {
     let Some(source) = source else {
-        return defaults;
+        return if service_accepts_resolution(defaults) {
+            Ok(defaults)
+        } else {
+            Err(generation_error("VID2_WIDTH/VID2_HEIGHT must be multiples of 32, each at least 256, with width*height <= 1344*768"))
+        };
     };
+    let source_long = source.width.max(source.height);
+    let source_short = source.width.min(source.height);
+    if source_short < VIDEO_MIN_EDGE {
+        return Err(generation_error(
+            "the first frame must be at least 256 pixels on both edges; it will not be enlarged",
+        ));
+    }
     let cap = defaults.width.max(defaults.height);
-    let long_edge = source.width.max(source.height);
-    if long_edge <= cap {
-        return source;
+    if cap < VIDEO_MIN_EDGE {
+        return Err(generation_error(
+            "the configured VID2_WIDTH/VID2_HEIGHT long-edge cap must be at least 256",
+        ));
     }
-    // Integer rounding keeps the long edge exact and the other edge within
-    // half a pixel of the source ratio. A very narrow image still needs 1px.
-    let scaled = |edge: u32| {
-        ((u64::from(edge) * u64::from(cap) + u64::from(long_edge) / 2) / u64::from(long_edge))
-            .max(1) as u32
-    };
-    VideoResolution {
-        width: scaled(source.width),
-        height: scaled(source.height),
+    // Equivalent to the continuous area scale, calculated without floats.
+    // Products fit u64 even for u32 source dimensions. A legal short edge
+    // also bounds every possible long edge to MAX_PIXELS / MIN_EDGE (4032).
+    let area_long_limit =
+        (VIDEO_MAX_PIXELS * u64::from(source_long) / u64::from(source_short)).isqrt();
+    let mut long_edge = u64::from(source_long)
+        .min(u64::from(cap))
+        .min(area_long_limit)
+        .min(VIDEO_MAX_PIXELS / u64::from(VIDEO_MIN_EDGE)) as u32;
+    long_edge = long_edge / VIDEO_DIMENSION_STEP * VIDEO_DIMENSION_STEP;
+    let ratio_grid = u64::from(source_long) * u64::from(VIDEO_DIMENSION_STEP);
+    while long_edge >= VIDEO_MIN_EDGE {
+        // Round the original-ratio short edge to the nearest grid point,
+        // half-up. Never independently clamp/stretch that side to 256.
+        let short_edge = ((u64::from(source_short) * u64::from(long_edge) + ratio_grid / 2)
+            / ratio_grid
+            * u64::from(VIDEO_DIMENSION_STEP)) as u32;
+        if short_edge < VIDEO_MIN_EDGE {
+            break; // Reducing the long edge cannot increase the short edge.
+        }
+        let candidate = if source.width >= source.height {
+            VideoResolution {
+                width: long_edge,
+                height: short_edge,
+            }
+        } else {
+            VideoResolution {
+                width: short_edge,
+                height: long_edge,
+            }
+        };
+        if candidate.width <= source.width
+            && candidate.height <= source.height
+            && service_accepts_resolution(candidate)
+        {
+            return Ok(candidate);
+        }
+        long_edge -= VIDEO_DIMENSION_STEP;
     }
+    Err(generation_error("the first frame's aspect ratio cannot fit the service's 32-pixel grid, 256-pixel minimum and pixel limit within the configured cap without enlarging it"))
 }
 
 fn generation_error(message: impl Into<String>) -> Vid2Error {
@@ -549,7 +605,7 @@ async fn generate_with_settings(
                 height: settings.height,
             },
             source.as_ref().map(|image| image.resolution),
-        );
+        )?;
         target_resolution = Some(resolution);
         on_phase(Vid2Phase::Submitting);
         let id = submit(settings, prompt, resolution, source).await?;
@@ -702,6 +758,67 @@ mod tests {
         data.into_inner()
     }
 
+    fn confirmed_backend_resolution_response(body: &[u8]) -> Vec<u8> {
+        let body = String::from_utf8_lossy(body);
+        let dimension = |name| {
+            body.split(&format!("name=\"{name}\"\r\n\r\n"))
+                .nth(1)
+                .and_then(|tail| tail.split("\r\n").next())
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        let width = dimension("width");
+        let height = dimension("height");
+        if width >= 256
+            && height >= 256
+            && width.is_multiple_of(32)
+            && height.is_multiple_of(32)
+            && u64::from(width) * u64::from(height) <= 1344 * 768
+        {
+            response_with_status(200, br#"{"id":"job-1"}"#.to_vec())
+        } else {
+            response_with_status(400, br#"{"detail":"width/height must be multiples of 32, >=256, and width*height <= 1344*768"}"#.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn reported_jpeg_1148x768_satisfies_confirmed_backend_validator() {
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1148, 768)
+            .write_to(&mut encoded, image::ImageFormat::Jpeg)
+            .unwrap();
+        let bytes = encoded.into_inner();
+        let server = TestServer::new(vec![
+            ExpectedRequest::new("POST", "/v1/videos/generate", vec![])
+                .with_response_from_body(confirmed_backend_resolution_response)
+                .with_header("x-api-key", "synthetic-vid2-key")
+                .with_body_fragment(b"name=\"first_frame\"; filename=\"first_frame.jpg\"")
+                .with_body_fragment(&bytes),
+            expected("GET", "/v1/videos/job-1", 200, br#"{"status":"success"}"#),
+            expected("GET", "/v1/videos/job-1/file", 200, &mp4()),
+        ]);
+        let source = validate_source_image(bytes).unwrap();
+        let (result, events) =
+            crate::utils::log_capture::capture_json_events_async(generate_with_settings(
+                &settings(&server),
+                request(),
+                async { Ok(Some(source)) },
+                |_| {},
+                None,
+            ))
+            .await;
+        server.join_allowing_client_disconnect().unwrap();
+        let video =
+            result.expect("reported1148x768 JPEG must fit the confirmed backend constraints");
+        assert!(events
+            .iter()
+            .any(|event| event["fields"]["source_width"] == 1148
+                && event["fields"]["source_height"] == 768
+                && event["fields"]["target_width"] == 1120
+                && event["fields"]["target_height"] == 736));
+        tokio::fs::remove_file(video.path).await.unwrap();
+    }
+
     #[tokio::test]
     async fn text_video_authenticates_all_requests_and_tracks_status_progression() {
         let server = TestServer::new(vec![
@@ -778,9 +895,9 @@ mod tests {
 
     #[tokio::test]
     async fn image_video_uses_the_first_frame_multipart_field() {
-        let bytes = png_at_resolution(320, 200);
+        let bytes = png_at_resolution(320, 256);
         let server = TestServer::new(vec![
-            submission_at_resolution(320, 200)
+            submission_at_resolution(320, 256)
                 .with_body_fragment(b"name=\"first_frame\"; filename=\"first_frame.png\"")
                 .with_body_fragment(b"Content-Type: image/png")
                 .with_body_fragment(&bytes),
@@ -804,12 +921,12 @@ mod tests {
     #[tokio::test]
     async fn image_video_uses_decoded_dimensions_and_preserves_original_first_frame_bytes() {
         for (width, height, target_width, target_height) in [
-            (4000, 3000, 1344, 1008),
-            (3000, 4000, 1008, 1344),
-            (1200, 1200, 1200, 1200),
-            (640, 360, 640, 360),
-            (1344, 1000, 1344, 1000),
-            (1500, 1001, 1344, 897),
+            (4000, 3000, 1152, 864),
+            (3000, 4000, 864, 1152),
+            (1200, 1200, 992, 992),
+            (640, 360, 640, 352),
+            (1344, 1000, 1152, 864),
+            (1500, 1001, 1216, 800),
         ] {
             let bytes = png_at_resolution(width, height);
             let server = TestServer::new(vec![
@@ -835,12 +952,12 @@ mod tests {
     #[tokio::test]
     async fn text_video_sends_custom_portrait_default_dimensions() {
         let server = TestServer::new(vec![
-            submission_at_resolution(720, 1280),
+            submission_at_resolution(768, 1280),
             expected("GET", "/v1/videos/job-1", 200, br#"{"status":"success"}"#),
             expected("GET", "/v1/videos/job-1/file", 200, &mp4()),
         ]);
         let mut config = settings(&server);
-        config.width = 720;
+        config.width = 768;
         config.height = 1280;
         let video = generate_with_settings(&config, request(), async { Ok(None) }, |_| {}, None)
             .await
@@ -861,21 +978,26 @@ mod tests {
                 height: 1344,
             },
         ] {
-            assert_eq!(video_resolution(defaults, None), defaults);
+            assert_eq!(video_resolution(defaults, None).unwrap(), defaults);
             for ((width, height), (target_width, target_height)) in [
-                ((4000, 3000), (1344, 1008)),
-                ((3000, 4000), (1008, 1344)),
-                ((2000, 2000), (1344, 1344)),
-                ((1200, 1200), (1200, 1200)),
-                ((1344, 1000), (1344, 1000)),
-                ((1000, 1344), (1000, 1344)),
-                ((1500, 1001), (1344, 897)),
-                ((1001, 1500), (897, 1344)),
-                ((8192, 1), (1344, 1)),
-                ((1, 8192), (1, 1344)),
+                ((1148, 768), (1120, 736)),
+                ((4000, 3000), (1152, 864)),
+                ((3000, 4000), (864, 1152)),
+                ((2000, 2000), (992, 992)),
+                ((1200, 1200), (992, 992)),
+                ((1344, 1000), (1152, 864)),
+                ((1000, 1344), (864, 1152)),
+                ((1500, 1001), (1216, 800)),
+                ((1001, 1500), (800, 1216)),
+                ((1509, 1000), (1216, 800)),
+                ((1280, 720), (1248, 704)),
+                ((640, 360), (640, 352)),
+                ((1344, 768), (1344, 768)),
+                ((768, 1344), (768, 1344)),
+                ((320, 256), (320, 256)),
             ] {
                 assert_eq!(
-                    video_resolution(defaults, Some(VideoResolution { width, height })),
+                    video_resolution(defaults, Some(VideoResolution { width, height })).unwrap(),
                     VideoResolution {
                         width: target_width,
                         height: target_height
@@ -883,23 +1005,195 @@ mod tests {
                 );
             }
         }
-        // Exactly half a pixel rounds upwards, rather than truncating.
+        // The ratio-derived short edge is 528, exactly halfway between grid
+        // points 512 and 544; use half-up rounding rather than truncation.
         assert_eq!(
             video_resolution(
                 VideoResolution {
-                    width: 3,
-                    height: 2
+                    width: 1024,
+                    height: 576
                 },
                 Some(VideoResolution {
-                    width: 4,
-                    height: 2
+                    width: 2048,
+                    height: 1056
                 })
-            ),
+            )
+            .unwrap(),
             VideoResolution {
-                width: 3,
-                height: 2
+                width: 1024,
+                height: 544
             }
         );
+    }
+
+    #[test]
+    fn image_resolution_matrix_respects_service_budget_cap_aspect_and_no_upscaling() {
+        let edges = [
+            0,
+            1,
+            255,
+            256,
+            257,
+            320,
+            352,
+            360,
+            512,
+            640,
+            720,
+            736,
+            768,
+            1000,
+            1001,
+            1024,
+            1148,
+            1200,
+            1280,
+            1344,
+            1500,
+            3000,
+            4000,
+            8192,
+            u32::MAX,
+        ];
+        for defaults in [
+            VideoResolution {
+                width: 1344,
+                height: 768,
+            },
+            VideoResolution {
+                width: 768,
+                height: 1344,
+            },
+            VideoResolution {
+                width: 1024,
+                height: 576,
+            },
+            VideoResolution {
+                width: 4096,
+                height: 4096,
+            },
+            VideoResolution {
+                width: 128,
+                height: 192,
+            },
+            VideoResolution {
+                width: 0,
+                height: 0,
+            },
+            VideoResolution {
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+        ] {
+            let cap = defaults.width.max(defaults.height);
+            for width in edges {
+                for height in edges {
+                    let source = VideoResolution { width, height };
+                    let result = video_resolution(defaults, Some(source));
+                    if width < 256 || height < 256 || cap < 256 {
+                        assert!(result.is_err());
+                        continue;
+                    }
+                    let native_is_valid = width.is_multiple_of(32)
+                        && height.is_multiple_of(32)
+                        && u64::from(width) * u64::from(height) <= 1_032_192
+                        && width.max(height) <= cap;
+                    if native_is_valid {
+                        assert_eq!(result.as_ref().unwrap(), &source);
+                    }
+                    if let Ok(target) = result {
+                        assert!(target.width >= 256 && target.height >= 256);
+                        assert!(
+                            target.width.is_multiple_of(32) && target.height.is_multiple_of(32)
+                        );
+                        assert!(u64::from(target.width) * u64::from(target.height) <= 1_032_192);
+                        assert!(target.width <= width && target.height <= height);
+                        assert!(target.width.max(target.height) <= cap);
+                        let cross_width = u64::from(target.width) * u64::from(height);
+                        let cross_height = u64::from(target.height) * u64::from(width);
+                        assert!(
+                            cross_width.abs_diff(cross_height) <= 16 * u64::from(width.max(height))
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            video_resolution(
+                VideoResolution {
+                    width: 4032,
+                    height: 256
+                },
+                Some(VideoResolution {
+                    width: 8192,
+                    height: 512
+                }),
+            )
+            .unwrap(),
+            VideoResolution {
+                width: 4032,
+                height: 256
+            }
+        );
+        assert_eq!(
+            video_resolution(
+                VideoResolution {
+                    width: 256,
+                    height: 4032
+                },
+                Some(VideoResolution {
+                    width: 512,
+                    height: 8192
+                }),
+            )
+            .unwrap(),
+            VideoResolution {
+                width: 256,
+                height: 4032
+            }
+        );
+        assert!(video_resolution(
+            VideoResolution {
+                width: 1344,
+                height: 768
+            },
+            Some(VideoResolution {
+                width: 8192,
+                height: 512
+            }),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn impossible_images_and_invalid_text_defaults_fail_locally_without_a_post() {
+        for (width, height, image_size) in [
+            (1280, 720, None), // unaligned text height
+            (128, 256, None),  // text edge below service minimum
+            (1344, 800, None), // aligned text size exceeds pixel budget
+            (u32::MAX, u32::MAX, None),
+            (128, 192, Some((1024, 768))), // image cap is below minimum
+            (1344, 768, Some((255, 768))),
+            (1344, 768, Some((768, 255))),
+            (1344, 768, Some((8192, 256))), // cannot fit aspect without stretching/upscaling
+            (1344, 768, Some((256, 8192))),
+        ] {
+            let server = TestServer::expect_no_requests();
+            let mut config = settings(&server);
+            config.width = width;
+            config.height = height;
+            let source = image_size.map(|(width, height)| {
+                validate_source_image(png_at_resolution(width, height)).unwrap()
+            });
+            let error =
+                generate_with_settings(&config, request(), async { Ok(source) }, |_| {}, None)
+                    .await
+                    .unwrap_err();
+            if image_size.is_none() {
+                assert!(error.to_string().contains("VID2_WIDTH/VID2_HEIGHT"));
+            }
+            server.join().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -967,8 +1261,8 @@ mod tests {
                 &config,
                 PROMPT,
                 VideoResolution {
-                    width: 1344,
-                    height: 840,
+                    width: 1280,
+                    height: 800,
                 },
                 Some(source),
             ))
@@ -993,8 +1287,8 @@ mod tests {
                 .iter()
                 .any(|event| event["fields"]["source_width"] == 1600
                     && event["fields"]["source_height"] == 1000
-                    && event["fields"]["target_width"] == 1344
-                    && event["fields"]["target_height"] == 840
+                    && event["fields"]["target_width"] == 1280
+                    && event["fields"]["target_height"] == 800
                     && event["fields"]["source_mime"] == "image/png"
                     && event["fields"]["source_bytes"] == source_bytes.len()));
             let logs = serde_json::to_string(&events).unwrap();
