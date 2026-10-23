@@ -131,9 +131,13 @@ pub async fn tldr_handler(
     let audit_context = create_command_audit_context(&state, &message, "tldr").await;
 
     let clock = WallClock::start();
+    let mut snapshot = ModelCatalogSnapshot::load();
+    let id = snapshot.resolve_default(ModelRequestCapabilities {
+        require_tools: true,
+        ..Default::default()
+    })?;
+    let clock = clock.for_gemini_pipeline(id == "gemini", true);
     let response = clock.run(async {
-        let mut snapshot = ModelCatalogSnapshot::load();
-        let id = snapshot.resolve_default(ModelRequestCapabilities { require_tools: true, ..Default::default() })?;
         let final_model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
         if messages.len() > CONFIG.agents.tldr_map_reduce_threshold {
         let mut progress_reporter =

@@ -111,6 +111,10 @@ pub async fn run_with_status_message<T>(
     run_with_status_report(work, |error| {
         let text = if error.is::<crate::utils::timing::OperationDeadlineExceeded>() {
             "This request reached its time limit. Please try a smaller request.".to_string()
+        } else if let Some(gemini_error) =
+            error.downcast_ref::<crate::llm::gemini::GeminiTextResponseError>()
+        {
+            gemini_error.user_message().to_string()
         } else if let Some(delivery_error) = error.downcast_ref::<ImageDeliveryError>() {
             delivery_error.user_message().to_string()
         } else if let Some(delivery_error) = error.downcast_ref::<VideoDeliveryError>() {
@@ -473,6 +477,34 @@ mod tests {
 #[cfg(test)]
 mod status_tests {
     use super::*;
+    #[tokio::test]
+    async fn gemini_incomplete_status_preserves_typed_error_through_context() {
+        use crate::llm::gemini::GeminiTextResponseError;
+        use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
+
+        for reason in ["MAX_TOKENS", "CONTINUATION"] {
+            let error = GeminiTextResponseError::Incomplete { reason };
+            let server = TestServer::new(vec![ExpectedRequest::new(
+                "POST", "/bot123:test/EditMessageText",
+                response_with_status(200, br#"{"ok":true,"result":{"message_id":9,"date":0,"chat":{"id":1,"type":"private"}}}"#.to_vec()),
+            ).with_body_fragment(error.user_message().as_bytes())]);
+            let bot = Bot::new("123:test").set_api_url(server.base_url());
+            let wrapped = anyhow::Error::new(error).context("Gemini fallback failed");
+            let result =
+                run_with_status_message(&bot, ChatId(1), MessageId(9), "generic failure", async {
+                    Err::<(), _>(wrapped)
+                })
+                .await;
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<GeminiTextResponseError>(),
+                Some(&error)
+            );
+            server.join().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn status_failure_is_reported_once_and_preserves_original_error() {
         let mut reports = 0;

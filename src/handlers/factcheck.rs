@@ -252,13 +252,14 @@ pub async fn factcheck_handler(
                 start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
 
             let clock = WallClock::start();
+            let mut snapshot = ModelCatalogSnapshot::load();
+            let id = snapshot.resolve_default(ModelRequestCapabilities::from_media(
+                &media_summary,
+                !CONFIG.agents.enable_agentic_factcheck,
+            ))?;
+            let clock = clock.for_gemini_pipeline(id == "gemini", media_summary.total > 0);
             let response = clock
                 .run(async {
-                    let mut snapshot = ModelCatalogSnapshot::load();
-                    let id = snapshot.resolve_default(ModelRequestCapabilities::from_media(
-                        &media_summary,
-                        !CONFIG.agents.enable_agentic_factcheck,
-                    ))?;
                     let final_model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
                     if CONFIG.agents.enable_agentic_factcheck {
                         let mut progress = ProgressReporter::new(

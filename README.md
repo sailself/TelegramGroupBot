@@ -202,7 +202,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `ENABLE_QC_TOPIC_DISCOVERY` - Enables semantic topic discovery for `/qc`. Default: `true`. Topic discovery analyzes at most `TLDR_MAX_MESSAGES` newest eligible stored text messages in the requested UTC range, using `TLDR_CHUNK_SIZE` chunks and up to four concurrent map calls. Results disclose capped and partial coverage and are LLM-assisted classifications, not exact semantic counts.
 - `AGENT_STEP_MODEL` - Model for cheap pipeline steps (claim extraction, query planning, reflection, chunk summaries). Accepts `gemini` or a runtime model id; `openai-codex:<slug>` works even for slugs not in the catalog (e.g. `openai-codex:gpt-5.4-mini`). Empty = derive automatically: a Codex final model runs steps on itself at `AGENT_STEP_REASONING`; a public OpenAI final model runs steps on itself at `AGENT_STEP_REASONING`; a Gemini final model uses `GEMINI_LITE_MODEL`. Default: empty.
 - `AGENT_STEP_REASONING` - Per-call reasoning effort for Responses-provider cheap pipeline steps and internal `/s` selection or `/qc` analytics gathering. It applies to public OpenAI and Codex, is ignored by other providers, and is validated against available Codex metadata; it does not replace the user's selected Codex reasoning level for final answers. Default: `low`.
-- `AGENT_MAX_WALL_CLOCK_SECS` - Absolute time budget for `/qc`, `/factcheck`, and `/tldr` text generation, including all pipeline phases and any legacy fallback. Expiry cancels local work and reports a timeout; fallback never resets the budget. Preparation, final delivery, and the optional TLDR infographic are outside this budget. Default: `480`.
+- `AGENT_MAX_WALL_CLOCK_SECS` - Absolute time budget for `/qc`, `/factcheck`, and `/tldr` text generation, including model resolution, all pipeline phases, and any legacy fallback. Expiry cancels local work and reports a timeout; fallback never resets the budget. Input preparation, final delivery, and the optional TLDR infographic are outside this budget. Default: `480`; native Gemini pipelines that can reach Argon use `GEMINI_ARGON_MAX_WALL_CLOCK_SECS` instead.
 - `TLDR_MAP_REDUCE_THRESHOLD` - `/tldr` switches to map-reduce above this many messages; at or below it the original single-call path runs unchanged. Default: `150`.
 - `TLDR_CHUNK_SIZE` - Messages per map-reduce chunk (chunks are summarized sequentially to keep memory flat). Default: `100`.
 - `TLDR_MAX_MESSAGES` - Hard cap on messages fetched for `/tldr`, including the previously unbounded reply-anchored variant. Default: `2000`.
@@ -222,20 +222,22 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 
 ### Gemini settings
 - `ENABLE_GEMINI` - When `false`, Gemini API-backed models and Gemini-only commands (`/vid`, `/mysong`) are disabled and hidden from model/command pickers. `/s` remains available when another ready model with `tools=true` is configured. Default: `true`.
-- `GEMINI_MODEL` - Default Gemini model. Default: `gemini-flash-latest`.
-- `GEMINI_LITE_MODEL` - Lite fallback model after `GEMINI_MODEL` failures. Default: `gemini-flash-lite-latest`.
-- `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-2.5-pro`.
+- `GEMINI_MODEL` - Default Gemini model. Default: `gemini-3.8-flash`.
+- `GEMINI_LITE_MODEL` - Lite fallback model after `GEMINI_MODEL` failures. Default: `gemini-3.5-flash-lite`.
+- `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-4-argon`.
 - `GEMINI_IMAGE_MODEL` - Image model. Default: `gemini-3-pro-image-preview`.
 - `GEMINI_MUSIC_MODEL` - Music model for `/mysong`. Default: `lyria-3-pro-preview`.
 - `GEMINI_VIDEO_MODEL` - Video model. Default: `veo-3.1-generate-preview`.
-- `GEMINI_TEMPERATURE` - Default: `0.7`.
-- `GEMINI_TOP_K` - Default: `40`.
-- `GEMINI_TOP_P` - Default: `0.95`.
-- `GEMINI_MAX_OUTPUT_TOKENS` - Default: `2048`.
-- `GEMINI_THINKING_LEVEL` - Sent as `thinkingConfig.thinkingLevel` to Gemini 3 models only (2.5-series models reject it). Default: `high`.
+- `GEMINI_TEMPERATURE` - Default: `0.7`. Argon omits this sampling parameter.
+- `GEMINI_TOP_K` - Default: `40`. Argon omits this sampling parameter.
+- `GEMINI_TOP_P` - Default: `0.95`. Argon omits this sampling parameter.
+- `GEMINI_MAX_OUTPUT_TOKENS` - Positive output budget, including reasoning. Native Argon clamps it to `32768` per hop and honors smaller values. Default: `32768`.
+- `GEMINI_THINKING_LEVEL` - Model-aware `thinkingConfig.thinkingLevel` for Gemini 3 and Argon, validated against the target model; omitted for Gemini 2.5. Default: `medium`.
 - `GEMINI_SAFETY_SETTINGS` - Safety profile: `standard` or `permissive` (`off`/`none` are treated as `permissive`). Default: `permissive`.
   - `standard` maps to `BLOCK_MEDIUM_AND_ABOVE`; `permissive` maps to `OFF` for all Gemini safety categories.
-- `GEMINI_REQUEST_TIMEOUT_SECS` - Per-attempt timeout for Gemini `generateContent` requests. Default: `90`.
+- `GEMINI_REQUEST_TIMEOUT_SECS` - Per-attempt timeout for non-Argon Gemini `generateContent` requests. Default: `90`.
+- `GEMINI_ARGON_REQUEST_TIMEOUT_SECS` - Positive per-attempt timeout for native Argon requests only. Default: `1200`.
+- `GEMINI_ARGON_MAX_WALL_CLOCK_SECS` - Positive absolute text-pipeline budget for `/qc`, `/factcheck`, and `/tldr` when native Gemini is selected and the main or Lite role is Argon, or the request uses the pro role and that role is Argon. This covers Argon reached during steps or fallback as well as the final answer. Shared across model resolution, phases, and legacy fallback; does not reset on fallback or extend Codex pipelines. Default: `1800`.
 - `GEMINI_IMAGE_REQUEST_TIMEOUT_SECS` - Per-attempt timeout for Gemini image generation. Default: `300`.
 
 ### Shared third-party model catalog
@@ -274,6 +276,35 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OPENAI_API_KEY` - OpenAI API key used for billed fallback models.
 - `OPENAI_BASE_URL` - Default: `https://api.openai.com/v1`.
 - `OPENAI_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `60`.
+
+### Gemini Argon alongside Codex
+
+Enable both providers while retaining your existing Codex default and quick-model settings. For Argon on every explicitly selected Gemini answer, use this rollout configuration (merge it into your configuration; do not replace unrelated settings):
+
+```dotenv
+ENABLE_GEMINI=true
+ENABLE_OPENAI_CODEX=true
+DEFAULT_TEXT_MODEL=openai-codex
+# Keep your existing DEFAULT_QUICK_TEXT_MODEL unchanged.
+# openai-codex:selected is also accepted as DEFAULT_TEXT_MODEL.
+GEMINI_MODEL=gemini-4-argon
+GEMINI_PRO_MODEL=gemini-4-argon
+GEMINI_LITE_MODEL=gemini-3.5-flash-lite
+GEMINI_THINKING_LEVEL=medium
+GEMINI_MAX_OUTPUT_TOKENS=32768
+GEMINI_ARGON_REQUEST_TIMEOUT_SECS=1200
+GEMINI_ARGON_MAX_WALL_CLOCK_SECS=1800
+```
+
+The picker retains one native `Gemini` entry alongside ready Codex models. Plain-text `/q` uses `GEMINI_MODEL`; media and YouTube requests use `GEMINI_PRO_MODEL`. The shipped defaults use Flash for the former and Argon for the latter; setting both roles to Argon makes both routes use Argon. `/tldr` uses the pro role. Configured fallbacks can still answer with another model after a retryable failure.
+
+An explicit `AGENT_STEP_MODEL` takes precedence for cheap orchestration steps: keep an existing Codex override if desired. When empty, Gemini final answers derive those steps from `GEMINI_LITE_MODEL`. Image, video, and music models have independent settings; keep `DEFAULT_IMAGE_MODEL` and the existing image/video/music configuration as desired. Argon text selection does not replace those models.
+
+This adapter uses bounded single-hop native `generateContent`, including tool turns. `MAX_TOKENS`, `CONTINUATION`, blocked responses, and empty final responses are reported as incomplete/errors instead of delivered as completed answers. It does not resume continuation tokens or implement long decode; automatic continuation and Interactions/background execution remain separate future work. The output cap includes reasoning. A longer client timeout does not guarantee that the server completes a request; see Google's [native migration guide](https://ai.google.dev/gemini-api/docs/generate-content/latest-model) and [long-decode guide](https://ai.google.dev/gemini-api/docs/generate-content/long-decode).
+
+Argon uses its own per-attempt request timeout. For `/qc`, `/factcheck`, and `/tldr`, native Gemini pipelines that can reach a configured Argon role use one absolute deadline across model resolution, phases, and legacy fallback. Codex pipelines retain `AGENT_MAX_WALL_CLOCK_SECS=480`; non-Argon HTTP calls retain `GEMINI_REQUEST_TIMEOUT_SECS=90`. Input preparation, final delivery, and the optional TLDR infographic remain outside the pipeline budget. `/q`, `/qq`, and `/s` use their existing bounded provider retries/tool loops, not the agent-pipeline deadline; a request with retries or several tool turns can take longer than one HTTP timeout.
+
+After updating configuration, restart the bot and inspect startup validation warnings (invalid positive budgets fall back to defaults). Verify API-project access to Argon before rollout; local configuration and unit tests do not establish account entitlement or successful live generation. Smoke-test selected Gemini text, media, a tool round trip, and structured agent steps, then confirm ordinary Codex `/q` and the existing `/qq` model still work. Check both successful output and incomplete/error reporting. To roll back Gemini availability, set `ENABLE_GEMINI=false` and restart while retaining the Codex default, quick model, and authentication; Gemini-only commands become unavailable. If the image default was Gemini, choose a ready image provider separately.
 
 ### OpenAI Codex via ChatGPT (optional)
 - `ENABLE_OPENAI_CODEX` - Enable ChatGPT-backed Codex support. Default: `true`.
