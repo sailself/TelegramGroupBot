@@ -318,18 +318,61 @@ pub fn parse_lenient_json<T: DeserializeOwned>(text: &str) -> Option<T> {
 /// One absolute deadline, shared by every phase and legacy fallback.
 #[derive(Clone, Copy)]
 pub struct WallClock {
+    started_at: Instant,
     deadline: Instant,
 }
 impl WallClock {
     pub fn start() -> Self {
+        Self::for_budget(Duration::from_secs(CONFIG.agents.max_wall_clock_secs))
+    }
+    pub(crate) fn for_budget(budget: Duration) -> Self {
+        let started_at = Instant::now();
         Self {
-            deadline: Instant::now() + Duration::from_secs(CONFIG.agents.max_wall_clock_secs),
+            started_at,
+            deadline: started_at + budget,
         }
     }
-    #[cfg(test)]
-    pub(crate) fn for_budget(budget: Duration) -> Self {
+    /// Resolve the budget from the native model roles this pipeline will call.
+    /// The original start instant is retained, including time spent selecting a model.
+    pub(crate) fn for_gemini_pipeline(self, native_gemini: bool, use_pro: bool) -> Self {
+        self.with_pipeline_budget(
+            native_gemini,
+            use_pro,
+            &CONFIG.gemini,
+            CONFIG.agents.max_wall_clock_secs,
+        )
+    }
+    fn with_pipeline_budget(
+        self,
+        native_gemini: bool,
+        use_pro: bool,
+        gemini: &crate::config::GeminiConfig,
+        normal_secs: u64,
+    ) -> Self {
+        let mut models = Vec::new();
+        if native_gemini {
+            // Main and Lite are reachable through steps and provider fallback even
+            // when the final answer targets Pro. Third-party pipelines stay bounded
+            // by the general budget regardless of Gemini configuration.
+            models.extend([gemini.model.as_str(), gemini.lite_model.as_str()]);
+            if use_pro {
+                models.push(gemini.pro_model.as_str());
+            }
+        }
+        self.with_model_budget(&models, normal_secs, gemini.argon_max_wall_clock_secs)
+    }
+    fn with_model_budget(self, models: &[&str], normal_secs: u64, argon_secs: u64) -> Self {
+        let seconds = if models
+            .iter()
+            .any(|model| crate::config::is_gemini_argon_model(model))
+        {
+            argon_secs
+        } else {
+            normal_secs
+        };
         Self {
-            deadline: Instant::now() + budget,
+            deadline: self.started_at + Duration::from_secs(seconds),
+            ..self
         }
     }
     pub fn remaining(&self) -> Duration {
@@ -508,6 +551,49 @@ mod tests {
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn native_argon_budget_preserves_selection_elapsed_time_and_provider_boundary() {
+        let mut gemini = CONFIG.gemini.clone();
+        gemini.model = "gemini-3.8-flash".into();
+        gemini.pro_model = "gemini-4-argon".into();
+        gemini.lite_model = "gemini-3.5-flash-lite".into();
+        gemini.argon_max_wall_clock_secs = 1800;
+        let clock = WallClock::for_budget(Duration::from_secs(480));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(
+            clock
+                .with_pipeline_budget(true, true, &gemini, 480)
+                .remaining(),
+            Duration::from_secs(1780)
+        );
+        assert_eq!(
+            clock
+                .with_pipeline_budget(true, false, &gemini, 480)
+                .remaining(),
+            Duration::from_secs(460)
+        );
+        // Codex/third-party requests never inherit the configured Argon allowance.
+        assert_eq!(
+            clock
+                .with_pipeline_budget(false, true, &gemini, 480)
+                .remaining(),
+            Duration::from_secs(460)
+        );
+        gemini.pro_model = "gemini-3.8-flash".into();
+        gemini.lite_model = "gemini-4-argon".into();
+        let fallback_clock = clock.with_pipeline_budget(true, false, &gemini, 480);
+        assert_eq!(fallback_clock.remaining(), Duration::from_secs(1780));
+        tokio::time::advance(Duration::from_secs(1779)).await;
+        let error = fallback_clock
+            .run(async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(error.is::<crate::utils::timing::OperationDeadlineExceeded>());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn fallback_inherits_remaining_deadline() {
         let clock = WallClock::for_budget(Duration::from_secs(10));

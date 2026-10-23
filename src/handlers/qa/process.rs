@@ -314,7 +314,8 @@ async fn run_chat_context_request(
     query: String,
     audit_context: Option<&LlmAuditContext>,
 ) -> (Result<(String, Option<String>)>, Vec<i64>) {
-    let clock = crate::agents::step::WallClock::start();
+    let clock = crate::agents::step::WallClock::start()
+        .for_gemini_pipeline(matches!(model, QaModel::Gemini), use_pro_gemini(request));
     match clock
         .run(async {
             let (result, ids) = run_chat_context_request_inner(

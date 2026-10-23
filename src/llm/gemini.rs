@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::config::CONFIG;
+use crate::config::{is_gemini_argon_model, CONFIG};
 use crate::llm::audit::{LlmAuditContext, LlmUsageRecord};
 use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
 use crate::llm::tool_loop::{
@@ -24,6 +24,10 @@ use crate::llm::transport::{
 };
 use crate::utils::http::get_http_client;
 use crate::utils::text::truncate_for_log;
+
+mod response;
+pub(crate) use response::GeminiTextResponseError;
+use response::{decode_text_response, remove_thought_parts, validate_text_response};
 
 #[derive(Debug, thiserror::Error)]
 #[error("Image generation failed: {0}")]
@@ -172,12 +176,16 @@ fn gemini_error_allows_model_fallback(err: &anyhow::Error) -> bool {
 }
 
 /// Total time the fallback chain may spend after the primary model failed.
-fn gemini_fallback_budget() -> Duration {
-    gemini_generate_content_timeout()
+fn gemini_fallback_budget(targets: &[GeminiFallback<'_>]) -> Duration {
+    targets
+        .iter()
+        .map(|target| gemini_generate_content_timeout(target.model))
+        .max()
+        .unwrap_or_else(|| Duration::from_secs(CONFIG.gemini.request_timeout_secs))
 }
 
-fn gemini_generate_content_timeout() -> Duration {
-    Duration::from_secs(CONFIG.gemini.request_timeout_secs)
+fn gemini_generate_content_timeout(model: &str) -> Duration {
+    Duration::from_secs(CONFIG.gemini.request_timeout_secs_for(model))
 }
 
 fn gemini_generate_content_url(model: &str) -> String {
@@ -896,8 +904,7 @@ async fn call_gemini_api(
         operation,
     )
     .await?;
-    let parsed = serde_json::from_value::<GeminiResponse>(value)
-        .map_err(|err| anyhow!("Gemini generateContent response decode failed: {}", err))?;
+    let parsed = decode_text_response(value)?;
     Ok(parsed)
 }
 
@@ -934,7 +941,7 @@ async fn call_gemini_api_value(
         model,
         payload,
         system_prompt_label,
-        gemini_generate_content_timeout(),
+        gemini_generate_content_timeout(model),
         audit_context,
         operation,
     )
@@ -982,13 +989,15 @@ async fn call_gemini_api_value_with_timeout(
     .await?;
 
     if tracing::enabled!(tracing::Level::DEBUG) {
-        let parsed = serde_json::from_value::<GeminiResponse>(value.clone()).ok();
+        let mut summary_value = value.clone();
+        remove_thought_parts(&mut summary_value);
+        let parsed = serde_json::from_value::<GeminiResponse>(summary_value).ok();
         let response_summary = parsed
             .as_ref()
             .map(summarize_gemini_response)
             .unwrap_or_else(|| {
                 json!({
-                    "rawResponsePreview": truncate_for_log(&value.to_string(), 400)
+                    "responseDecodeFailed": true
                 })
             });
         debug!(target: "llm.gemini", model = model, response = %response_summary);
@@ -1103,6 +1112,9 @@ fn extract_text_from_response_value(response: &Value) -> String {
             .cloned()
             .unwrap_or_default();
         for part in parts {
+            if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 if !text.trim().is_empty() {
                     text_parts.push(text.to_string());
@@ -1165,43 +1177,102 @@ fn base_generation_config() -> Value {
     })
 }
 
-/// `thinkingConfig` for `GEMINI_THINKING_LEVEL`. Only Gemini 3 models accept
-/// `thinkingLevel`; the 2.5 generation uses token budgets and rejects it, so
-/// the setting is ignored there.
+/// Gemini 2.5 uses thinking budgets rather than thinking levels.
 fn thinking_config_for(model: &str, level: &str) -> Option<Value> {
-    let level = level.trim();
-    if level.is_empty() || !model.trim().to_ascii_lowercase().starts_with("gemini-3") {
+    let model = model.trim().to_ascii_lowercase();
+    let argon = is_gemini_argon_model(&model);
+    if !argon && !model.starts_with("gemini-3-") && !model.starts_with("gemini-3.") {
         return None;
     }
+    let level = level.trim().to_ascii_lowercase();
+    // Empty retains the provider default, as it did before Argon support.
+    if level.is_empty() {
+        return None;
+    }
+    let (supported, default): (&[&str], &str) = if model.starts_with("gemini-3.1-flash-lite-image")
+    {
+        (&["minimal", "high"], "minimal")
+    } else if model.starts_with("gemini-3-pro") {
+        (&["low", "high"], "high")
+    } else if argon || model.starts_with("gemini-3.8-flash") {
+        (&["low", "medium", "high"], "medium")
+    } else if model.starts_with("gemini-3.6-flash") {
+        (&["minimal", "low", "medium", "high"], "medium")
+    } else if model.starts_with("gemini-3.5-flash-lite")
+        || model.starts_with("gemini-3.1-flash-lite")
+    {
+        (&["minimal", "low", "medium", "high"], "minimal")
+    } else if model.starts_with("gemini-3-flash") {
+        (&["minimal", "low", "medium", "high"], "high")
+    } else {
+        (&["low", "medium", "high"], "high")
+    };
+    let level = if supported.contains(&level.as_str()) {
+        level.as_str()
+    } else {
+        warn!(
+            model,
+            default, "Invalid Gemini thinking level; using model default"
+        );
+        default
+    };
     Some(json!({ "thinkingLevel": level }))
 }
 
-/// Sampling config for text calls, with the thinking level when `model`
-/// supports it.
-fn generation_config_for(model: &str, thinking_level: &str) -> Value {
-    let mut config = base_generation_config();
+fn apply_model_generation_policy(
+    config: &mut Map<String, Value>,
+    model: &str,
+    thinking_level: &str,
+) {
+    config.remove("thinkingConfig");
     if let Some(thinking) = thinking_config_for(model, thinking_level) {
-        if let Some(object) = config.as_object_mut() {
-            object.insert("thinkingConfig".to_string(), thinking);
-        }
+        config.insert("thinkingConfig".to_string(), thinking);
     }
-    config
+    if is_gemini_argon_model(model) {
+        for field in ["temperature", "topP", "topK", "candidateCount"] {
+            config.remove(field);
+        }
+        let configured = config
+            .get("maxOutputTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let bounded = if configured == 0 {
+            32768
+        } else {
+            configured.min(32768)
+        };
+        if configured != bounded {
+            warn!(
+                model,
+                "Normalizing Argon output budget to bounded single-hop limit"
+            );
+        }
+        config.insert("maxOutputTokens".to_string(), json!(bounded));
+    }
 }
 
-/// The same request retargeted at `model`, with `thinkingConfig` re-derived
-/// for that model: a fallback chain may cross generations, and Gemini 2.5
-/// rejects the `thinkingLevel` that Gemini 3 accepts.
+fn generation_config_for(model: &str, thinking_level: &str) -> Value {
+    let mut config = base_generation_config()
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    apply_model_generation_policy(&mut config, model, thinking_level);
+    Value::Object(config)
+}
+
+/// Rebuild model-dependent settings while preserving response format and other
+/// request settings. Sampling defaults are restored after an Argon hop.
 fn payload_for_model(payload: &Value, model: &str, thinking_level: &str) -> Value {
     let mut payload = payload.clone();
-    if let Some(config) = payload
-        .get_mut("generationConfig")
-        .and_then(Value::as_object_mut)
-    {
-        config.remove("thinkingConfig");
-        if let Some(thinking) = thinking_config_for(model, thinking_level) {
-            config.insert("thinkingConfig".to_string(), thinking);
-        }
+    let mut config = base_generation_config()
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(previous) = payload.get("generationConfig").and_then(Value::as_object) {
+        config.extend(previous.clone());
     }
+    apply_model_generation_policy(&mut config, model, thinking_level);
+    payload["generationConfig"] = Value::Object(config);
     payload
 }
 
@@ -1209,13 +1280,14 @@ fn with_response_json_schema(config: Value, response_json_schema: Option<&Value>
     let Some(schema) = response_json_schema else {
         return config;
     };
-
     let mut config_object = config.as_object().cloned().unwrap_or_default();
+    config_object.remove("responseMimeType");
+    config_object.remove("responseJsonSchema");
+    config_object.remove("responseSchema");
     config_object.insert(
-        "responseMimeType".to_string(),
-        Value::String("application/json".to_string()),
+        "responseFormat".to_string(),
+        json!({"text": {"mimeType": "application/json", "schema": schema}}),
     );
-    config_object.insert("responseJsonSchema".to_string(), schema.clone());
     Value::Object(config_object)
 }
 
@@ -1253,12 +1325,11 @@ fn gemini_tool_call(function_call: &Value) -> ToolCall {
 }
 
 fn decode_gemini_turn(response: &Value) -> Result<ModelTurn<Value>> {
+    validate_text_response(response, true)?;
     let content = extract_candidate_content(response)
         .ok_or_else(|| anyhow!("Gemini tool response did not include candidate content"))?;
-    let tool_calls = extract_function_calls(&content)
-        .iter()
-        .map(gemini_tool_call)
-        .collect();
+    let function_calls = extract_function_calls(&content);
+    let tool_calls = function_calls.iter().map(gemini_tool_call).collect();
     Ok(ModelTurn {
         text: extract_text_from_response_value(response),
         tool_calls,
@@ -1318,6 +1389,9 @@ impl ToolProtocol for GeminiProtocol<'_> {
                 "call_gemini_with_tool_runtime",
             )
             .await?;
+            if tools.is_none_or(|tools| tools.is_empty()) {
+                validate_text_response(&response, false)?;
+            }
             decode_gemini_turn(&response)
         })
     }
@@ -1374,7 +1448,7 @@ pub async fn call_gemini_with_tool_runtime(
     } else {
         CONFIG.gemini.model.as_str()
     };
-    let deadline = TurnDeadline::for_runtime(gemini_generate_content_timeout(), runtime);
+    let deadline = TurnDeadline::for_runtime(gemini_generate_content_timeout(model), runtime);
     let mut protocol = GeminiProtocol {
         model,
         system_prompt,
@@ -1433,89 +1507,54 @@ pub async fn call_gemini_model_simple(
         operation,
     )
     .await?;
+    validate_text_response(&response, false)?;
     Ok(GeminiCallResult {
         text: extract_text_from_response_value(&response),
         model_used: model.to_string(),
     })
 }
 
-async fn call_gemini_lite_fallback(
-    payload: &serde_json::Value,
-    system_prompt_label: Option<&str>,
-    previous_model: &str,
-    previous_err: &anyhow::Error,
-    audit_context: Option<&LlmAuditContext>,
-) -> Result<GeminiCallResult> {
-    let lite_model = CONFIG.gemini.lite_model.trim();
-    if lite_model.is_empty() {
-        return Err(anyhow!(
-            "Gemini request failed on model '{}' and GEMINI_LITE_MODEL is not configured. Previous error: {}",
-            previous_model,
-            previous_err
-        ));
+fn same_gemini_model(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+struct GeminiFallback<'a> {
+    model: &'a str,
+    operation: &'static str,
+    attempts: usize,
+}
+
+/// The fallback chain contains each configured model once, excluding the
+/// primary. Transport retries of a chosen target remain independently bounded.
+fn gemini_fallback_targets<'a>(
+    primary: &str,
+    use_pro: bool,
+    default: &'a str,
+    lite: &'a str,
+) -> Vec<GeminiFallback<'a>> {
+    let mut targets = Vec::new();
+    let default = default.trim();
+    let lite = lite.trim();
+    if use_pro && !default.is_empty() && !same_gemini_model(primary, default) {
+        targets.push(GeminiFallback {
+            model: default,
+            operation: "call_gemini_fallback",
+            attempts: 1,
+        });
     }
-
-    if lite_model.eq_ignore_ascii_case(previous_model) {
-        return Err(anyhow!(
-            "Gemini request failed on model '{}' and GEMINI_LITE_MODEL points to the same model. Previous error: {}",
-            previous_model,
-            previous_err
-        ));
+    if !lite.is_empty()
+        && !same_gemini_model(primary, lite)
+        && !targets
+            .iter()
+            .any(|target| same_gemini_model(target.model, lite))
+    {
+        targets.push(GeminiFallback {
+            model: lite,
+            operation: "call_gemini_lite_fallback",
+            attempts: GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
+        });
     }
-
-    warn!(
-        "Gemini model '{}' failed after retries; trying lite fallback model '{}' for up to {} attempts: {}",
-        previous_model,
-        lite_model,
-        GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
-        previous_err
-    );
-
-    let mut last_lite_err = None;
-    for attempt in 1..=GEMINI_LITE_FALLBACK_MAX_ATTEMPTS {
-        let result = async {
-            let response = call_gemini_api(
-                lite_model,
-                payload_for_model(payload, lite_model, &CONFIG.gemini.thinking_level),
-                system_prompt_label,
-                audit_context,
-                "call_gemini_lite_fallback",
-            )
-            .await?;
-            Ok::<_, anyhow::Error>(extract_text_from_response(response))
-        }
-        .await;
-
-        match result {
-            Ok(text) => {
-                return Ok(GeminiCallResult {
-                    text,
-                    model_used: lite_model.to_string(),
-                });
-            }
-            Err(err) => {
-                warn!(
-                    "Gemini lite fallback attempt {}/{} failed on model '{}': {}",
-                    attempt, GEMINI_LITE_FALLBACK_MAX_ATTEMPTS, lite_model, err
-                );
-                let worth_retrying = gemini_error_allows_model_fallback(&err);
-                last_lite_err = Some(err);
-                if !worth_retrying {
-                    break;
-                }
-            }
-        }
-    }
-
-    let lite_err = last_lite_err.unwrap_or_else(|| anyhow!("Unknown Gemini lite fallback failure"));
-    Err(anyhow!(
-        "Gemini request failed on model '{}' and lite fallback model '{}' after {} attempts. Previous error: {}. Lite fallback error: {}",
-        previous_model,
-        lite_model,
-        GEMINI_LITE_FALLBACK_MAX_ATTEMPTS,
-        previous_err,
-        lite_err
-    ))
+    targets
 }
 
 /// One Gemini text call (default or pro model, with the lite fallback chain).
@@ -1575,8 +1614,8 @@ pub async fn call_gemini(request: GeminiCallRequest<'_>) -> Result<GeminiCallRes
     } else {
         &CONFIG.gemini.model
     };
-    // Fallback models reuse this payload with thinkingConfig re-derived per
-    // model (payload_for_model): the chain may cross generations.
+    // Retarget model-dependent generation fields on fallback: the chain may
+    // cross generations with different thinking and sampling contracts.
     let payload = json!({
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
         "contents": [{ "role": "user", "parts": parts }],
@@ -1616,13 +1655,19 @@ pub async fn call_gemini(request: GeminiCallRequest<'_>) -> Result<GeminiCallRes
                 return Err(primary_err);
             }
 
-            let budget = gemini_fallback_budget();
+            let targets = gemini_fallback_targets(
+                primary_model,
+                use_pro_model,
+                &CONFIG.gemini.model,
+                &CONFIG.gemini.lite_model,
+            );
+            let budget = gemini_fallback_budget(&targets);
             let primary_err_text = primary_err.to_string();
             let fallbacks = run_gemini_model_fallbacks(
                 &payload,
                 system_prompt_label,
                 primary_model,
-                use_pro_model,
+                &targets,
                 primary_err,
                 audit_context,
             );
@@ -1642,80 +1687,54 @@ pub async fn call_gemini(request: GeminiCallRequest<'_>) -> Result<GeminiCallRes
 /// Try the remaining models after the primary one failed with a fallback-worthy
 /// error: pro -> default -> lite, or default -> lite.
 async fn run_gemini_model_fallbacks(
-    payload: &serde_json::Value,
+    payload: &Value,
     system_prompt_label: Option<&str>,
     primary_model: &str,
-    use_pro_model: bool,
+    targets: &[GeminiFallback<'_>],
     primary_err: anyhow::Error,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<GeminiCallResult> {
-    if !use_pro_model {
-        return call_gemini_lite_fallback(
-            payload,
-            system_prompt_label,
-            primary_model,
-            &primary_err,
-            audit_context,
-        )
-        .await;
-    }
-
-    let fallback_model = CONFIG.gemini.model.as_str();
-    warn!(
-        "Gemini Pro model '{}' failed after retries; falling back to default model '{}': {}",
-        primary_model, fallback_model, primary_err
-    );
-
-    let fallback_text = async {
-        let response = call_gemini_api(
-            fallback_model,
-            payload_for_model(payload, fallback_model, &CONFIG.gemini.thinking_level),
-            system_prompt_label,
-            audit_context,
-            "call_gemini_fallback",
-        )
-        .await?;
-        Ok::<_, anyhow::Error>(extract_text_from_response(response))
-    }
-    .await;
-
-    match fallback_text {
-        Ok(text) => Ok(GeminiCallResult {
-            text,
-            model_used: fallback_model.to_string(),
-        }),
-        Err(fallback_err) => {
-            if !gemini_error_allows_model_fallback(&fallback_err) {
-                return Err(anyhow!(
-                    "Gemini request failed on primary model '{}' and fallback model '{}'. \
-Primary error: {}. Fallback error: {}",
-                    primary_model,
-                    fallback_model,
-                    primary_err,
-                    fallback_err
-                ));
-            }
-            call_gemini_lite_fallback(
-                payload,
+    let mut last_error = primary_err;
+    for target in targets {
+        for attempt in 1..=target.attempts {
+            warn!(
+                model = target.model,
+                attempt,
+                max_attempts = target.attempts,
+                "Trying Gemini fallback after failure: {last_error}"
+            );
+            let response = call_gemini_api(
+                target.model,
+                payload_for_model(payload, target.model, &CONFIG.gemini.thinking_level),
                 system_prompt_label,
-                fallback_model,
-                &fallback_err,
                 audit_context,
+                target.operation,
             )
-            .await
-            .map_err(|lite_err| {
-                anyhow!(
-                    "Gemini request failed on primary model '{}' and fallback model '{}'. \
-Primary error: {}. Fallback error: {}. Lite fallback error: {}",
-                    primary_model,
-                    fallback_model,
-                    primary_err,
-                    fallback_err,
-                    lite_err
-                )
-            })
+            .await;
+            match response {
+                Ok(response) => {
+                    return Ok(GeminiCallResult {
+                        text: extract_text_from_response(response),
+                        model_used: target.model.to_string(),
+                    })
+                }
+                Err(error) => {
+                    let retryable = gemini_error_allows_model_fallback(&error);
+                    last_error = error.context(format!(
+                        "Gemini fallback '{}' failed after primary '{}'",
+                        target.model, primary_model
+                    ));
+                    if !retryable {
+                        return Err(last_error);
+                    }
+                }
+            }
         }
     }
+    Err(last_error.context(format!(
+        "No remaining Gemini fallback after primary '{}' failed",
+        primary_model
+    )))
 }
 
 pub async fn generate_image_with_gemini(
@@ -2185,7 +2204,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_level_is_only_sent_to_gemini_3_models() {
+    fn older_gemini_thinking_settings_remain_compatible() {
         assert_eq!(
             thinking_config_for("gemini-3-pro-preview", "high"),
             Some(json!({ "thinkingLevel": "high" }))
@@ -2206,6 +2225,115 @@ mod tests {
         assert!(generation_config_for("gemini-2.5-flash", "high")
             .get("thinkingConfig")
             .is_none());
+    }
+
+    #[test]
+    fn argon_generation_uses_supported_thinking_and_a_bounded_output_budget() {
+        for (requested, expected) in [
+            ("low", "low"),
+            (" MEDIUM ", "medium"),
+            ("high", "high"),
+            ("minimal", "medium"),
+            ("invalid", "medium"),
+        ] {
+            assert_eq!(
+                thinking_config_for("gemini-4-argon", requested),
+                Some(json!({"thinkingLevel": expected}))
+            );
+        }
+        for (configured, expected) in [(8000, 8000), (32768, 32768), (65536, 32768)] {
+            let payload = json!({"generationConfig": {
+                "maxOutputTokens": configured, "temperature": 0.2,
+                "topP": 0.8, "topK": 20, "candidateCount": 2,
+            }});
+            let adapted = payload_for_model(&payload, "gemini-4-argon", "medium");
+            let config = &adapted["generationConfig"];
+            assert_eq!(config["maxOutputTokens"], expected);
+            for key in ["temperature", "topP", "topK", "candidateCount"] {
+                assert!(config.get(key).is_none(), "{key}");
+            }
+        }
+        assert_eq!(
+            thinking_config_for("gemini-3.8-flash", "minimal"),
+            Some(json!({"thinkingLevel": "medium"}))
+        );
+        assert_eq!(
+            thinking_config_for("gemini-3-pro-preview", "medium"),
+            Some(json!({"thinkingLevel": "high"}))
+        );
+        assert_eq!(
+            thinking_config_for("gemini-3.5-flash-lite", "minimal"),
+            Some(json!({"thinkingLevel": "minimal"}))
+        );
+        assert_eq!(thinking_config_for("gemini-30-unknown", "high"), None);
+    }
+
+    #[test]
+    fn argon_fallback_retargets_sampling_and_preserves_structured_output() {
+        let schema = json!({"type":"object","properties":{"answer":{"type":"string"}},
+            "required":["answer"]});
+        let config = with_response_json_schema(
+            json!({"responseMimeType":"old",
+            "responseJsonSchema":{}, "responseSchema":{}, "maxOutputTokens":8000}),
+            Some(&schema),
+        );
+        assert_eq!(config["responseFormat"]["text"]["schema"], schema);
+        assert_eq!(
+            config["responseFormat"]["text"]["mimeType"],
+            "application/json"
+        );
+        for key in ["responseMimeType", "responseJsonSchema", "responseSchema"] {
+            assert!(config.get(key).is_none());
+        }
+        let payload = json!({"systemInstruction":{"parts":[{"text":"system"}]},
+            "contents":[{"role":"user","parts":[{"text":"question"}]}],
+            "generationConfig":config});
+        let argon = payload_for_model(&payload, "gemini-4-argon", "medium");
+        let fallback = payload_for_model(&argon, "gemini-2.5-flash", "medium");
+        assert_eq!(
+            fallback["generationConfig"]["temperature"],
+            json!(CONFIG.gemini.temperature)
+        );
+        assert_eq!(
+            fallback["generationConfig"]["topK"],
+            json!(CONFIG.gemini.top_k)
+        );
+        assert!(fallback["generationConfig"].get("thinkingConfig").is_none());
+        assert_eq!(fallback["generationConfig"]["maxOutputTokens"], 8000);
+        assert_eq!(
+            fallback["generationConfig"]["responseFormat"],
+            config["responseFormat"]
+        );
+        assert_eq!(fallback["contents"], payload["contents"]);
+        assert_eq!(fallback["systemInstruction"], payload["systemInstruction"]);
+    }
+
+    #[test]
+    fn fallback_targets_never_repeat_a_primary_or_earlier_target() {
+        for (primary, use_pro, default, lite, expected) in [
+            ("argon", true, "flash", "lite", vec!["flash", "lite"]),
+            ("argon", true, " ARGON ", "lite", vec!["lite"]),
+            ("argon", true, "flash", " ARGON ", vec!["flash"]),
+            ("argon", true, "flash", " FLASH ", vec!["flash"]),
+            ("argon", false, "unused", "lite", vec!["lite"]),
+            ("argon", true, "argon", " ARGON ", vec![]),
+            ("argon", true, " ", "", vec![]),
+        ] {
+            let targets = gemini_fallback_targets(primary, use_pro, default, lite);
+            assert_eq!(
+                targets
+                    .iter()
+                    .map(|target| target.model)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        // A slow fallback must not inherit a shorter primary model's HTTP budget.
+        let targets = gemini_fallback_targets("gemini-3.8-flash", false, "", "gemini-4-argon");
+        assert_eq!(
+            gemini_fallback_budget(&targets),
+            Duration::from_secs(CONFIG.gemini.argon_request_timeout_secs)
+        );
     }
 
     #[test]
@@ -2230,7 +2358,13 @@ mod tests {
     #[test]
     fn fallback_budget_matches_one_request_timeout() {
         assert_eq!(
-            gemini_fallback_budget().as_secs(),
+            gemini_fallback_budget(&gemini_fallback_targets(
+                "gemini-3-pro",
+                true,
+                "gemini-3-flash",
+                "gemini-3-flash-lite"
+            ))
+            .as_secs(),
             CONFIG.gemini.request_timeout_secs
         );
     }
@@ -2305,8 +2439,12 @@ mod tests {
     #[test]
     fn gemini_timeout_helpers_use_general_and_image_specific_config() {
         assert_eq!(
-            gemini_generate_content_timeout().as_secs(),
+            gemini_generate_content_timeout("gemini-3-flash").as_secs(),
             CONFIG.gemini.request_timeout_secs
+        );
+        assert_eq!(
+            gemini_generate_content_timeout("gemini-4-argon").as_secs(),
+            CONFIG.gemini.argon_request_timeout_secs
         );
         assert_eq!(
             gemini_image_generation_timeout().as_secs(),

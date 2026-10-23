@@ -658,16 +658,18 @@ fn explicit_codex_quick_model_does_not_fall_back_to_selected_default() {
     let luna = model(ThirdPartyProvider::OpenAICodex, "GPT-5.6-Luna", "selected");
     let mut models = vec![luna];
     add_explicit_quick_model(&mut models, Some(terra));
-    let result = resolve_quick_text_model_with_models(
-        "openai-codex:gpt-5.6-terra",
-        "openai-codex:selected",
-        &models,
-        &[ThirdPartyProvider::OpenAICodex],
-        false,
-        ModelRequestCapabilities::default(),
-    );
+    for gemini_available in [false, true] {
+        let result = resolve_quick_text_model_with_models(
+            "openai-codex:gpt-5.6-terra",
+            "openai-codex:selected",
+            &models,
+            &[ThirdPartyProvider::OpenAICodex],
+            gemini_available,
+            ModelRequestCapabilities::default(),
+        );
 
-    assert_eq!(result.as_deref(), Ok("openai-codex:gpt-5.6-terra"));
+        assert_eq!(result.as_deref(), Ok("openai-codex:gpt-5.6-terra"));
+    }
 }
 
 #[test]
@@ -1033,6 +1035,46 @@ fn selectable_models_keeps_picker_when_gemini_and_audio_model_are_available() {
         model_ids,
         vec!["gemini".to_string(), "nvidia:nemotron-omni".to_string()]
     );
+}
+
+#[test]
+fn gemini_coexists_with_codex_without_replacing_the_configured_default() {
+    let selected = model(
+        ThirdPartyProvider::OpenAICodex,
+        "Selected Codex",
+        "selected",
+    );
+    let snapshot = snapshot_of(vec![selected], &[ThirdPartyProvider::OpenAICodex]);
+    let request = ModelRequestCapabilities::default();
+
+    for default_model in ["openai-codex", "openai-codex:selected"] {
+        let keyboard =
+            create_model_selection_keyboard_with_models(&snapshot, true, default_model, request);
+        let callbacks = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            callbacks,
+            vec!["model_select:openai-codex:selected", "model_select:gemini"]
+        );
+        assert_eq!(
+            crate::llm::text_model::resolve_default_text_model_with_models(
+                default_model,
+                &snapshot.models,
+                &snapshot.ready_providers,
+                true,
+                request,
+            )
+            .as_deref(),
+            Ok("openai-codex:selected")
+        );
+    }
 }
 
 #[test]

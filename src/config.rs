@@ -147,8 +147,32 @@ pub struct GeminiConfig {
     pub thinking_level: String,
     pub safety_settings: String,
     pub request_timeout_secs: u64,
+    pub argon_request_timeout_secs: u64,
+    pub argon_max_wall_clock_secs: u64,
     pub image_request_timeout_secs: u64,
     pub upload_fanout: usize,
+}
+
+/// Match the native Argon model and versioned variants, not similarly named families.
+pub(crate) fn is_gemini_argon_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model == "gemini-4-argon"
+        || model.strip_prefix("gemini-4-argon-").is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+}
+
+impl GeminiConfig {
+    pub(crate) fn request_timeout_secs_for(&self, model: &str) -> u64 {
+        if is_gemini_argon_model(model) {
+            self.argon_request_timeout_secs
+        } else {
+            self.request_timeout_secs
+        }
+    }
 }
 
 /// Shared shape for the OpenAI-compatible chat providers (OpenRouter,
@@ -397,6 +421,19 @@ fn env_f32(name: &str, default: f32) -> f32 {
 
 fn env_i32(name: &str, default: i32) -> i32 {
     env_parsed(name, default)
+}
+
+fn env_positive_i32(name: &str, default: i32) -> i32 {
+    let value = env_i32(name, default);
+    if value <= 0 {
+        warn!(
+            env = name,
+            value, "value must be positive, using the default"
+        );
+        default
+    } else {
+        value
+    }
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
@@ -783,22 +820,24 @@ fn load_gemini() -> GeminiConfig {
     GeminiConfig {
         enabled: env_bool("ENABLE_GEMINI", true),
         api_key: env_string("GEMINI_API_KEY", ""),
-        model: env_string("GEMINI_MODEL", "gemini-flash-latest"),
-        lite_model: env_string("GEMINI_LITE_MODEL", "gemini-flash-lite-latest"),
-        pro_model: env_string("GEMINI_PRO_MODEL", "gemini-2.5-pro"),
+        model: env_string("GEMINI_MODEL", "gemini-3.8-flash"),
+        lite_model: env_string("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite"),
+        pro_model: env_string("GEMINI_PRO_MODEL", "gemini-4-argon"),
         image_model: env_string("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview"),
         music_model: env_string("GEMINI_MUSIC_MODEL", "lyria-3-pro-preview"),
         video_model: env_string("GEMINI_VIDEO_MODEL", "veo-3.1-generate-preview"),
         temperature: env_f32("GEMINI_TEMPERATURE", 0.7),
         top_k: env_i32("GEMINI_TOP_K", 40),
         top_p: env_f32("GEMINI_TOP_P", 0.95),
-        max_output_tokens: env_i32("GEMINI_MAX_OUTPUT_TOKENS", 2048),
-        thinking_level: env_string("GEMINI_THINKING_LEVEL", "high"),
+        max_output_tokens: env_positive_i32("GEMINI_MAX_OUTPUT_TOKENS", 32768),
+        thinking_level: env_string("GEMINI_THINKING_LEVEL", "medium"),
         safety_settings: normalize_gemini_safety_settings(env_string(
             "GEMINI_SAFETY_SETTINGS",
             "permissive",
         )),
         request_timeout_secs: env_timeout_secs("GEMINI_REQUEST_TIMEOUT_SECS", 90),
+        argon_request_timeout_secs: env_positive_u64("GEMINI_ARGON_REQUEST_TIMEOUT_SECS", 1200),
+        argon_max_wall_clock_secs: env_positive_u64("GEMINI_ARGON_MAX_WALL_CLOCK_SECS", 1800),
         image_request_timeout_secs: env_timeout_secs("GEMINI_IMAGE_REQUEST_TIMEOUT_SECS", 300),
         upload_fanout: env_usize("GEMINI_UPLOAD_FANOUT", 3).max(1),
     }
@@ -1208,6 +1247,58 @@ pub(crate) fn gemini_api_available_from(enable_gemini: bool, api_key: &str) -> b
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn argon_family_requires_a_model_boundary() {
+        for model in [
+            "gemini-4-argon",
+            " GEMINI-4-ARGON ",
+            "gemini-4-argon-001",
+            "gemini-4-argon-preview-10-22",
+        ] {
+            assert!(is_gemini_argon_model(model), "{model}");
+        }
+        for model in [
+            "gemini-4-argonite",
+            "gemini-4",
+            "gemini-3.8-flash",
+            "gemini-4-argon-",
+            "other/gemini-4-argon",
+            "gemini-4-argon/image",
+        ] {
+            assert!(!is_gemini_argon_model(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn gemini_argon_limits_validate_and_preserve_smaller_explicit_values() {
+        let _lock = lock_env_and_force_config();
+        for invalid in ["0", "-1", "invalid", "18446744073709551616"] {
+            let _env = [
+                set_env_var_for_test("GEMINI_MAX_OUTPUT_TOKENS", invalid),
+                set_env_var_for_test("GEMINI_ARGON_REQUEST_TIMEOUT_SECS", invalid),
+                set_env_var_for_test("GEMINI_ARGON_MAX_WALL_CLOCK_SECS", invalid),
+                set_env_var_for_test("GEMINI_REQUEST_TIMEOUT_SECS", "90"),
+            ];
+            let config = load_gemini();
+            assert_eq!(config.max_output_tokens, 32768);
+            assert_eq!(config.argon_max_wall_clock_secs, 1800);
+            assert_eq!(
+                config.request_timeout_secs_for(" GEMINI-4-ARGON-001 "),
+                1200
+            );
+            assert_eq!(config.request_timeout_secs_for("gemini-3.8-flash"), 90);
+        }
+        let _env = [
+            set_env_var_for_test("GEMINI_MAX_OUTPUT_TOKENS", "8000"),
+            set_env_var_for_test("GEMINI_ARGON_REQUEST_TIMEOUT_SECS", "60"),
+            set_env_var_for_test("GEMINI_ARGON_MAX_WALL_CLOCK_SECS", "120"),
+        ];
+        let config = load_gemini();
+        assert_eq!(config.max_output_tokens, 8000);
+        assert_eq!(config.argon_request_timeout_secs, 60);
+        assert_eq!(config.argon_max_wall_clock_secs, 120);
+    }
 
     // Environment variables are process-wide; hold this lock for the whole
     // span of any test that sets/removes one so tests can't race each other.
