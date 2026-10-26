@@ -15,8 +15,8 @@ use crate::state::{AppState, PendingEntryGuard, PendingQRequest, QaCommandMode};
 use crate::utils::timing::{complete_command_timer, now_unix_seconds};
 
 use super::model_resolution::{
-    configured_model_display_name, default_model_selection_key,
-    selectable_model_ids_for_request_with_models, ModelCatalogSnapshot, QaModel,
+    default_model_selection_key, selectable_model_ids_for_request_with_models,
+    ModelCatalogSnapshot, QaModel,
 };
 use super::process::process_request;
 
@@ -132,7 +132,7 @@ pub(super) fn create_model_selection_keyboard_with_models(
         .iter()
         .map(|model_id| {
             InlineKeyboardButton::callback(
-                configured_model_display_name(snapshot, model_id),
+                snapshot.display_name(model_id),
                 model_selection_callback_data(model_id),
             )
         })
