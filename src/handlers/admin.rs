@@ -118,6 +118,7 @@ async fn build_status_report(state: &AppState) -> String {
     let media_group_count = state.media_group_count();
     let pending_q_requests = state.pending_q_requests.count();
     let pending_image_requests = state.pending_image_requests.count();
+    let pending_agent_model_requests = state.pending_agent_model_requests.count();
     let pending_codex_model_requests = state.pending_codex_model_requests.count();
     let pending_codex_reasoning_requests = state.pending_codex_reasoning_requests.count();
 
@@ -167,9 +168,10 @@ async fn build_status_report(state: &AppState) -> String {
         heavy_active, heavy_waiting, CONFIG.limits.heavy_command_max_concurrency
     ));
     report.push_str(&format!(
-        "pending_requests: q={} image={} codex_model={} codex_reasoning={}\n",
+        "pending_requests: q={} image={} agent_model={} codex_model={} codex_reasoning={}\n",
         pending_q_requests,
         pending_image_requests,
+        pending_agent_model_requests,
         pending_codex_model_requests,
         pending_codex_reasoning_requests
     ));

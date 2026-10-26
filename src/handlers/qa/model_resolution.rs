@@ -65,7 +65,7 @@ impl QaModel {
                     Some(&CONFIG.models.quick_reasoning_effort),
                 ),
                 Some(explicit) => codex_selected_model_label(&explicit.record),
-                None => configured_model_display_name(snapshot, &config.id),
+                None => snapshot.display_name(&config.id),
             },
         }
     }
@@ -132,31 +132,6 @@ pub(super) fn third_party_provider_label(provider: ThirdPartyProvider) -> &'stat
         ThirdPartyProvider::Ollama => "Ollama",
         ThirdPartyProvider::OpenAI => "OpenAI",
         ThirdPartyProvider::OpenAICodex => "OpenAI Codex",
-    }
-}
-
-pub(super) fn configured_model_display_name(
-    snapshot: &ModelCatalogSnapshot,
-    model_name: &str,
-) -> String {
-    if model_name == MODEL_GEMINI {
-        "Gemini".to_string()
-    } else {
-        snapshot
-            .config(model_name)
-            .map(|config| {
-                if config.provider == ThirdPartyProvider::OpenAICodex {
-                    if let Some(record) = snapshot
-                        .codex_record
-                        .as_ref()
-                        .filter(|record| record.slug == config.model)
-                    {
-                        return codex_selected_model_label(record);
-                    }
-                }
-                config.name.clone()
-            })
-            .unwrap_or_else(|| model_name.to_string())
     }
 }
 

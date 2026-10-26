@@ -24,6 +24,7 @@ mod utils;
 
 use config::CONFIG;
 use db::database::Database;
+use handlers::agent_model_picker::AGENT_MODEL_CALLBACK_PREFIX;
 use handlers::codex_admin::{
     CODEX_MODEL_PAGE_CALLBACK_PREFIX, CODEX_MODEL_SELECT_CALLBACK_PREFIX,
     CODEX_REASONING_SELECT_CALLBACK_PREFIX,
@@ -450,6 +451,13 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
         spawn_logged(
             "model selection callback",
             qa::model_selection_callback(bot, state, query),
+        );
+        return Ok(());
+    }
+    if data.starts_with(AGENT_MODEL_CALLBACK_PREFIX) {
+        spawn_logged(
+            "agent model callback",
+            handlers::agent_model_picker::agent_model_callback(bot, state, query),
         );
         return Ok(());
     }

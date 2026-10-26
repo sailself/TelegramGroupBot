@@ -1,5 +1,6 @@
 pub mod access;
 pub mod admin;
+pub mod agent_model_picker;
 pub mod codex_admin;
 pub mod content;
 pub mod enrichment;

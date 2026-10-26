@@ -88,6 +88,28 @@ impl ModelCatalogSnapshot {
     pub fn count(&self) -> usize {
         self.models.len()
     }
+
+    /// Label for `id` in pickers and progress messages: "Gemini", the selected
+    /// Codex model with its reasoning level, or the configured model name.
+    pub fn display_name(&self, id: &str) -> String {
+        if id == MODEL_GEMINI {
+            return "Gemini".to_string();
+        }
+        self.config(id)
+            .map(|config| {
+                if config.provider == ThirdPartyProvider::OpenAICodex {
+                    if let Some(record) = self
+                        .codex_record
+                        .as_ref()
+                        .filter(|record| record.slug == config.model)
+                    {
+                        return crate::llm::runtime_models::codex_selected_model_label(record);
+                    }
+                }
+                config.name.clone()
+            })
+            .unwrap_or_else(|| id.to_string())
+    }
 }
 
 /// The model that answers one `/q`-family request, resolved once against a
