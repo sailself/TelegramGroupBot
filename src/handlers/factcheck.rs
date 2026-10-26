@@ -9,15 +9,18 @@ use crate::agents::factcheck::{run_factcheck_pipeline, FactcheckOutcome};
 use crate::agents::step::WallClock;
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
+use crate::handlers::agent_model_picker::{
+    run_with_agent_model_choice, AgentModelRequest, ChosenAgentModel,
+};
 use crate::handlers::enrichment::{
     count_sources, enrich_request, entity_link_urls, render_sources, Enrichment, EnrichmentBudget,
     SourceCounts, SourceKind,
 };
 use crate::handlers::media::{collect_message_media, MediaCollectionOptions};
 use crate::handlers::responses::{send_response, ResponseContent};
-use crate::llm::audit::create_command_audit_context;
-use crate::llm::media::{summarize_media_files, MediaSummary};
-use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel};
+use crate::llm::audit::{create_command_audit_context, LlmAuditContext};
+use crate::llm::media::{summarize_media_files, MediaFile, MediaSummary};
+use crate::llm::resolved_model::ResolvedTextModel;
 use crate::llm::text_model::{call_resolved_text_model, ModelRequestCapabilities};
 use crate::prompts::{FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY};
 use crate::state::AppState;
@@ -145,7 +148,7 @@ pub async fn factcheck_handler(
         .await?;
         return Ok(());
     }
-    let _heavy_permit = state.acquire_heavy_command_permit().await;
+    let heavy_permit = state.acquire_heavy_command_permit().await;
 
     let reply_message = message.reply_to_message();
     let query_text = query.unwrap_or_default();
@@ -237,36 +240,82 @@ pub async fn factcheck_handler(
         "Twitter post(s)",
     );
 
-    let processing_message = bot
-        .send_message(message.chat.id, processing_message_text)
-        .reply_parameters(ReplyParameters::new(message.id))
-        .await?;
+    let capabilities = ModelRequestCapabilities::from_media(
+        &media_summary,
+        !CONFIG.agents.enable_agentic_factcheck,
+    );
+    let job = FactcheckJob {
+        chat_id: message.chat.id,
+        statement,
+        media_files,
+        media_summary,
+        user_language_code: user_language_code.map(str::to_string),
+        audit_context,
+    };
+    run_with_agent_model_choice(
+        &bot,
+        &state,
+        &message,
+        heavy_permit,
+        AgentModelRequest {
+            command: "factcheck",
+            capabilities,
+            processing_text: processing_message_text,
+            run: Box::new(move |bot, state, model| Box::pin(run_factcheck(bot, state, job, model))),
+        },
+    )
+    .await
+}
+
+/// What `/factcheck` checks, gathered before the model is chosen.
+struct FactcheckJob {
+    chat_id: ChatId,
+    statement: String,
+    media_files: Vec<MediaFile>,
+    media_summary: MediaSummary,
+    user_language_code: Option<String>,
+    audit_context: Option<LlmAuditContext>,
+}
+
+async fn run_factcheck(
+    bot: Bot,
+    state: AppState,
+    job: FactcheckJob,
+    model: ChosenAgentModel,
+) -> Result<()> {
+    let FactcheckJob {
+        chat_id,
+        statement,
+        media_files,
+        media_summary,
+        user_language_code,
+        audit_context,
+    } = job;
+    let ChosenAgentModel {
+        id,
+        mut snapshot,
+        status_message_id,
+        heavy_permit,
+    } = model;
+    let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
+    let user_language_code = user_language_code.as_deref();
     crate::utils::telegram::run_with_status_message(
         &bot,
-        processing_message.chat.id,
-        processing_message.id,
+        chat_id,
+        status_message_id,
         "Failed to fact-check this message. Please try again.",
         async {
-            let _heavy_permit = _heavy_permit;
             let _chat_action =
-                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
+                start_chat_action_heartbeat(bot.clone(), chat_id, ChatAction::Typing);
 
-            let clock = WallClock::start();
-            let mut snapshot = ModelCatalogSnapshot::load();
-            let id = snapshot.resolve_default(ModelRequestCapabilities::from_media(
-                &media_summary,
-                !CONFIG.agents.enable_agentic_factcheck,
-            ))?;
-            let clock = clock.for_gemini_pipeline(id == "gemini", media_summary.total > 0);
+            let clock =
+                WallClock::start().for_gemini_pipeline(id == "gemini", media_summary.total > 0);
             let response = clock
                 .run(async {
                     let final_model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
                     if CONFIG.agents.enable_agentic_factcheck {
-                        let mut progress = ProgressReporter::new(
-                            bot.clone(),
-                            message.chat.id,
-                            processing_message.id,
-                        );
+                        let mut progress =
+                            ProgressReporter::new(bot.clone(), chat_id, status_message_id);
                         match run_factcheck_pipeline(
                             &statement,
                             &media_files,
@@ -311,8 +360,8 @@ pub async fn factcheck_handler(
 
             send_response(
                 &bot,
-                processing_message.chat.id,
-                processing_message.id,
+                chat_id,
+                status_message_id,
                 &response_with_model,
                 "Fact Check",
             )

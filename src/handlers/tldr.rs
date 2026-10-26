@@ -7,21 +7,25 @@ use tracing::{error, info, warn};
 
 use crate::agents::step::WallClock;
 use crate::config::CONFIG;
+use crate::db::models::MessageRow;
 use crate::handlers::access::{check_access_control, is_rate_limited};
+use crate::handlers::agent_model_picker::{
+    run_with_agent_model_choice, AgentModelRequest, ChosenAgentModel,
+};
 use crate::handlers::content::create_telegraph_answer;
 use crate::handlers::image::generate_image_with_configured_default;
 use crate::handlers::responses::{send_response, ResponseContent};
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::media::detect_mime_type;
-use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel};
+use crate::llm::resolved_model::ResolvedTextModel;
 use crate::llm::text_model::{call_resolved_text_model, ModelRequestCapabilities};
 use crate::llm::{GeminiImageConfig, LlmAuditContext};
 use crate::prompts::TLDR_SYSTEM_PROMPT;
 use crate::state::AppState;
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
 use crate::utils::progress::ProgressReporter;
-use crate::utils::telegram::start_chat_action_heartbeat;
-use crate::utils::timing::{complete_command_timer, start_command_timer};
+use crate::utils::telegram::{send_message_with_retry, start_chat_action_heartbeat};
+use crate::utils::timing::{complete_command_timer, start_command_timer, CommandTimer};
 
 /// Legacy single-call /tldr: the whole history in one prompt. Used below the
 /// map-reduce threshold and as the fallback when the pipeline cannot start.
@@ -51,6 +55,7 @@ async fn tldr_single_call(
 }
 
 const TLDR_DEFAULT_MESSAGE_COUNT: i64 = 100;
+const TLDR_FAILURE_TEXT: &str = "Failed to generate a summary. Please try again.";
 
 /// Number of messages `/tldr <n>` should summarize, clamped to a sane range so
 /// a negative or huge argument cannot turn into an unbounded fetch.
@@ -85,37 +90,28 @@ pub async fn tldr_handler(
         .await?;
         return Ok(());
     }
-    let _heavy_permit = state.acquire_heavy_command_permit().await;
+    let heavy_permit = state.acquire_heavy_command_permit().await;
 
     let mut timer = start_command_timer("tldr", &message);
-    let processing_message = bot
-        .send_message(message.chat.id, "Summarizing recent messages...")
-        .reply_parameters(ReplyParameters::new(message.id))
-        .await?;
-    crate::utils::telegram::run_with_status_message(&bot, processing_message.chat.id, processing_message.id, "Failed to generate a summary. Please try again.", async {
-            let _heavy_permit = _heavy_permit;
-
-    let _chat_action =
-        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-
-    let mut messages = if let Some(reply) = message.reply_to_message() {
-        // Fetch one past the cap so the truncation notice below still fires
-        // without pulling the whole chat into memory.
-        let fetch_limit = (CONFIG.agents.tldr_max_messages + 1) as i64;
-        state
-            .db
-            .select_messages_from_id(message.chat.id.0, reply.id.0 as i64, fetch_limit)
-            .await?
-    } else {
-        let n = resolve_tldr_count(count.as_deref(), CONFIG.agents.tldr_max_messages);
-        state.db.select_messages(message.chat.id.0, n).await?
+    let mut messages = match fetch_tldr_messages(&state, &message, count.as_deref()).await {
+        Ok(messages) => messages,
+        Err(err) => {
+            send_message_with_retry(&bot, message.chat.id, TLDR_FAILURE_TEXT, Some(message.id))
+                .await?;
+            complete_command_timer(
+                &mut timer,
+                "error",
+                Some("message_fetch_failed".to_string()),
+            );
+            return Err(err);
+        }
     };
-
     if messages.is_empty() {
-        bot.edit_message_text(
+        send_message_with_retry(
+            &bot,
             message.chat.id,
-            processing_message.id,
             "No messages found to summarize.",
+            Some(message.id),
         )
         .await?;
         complete_command_timer(&mut timer, "error", Some("no_messages".to_string()));
@@ -128,20 +124,86 @@ pub async fn tldr_handler(
         let skip = messages.len() - CONFIG.agents.tldr_max_messages;
         messages.drain(..skip);
     }
-    let audit_context = create_command_audit_context(&state, &message, "tldr").await;
+    let job = TldrJob {
+        chat_id: message.chat.id,
+        messages,
+        truncated_to_cap,
+        audit_context: create_command_audit_context(&state, &message, "tldr").await,
+        timer,
+    };
+    run_with_agent_model_choice(
+        &bot,
+        &state,
+        &message,
+        heavy_permit,
+        AgentModelRequest {
+            command: "tldr",
+            capabilities: ModelRequestCapabilities {
+                require_tools: true,
+                ..Default::default()
+            },
+            processing_text: "Summarizing recent messages...".to_string(),
+            run: Box::new(move |bot, state, model| Box::pin(run_tldr(bot, state, job, model))),
+        },
+    )
+    .await
+}
 
-    let clock = WallClock::start();
-    let mut snapshot = ModelCatalogSnapshot::load();
-    let id = snapshot.resolve_default(ModelRequestCapabilities {
-        require_tools: true,
-        ..Default::default()
-    })?;
-    let clock = clock.for_gemini_pipeline(id == "gemini", true);
+/// Messages `/tldr` summarizes: from the replied-to message on, or the last N.
+async fn fetch_tldr_messages(
+    state: &AppState,
+    message: &Message,
+    count: Option<&str>,
+) -> Result<Vec<MessageRow>> {
+    let messages = if let Some(reply) = message.reply_to_message() {
+        // Fetch one past the cap so the truncation notice below still fires
+        // without pulling the whole chat into memory.
+        let fetch_limit = (CONFIG.agents.tldr_max_messages + 1) as i64;
+        state
+            .db
+            .select_messages_from_id(message.chat.id.0, reply.id.0 as i64, fetch_limit)
+            .await?
+    } else {
+        let n = resolve_tldr_count(count, CONFIG.agents.tldr_max_messages);
+        state.db.select_messages(message.chat.id.0, n).await?
+    };
+    Ok(messages)
+}
+
+/// What `/tldr` summarizes, gathered before the model is chosen.
+struct TldrJob {
+    chat_id: ChatId,
+    messages: Vec<MessageRow>,
+    truncated_to_cap: bool,
+    audit_context: Option<LlmAuditContext>,
+    timer: CommandTimer,
+}
+
+async fn run_tldr(bot: Bot, state: AppState, job: TldrJob, model: ChosenAgentModel) -> Result<()> {
+    let TldrJob {
+        chat_id,
+        messages,
+        truncated_to_cap,
+        audit_context,
+        mut timer,
+    } = job;
+    let ChosenAgentModel {
+        id,
+        mut snapshot,
+        status_message_id,
+        heavy_permit,
+    } = model;
+    let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
+    crate::utils::telegram::run_with_status_message(&bot, chat_id, status_message_id, TLDR_FAILURE_TEXT, async {
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), chat_id, ChatAction::Typing);
+
+    let clock = WallClock::start().for_gemini_pipeline(id == "gemini", true);
     let response = clock.run(async {
         let final_model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
         if messages.len() > CONFIG.agents.tldr_map_reduce_threshold {
         let mut progress_reporter =
-            ProgressReporter::new(bot.clone(), message.chat.id, processing_message.id);
+            ProgressReporter::new(bot.clone(), chat_id, status_message_id);
         match crate::agents::tldr::summarize_messages_map_reduce(
             &messages,
             audit_context.as_ref(),
@@ -176,8 +238,8 @@ pub async fn tldr_handler(
     }
     if summary_text.trim().is_empty() {
         bot.edit_message_text(
-            processing_message.chat.id,
-            processing_message.id,
+            chat_id,
+            status_message_id,
             "Failed to generate a summary. Please try again later.",
         )
         .await?;
@@ -189,8 +251,8 @@ pub async fn tldr_handler(
 
     let _ = bot
         .edit_message_text(
-            processing_message.chat.id,
-            processing_message.id,
+            chat_id,
+            status_message_id,
             if infographic_enabled {
                 "Summary generated. Generating infographic..."
             } else {
@@ -272,8 +334,8 @@ Use the same language as the summary text for any labels.\
 
     let _ = bot
         .edit_message_text(
-            processing_message.chat.id,
-            processing_message.id,
+            chat_id,
+            status_message_id,
             if infographic_enabled {
                 "Infographic step completed. Finalizing response..."
             } else {
@@ -284,8 +346,8 @@ Use the same language as the summary text for any labels.\
 
     send_response(
         &bot,
-        processing_message.chat.id,
-        processing_message.id,
+        chat_id,
+        status_message_id,
         &final_message,
         "Message Summary",
     )

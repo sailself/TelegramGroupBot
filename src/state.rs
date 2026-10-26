@@ -11,6 +11,7 @@ use tokio::task::AbortHandle;
 
 use crate::config::CONFIG;
 use crate::db::database::Database;
+use crate::handlers::agent_model_picker::PendingAgentModelRequest;
 use crate::handlers::enrichment::Enrichment;
 use crate::llm::openai_codex::{CodexReasoningEffortOption, CodexRemoteModel};
 use crate::utils::timing::CommandTimer;
@@ -361,6 +362,7 @@ pub struct AppState {
     pub bot_username_lower: String,
     pub pending_q_requests: PendingRequests<PendingQRequest>,
     pub pending_image_requests: PendingRequests<PendingImageRequest>,
+    pub pending_agent_model_requests: PendingRequests<PendingAgentModelRequest>,
     pub pending_codex_model_requests: PendingRequests<PendingCodexModelRequest>,
     pub pending_codex_reasoning_requests: PendingRequests<PendingCodexReasoningRequest>,
     pub active_codex_login: Arc<Mutex<Option<ActiveCodexLogin>>>,
@@ -378,6 +380,7 @@ impl AppState {
             bot_username_lower,
             pending_q_requests: PendingRequests::new(),
             pending_image_requests: PendingRequests::new(),
+            pending_agent_model_requests: PendingRequests::new(),
             pending_codex_model_requests: PendingRequests::new(),
             pending_codex_reasoning_requests: PendingRequests::new(),
             active_codex_login: Arc::new(Mutex::new(None)),
