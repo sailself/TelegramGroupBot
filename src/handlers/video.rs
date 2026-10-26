@@ -151,12 +151,14 @@ async fn deliver_video(
     path: &Path,
     caption: &str,
 ) -> Result<()> {
+    // Blurred like img2: the video and its prompt caption stay hidden until tapped.
+    let caption = format!("<tg-spoiler>{caption}</tg-spoiler>");
     retry_telegram("vid2 send_video", || {
         bot.send_video(chat_id, InputFile::file(path.to_path_buf()))
-            .caption(caption.to_string())
+            .caption(caption.clone())
             .parse_mode(ParseMode::Html)
             .disable_notification(false)
-            .has_spoiler(false)
+            .has_spoiler(true)
             .supports_streaming(true)
             .reply_parameters(ReplyParameters::new(reply_to))
     })
@@ -488,7 +490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_video_reply_uses_html_normal_notification_and_removes_only_progress() {
+    async fn successful_video_reply_is_blurred_like_img2_and_removes_only_progress() {
         let caption = video_caption(r#"<tg-spoiler>A & "B"</tg-spoiler>"#);
         let server = TestServer::new(vec![
             ExpectedRequest::new(
@@ -500,8 +502,8 @@ mod tests {
             .with_body_fragment(b"name=\"reply_parameters\"\r\n\r\n{\"message_id\":42}")
             .with_body_fragment(b"name=\"parse_mode\"\r\n\r\nHTML")
             .with_body_fragment(b"name=\"disable_notification\"\r\n\r\nfalse")
-            .with_body_fragment(b"name=\"has_spoiler\"\r\n\r\nfalse")
-            .with_body_fragment(caption.as_bytes()),
+            .with_body_fragment(b"name=\"has_spoiler\"\r\n\r\ntrue")
+            .with_body_fragment(format!("<tg-spoiler>{caption}</tg-spoiler>").as_bytes()),
             delete_progress_response(true, false),
         ]);
         let bot = Bot::new("123:test").set_api_url(server.base_url());
