@@ -69,17 +69,16 @@ fn is_reply_to_this_bot(message: &Message, bot_user_id: i64) -> bool {
     i64::try_from(reply_from.id.0).ok() == Some(bot_user_id)
 }
 
-/// Whether the message this update replies to contains an image.
+/// Whether the message this update replies to contains an image or a video.
 ///
-/// A reply to one of the bot's own image responses (`/img`, `/image`, `/img2`)
-/// is almost always a comment on the picture rather than a follow-up question,
-/// so the auto-`/q` reply trigger skips those unless the user also mentions the
-/// bot explicitly.
-fn reply_target_has_image(message: &Message) -> bool {
+/// A reply to one of the bot's own image or video responses (`/img`, `/image`,
+/// `/img2`, `/vid`, `/vid2`) is almost always a comment on the media rather
+/// than a follow-up question, so the auto-`/q` reply trigger skips those unless
+/// the user also mentions the bot explicitly.
+fn reply_target_has_image_or_video(message: &Message) -> bool {
     message
         .reply_to_message()
-        .map(message_has_image)
-        .unwrap_or(false)
+        .is_some_and(|reply| message_has_image(reply) || reply.video().is_some())
 }
 
 fn is_mentioning_this_bot(message: &Message, bot_user_id: i64, bot_username_lower: &str) -> bool {
@@ -138,7 +137,7 @@ pub(super) fn should_auto_q_trigger_with_config(
     }
 
     is_mentioning_this_bot(message, bot_user_id, bot_username_lower)
-        || (is_reply_to_this_bot(message, bot_user_id) && !reply_target_has_image(message))
+        || (is_reply_to_this_bot(message, bot_user_id) && !reply_target_has_image_or_video(message))
 }
 
 pub fn build_auto_q_query(

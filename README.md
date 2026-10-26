@@ -17,7 +17,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/factcheck` - Fact-check a statement (text or reply).
 - `/q` - Ask a question (uses model selection when third-party models are configured).
 - `/qc` - Ask about this chat through independently routed recall, analytics whose results are exact only for the normalized query over eligible stored-text rows, or LLM-assisted topic discovery.
-- Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically.
+- Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically. Replies to the bot's generated images or videos (including `/img2` and `/vid2` results) do not, unless the reply also mentions the bot.
 - `/qq` - Provider-neutral quick answer: skips model selection, stays brief, and may use one bounded web-search round for genuinely current facts. Use `/q` for deeper verification or research.
 - `/burn_baby_burn` - Show how many tokens you have used in the current chat.
 - `/token_devourers [n]` - Show the top token consumers in the current group chat.
