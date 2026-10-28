@@ -187,6 +187,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `DEFAULT_IMAGE_MODEL` - Default image model for `/img`, `/image` timeout/default generation, `/tldr` infographics, and `/paintme`/`/portraitme`. Use `gemini` or `codex`. Default: `gemini`.
 - `TELEGRAM_MAX_LENGTH` - Max message length before truncation or Telegraph. Default: `4000`.
 - `USER_HISTORY_MESSAGE_COUNT` - Messages to retain for user history. Default: `200`.
+- `Q_REPLY_CHAIN_MAX_MESSAGES` - Maximum reply-chain messages used by `/q` and automatic `/q`; includes the direct reply and excludes the current question. Default: `10`, minimum: `1`. Older replies contribute text or captions only; automatic link fetching and media collection use the question and direct reply. Stored messages and successful bot answers support continuity; unavailable older messages stop the chain, and history is not backfilled.
 - `LOG_LEVEL` - Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info`.
 - `PUBLISH_BOT_COMMANDS` - When `true`, publish the built-in command list on startup via Telegram `setMyCommands`. Default: `false`.
   - Warning: Telegram treats this as a replacement for the default-scope command list. Leave it `false` if you manage commands in BotFather.

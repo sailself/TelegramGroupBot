@@ -9,6 +9,60 @@ use crate::state::QaCommandMode;
 pub(super) const NO_VIDEO_CAPABLE_MODEL_MESSAGE: &str =
     "No video-capable AI model is available. Enable Gemini or configure a ready third-party model with video=true.";
 
+pub(super) struct PreparedQaInput {
+    pub original: String,
+    pub query_base: String,
+    pub question: String,
+    pub youtube_urls: Vec<String>,
+}
+
+/// Only the current question and direct reply enter automatic URL extraction.
+pub(super) fn prepare_qa_input(
+    mode: QaCommandMode,
+    query: &str,
+    direct: Option<&str>,
+    media: &MediaSummary,
+    gemini_available: bool,
+) -> PreparedQaInput {
+    let reply = direct.unwrap_or_default();
+    let original = if query.trim().is_empty() {
+        if reply.trim().is_empty() {
+            build_media_only_qa_prompt(media).unwrap_or_default()
+        } else {
+            reply.to_string()
+        }
+    } else {
+        query.to_string()
+    };
+    let query_base = if query.trim().is_empty() {
+        original.clone()
+    } else if reply.trim().is_empty() {
+        query.to_string()
+    } else {
+        format!(
+            "Context from replied message: \"{}\"\n\nQuestion: {}",
+            reply, query
+        )
+    };
+    let (mut question, youtube_urls) =
+        prepare_youtube_inputs_for_qa(&query_base, mode, None, gemini_available);
+    if mode == QaCommandMode::Standard && direct.is_some() {
+        question = if query.trim().is_empty() && !reply.trim().is_empty() {
+            "Please respond to the directly replied message.".to_string()
+        } else if query.trim().is_empty() {
+            original.clone()
+        } else {
+            prepare_youtube_inputs_for_qa(query, mode, None, gemini_available).0
+        };
+    }
+    PreparedQaInput {
+        original,
+        query_base,
+        question,
+        youtube_urls,
+    }
+}
+
 const QC_SYSTEM_PROMPT: &str = r#"You are a helpful assistant in a Telegram group chat. Use chat_context_query to retrieve messages from the current source chat only — never assume access to any other chat. Query the chat first when the user asks about prior discussion here; use web_search only for external or current facts that are not contained in the retrieved messages.
 
 - Lead with a direct, clear answer; be concise but complete.

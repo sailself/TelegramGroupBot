@@ -13,6 +13,36 @@ fn topic_window_is_capped(total_eligible: i64, selected_messages: usize) -> bool
 }
 
 impl Database {
+    /// Follow stored reply links within one chat, returning oldest first.
+    pub async fn get_reply_chain(
+        &self,
+        chat_id: i64,
+        start_message_id: i64,
+        max_messages: usize,
+    ) -> Result<Vec<MessageRow>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut rows = Vec::new();
+        let mut next = Some(start_message_id);
+        while rows.len() < max_messages {
+            let Some(id) = next else { break };
+            if !seen.insert(id) {
+                break;
+            }
+            let row = sqlx::query_as::<_, MessageRow>(
+                "SELECT id, message_id, chat_id, user_id, username, text, language, date, reply_to_message_id, asks_ai, ai_command, is_synthetic_record FROM messages WHERE chat_id = ? AND message_id = ?",
+            )
+            .bind(chat_id)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(row) = row else { break };
+            next = row.reply_to_message_id;
+            rows.push(row);
+        }
+        rows.reverse();
+        Ok(rows)
+    }
+
     pub async fn run_chat_analytics(
         &self,
         chat_id: i64,
@@ -308,6 +338,70 @@ mod tests {
     use crate::db::test_support::{
         at, init_test_db, insert_count_message, queue_message, queue_message_with_user,
     };
+
+    #[tokio::test]
+    async fn reply_chain_follows_links_and_flushes_queued_rows() {
+        let db = crate::db::test_support::init_test_db("reply_chain").await;
+        for (chat, id, parent, text, synthetic) in [
+            (1, 1, Some(3), Some("old"), false),
+            (1, 2, Some(1), None, false),
+            (1, 3, Some(2), Some("/q answer"), true),
+            (2, 4, None, Some("other chat"), false),
+        ] {
+            let insert = build_message_insert(
+                Some(123),
+                Some("user".into()),
+                text.map(str::to_string),
+                None,
+                chrono::Utc::now(),
+                parent,
+                Some(chat),
+                Some(id),
+                None,
+                false,
+                None,
+                false,
+                synthetic,
+            );
+            db.queue_message_insert(insert).await.unwrap();
+        }
+        db.flush_pending_writes().await.unwrap();
+        let ids =
+            |rows: Vec<MessageRow>| rows.into_iter().map(|r| r.message_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(db.get_reply_chain(1, 3, 10).await.unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(ids(db.get_reply_chain(1, 3, 2).await.unwrap()), vec![2, 3]);
+        assert_eq!(ids(db.get_reply_chain(1, 3, 1).await.unwrap()), vec![3]);
+        assert!(db.get_reply_chain(1, 3, 0).await.unwrap().is_empty());
+        assert!(db.get_reply_chain(1, 4, 10).await.unwrap().is_empty());
+        assert!(db.get_reply_chain(2, 3, 10).await.unwrap().is_empty());
+        // A missing ancestor must not be filled from a different chat, even
+        // when that chat has the exact parent message ID.
+        sqlx::query(
+            "UPDATE messages SET reply_to_message_id = 4 WHERE chat_id = 1 AND message_id = 1",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            ids(db.get_reply_chain(1, 3, 10).await.unwrap()),
+            vec![1, 2, 3]
+        );
+        let rows = db.get_reply_chain(1, 3, 10).await.unwrap();
+        assert!(rows[1].text.is_none());
+        assert!(rows[2].is_synthetic_record);
+        assert_eq!(rows[2].text.as_deref(), Some("/q answer"));
+        // Reply history uses raw message rows even while search is rebuilding.
+        db.search_ready
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            ids(db.get_reply_chain(1, 3, 10).await.unwrap()),
+            vec![1, 2, 3]
+        );
+        db.shutdown().await;
+    }
 
     #[tokio::test]
     async fn batched_windows_preserve_order_duplicates_clamping_and_missing_centers() {

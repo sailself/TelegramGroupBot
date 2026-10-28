@@ -481,6 +481,7 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
 }
 
 async fn handle_media_group(state: AppState, message: Message) -> HandlerResult {
+    handlers::responses::log_message(&state, &message).await;
     media::handle_media_group(state, message).await;
     Ok(())
 }
@@ -502,7 +503,8 @@ async fn handle_text_message(bot: Bot, state: AppState, message: Message) -> Han
     Ok(())
 }
 
-async fn ignore_message(_message: Message) -> HandlerResult {
+async fn ignore_message(state: AppState, message: Message) -> HandlerResult {
+    handlers::responses::log_message(&state, &message).await;
     Ok(())
 }
 

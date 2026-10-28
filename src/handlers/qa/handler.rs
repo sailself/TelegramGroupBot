@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::config::CONFIG;
 use crate::db::database::build_message_insert;
-use crate::db::models::MessageInsert;
+use crate::db::models::{MessageInsert, MessageRow};
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::enrichment::{
     count_sources, enrich_request, entity_link_urls, EnrichmentBudget, SourceKind,
@@ -36,11 +36,76 @@ use super::model_resolution::{
 };
 use super::process::process_request;
 use super::prompt::{
-    build_media_only_qa_prompt, prepare_youtube_inputs_for_qa, NO_VIDEO_CAPABLE_MODEL_MESSAGE,
+    prepare_qa_input, prepare_youtube_inputs_for_qa, NO_VIDEO_CAPABLE_MODEL_MESSAGE,
 };
 use super::selection_ui::{
     create_model_selection_keyboard, process_timed_out_q_request_with_default_model,
 };
+
+pub(super) async fn snapshot_reply_context(
+    state: &AppState,
+    source_chat_id: i64,
+    reply: &Message,
+    max_messages: usize,
+) -> Option<Vec<MessageRow>> {
+    if reply.chat.id.0 != source_chat_id {
+        warn!("Ignoring reply from another chat");
+        return None;
+    }
+    match tokio::time::timeout(Duration::from_secs(1), state.db.flush_pending_writes()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!("Failed to flush reply history: {err}"),
+        Err(_) => warn!("Timed out flushing reply history"),
+    }
+    let mut rows = match state
+        .db
+        .get_reply_chain(source_chat_id, reply.id.0 as i64, max_messages.max(1))
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            warn!("Failed to read reply history: {err}");
+            Vec::new()
+        }
+    };
+    let mut direct = MessageRow {
+        id: 0,
+        message_id: reply.id.0 as i64,
+        chat_id: reply.chat.id.0,
+        user_id: reply.from.as_ref().and_then(|u| i64::try_from(u.id.0).ok()),
+        username: reply.from.as_ref().map(|u| u.full_name()),
+        text: Some(
+            message_text_or_caption(reply)
+                .unwrap_or("[no text or caption]")
+                .to_string(),
+        ),
+        language: None,
+        date: reply.date,
+        reply_to_message_id: None,
+        asks_ai: false,
+        ai_command: None,
+        is_synthetic_record: false,
+    };
+    if rows
+        .last()
+        .is_some_and(|row| row.message_id == direct.message_id)
+    {
+        if let Some(stored) = rows.pop() {
+            direct.reply_to_message_id = stored.reply_to_message_id;
+        }
+    }
+    rows.push(direct);
+    for row in &mut rows {
+        if row
+            .text
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+        {
+            row.text = Some("[no text or caption]".to_string());
+        }
+    }
+    Some(rows)
+}
 
 async fn create_q_audit_context(
     state: &AppState,
@@ -124,7 +189,9 @@ async fn q_handler_internal(
 
     let query_text_raw = query.unwrap_or_default();
     let query_entities = message_entities_for_text(&message);
-    let reply_message = message.reply_to_message();
+    let reply_message = message
+        .reply_to_message()
+        .filter(|reply| reply.chat.id == message.chat.id);
     let mut reply_text = String::new();
     let mut reply_entities = None;
 
@@ -141,15 +208,14 @@ async fn q_handler_internal(
         collect_message_media(&bot, &state, &message, MediaCollectionOptions::for_qa()).await;
     let initial_media_summary = summarize_media_files(&media.files);
 
-    let original_query = if query_text_raw.trim().is_empty() {
-        if reply_text.trim().is_empty() {
-            build_media_only_qa_prompt(&initial_media_summary).unwrap_or_default()
-        } else {
-            reply_text.clone()
-        }
-    } else {
-        query_text_raw.clone()
-    };
+    let prepared = prepare_qa_input(
+        mode,
+        &query_text_raw,
+        reply_message.map(|_| reply_text.as_str()),
+        &initial_media_summary,
+        CONFIG.gemini_api_available(),
+    );
+    let original_query = prepared.original;
 
     if original_query.trim().is_empty() {
         reply_with_retry(
@@ -167,6 +233,23 @@ async fn q_handler_internal(
         return Ok(());
     }
 
+    let reply_context = if mode == QaCommandMode::Standard {
+        match reply_message {
+            Some(reply) => {
+                snapshot_reply_context(
+                    &state,
+                    message.chat.id.0,
+                    reply,
+                    CONFIG.limits.q_reply_chain_max_messages,
+                )
+                .await
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     if mode == QaCommandMode::ChatContext && !state.db.is_search_ready() {
         reply_with_retry(
             &bot,
@@ -180,23 +263,9 @@ async fn q_handler_internal(
         return Ok(());
     }
 
-    let query_base = if query_text_raw.trim().is_empty() {
-        if reply_text.trim().is_empty() {
-            original_query.clone()
-        } else {
-            reply_text.clone()
-        }
-    } else if reply_text.trim().is_empty() {
-        query_text_raw.clone()
-    } else {
-        format!(
-            "Context from replied message: \"{}\"\n\nQuestion: {}",
-            reply_text, query_text_raw
-        )
-    };
-
-    let (mut query_text, mut youtube_urls) =
-        prepare_youtube_inputs_for_qa(&query_base, mode, None, CONFIG.gemini_api_available());
+    let query_base = prepared.query_base;
+    let mut query_text = prepared.question;
+    let mut youtube_urls = prepared.youtube_urls;
 
     let user_language_code = message
         .from
@@ -209,7 +278,9 @@ async fn q_handler_internal(
         .map(|user| user.full_name())
         .unwrap_or_else(|| "Anonymous".to_string());
 
-    let db_query_text = if let Some(reply) = message.reply_to_message() {
+    let db_query_text = if mode == QaCommandMode::Standard {
+        query_text_raw.clone()
+    } else if let Some(reply) = message.reply_to_message() {
         let replied_text = reply
             .text()
             .map(|value| value.to_string())
@@ -425,6 +496,7 @@ async fn q_handler_internal(
         let pending_request = PendingQRequest {
             user_id,
             query: query_text.clone(),
+            reply_context: reply_context.clone(),
             telegram_language_code: user_language_code.map(str::to_string),
             enrichment,
             chat_id: message.chat.id.0,
@@ -476,6 +548,7 @@ async fn q_handler_internal(
     let pending_request = PendingQRequest {
         user_id,
         query: query_text.clone(),
+        reply_context,
         telegram_language_code: user_language_code.map(str::to_string),
         enrichment,
         chat_id: message.chat.id.0,

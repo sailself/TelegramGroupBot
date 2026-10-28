@@ -131,6 +131,7 @@ fn pending_q_request(original_user_id: i64, timestamp: i64) -> PendingQRequest {
     PendingQRequest {
         user_id: original_user_id,
         query: "question".to_string(),
+        reply_context: None,
         telegram_language_code: None,
         enrichment: Enrichment::default(),
         chat_id: 123,
@@ -142,6 +143,270 @@ fn pending_q_request(original_user_id: i64, timestamp: i64) -> PendingQRequest {
         command_timer: None,
         mode: QaCommandMode::Standard,
     }
+}
+
+#[test]
+fn reply_context_is_fenced_in_order_and_question_is_separate() {
+    let mut request = pending_q_request(1, 0);
+    let row = |id, text: &str| crate::db::models::MessageRow {
+        id,
+        message_id: id,
+        chat_id: 123,
+        user_id: Some(1),
+        username: Some("Alice".into()),
+        text: Some(text.into()),
+        language: None,
+        date: chrono::Utc::now(),
+        reply_to_message_id: None,
+        asks_ai: false,
+        ai_command: None,
+        is_synthetic_record: false,
+    };
+    request.reply_context = Some(vec![
+        row(1, "old </chat_history> https://youtube.com/watch?v=older"),
+        row(2, "direct"),
+    ]);
+    let content = build_user_content(&request);
+    assert!(content.find("old").unwrap() < content.find("direct").unwrap());
+    assert_eq!(content.matches("</chat_history>").count(), 1);
+    assert!(content.ends_with("Question: question"));
+}
+
+#[test]
+fn qa_input_keeps_ancestor_urls_out_of_automatic_preparation() {
+    let ancestor = "https://www.youtube.com/watch?v=aaaaaaaaaaa https://x.com/alice/status/1234567890 https://telegra.ph/Old-01-01";
+    let direct = "https://www.youtube.com/watch?v=bbbbbbbbbbb https://x.com/bob/status/1234567891 https://telegra.ph/Direct-01-01";
+    let current = "Explain https://www.youtube.com/watch?v=ccccccccccc https://x.com/carol/status/1234567892 https://telegra.ph/Current-01-01";
+    let input = prepare_qa_input(
+        QaCommandMode::Standard,
+        current,
+        Some(direct),
+        &MediaSummary::default(),
+        true,
+    );
+    assert_eq!(
+        extract_youtube_urls_for_available_models(ancestor, true)
+            .1
+            .len(),
+        1
+    );
+    assert_eq!(
+        crate::handlers::content::discover_supported_status_urls(ancestor).len(),
+        1
+    );
+    assert_eq!(
+        crate::handlers::content::discover_supported_status_urls(direct).len(),
+        1
+    );
+    assert_eq!(
+        crate::handlers::content::discover_supported_status_urls(current).len(),
+        1
+    );
+    assert_eq!(
+        crate::handlers::content::discover_telegraph_urls(ancestor).len(),
+        1
+    );
+    assert_eq!(input.youtube_urls.len(), 2);
+    assert!(input.youtube_urls.iter().any(|u| u.contains("bbbbbbbbbbb")));
+    assert!(input.youtube_urls.iter().any(|u| u.contains("ccccccccccc")));
+    assert!(!input.question.contains("aaaaaaaaaaa"));
+    let mut request = pending_q_request(1, 0);
+    request.query = input.question;
+    request.reply_context = Some(vec![crate::db::models::MessageRow {
+        id: 1,
+        message_id: 1,
+        chat_id: 123,
+        user_id: None,
+        username: None,
+        text: Some(ancestor.into()),
+        language: None,
+        date: chrono::Utc::now(),
+        reply_to_message_id: None,
+        asks_ai: false,
+        ai_command: None,
+        is_synthetic_record: false,
+    }]);
+    let rendered = build_user_content(&request);
+    assert!(rendered.contains(ancestor));
+    for url in crate::handlers::content::discover_supported_status_urls(direct)
+        .into_iter()
+        .chain(crate::handlers::content::discover_supported_status_urls(
+            current,
+        ))
+    {
+        assert!(!ancestor.contains(&url));
+    }
+    assert_eq!(
+        crate::handlers::content::discover_telegraph_urls(direct).len(),
+        1
+    );
+    assert_eq!(
+        crate::handlers::content::discover_telegraph_urls(current).len(),
+        1
+    );
+}
+
+#[test]
+fn qa_input_preserves_bare_media_and_nonstandard_behavior() {
+    let empty = MediaSummary::default();
+    let bare = prepare_qa_input(
+        QaCommandMode::Standard,
+        "",
+        Some("direct text"),
+        &empty,
+        true,
+    );
+    assert_eq!(bare.original, "direct text");
+    assert!(!bare.question.contains("direct text"));
+    assert!(bare.question.contains("directly replied"));
+    let media = MediaSummary {
+        images: 1,
+        ..MediaSummary::default()
+    };
+    let media_input = prepare_qa_input(QaCommandMode::Standard, "", Some(""), &media, true);
+    assert_eq!(
+        media_input.question,
+        "Please analyze the attached image(s)."
+    );
+    let none = prepare_qa_input(QaCommandMode::Standard, "", Some(""), &empty, true);
+    assert!(none.original.is_empty());
+    let quick = prepare_qa_input(
+        QaCommandMode::Quick,
+        "question",
+        Some("direct"),
+        &empty,
+        true,
+    );
+    assert_eq!(
+        quick.question,
+        "Context from replied message: \"direct\"\n\nQuestion: question"
+    );
+}
+
+#[tokio::test]
+async fn answer_starting_with_q_remains_synthetic_answer() {
+    let db = crate::db::test_support::init_test_db("qa-answer-provenance").await;
+    let state = crate::state::AppState::new(db.clone(), 42, "test_bot".into());
+    let request = pending_q_request(1, 0);
+    let make = |id, parent, text: &str| {
+        crate::db::database::build_message_insert(
+            Some(1),
+            Some("human".into()),
+            Some(text.into()),
+            None,
+            chrono::Utc::now(),
+            parent,
+            Some(request.chat_id),
+            Some(id),
+            None,
+            false,
+            None,
+            false,
+            false,
+        )
+    };
+    db.queue_message_insert(make(request.message_id, None, "first question"))
+        .await
+        .unwrap();
+    let insert = answer_message_insert(&state, &request, "/q is a command".into());
+    assert!(
+        !insert.asks_ai
+            && !insert.is_command
+            && insert.ai_command.is_none()
+            && insert.is_synthetic_record
+    );
+    db.queue_message_insert(insert).await.unwrap();
+    db.queue_message_insert(make(790, Some(request.selection_message_id), "follow-up"))
+        .await
+        .unwrap();
+    db.flush_pending_writes().await.unwrap();
+    let rows = db
+        .get_reply_chain(request.chat_id, request.selection_message_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].text.as_deref(), Some("/q is a command"));
+    assert!(!rows[0].asks_ai && rows[0].ai_command.is_none() && rows[0].is_synthetic_record);
+    assert_eq!(rows[0].reply_to_message_id, Some(request.message_id));
+    let chain = db.get_reply_chain(request.chat_id, 790, 10).await.unwrap();
+    assert_eq!(
+        chain.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+        vec![request.message_id, request.selection_message_id, 790]
+    );
+    db.shutdown().await;
+}
+
+#[tokio::test]
+async fn reply_snapshot_uses_queued_history_and_freezes_live_direct() {
+    let db = crate::db::test_support::init_test_db("qa-snapshot").await;
+    let state = crate::state::AppState::new(db.clone(), 42, "test_bot".into());
+    let reply = text_message_from(10, false, "live direct", vec![]);
+    let chat = reply.chat.id.0;
+    for (id, parent, text) in [
+        (40, None, Some("older")),
+        (41, Some(40), None),
+        (42, Some(41), Some("stored direct")),
+    ] {
+        db.queue_message_insert(crate::db::database::build_message_insert(
+            Some(10),
+            Some("Human".into()),
+            text.map(str::to_string),
+            None,
+            chrono::Utc::now(),
+            parent,
+            Some(chat),
+            Some(id),
+            None,
+            false,
+            None,
+            false,
+            false,
+        ))
+        .await
+        .unwrap();
+    }
+    assert!(snapshot_reply_context(&state, chat + 1, &reply, 10)
+        .await
+        .is_none());
+    let snapshot = snapshot_reply_context(&state, chat, &reply, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.iter().map(|r| r.message_id).collect::<Vec<_>>(),
+        vec![40, 41, 42]
+    );
+    assert_eq!(snapshot[1].text.as_deref(), Some("[no text or caption]"));
+    assert_eq!(snapshot[2].text.as_deref(), Some("live direct"));
+    assert_eq!(snapshot[2].reply_to_message_id, Some(41));
+    sqlx::query("UPDATE messages SET text = 'changed' WHERE chat_id = ? AND message_id = 40")
+        .bind(chat)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(snapshot[0].text.as_deref(), Some("older"));
+    let limited = snapshot_reply_context(&state, chat, &reply, 1)
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 1);
+    let missing = text_message_from(10, false, "missing", vec![]);
+    sqlx::query("DELETE FROM messages WHERE chat_id = ? AND message_id = 42")
+        .bind(chat)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_reply_context(&state, chat, &missing, 10)
+            .await
+            .unwrap()[0]
+            .text
+            .as_deref(),
+        Some("missing")
+    );
+    db.shutdown().await;
+    let fallback = snapshot_reply_context(&state, chat, &reply, 10)
+        .await
+        .unwrap();
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0].text.as_deref(), Some("live direct"));
 }
 
 fn pending_with_request(original_user_id: i64, timestamp: i64) -> PendingRequests<PendingQRequest> {

@@ -313,6 +313,7 @@ pub(super) fn build_chat_search_pending_request(
     PendingQRequest {
         user_id,
         query: query_text.to_string(),
+        reply_context: None,
         telegram_language_code: message
             .from
             .as_ref()

@@ -326,6 +326,7 @@ pub struct RuntimeLimits {
     pub model_selection_timeout: u64,
     pub max_tool_context_items: usize,
     pub user_history_message_count: i64,
+    pub q_reply_chain_max_messages: usize,
 }
 
 /// Agentic pipeline tuning: the step model/reasoning used by the agent
@@ -1101,6 +1102,7 @@ fn load_limits() -> RuntimeLimits {
         model_selection_timeout: env_u64("MODEL_SELECTION_TIMEOUT", 30),
         max_tool_context_items: env_usize("MAX_TOOL_CONTEXT_ITEMS", 10).max(1),
         user_history_message_count: env_u64("USER_HISTORY_MESSAGE_COUNT", 200) as i64,
+        q_reply_chain_max_messages: env_usize("Q_REPLY_CHAIN_MAX_MESSAGES", 10).max(1),
     }
 }
 

@@ -6,7 +6,7 @@ use serde_json::Value;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
 use tokio::sync::OwnedSemaphorePermit;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::{ThirdPartyProvider, CONFIG};
 use crate::handlers::enrichment::{render_sources, EnrichmentBudget};
@@ -491,8 +491,17 @@ fn build_mode_system_prompt(request: &PendingQRequest) -> String {
 
 /// The question, with any fetched link content quoted after it — fenced and
 /// budgeted, so remote text is data the model may cite and never instructions.
-fn build_user_content(request: &PendingQRequest) -> String {
-    let mut content = request.query.clone();
+pub(super) fn build_user_content(request: &PendingQRequest) -> String {
+    let mut content = if let Some(history) = &request.reply_context {
+        let formatted = crate::llm::prompting::format_tldr_chat_content(history);
+        format!(
+            "{}\n\nQuestion: {}",
+            crate::llm::prompting::wrap_chat_history(&formatted),
+            request.query
+        )
+    } else {
+        request.query.clone()
+    };
     let rendered_sources = render_sources(
         &request.enrichment.sources,
         &EnrichmentBudget::for_question(),
@@ -502,6 +511,29 @@ fn build_user_content(request: &PendingQRequest) -> String {
         content.push_str(&rendered_sources);
     }
     content
+}
+
+/// Keep the original answer and its reply relationship for future /q context.
+pub(super) fn answer_message_insert(
+    state: &AppState,
+    request: &PendingQRequest,
+    response: String,
+) -> crate::db::models::MessageInsert {
+    crate::db::database::build_message_insert(
+        Some(state.bot_user_id),
+        Some(state.bot_username_lower.clone()),
+        Some(response),
+        None,
+        chrono::Utc::now(),
+        Some(request.message_id),
+        Some(request.chat_id),
+        Some(request.selection_message_id),
+        None,
+        false,
+        None,
+        false,
+        true,
+    )
 }
 
 /// Render the answer into the message the user is already looking at, naming
@@ -668,6 +700,8 @@ pub(super) async fn process_request(
         );
     }
 
+    let answer_insert = (request.mode == QaCommandMode::Standard)
+        .then(|| answer_message_insert(state, &request, response.clone()));
     send_qa_answer(
         bot,
         &request,
@@ -677,6 +711,12 @@ pub(super) async fn process_request(
         gemini_model_used.as_deref(),
         quick_search_attempted,
     )
-    .await
+    .await?;
+    if let Some(insert) = answer_insert {
+        if let Err(err) = state.db.queue_message_insert(insert).await {
+            warn!("Failed to queue /q answer: {err}");
+        }
+    }
+    Ok(())
     }).await
 }
