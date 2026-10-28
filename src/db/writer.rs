@@ -23,7 +23,6 @@ const DB_WRITE_DEAD_LETTER_PATH: &str = "data/db_writer_dead_letters.jsonl";
 /// Work items for the background writer task.
 pub(super) enum WriterCommand {
     Insert(MessageInsert),
-    #[cfg(test)]
     Flush(tokio::sync::oneshot::Sender<std::result::Result<(), String>>),
     /// Flush everything queued so far (and anything that races in), close the
     /// pool, and exit.
@@ -38,8 +37,7 @@ impl Database {
             .map_err(|_| anyhow!("Failed to queue message insert: writer is not accepting work"))
     }
 
-    #[cfg(test)]
-    pub(crate) async fn flush_for_test(&self) -> Result<()> {
+    pub async fn flush_pending_writes(&self) -> Result<()> {
         let (send, receive) = tokio::sync::oneshot::channel();
         self.sender
             .send(WriterCommand::Flush(send))
@@ -49,6 +47,11 @@ impl Database {
             .await
             .map_err(|_| anyhow!("writer dropped acknowledgement"))?
             .map_err(anyhow::Error::msg)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn flush_for_test(&self) -> Result<()> {
+        self.flush_pending_writes().await
     }
 
     /// Flush everything queued for the background writer and close the pool.
@@ -117,14 +120,9 @@ async fn run_writer(
         let Some(command) = receiver.recv().await else {
             break;
         };
-        #[cfg(test)]
         let mut acknowledgements = Vec::new();
-        #[cfg(test)]
         let mut flush_requested = false;
-        #[cfg(not(test))]
-        let flush_requested = false;
         match command {
-            #[cfg(test)]
             WriterCommand::Flush(sender) => {
                 acknowledgements.push(sender);
                 flush_requested = true;
@@ -138,7 +136,6 @@ async fn run_writer(
             while buffer.len() < batch_size {
                 match tokio::time::timeout_at(flush_at, receiver.recv()).await {
                     Ok(Some(WriterCommand::Insert(message))) => buffer.push(message),
-                    #[cfg(test)]
                     Ok(Some(WriterCommand::Flush(sender))) => {
                         acknowledgements.push(sender);
                         break;
@@ -159,7 +156,6 @@ async fn run_writer(
             while let Some(command) = receiver.recv().await {
                 match command {
                     WriterCommand::Insert(message) => buffer.push(message),
-                    #[cfg(test)]
                     WriterCommand::Flush(sender) => acknowledgements.push(sender),
                     WriterCommand::Shutdown => {}
                 }
@@ -171,7 +167,6 @@ async fn run_writer(
         if let Err(err) = &result {
             error!("Error in db_writer batch after recovery attempts: {err}");
         }
-        #[cfg(test)]
         for acknowledgement in acknowledgements {
             let _ = acknowledgement.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
         }

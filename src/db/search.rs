@@ -213,6 +213,15 @@ pub fn clean_text_for_display(text: &str, is_synthetic_record: bool) -> String {
 }
 
 fn merge_provenance(explicit: &SearchProvenance, derived: &SearchProvenance) -> SearchProvenance {
+    // Synthetic answers carry authoritative provenance. Their prose can quote
+    // commands (or begin with "Ask ...") without becoming a user AI request.
+    if explicit.is_synthetic_record
+        && !explicit.asks_ai
+        && !explicit.is_command
+        && explicit.ai_command.is_none()
+    {
+        return explicit.clone();
+    }
     SearchProvenance {
         asks_ai: explicit.asks_ai || derived.asks_ai,
         ai_command: explicit
@@ -603,6 +612,28 @@ mod tests {
         assert!(tags.contains("twitter_link"));
         assert!(tags.contains("x_link"));
         assert!(tags.contains("command_qc"));
+    }
+
+    #[test]
+    fn synthetic_answers_do_not_infer_user_command_provenance() {
+        for answer in ["/q is a command", "Ask about chat history", "Ask a friend"] {
+            let document = normalize_message_document(
+                -123,
+                Some(answer),
+                None,
+                &SearchProvenance {
+                    is_synthetic_record: true,
+                    ..Default::default()
+                },
+            );
+            assert!(!document.provenance.asks_ai);
+            assert!(!document.provenance.is_command);
+            assert!(document.provenance.ai_command.is_none());
+            assert!(document.provenance.is_synthetic_record);
+            let tags = document.search_tags.unwrap();
+            assert!(!tags.contains("asks_ai"));
+            assert!(!tags.contains("command_q"));
+        }
     }
 
     #[test]

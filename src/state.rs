@@ -38,6 +38,8 @@ impl QaCommandMode {
 pub struct PendingQRequest {
     pub user_id: i64,
     pub query: String,
+    /// Chronological reply history frozen at intake for standard /q requests.
+    pub reply_context: Option<Vec<crate::db::models::MessageRow>>,
     pub telegram_language_code: Option<String>,
     /// Media, YouTube inputs and fetched link content for this request. The
     /// fetched text is structured, never pre-spliced into `query`: it reaches

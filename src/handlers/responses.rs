@@ -5,6 +5,7 @@ use tracing::{error, warn};
 
 use crate::config::CONFIG;
 use crate::db::database::build_message_insert;
+use crate::db::models::MessageInsert;
 use crate::db::search::derive_search_provenance;
 use crate::handlers::content::create_telegraph_answer;
 use crate::state::AppState;
@@ -145,15 +146,11 @@ where
     Ok(())
 }
 
-pub async fn log_message(state: &AppState, message: &Message) {
+fn incoming_message_insert(message: &Message) -> MessageInsert {
     let text = message
         .text()
         .map(|value| value.to_string())
         .or_else(|| message.caption().map(|value| value.to_string()));
-
-    let Some(text) = text else {
-        return;
-    };
 
     let username = if let Some(user) = message.from.as_ref() {
         if !user.full_name().is_empty() {
@@ -167,14 +164,17 @@ pub async fn log_message(state: &AppState, message: &Message) {
         "Anonymous".to_string()
     };
 
-    let provenance = derive_search_provenance(&text);
-    let insert = build_message_insert(
+    let provenance = text
+        .as_deref()
+        .map(derive_search_provenance)
+        .unwrap_or_default();
+    build_message_insert(
         message
             .from
             .as_ref()
             .and_then(|user| i64::try_from(user.id.0).ok()),
         Some(username),
-        Some(text.clone()),
+        text,
         None,
         message.date,
         message.reply_to_message().map(|msg| msg.id.0 as i64),
@@ -185,8 +185,11 @@ pub async fn log_message(state: &AppState, message: &Message) {
         provenance.ai_command,
         provenance.is_command,
         false,
-    );
+    )
+}
 
+pub async fn log_message(state: &AppState, message: &Message) {
+    let insert = incoming_message_insert(message);
     if let Err(err) = state.db.queue_message_insert(insert).await {
         error!("Failed to queue message insert: {err}");
     }
@@ -195,6 +198,36 @@ pub async fn log_message(state: &AppState, message: &Message) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incoming_media_record_preserves_caption_and_parent_without_requiring_text() {
+        let make = |caption: Option<&str>| {
+            let mut value = serde_json::json!({
+                "message_id": 42, "date": 123,
+                "chat": { "id": -100, "type": "group", "title": "test" },
+                "from": { "id": 7, "is_bot": false, "first_name": "Alice" },
+                "photo": [{ "file_id": "f", "file_unique_id": "u", "width": 1, "height": 1 }],
+                "reply_to_message": { "message_id": 41, "date": 122,
+                    "chat": { "id": -100, "type": "group", "title": "test" }, "text": "parent" }
+            });
+            if let Some(caption) = caption {
+                value["caption"] = caption.into();
+            }
+            serde_json::from_value::<Message>(value).unwrap()
+        };
+        let without = incoming_message_insert(&make(None));
+        assert_eq!(without.text, None);
+        assert_eq!(without.reply_to_message_id, Some(41));
+        assert_eq!(
+            (without.chat_id, without.message_id, without.user_id),
+            (-100, 42, Some(7))
+        );
+        assert_eq!(without.username.as_deref(), Some("Alice"));
+        assert_eq!(without.date.timestamp(), 123);
+        assert!(!without.is_command);
+        let with = incoming_message_insert(&make(Some("caption")));
+        assert_eq!(with.text.as_deref(), Some("caption"));
+    }
 
     #[test]
     fn overflow_detection_counts_characters_not_bytes() {
