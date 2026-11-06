@@ -75,6 +75,8 @@ enum Command {
     S(String),
     #[command(description = "用 Gemini 生成/编辑图片，可直接描述或回复图片/贴纸")]
     Img(String),
+    #[command(description = "用 Codex 生成 GIF 动画，可回复静态图片作为参考")]
+    Gif(String),
     #[command(description = "hidden image generation command")]
     Img2(String),
     #[command(description = "与 /img 相同，但附带分辨率与长宽比按钮")]
@@ -341,6 +343,12 @@ async fn handle_command(
             spawn_logged(
                 "img",
                 handlers::image::img_handler(bot, state, message, optional_arg(arg)),
+            );
+        }
+        Command::Gif(arg) => {
+            spawn_logged(
+                "gif",
+                handlers::image::gif_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Img2(arg) => {

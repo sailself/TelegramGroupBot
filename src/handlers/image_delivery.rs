@@ -3,7 +3,10 @@ use crate::utils::telegram::{edit_message_text_with_retry, retry_telegram, Image
 use anyhow::Result;
 use teloxide::{
     prelude::*,
-    types::{InputFile, InputMedia, InputMediaPhoto, MessageId, ParseMode, ReplyParameters},
+    types::{
+        InputFile, InputMedia, InputMediaAnimation, InputMediaPhoto, MessageId, ParseMode,
+        ReplyParameters,
+    },
 };
 
 pub(super) async fn deliver_generated_images(
@@ -68,6 +71,30 @@ pub(super) async fn deliver_generated_images(
     Ok(())
 }
 
+pub(super) async fn deliver_generated_gif(
+    bot: &Bot,
+    chat: ChatId,
+    status: MessageId,
+    bytes: Vec<u8>,
+    caption: &str,
+) -> Result<()> {
+    let animation = InputMedia::Animation(
+        InputMediaAnimation::new(InputFile::memory(bytes).file_name("animation.gif"))
+            .caption(caption.to_string())
+            .parse_mode(ParseMode::Html),
+    );
+    // Edits target the same message even if a response is lost. Never fall back
+    // to sendAnimation: the previous edit might already have succeeded.
+    match retry_telegram("edit generated GIF", || {
+        bot.edit_message_media(chat, status, animation.clone())
+    })
+    .await
+    {
+        Ok(_) | Err(teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)) => Ok(()),
+        Err(error) => Err(crate::utils::telegram::GifDeliveryError(error).into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +126,106 @@ mod tests {
             response(ok, retry),
         )
         .with_body_fragment(b"GENERATED_IMAGE_BYTES")
+    }
+
+    fn gif_edit(response: Vec<u8>) -> ExpectedRequest {
+        ExpectedRequest::new("POST", "/bot123:test/EditMessageMedia", response)
+            .with_body_fragment(b"GIF_BYTES")
+            .with_body_fragment(b"animation.gif")
+            .with_body_fragment(b"caption")
+            .with_body_fragment(b"name=\"message_id\"\r\n\r\n2\r\n")
+            .with_body_fragment(b"name=\"chat_id\"\r\n\r\n1\r\n")
+            .with_body_fragment(br#""type":"animation""#)
+    }
+
+    #[tokio::test]
+    async fn gif_delivery_retries_same_edit_after_rate_limit() {
+        let server = TestServer::new(vec![
+            gif_edit(response(false, true)),
+            gif_edit(response(true, false)),
+        ]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        deliver_generated_gif(
+            &bot,
+            ChatId(1),
+            MessageId(2),
+            b"GIF_BYTES".to_vec(),
+            "caption",
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gif_delivery_lost_response_then_confirmed_edit_is_success() {
+        let server = TestServer::new(vec![gif_edit(Vec::new()), gif_edit(response(true, false))]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        deliver_generated_gif(
+            &bot,
+            ChatId(1),
+            MessageId(2),
+            b"GIF_BYTES".to_vec(),
+            "caption",
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gif_delivery_lost_response_then_not_modified_is_success() {
+        let unchanged = response_with_status(400, br#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"}"#.to_vec());
+        let server = TestServer::new(vec![gif_edit(Vec::new()), gif_edit(unchanged)]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        deliver_generated_gif(
+            &bot,
+            ChatId(1),
+            MessageId(2),
+            b"GIF_BYTES".to_vec(),
+            "caption",
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gif_delivery_lost_responses_fail_without_sending_again() {
+        let server = TestServer::new(vec![
+            gif_edit(Vec::new()),
+            gif_edit(Vec::new()),
+            gif_edit(Vec::new()),
+        ]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        let error = deliver_generated_gif(
+            &bot,
+            ChatId(1),
+            MessageId(2),
+            b"GIF_BYTES".to_vec(),
+            "caption",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<crate::utils::telegram::GifDeliveryError>());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gif_delivery_rejection_is_not_retried_or_resent() {
+        let server = TestServer::new(vec![gif_edit(response(false, false))]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        let error = deliver_generated_gif(
+            &bot,
+            ChatId(1),
+            MessageId(2),
+            b"GIF_BYTES".to_vec(),
+            "caption",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<crate::utils::telegram::GifDeliveryError>());
+        server.join().unwrap();
     }
 
     #[tokio::test]

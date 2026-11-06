@@ -76,9 +76,9 @@ fn is_reply_to_this_bot(message: &Message, bot_user_id: i64) -> bool {
 /// than a follow-up question, so the auto-`/q` reply trigger skips those unless
 /// the user also mentions the bot explicitly.
 fn reply_target_has_image_or_video(message: &Message) -> bool {
-    message
-        .reply_to_message()
-        .is_some_and(|reply| message_has_image(reply) || reply.video().is_some())
+    message.reply_to_message().is_some_and(|reply| {
+        message_has_image(reply) || reply.video().is_some() || reply.animation().is_some()
+    })
 }
 
 fn is_mentioning_this_bot(message: &Message, bot_user_id: i64, bot_username_lower: &str) -> bool {

@@ -433,6 +433,146 @@ async fn finalize_image_request(
     }).await
 }
 
+fn gif_reference_ids(message: &Message) -> Result<Vec<FileId>> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for source in std::iter::once(message).chain(message.reply_to_message()) {
+        if source.animation().is_some() || source.video().is_some() {
+            return Err(crate::utils::telegram::GifUserError(
+                "GIF references must be static images.",
+            )
+            .into());
+        }
+        if source.media_group_id().is_some() {
+            return Err(crate::utils::telegram::GifUserError(
+                "GIF references do not support albums. Please send or reply to a single image separately.",
+            ).into());
+        }
+        if let Some(photo) = source.photo().and_then(|photos| photos.last()) {
+            if seen.insert(photo.file.id.clone()) {
+                ids.push(photo.file.id.clone());
+            }
+        }
+        if source.sticker().is_some() {
+            return Err(crate::utils::telegram::GifUserError(
+                "Please use a static photo or image document, not a sticker.",
+            )
+            .into());
+        }
+        if let Some(document) = source.document() {
+            if !document.mime_type.as_ref().is_some_and(|mime| {
+                matches!(
+                    mime.essence_str(),
+                    "image/png" | "image/jpeg" | "image/webp"
+                )
+            }) {
+                return Err(crate::utils::telegram::GifUserError(
+                    "GIF references must be static PNG, JPEG, or WebP images.",
+                )
+                .into());
+            }
+            if seen.insert(document.file.id.clone()) {
+                ids.push(document.file.id.clone());
+            }
+        }
+    }
+    if ids.len() > crate::llm::codex_image::CODEX_IMAGE_MAX_INPUT_IMAGES {
+        return Err(crate::utils::telegram::GifUserError(
+            "GIF supports at most five reference images.",
+        )
+        .into());
+    }
+    Ok(ids)
+}
+
+async fn gif_reference_urls(bot: &Bot, message: &Message) -> Result<Vec<String>> {
+    let ids = gif_reference_ids(message)?;
+    let mut urls = Vec::new();
+    for id in &ids {
+        urls.push(get_file_url(bot, id).await.map_err(|_| {
+            crate::utils::telegram::GifUserError(
+                "Could not retrieve a reference image from Telegram.",
+            )
+        })?);
+    }
+    Ok(urls)
+}
+
+/// Generate an animated GIF from a Codex sprite sheet.
+pub async fn gif_handler(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    _prompt: Option<String>,
+) -> Result<()> {
+    if !check_access_control(&bot, &message, "gif").await {
+        return Ok(());
+    }
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|u| i64::try_from(u.id.0).ok())
+        .unwrap_or_default();
+    if is_rate_limited(user_id) {
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
+    let prompt = strip_command_prefix(
+        message
+            .text()
+            .or_else(|| message.caption())
+            .unwrap_or_default(),
+        "/gif",
+    );
+    if prompt.trim().is_empty() {
+        bot.send_message(message.chat.id, "Please provide a prompt: /gif <prompt>")
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await?;
+        return Ok(());
+    }
+    if !crate::llm::codex_image::codex_image_available() {
+        bot.send_message(
+            message.chat.id,
+            "Codex is unavailable. Complete Codex setup with /codexlogin.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
+    let permit = state.acquire_heavy_command_permit().await;
+    let audit = create_command_audit_context(&state, &message, "gif").await;
+    let status = bot
+        .send_message(message.chat.id, "Generating your GIF...")
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+    crate::utils::telegram::run_with_status_message(&bot, message.chat.id, status.id, "Failed to generate your GIF. Check the prompt and static reference images, then try again.", async {
+        let _permit = permit;
+        let urls = gif_reference_urls(&bot, &message).await?;
+        let _action = start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadVideo);
+        let bytes = crate::llm::codex_gif::generate(&prompt, &urls, audit.as_ref()).await.map_err(|error| {
+            let message = if error.0.starts_with("GIF_LAYOUT:") {
+                "The generated frame sheet could not be decoded or is too small. Please try again."
+            } else if error.0.starts_with("GIF_LIMIT:") {
+                "The generated frame sheet could not be processed within the GIF size limits. Please try again."
+            } else { match error.0.as_str() {
+                "Failed to download a reference image" => "Could not download a reference image.",
+                "Reference must be a static PNG, JPEG, or WebP image" | "Reference images must be static" | "Invalid reference image" => "A reference is invalid or animated. Use a static PNG, JPEG, or WebP image.",
+                _ => "GIF generation failed. Please try again.",
+            }};
+            tracing::warn!("Codex GIF generation failed");
+            crate::utils::telegram::GifUserError(message)
+        })?;
+        let caption = build_image_caption(&crate::llm::codex_gif::model(), &prompt).await;
+        super::image_delivery::deliver_generated_gif(&bot, message.chat.id, status.id, bytes, &caption).await?;
+        Ok(())
+    }).await
+}
+
 pub async fn img_handler(
     bot: Bot,
     state: AppState,
@@ -992,6 +1132,46 @@ mod tests {
             tokio::time::advance(Duration::from_secs(10)).await;
             assert!(!valid_selection(&request, 1, 2, 4, stage));
         }
+    }
+
+    #[tokio::test]
+    async fn gif_reference_collection_handles_photos_documents_and_failures() {
+        use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
+        let mut raw = serde_json::json!({"message_id": 1, "date": 1, "chat": {"id": 1, "type": "private"}, "text": "/gif move", "reply_to_message": {"message_id": 2, "date": 1, "chat": {"id": 1, "type": "private"}, "photo": [{"file_id":"gif-ref-photo", "file_unique_id":"photo", "width":2, "height":2}]}});
+        let message: Message = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            gif_reference_ids(&message).unwrap()[0].to_string(),
+            "gif-ref-photo"
+        );
+        raw["reply_to_message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("photo");
+        raw["reply_to_message"]["document"] = serde_json::json!({"file_id":"gif-ref-doc", "file_unique_id":"doc", "mime_type":"image/png"});
+        let message: Message = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            gif_reference_ids(&message).unwrap()[0].to_string(),
+            "gif-ref-doc"
+        );
+        let mut album = raw.clone();
+        album["reply_to_message"]["media_group_id"] = serde_json::json!("album");
+        let album: Message = serde_json::from_value(album).unwrap();
+        assert!(gif_reference_ids(&album).is_err());
+        raw["reply_to_message"]["document"]["mime_type"] = serde_json::json!("image/gif");
+        let unsupported: Message = serde_json::from_value(raw).unwrap();
+        assert!(gif_reference_ids(&unsupported).is_err());
+        let response = response_with_status(
+            400,
+            br#"{"ok":false,"error_code":400,"description":"Bad Request: missing file"}"#.to_vec(),
+        );
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "POST",
+            "/bot123:test/GetFile",
+            response,
+        )]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        assert!(gif_reference_urls(&bot, &message).await.is_err());
+        server.join().unwrap();
     }
 
     #[test]

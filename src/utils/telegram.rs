@@ -99,6 +99,14 @@ impl VideoDeliveryError {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("GIF request failed: {0}")]
+pub(crate) struct GifUserError(pub &'static str);
+
+#[derive(Debug, thiserror::Error)]
+#[error("GIF delivery failed: {0}")]
+pub(crate) struct GifDeliveryError(pub RequestError);
+
 /// Every post-status operation either completes normally or attempts a terminal
 /// edit. A failed edit must never replace the error that caused the command to fail.
 pub async fn run_with_status_message<T>(
@@ -117,6 +125,10 @@ pub async fn run_with_status_message<T>(
             gemini_error.user_message().to_string()
         } else if let Some(delivery_error) = error.downcast_ref::<ImageDeliveryError>() {
             delivery_error.user_message().to_string()
+        } else if let Some(gif_error) = error.downcast_ref::<GifUserError>() {
+            gif_error.0.to_string()
+        } else if error.is::<GifDeliveryError>() {
+            "The GIF was generated, but Telegram did not confirm the update. It may already be visible; check the existing message before trying again.".to_string()
         } else if let Some(delivery_error) = error.downcast_ref::<VideoDeliveryError>() {
             delivery_error.user_message().to_string()
         } else if let Some(video_error) = error.downcast_ref::<crate::llm::vid2_video::Vid2Error>()

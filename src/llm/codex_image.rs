@@ -108,6 +108,15 @@ pub fn build_codex_image_generation_payload(
     input_images: &[ImageInput],
     size: Option<&str>,
 ) -> Value {
+    build_codex_image_payload_for_model(prompt, input_images, size, &codex_image_display_model())
+}
+
+pub(super) fn build_codex_image_payload_for_model(
+    prompt: &str,
+    input_images: &[ImageInput],
+    size: Option<&str>,
+    image_model: &str,
+) -> Value {
     let mut content = vec![json!({
         "type": "input_text",
         "text": prompt,
@@ -124,7 +133,7 @@ pub fn build_codex_image_generation_payload(
 
     let mut tool = json!({
         "type": "image_generation",
-        "model": codex_image_display_model(),
+        "model": image_model,
     });
     if let Some(size) = size {
         tool["size"] = json!(size);
@@ -288,23 +297,31 @@ fn extract_codex_image_generation_result(
     Ok(CodexImageGenerationResult { images, usage })
 }
 
-async fn call_codex_image_api(
+pub(super) async fn call_codex_image_api(
     payload: &Value,
+    model: &str,
+    operation: &str,
+    extra_metadata: Option<Value>,
     audit_context: Option<&LlmAuditContext>,
 ) -> Result<Vec<Vec<u8>>, ImageGenerationError> {
     let url = codex_image_response_url();
     let url = url.as_str();
-    let model = codex_image_display_model();
-    let model_ref = model.as_str();
-    let metadata = json!({
+    let model_ref = model;
+    let mut metadata = json!({
         "responses_model": payload.get("model").cloned().unwrap_or(Value::Null),
         "timeout_secs": CONFIG.codex.request_timeout_secs,
         "streaming_sse": true,
     });
+    if let Some(Value::Object(extra)) = extra_metadata {
+        metadata
+            .as_object_mut()
+            .expect("metadata is an object")
+            .extend(extra);
+    }
     let call = LlmCall::begin(
         ThirdPartyProvider::OpenAICodex.as_str(),
         model_ref,
-        "generate_image_with_codex",
+        operation,
         audit_context,
         Some(&metadata),
     )
@@ -418,7 +435,14 @@ pub async fn generate_image_with_codex(
         .and_then(|config| config.size.as_deref())
         .filter(|size| is_supported_codex_image_size(size));
     let payload = build_codex_image_generation_payload(prompt, &input_images, size);
-    let images = call_codex_image_api(&payload, audit_context).await?;
+    let images = call_codex_image_api(
+        &payload,
+        &codex_image_display_model(),
+        "generate_image_with_codex",
+        None,
+        audit_context,
+    )
+    .await?;
 
     if upload_to_cwd && !CONFIG.cwd_pw.api_key.trim().is_empty() {
         let model = codex_image_display_model();

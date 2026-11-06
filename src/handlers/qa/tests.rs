@@ -600,6 +600,7 @@ enum BotReply {
     Photo,
     /// A delivered `/vid2` result: a captioned video.
     Video,
+    Animation,
 }
 
 fn reply_to_this_bot_message(
@@ -634,6 +635,9 @@ fn reply_to_this_bot_message(
                 "width": 90,
                 "height": 90
             }]);
+        }
+        BotReply::Animation => {
+            replied["animation"] = json!({"file_id":"gif-file-id", "file_unique_id":"gif-unique-id", "width":64, "height":64, "duration":2, "mime_type":"image/gif"});
         }
         BotReply::Video => {
             replied["video"] = json!({
@@ -709,6 +713,18 @@ fn auto_q_still_triggers_when_mentioning_bot_despite_reply_image() {
     );
 
     assert!(should_auto_q_trigger_with_config(
+        &message,
+        42,
+        "helperbot",
+        true
+    ));
+}
+
+#[test]
+fn auto_q_skips_reply_to_bot_animation() {
+    let message =
+        reply_to_this_bot_message(1001, "nice animation", vec![], 42, BotReply::Animation);
+    assert!(!should_auto_q_trigger_with_config(
         &message,
         42,
         "helperbot",

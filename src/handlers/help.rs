@@ -69,6 +69,9 @@ TelegramGroupHelperBot 指令说明
 用法：`/img [描述]` 用于生成新图片
 或回复一张图片后发送 `/img [描述]` 来编辑图片
 
+/gif - 用 Codex 生成 GIF 动画，可回复静态图片或在图片标题中使用
+用法：`/gif [描述]`
+
 /image - 与 /img 相同；Gemini 可选分辨率和长宽比，Codex 可选图片尺寸
 用法：`/image [描述]`，然后选择模型和生成尺寸；Gemini 长宽比可选择 Auto
 

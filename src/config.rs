@@ -215,6 +215,9 @@ pub struct CodexConfig {
     pub request_timeout_secs: u64,
     pub image_responses_model: String,
     pub image_model: String,
+    pub gif_model: String,
+    pub gif_frame_count: u32,
+    pub gif_frame_duration_ms: u32,
 }
 
 /// The self-hosted image generation backend ("img2"), opt-in and unrelated
@@ -405,6 +408,16 @@ impl std::str::FromStr for LooseBool {
             "false" | "0" | "no" => Ok(LooseBool(false)),
             _ => Err(()),
         }
+    }
+}
+
+fn env_bounded_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
+    let value = env_parsed(name, default);
+    if (min..=max).contains(&value) {
+        value
+    } else {
+        tracing::warn!(env = name, value, "out of range, using the default");
+        default
     }
 }
 
@@ -934,6 +947,9 @@ fn load_codex() -> Result<CodexConfig> {
         request_timeout_secs: env_timeout_secs("OPENAI_CODEX_REQUEST_TIMEOUT_SECS", 300),
         image_responses_model: env_string("OPENAI_CODEX_IMAGE_RESPONSES_MODEL", "gpt-5.5"),
         image_model: env_string("OPENAI_CODEX_IMAGE_MODEL", "gpt-image-2"),
+        gif_model: env_string("OPENAI_CODEX_GIF_MODEL", "gpt-image-2"),
+        gif_frame_count: env_bounded_u32("OPENAI_CODEX_GIF_FRAME_COUNT", 9, 2, 16),
+        gif_frame_duration_ms: env_bounded_u32("OPENAI_CODEX_GIF_FRAME_DURATION_MS", 200, 20, 2000),
     })
 }
 
@@ -1249,6 +1265,27 @@ pub(crate) fn gemini_api_available_from(enable_gemini: bool, api_key: &str) -> b
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn gif_frame_settings_boundaries_and_fallback() {
+        let _guard = lock_env_and_force_config();
+        for (name, default, min, max) in [
+            ("OPENAI_CODEX_GIF_FRAME_COUNT", 9, 2, 16),
+            ("OPENAI_CODEX_GIF_FRAME_DURATION_MS", 200, 20, 2000),
+        ] {
+            for (value, expected) in [
+                (min.to_string(), min),
+                (max.to_string(), max),
+                ((min - 1).to_string(), default),
+                ((max + 1).to_string(), default),
+                ("bad".to_string(), default),
+                (" ".to_string(), default),
+            ] {
+                let _env = set_env_var_for_test(name, &value);
+                assert_eq!(env_bounded_u32(name, default, min, max), expected);
+            }
+        }
+    }
 
     #[test]
     fn argon_family_requires_a_model_boundary() {

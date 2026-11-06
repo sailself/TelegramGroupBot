@@ -24,6 +24,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/token_devourers [n]` - Show the top token consumers in the current group chat.
 - `/token_stats [model|user]` - Show bot-wide token usage totals (admin-only).
 - `/s` - Search this chat with a tool-capable model and return relevant message links.
+- `/gif <prompt>` - Generate a looping GIF from a Codex-generated sprite sheet; reply to a static PNG, JPEG, or WebP image or use a photo caption for a reference. Animated references, video, stickers, and media groups are rejected; send or reply to individual images separately. GIFs are delivered to Telegram and are not uploaded to cwd.pw.
 - `/img` - Generate or edit an image with the configured default image model, or choose Gemini/Codex when Codex is enabled.
 - `/image` - Generate an image with selectable Gemini resolution/aspect ratio or Codex image size; timeout uses the configured default image model.
 - `/vid` - Generate a video from text.
@@ -321,6 +322,9 @@ After updating configuration, restart the bot and inspect startup validation war
 - `OPENAI_CODEX_MODEL_PATH` - Local selected-model cache path. Default: `data/openai_codex_model.json`.
 - `OPENAI_CODEX_REQUEST_TIMEOUT_SECS` - Per-attempt request timeout. Default: `300`.
 - `OPENAI_CODEX_IMAGE_RESPONSES_MODEL` - Responses model used to invoke Codex image generation. Default: `gpt-5.5`.
+- `OPENAI_CODEX_GIF_MODEL` - Independent Codex image-tool model used for the GIF sprite sheet. Default: `gpt-image-2`.
+- `OPENAI_CODEX_GIF_FRAME_COUNT` - GIF frames, 2–16. Default: `9`.
+- `OPENAI_CODEX_GIF_FRAME_DURATION_MS` - Frame duration in milliseconds, 20–2000, rounded to the nearest 10 ms. Default: `200`. The bot divides a borderless equal-tile sheet by geometry; it cannot verify whether generated poses follow the requested layout. Raw sheets are retained in `data/media/gif` for troubleshooting, with rotation at 16 sheets or 128 MiB total.
 - `OPENAI_CODEX_IMAGE_MODEL` - Codex image-generation tool model offered in `/img` and `/image`, and used when `DEFAULT_IMAGE_MODEL=codex`. Default: `gpt-image-2`.
 - Login and model-account administration are restricted to whitelisted users in private chats and managed with `/codexlogin` and `/codexlogout`.
 - The active Codex model is selected live with `/codexmodel`, bound to the current ChatGPT account, and exposed in the bot as the runtime alias `openai-codex:selected`; ordinary `/q` continues to use this global selection.
