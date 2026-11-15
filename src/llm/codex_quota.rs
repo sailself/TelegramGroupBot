@@ -102,7 +102,7 @@ impl CodexUsageLimitError {
 
     pub fn user_message(&self) -> String {
         format!(
-            "{} Please try again with another model.",
+            "{} Please try again then or pick another model.",
             self.availability_note()
         )
     }
@@ -244,6 +244,11 @@ pub fn active_hold() -> Option<CodexQuotaHold> {
     let current_account = crate::llm::runtime_models::current_codex_account_id();
     hold.covers(now_unix_seconds(), current_account.as_deref())
         .then_some(hold)
+}
+
+/// The hold in force, as the error a Codex request would fail with.
+pub fn active_limit() -> Option<CodexUsageLimitError> {
+    active_hold().map(|hold| CodexUsageLimitError { until: hold.until })
 }
 
 /// The hold this test thread recorded, expired or not.

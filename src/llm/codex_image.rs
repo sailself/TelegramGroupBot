@@ -75,8 +75,12 @@ fn codex_image_responses_model() -> String {
     }
 }
 
+/// Whether Codex can generate an image now: set up, signed in, and not on a
+/// quota hold (images draw on the same account window as text).
 pub fn codex_image_available() -> bool {
-    CONFIG.codex.enabled && openai_codex::is_auth_ready()
+    CONFIG.codex.enabled
+        && openai_codex::is_auth_ready()
+        && crate::llm::codex_quota::active_hold().is_none()
 }
 
 pub fn is_supported_codex_image_size(size: &str) -> bool {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm::codex_quota::CodexUsageLimitError;
 
 pub(super) const IMAGE_RESOLUTION_OPTIONS: [&str; 3] = ["2K", "4K", "1K"];
 pub(super) const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 14] = [
@@ -58,10 +59,53 @@ pub(super) fn parse_default_image_generation_model(value: &str) -> Option<ImageG
     }
 }
 
+/// What stands in for Codex image generation when Codex cannot serve a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CodexImageFallback {
+    /// Codex is unavailable for a reason a stand-in does not address (or it
+    /// failed for its own reasons): report that.
+    None,
+    /// The quota is on hold and Gemini can generate the image instead.
+    Gemini(CodexUsageLimitError),
+    /// The quota is on hold and no other image model exists.
+    QuotaSpent(CodexUsageLimitError),
+}
+
+/// `codex_hold` is the quota hold in force, if any. Only a hold has a
+/// stand-in: a Codex that is logged out or disabled is a setup problem.
+pub(super) fn codex_image_fallback(
+    codex_hold: Option<CodexUsageLimitError>,
+    gemini_available: bool,
+) -> CodexImageFallback {
+    match codex_hold {
+        Some(limit) if gemini_available => CodexImageFallback::Gemini(limit),
+        Some(limit) => CodexImageFallback::QuotaSpent(limit),
+        None => CodexImageFallback::None,
+    }
+}
+
+/// Why no image model can take a request: a quota hold with nothing to stand
+/// in for Codex, or no image model set up at all.
+pub(super) fn no_image_model_message(codex_hold: Option<CodexUsageLimitError>) -> String {
+    match codex_hold {
+        Some(limit) => format!(
+            "{} No other image model is available.",
+            limit.availability_note()
+        ),
+        None => {
+            "No image model is configured. Enable Gemini or complete Codex setup with /codexlogin."
+                .to_string()
+        }
+    }
+}
+
+/// `codex_available` is false during a quota hold; `codex_hold` says so, and
+/// lets a Codex default give way to Gemini instead of a setup error.
 pub(super) fn resolve_default_image_generation_model(
     default_model: &str,
     gemini_available: bool,
     codex_available: bool,
+    codex_hold: Option<CodexUsageLimitError>,
 ) -> std::result::Result<ImageGenerationModel, String> {
     let Some(model) = parse_default_image_generation_model(default_model) else {
         return Err(format!(
@@ -81,6 +125,13 @@ pub(super) fn resolve_default_image_generation_model(
     }
 
     if model == ImageGenerationModel::CodexGptImage2 && !codex_available {
+        match codex_image_fallback(codex_hold, gemini_available) {
+            CodexImageFallback::Gemini(_) => return Ok(ImageGenerationModel::Gemini),
+            CodexImageFallback::QuotaSpent(limit) => {
+                return Err(no_image_model_message(Some(limit)))
+            }
+            CodexImageFallback::None => {}
+        }
         return Err(format!(
             "Default image model {} is unavailable. Complete Codex setup with /codexlogin or set DEFAULT_IMAGE_MODEL=gemini.",
             default_model.trim()
