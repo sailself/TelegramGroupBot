@@ -37,7 +37,8 @@ pub use audit::{audit_context_from_id, LlmAuditContext};
 pub use codex_image::{generate_image_with_codex, CodexImageConfig};
 pub use gemini::{
     call_gemini, call_gemini_with_tool_runtime, generate_image_with_gemini,
-    generate_music_with_lyria, generate_video_with_veo, GeminiCallRequest, GeminiImageConfig,
+    generate_music_with_lyria, generate_video_with_omni, GeminiCallRequest, GeminiImageConfig,
+    VideoGenerationError, VideoGenerationRequest, VideoTask,
 };
 pub use img2_image::generate_image_with_img2;
 pub use third_party::{call_third_party_with_reasoning_config, ThirdPartyCallOptions};

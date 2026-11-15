@@ -90,10 +90,58 @@ pub fn from_gemini(response: &Value) -> LlmUsageRecord {
     }
 }
 
+/// Gemini Interactions API `usage`: `total_*_tokens`, with the interaction id
+/// as the response id.
+pub fn from_gemini_interaction(response: &Value) -> LlmUsageRecord {
+    let usage = usage_object(response);
+    LlmUsageRecord {
+        response_id: response_id(response),
+        input_tokens: usage.and_then(|u| i64_at(u, "/total_input_tokens")),
+        output_tokens: usage.and_then(|u| i64_at(u, "/total_output_tokens")),
+        total_tokens: usage.and_then(|u| i64_at(u, "/total_tokens")),
+        reasoning_tokens: usage.and_then(|u| i64_at(u, "/total_thought_tokens")),
+        cached_input_tokens: usage.and_then(|u| i64_at(u, "/total_cached_tokens")),
+        cache_write_tokens: None,
+        raw_usage_json: usage.map(Value::to_string),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn gemini_interaction_usage_reads_the_total_token_fields() {
+        let response = json!({
+            "id": "v1_abc",
+            "usage": {
+                "total_tokens": 6341,
+                "total_input_tokens": 14,
+                "total_cached_tokens": 3,
+                "total_output_tokens": 5793,
+                "total_thought_tokens": 534,
+                "output_tokens_by_modality": [{ "modality": "video", "tokens": 5793 }]
+            }
+        });
+
+        let usage = from_gemini_interaction(&response);
+
+        assert_eq!(usage.response_id.as_deref(), Some("v1_abc"));
+        assert_eq!(usage.input_tokens, Some(14));
+        assert_eq!(usage.output_tokens, Some(5793));
+        assert_eq!(usage.total_tokens, Some(6341));
+        assert_eq!(usage.reasoning_tokens, Some(534));
+        assert_eq!(usage.cached_input_tokens, Some(3));
+        assert!(usage
+            .raw_usage_json
+            .unwrap()
+            .contains("output_tokens_by_modality"));
+
+        let unstored = from_gemini_interaction(&json!({ "status": "completed" }));
+        assert_eq!(unstored.response_id, None);
+        assert_eq!(unstored.raw_usage_json, None);
+    }
 
     #[test]
     fn chat_completions_usage_reads_prompt_completion_and_total_tokens() {

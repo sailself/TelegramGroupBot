@@ -135,6 +135,9 @@ pub async fn run_with_status_message<T>(
             "The GIF was generated, but Telegram did not confirm the update. It may already be visible; check the existing message before trying again.".to_string()
         } else if let Some(delivery_error) = error.downcast_ref::<VideoDeliveryError>() {
             delivery_error.user_message().to_string()
+        } else if let Some(video_error) = error.downcast_ref::<crate::llm::VideoGenerationError>()
+        {
+            format!("Failed to generate your video: {}", video_error.0)
         } else if let Some(video_error) = error.downcast_ref::<crate::llm::vid2_video::Vid2Error>()
         {
             match video_error {
@@ -572,7 +575,7 @@ mod status_tests {
     async fn video_status_distinguishes_generation_timeout_and_delivery_failures() {
         use crate::llm::vid2_video::Vid2Error;
         use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
-        let cases: [(anyhow::Error, &str); 3] = [
+        let cases: [(anyhow::Error, &str); 4] = [
             (
                 Vid2Error::Generation("first frame download failed".into()).into(),
                 "Failed to generate your video: first frame download failed.",
@@ -587,6 +590,13 @@ mod status_tests {
                 }
                 .into(),
                 "Your video was generated and saved locally, but Telegram rejected its delivery.",
+            ),
+            (
+                crate::llm::VideoGenerationError(
+                    "Exactly one input video is required for edit task.".into(),
+                )
+                .into(),
+                "Failed to generate your video: Exactly one input video is required for edit task.",
             ),
         ];
         for (error, expected_text) in cases {

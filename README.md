@@ -27,7 +27,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/gif <prompt>` - Generate a looping GIF from a Codex-generated sprite sheet; reply to a static PNG, JPEG, or WebP image or use a photo caption for a reference. Animated references, video, stickers, and media groups are rejected; send or reply to individual images separately. GIFs are delivered to Telegram and are not uploaded to cwd.pw.
 - `/img` - Generate or edit an image with the configured default image model, or choose Gemini/Codex when Codex is enabled.
 - `/image` - Generate an image with selectable Gemini resolution/aspect ratio or Codex image size; timeout uses the configured default image model.
-- `/vid` - Generate a video from text.
+- `/vid <prompt>` - Generate a video with Gemini Omni. Reply to, or attach, images or a video to use them as input: the model animates one image, treats two as first and last frame, takes up to six as subject references, and edits or extends a video as the prompt asks. The replied-to message is read first, then the attachment; an album contributes all of its photos. A bare `/vid` uses the replied-to text or caption as the prompt. The model infers the mode from the prompt and the media; if it picks the wrong one, start the prompt with `--t2v`, `--i2v`, `--ref`, `--edit`, or `--extend` to name the task (text-to-video, image-to-video, reference-to-video, edit, extend). Telegram serves bots files of up to 20 MB, and editing needs a video of 15 seconds or less.
 - `/mysong` - Generate a theme song from your chat history.
 - `/profileme` - Generate a profile based on your chat history.
 - `/paintme` - Create an artistic prompt based on your history.
@@ -230,7 +230,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-4-argon`.
 - `GEMINI_IMAGE_MODEL` - Image model. Default: `gemini-3-pro-image-preview`.
 - `GEMINI_MUSIC_MODEL` - Music model for `/mysong`. Default: `lyria-3-pro-preview`.
-- `GEMINI_VIDEO_MODEL` - Video model. Default: `veo-3.1-generate-preview`.
+- `GEMINI_VIDEO_MODEL` - Video model for `/vid`, called through the Interactions API. Default: `gemini-omni-1.2-flash`. Veo models are no longer served by the Gemini API.
 - `GEMINI_TEMPERATURE` - Default: `0.7`. Argon omits this sampling parameter.
 - `GEMINI_TOP_K` - Default: `40`. Argon omits this sampling parameter.
 - `GEMINI_TOP_P` - Default: `0.95`. Argon omits this sampling parameter.
