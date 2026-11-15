@@ -206,6 +206,17 @@ async fn build_status_report(state: &AppState) -> String {
         bool_label(codex_ready)
     ));
     report.push_str(&format!(
+        "openai_codex_quota_hold: {}\n",
+        match crate::llm::codex_quota::active_limit() {
+            Some(limit) => format!(
+                "until unix time {} (about {})",
+                limit.until,
+                limit.wait_label(crate::utils::timing::now_unix_seconds())
+            ),
+            None => "none".to_string(),
+        }
+    ));
+    report.push_str(&format!(
         "openai_codex_auth_file: {}\n",
         CONFIG.codex.auth_path
     ));

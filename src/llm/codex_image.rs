@@ -75,8 +75,12 @@ fn codex_image_responses_model() -> String {
     }
 }
 
+/// Whether Codex can generate an image now: set up, signed in, and not on a
+/// quota hold (images draw on the same account window as text).
 pub fn codex_image_available() -> bool {
-    CONFIG.codex.enabled && openai_codex::is_auth_ready()
+    CONFIG.codex.enabled
+        && openai_codex::is_auth_ready()
+        && crate::llm::codex_quota::active_hold().is_none()
 }
 
 pub fn is_supported_codex_image_size(size: &str) -> bool {
@@ -395,14 +399,26 @@ pub(super) async fn call_codex_image_api(
             );
             Ok(result.images)
         }
-        Err(err) => Err(codex_image_error(err)),
+        Err(err) => Err(codex_image_error(
+            err,
+            crate::llm::runtime_models::current_codex_account_id,
+        )),
     }
 }
 
 /// Decode failures already carry the user-facing message (`response.failed`
 /// reasons, payload limits); other failures keep the transport's wording.
-fn codex_image_error(err: ProviderError) -> ImageGenerationError {
+fn codex_image_error(
+    err: ProviderError,
+    current_account: impl FnOnce() -> Option<String>,
+) -> ImageGenerationError {
     match err {
+        // Images draw on the same account window as text, so a spent window
+        // seen here puts Codex on hold for both.
+        ProviderError::UsageLimit { notice, .. } => ImageGenerationError(
+            crate::llm::codex_quota::note_usage_limit(notice, current_account().as_deref())
+                .user_message(),
+        ),
         ProviderError::Decode { detail, .. } => ImageGenerationError(detail),
         other => ImageGenerationError(other.to_string()),
     }
@@ -466,6 +482,39 @@ pub async fn generate_image_with_codex(
 mod tests {
     use super::*;
     use base64::engine::general_purpose;
+
+    #[test]
+    fn usage_limit_failures_set_the_quota_hold_and_tell_the_user_when_codex_is_back() {
+        let error = codex_image_error(
+            ProviderError::UsageLimit {
+                provider: CODEX_IMAGE_PROVIDER.to_string(),
+                notice: crate::llm::transport::UsageLimitNotice {
+                    resets_at: None,
+                    resets_in_seconds: Some(13_974),
+                },
+                body_snippet: "{...}".to_string(),
+            },
+            || Some("acct-image".to_string()),
+        );
+
+        let hold = crate::llm::codex_quota::stored_hold_for_test().expect("the hold is recorded");
+        assert_eq!(hold.account_id.as_deref(), Some("acct-image"));
+        assert_eq!(
+            error.0,
+            crate::llm::codex_quota::CodexUsageLimitError { until: hold.until }.user_message()
+        );
+        assert!(error.0.contains("usage limit"), "{}", error.0);
+    }
+
+    #[test]
+    fn other_transport_failures_keep_their_wording_and_set_no_hold() {
+        let error = codex_image_error(ProviderError::rejected("Codex login expired"), || {
+            panic!("the account is only looked up for a usage limit")
+        });
+
+        assert_eq!(error.0, "Codex login expired");
+        assert_eq!(crate::llm::codex_quota::stored_hold_for_test(), None);
+    }
 
     #[test]
     fn canonicalizes_chatgpt_codex_responses_base_urls() {

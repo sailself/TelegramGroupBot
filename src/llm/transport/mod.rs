@@ -16,11 +16,13 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
-pub use body::{read_body_limited, read_body_limited_or_partial, read_json, BodyRead};
+pub use body::{
+    read_body_limited, read_body_limited_or_partial, read_json, BodyRead, UsageLimitNotice,
+};
 pub use error::ProviderError;
 pub use retry::RetryPolicy;
 
-use self::body::{summarize_error_body, ERROR_BODY_LIMIT};
+use self::body::{summarize_error_body, usage_limit_notice, ERROR_BODY_LIMIT};
 use self::retry::retry_after_from_headers;
 use crate::llm::audit::{
     log_llm_request_started, record_llm_request_failure, record_llm_request_success,
@@ -169,7 +171,8 @@ impl<'a> LlmCall<'a> {
 ///
 /// Non-2xx statuses are classified by [`RetryPolicy`]: transient ones wait
 /// for `Retry-After`/rate-limit hints (or the backoff) and retry, permanent
-/// ones return at once. A 401 retries once through the builder when the
+/// ones return at once, as does a 429 that reports a spent usage window
+/// ([`ProviderError::UsageLimit`]). A 401 retries once through the builder when the
 /// policy has `refresh_auth_on_unauthorized`.
 pub async fn call_with_retry<T, B, BFut, R, RFut, U>(
     call: &LlmCall<'_>,
@@ -261,13 +264,23 @@ where
                 Err(_) => String::new(),
             };
             let summary = summarize_error_body(&body);
-            let error = ProviderError::http(
-                provider,
-                status,
-                summary.message,
-                summary.snippet.clone(),
-                retry_after,
-            )
+            let usage_limit = (status == StatusCode::TOO_MANY_REQUESTS)
+                .then(|| usage_limit_notice(&body))
+                .flatten();
+            let error = match usage_limit {
+                Some(notice) => ProviderError::UsageLimit {
+                    provider: provider.to_string(),
+                    notice,
+                    body_snippet: summary.snippet.clone(),
+                },
+                None => ProviderError::http(
+                    provider,
+                    status,
+                    summary.message,
+                    summary.snippet.clone(),
+                    retry_after,
+                ),
+            }
             .sanitized(|text| call.redact(text));
             let retrying = error.is_retryable() && policy.allows_retry(attempt);
             let message = format!(
@@ -506,6 +519,43 @@ mod tests {
             } => {
                 assert_eq!(*status, StatusCode::BAD_REQUEST);
                 assert_eq!(message.as_deref(), Some("bad model"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        server.join().expect("exactly one request was served");
+    }
+
+    /// The body Codex returned on 2026-11-15 when the 5-hour window ran out.
+    const USAGE_LIMIT_BODY: &str = r#"{"error":{"eligible_promo":null,"limit_window_minutes":300,"message":"The usage limit has been reached","plan_type":"plus","resets_at":1794726809,"resets_in_seconds":13974,"type":"usage_limit_reached"}}"#;
+
+    #[tokio::test]
+    async fn usage_limit_responses_are_returned_without_retrying() {
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "POST",
+            "/v1",
+            raw_response(429, &[], USAGE_LIMIT_BODY),
+        )]);
+        let url = server.url("/v1").to_string();
+        let url = url.as_str();
+        let call = LlmCall::begin("test-provider", "model", "op", None, None);
+
+        let err = call_with_retry(
+            &call,
+            &fast_policy(3),
+            |_| async move { Ok(get_http_client().post(url).json(&json!({}))) },
+            |_| {},
+            read_json_value,
+            no_usage,
+        )
+        .await
+        .expect_err("a spent usage window is permanent for this request");
+
+        assert_eq!(err.status(), Some(StatusCode::TOO_MANY_REQUESTS), "{err:?}");
+        assert!(!err.is_retryable(), "{err:?}");
+        match &err {
+            ProviderError::UsageLimit { notice, .. } => {
+                assert_eq!(notice.resets_at, Some(1794726809));
+                assert_eq!(notice.resets_in_seconds, Some(13974));
             }
             other => panic!("unexpected error: {other:?}"),
         }

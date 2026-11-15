@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 
+use super::body::UsageLimitNotice;
 use super::retry::{is_retryable_status, is_retryable_transport_error};
 
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +26,16 @@ pub enum ProviderError {
         /// Bounded, log-safe excerpt of the error body.
         body_snippet: String,
         retry_after: Option<Duration>,
+    },
+    /// A 429 whose body says the account's usage window is spent. Unlike a
+    /// rate limit it does not clear within the retry budget, so it is never
+    /// retried; `notice` says when the window resets.
+    #[error("{provider} usage limit reached: {body_snippet}")]
+    UsageLimit {
+        provider: String,
+        notice: UsageLimitNotice,
+        /// Bounded, log-safe excerpt of the error body.
+        body_snippet: String,
     },
     /// A 2xx response whose body could not be read or parsed. `retryable`
     /// marks stream interruptions and incomplete SSE streams, which a fresh
@@ -61,6 +72,14 @@ impl ProviderError {
             } => {
                 *provider = redact(provider);
                 *message = message.as_deref().map(&redact);
+                *body_snippet = redact(body_snippet);
+            }
+            Self::UsageLimit {
+                provider,
+                body_snippet,
+                ..
+            } => {
+                *provider = redact(provider);
                 *body_snippet = redact(body_snippet);
             }
             Self::Decode {
@@ -115,13 +134,14 @@ impl ProviderError {
         match self {
             Self::Transport { retryable, .. } | Self::Decode { retryable, .. } => *retryable,
             Self::Http { status, .. } => is_retryable_status(*status),
-            Self::BodyTooLarge { .. } | Self::Rejected(_) => false,
+            Self::UsageLimit { .. } | Self::BodyTooLarge { .. } | Self::Rejected(_) => false,
         }
     }
 
     pub fn status(&self) -> Option<StatusCode> {
         match self {
             Self::Http { status, .. } => Some(*status),
+            Self::UsageLimit { .. } => Some(StatusCode::TOO_MANY_REQUESTS),
             _ => None,
         }
     }
@@ -178,6 +198,32 @@ mod tests {
             overloaded.to_string(),
             "OpenRouter request failed with status 503 Service Unavailable: busy"
         );
+    }
+
+    #[test]
+    fn usage_limit_errors_are_permanent_and_keep_the_429_status() {
+        let notice = UsageLimitNotice {
+            resets_at: Some(1794726809),
+            resets_in_seconds: Some(13974),
+        };
+        let spent = ProviderError::UsageLimit {
+            provider: "OpenAI Codex".to_string(),
+            notice,
+            body_snippet: "{...}".to_string(),
+        };
+
+        assert!(!spent.is_retryable());
+        assert_eq!(spent.status(), Some(StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(spent.to_string(), "OpenAI Codex usage limit reached: {...}");
+
+        let throttled = ProviderError::http(
+            "OpenAI Codex",
+            StatusCode::TOO_MANY_REQUESTS,
+            None,
+            "slow down".to_string(),
+            None,
+        );
+        assert!(throttled.is_retryable());
     }
 
     #[test]

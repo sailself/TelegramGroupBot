@@ -123,6 +123,10 @@ pub async fn run_with_status_message<T>(
             error.downcast_ref::<crate::llm::gemini::GeminiTextResponseError>()
         {
             gemini_error.user_message().to_string()
+        } else if let Some(usage_limit) =
+            error.downcast_ref::<crate::llm::codex_quota::CodexUsageLimitError>()
+        {
+            usage_limit.user_message()
         } else if let Some(delivery_error) = error.downcast_ref::<ImageDeliveryError>() {
             delivery_error.user_message().to_string()
         } else if let Some(gif_error) = error.downcast_ref::<GifUserError>() {
@@ -515,6 +519,32 @@ mod status_tests {
             );
             server.join().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn codex_usage_limit_status_says_when_codex_is_back() {
+        use crate::llm::codex_quota::CodexUsageLimitError;
+        use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
+
+        let error = CodexUsageLimitError {
+            until: crate::utils::timing::now_unix_seconds() + 2 * 3_600 + 30 * 60 + 30,
+        };
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "POST", "/bot123:test/EditMessageText",
+            response_with_status(200, br#"{"ok":true,"result":{"message_id":9,"date":0,"chat":{"id":1,"type":"private"}}}"#.to_vec()),
+        ).with_body_fragment(b"Codex has reached its usage limit and should be back in about 2h 30m")]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        let wrapped = anyhow::Error::new(error).context("tool loop failed");
+        let result =
+            run_with_status_message(&bot, ChatId(1), MessageId(9), "generic failure", async {
+                Err::<(), _>(wrapped)
+            })
+            .await;
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<CodexUsageLimitError>(),
+            Some(&error)
+        );
+        server.join().unwrap();
     }
 
     #[tokio::test]

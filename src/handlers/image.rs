@@ -33,7 +33,7 @@ use crate::utils::telegram::{
     send_message_with_retry, start_chat_action_heartbeat, strip_command_prefix,
 };
 use crate::utils::text::{escape_html, truncate_with_ellipsis};
-use tracing::info;
+use tracing::{info, warn};
 
 mod selection;
 use selection::*;
@@ -240,6 +240,7 @@ pub(super) async fn generate_image_with_configured_default(
         &CONFIG.models.default_image_model,
         CONFIG.gemini_api_available(),
         crate::llm::codex_image::codex_image_available(),
+        crate::llm::codex_quota::active_limit(),
     ) {
         Ok(model) => model,
         Err(err) => {
@@ -264,19 +265,87 @@ pub(super) async fn generate_image_with_configured_default(
         ),
         ImageGenerationModel::CodexGptImage2 => {
             let model_name = crate::llm::codex_image::codex_image_display_model();
-            (
-                model_name,
-                generate_image_with_codex(
-                    prompt,
-                    image_urls,
-                    codex_config,
-                    upload_to_cwd,
-                    audit_context,
-                )
-                .await,
+            let result = generate_image_with_codex(
+                prompt,
+                image_urls,
+                codex_config,
+                upload_to_cwd,
+                audit_context,
             )
+            .await;
+            // Codex failed on a spent usage window: Gemini makes the image.
+            if result.is_err() {
+                if let CodexImageFallback::Gemini(_) = codex_image_fallback(
+                    crate::llm::codex_quota::active_limit(),
+                    CONFIG.gemini_api_available(),
+                ) {
+                    warn!("Codex usage limit reached; generating the image with Gemini");
+                    return (
+                        CONFIG.gemini.image_model.clone(),
+                        generate_image_with_gemini(
+                            prompt,
+                            image_urls,
+                            gemini_config,
+                            upload_to_cwd,
+                            audit_context,
+                        )
+                        .await,
+                    );
+                }
+            }
+            (model_name, result)
         }
     }
+}
+
+/// Generate `request`'s image with Gemini, announcing it in the status
+/// message. `status_prefix` explains a switch away from another model.
+async fn generate_request_image_with_gemini(
+    bot: &Bot,
+    request: &PendingImageRequest,
+    prompt: &str,
+    resolution: Option<&str>,
+    aspect_ratio: Option<&str>,
+    status_prefix: &str,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<(
+    String,
+    std::result::Result<Vec<Vec<u8>>, ImageGenerationError>,
+)> {
+    let (final_resolution, final_aspect) =
+        resolve_image_request_settings(request, resolution, aspect_ratio);
+    let image_config = Some(GeminiImageConfig {
+        aspect_ratio: final_aspect.clone(),
+        image_size: if final_resolution.trim().is_empty() {
+            None
+        } else {
+            Some(final_resolution.clone())
+        },
+    });
+    let aspect = match final_aspect.as_deref() {
+        Some(final_aspect) => format!("{final_aspect} aspect ratio"),
+        None => "automatic aspect ratio".to_string(),
+    };
+    bot.edit_message_text(
+        ChatId(request.chat_id),
+        MessageId(request.selection_message_id as i32),
+        format!(
+            "{status_prefix}Generating your image with {} at {} resolution with {aspect}...",
+            CONFIG.gemini.image_model, final_resolution
+        ),
+    )
+    .await?;
+    Ok((
+        CONFIG.gemini.image_model.clone(),
+        generate_image_with_gemini(
+            prompt,
+            &request.image_urls,
+            image_config,
+            !CONFIG.cwd_pw.api_key.is_empty(),
+            audit_context,
+        )
+        .await,
+    ))
 }
 
 async fn finalize_image_request(
@@ -294,6 +363,7 @@ async fn finalize_image_request(
             &CONFIG.models.default_image_model,
             CONFIG.gemini_api_available(),
             crate::llm::codex_image::codex_image_available(),
+            crate::llm::codex_quota::active_limit(),
         ) {
             Ok(model) => model,
             Err(err) => {
@@ -318,18 +388,36 @@ async fn finalize_image_request(
             .await;
         return Ok(());
     }
-    if selected_model == ImageGenerationModel::CodexGptImage2
+    let selected_model = if selected_model == ImageGenerationModel::CodexGptImage2
         && !crate::llm::codex_image::codex_image_available()
     {
-        let _ = bot
-            .edit_message_text(
-                ChatId(request.chat_id),
-                MessageId(request.selection_message_id as i32),
-                "Codex image generation is unavailable. Complete Codex setup with /codexlogin.",
-            )
-            .await;
-        return Ok(());
-    }
+        // Codex was picked from a menu shown before it went on hold, or it is
+        // not set up. Only the hold has a stand-in.
+        let unavailable = match codex_image_fallback(
+            crate::llm::codex_quota::active_limit(),
+            CONFIG.gemini_api_available(),
+        ) {
+            CodexImageFallback::Gemini(_) => None,
+            CodexImageFallback::QuotaSpent(limit) => Some(limit.user_message()),
+            CodexImageFallback::None => Some(
+                "Codex image generation is unavailable. Complete Codex setup with /codexlogin."
+                    .to_string(),
+            ),
+        };
+        if let Some(text) = unavailable {
+            let _ = bot
+                .edit_message_text(
+                    ChatId(request.chat_id),
+                    MessageId(request.selection_message_id as i32),
+                    text,
+                )
+                .await;
+            return Ok(());
+        }
+        ImageGenerationModel::Gemini
+    } else {
+        selected_model
+    };
 
     let mut prompt = request.prompt.clone();
     if !request.telegraph_contents.is_empty() {
@@ -341,96 +429,116 @@ async fn finalize_image_request(
     }
 
     let processing_message_id = MessageId(request.selection_message_id as i32);
-    crate::utils::telegram::run_with_status_message(bot, ChatId(request.chat_id), processing_message_id, "Failed to generate your image. Please try again.", async {
+    crate::utils::telegram::run_with_status_message(
+        bot,
+        ChatId(request.chat_id),
+        processing_message_id,
+        "Failed to generate your image. Please try again.",
+        async {
             let _heavy_permit = _heavy_permit;
 
-    let _chat_action = start_chat_action_heartbeat(
-        bot.clone(),
-        ChatId(request.chat_id),
-        ChatAction::UploadPhoto,
-    );
+            let _chat_action = start_chat_action_heartbeat(
+                bot.clone(),
+                ChatId(request.chat_id),
+                ChatAction::UploadPhoto,
+            );
 
-    let (model_name, image_result) = match selected_model {
-        ImageGenerationModel::Gemini => {
-            let (final_resolution, final_aspect) =
-                resolve_image_request_settings(&request, resolution, aspect_ratio);
-            let image_config = Some(GeminiImageConfig {
-                aspect_ratio: final_aspect.clone(),
-                image_size: if final_resolution.trim().is_empty() {
-                    None
-                } else {
-                    Some(final_resolution.clone())
-                },
-            });
-            bot.edit_message_text(
+            let (model_name, image_result) = match selected_model {
+                ImageGenerationModel::Gemini => {
+                    generate_request_image_with_gemini(
+                        bot,
+                        &request,
+                        &prompt,
+                        resolution,
+                        aspect_ratio,
+                        "",
+                        audit_context.as_ref(),
+                    )
+                    .await?
+                }
+                ImageGenerationModel::CodexGptImage2 => {
+                    let size = request
+                        .codex_size
+                        .as_deref()
+                        .filter(|size| crate::llm::codex_image::is_supported_codex_image_size(size))
+                        .map(|size| size.to_string());
+                    let model_name = crate::llm::codex_image::codex_image_display_model();
+                    bot.edit_message_text(
+                        ChatId(request.chat_id),
+                        processing_message_id,
+                        if let Some(size) = size.as_deref() {
+                            format!("Generating your image with {} at {}...", model_name, size)
+                        } else {
+                            format!("Generating your image with {}...", model_name)
+                        },
+                    )
+                    .await?;
+                    (
+                        model_name,
+                        generate_image_with_codex(
+                            &prompt,
+                            &request.image_urls,
+                            Some(CodexImageConfig { size }),
+                            !CONFIG.cwd_pw.api_key.is_empty(),
+                            audit_context.as_ref(),
+                        )
+                        .await,
+                    )
+                }
+            };
+
+            // A Codex failure while Codex is on hold is the spent usage window (a hold
+            // is only set by one, and no new request picks Codex during it): Gemini
+            // makes the image instead when it can.
+            let (model_name, image_result) = match image_result {
+                Err(error) if selected_model == ImageGenerationModel::CodexGptImage2 => {
+                    match codex_image_fallback(
+                        crate::llm::codex_quota::active_limit(),
+                        CONFIG.gemini_api_available(),
+                    ) {
+                        CodexImageFallback::Gemini(limit) => {
+                            warn!(
+                                "Codex usage limit reached; rerunning the image request on Gemini"
+                            );
+                            let status_prefix = format!("{} ", limit.availability_note());
+                            generate_request_image_with_gemini(
+                                bot,
+                                &request,
+                                &prompt,
+                                resolution,
+                                aspect_ratio,
+                                &status_prefix,
+                                audit_context.as_ref(),
+                            )
+                            .await?
+                        }
+                        CodexImageFallback::QuotaSpent(limit) => return Err(limit.into()),
+                        CodexImageFallback::None => (model_name, Err(error)),
+                    }
+                }
+                image_result => (model_name, image_result),
+            };
+            let images = match image_result {
+                Ok(images) => images,
+                Err(err) => return Err(anyhow::anyhow!(err.0)),
+            };
+            let caption = build_image_caption(&model_name, &prompt).await;
+
+            super::image_delivery::deliver_generated_images(
+                bot,
                 ChatId(request.chat_id),
                 processing_message_id,
-                if let Some(final_aspect) = final_aspect.as_deref() {
-                    format!(
-                        "Generating your image with {} at {} resolution with {} aspect ratio...",
-                        CONFIG.gemini.image_model, final_resolution, final_aspect
-                    )
-                } else {
-                    format!(
-                        "Generating your image with {} at {} resolution with automatic aspect ratio...",
-                        CONFIG.gemini.image_model, final_resolution
-                    )
-                },
+                MessageId(request.message_id as i32),
+                images.into_iter().map(InputFile::memory).collect(),
+                &caption,
+                false,
             )
             .await?;
-            (
-                CONFIG.gemini.image_model.clone(),
-                generate_image_with_gemini(
-                    &prompt,
-                    &request.image_urls,
-                    image_config,
-                    !CONFIG.cwd_pw.api_key.is_empty(),
-                    audit_context.as_ref(),
-                )
-                .await,
-            )
-        }
-        ImageGenerationModel::CodexGptImage2 => {
-            let size = request
-                .codex_size
-                .as_deref()
-                .filter(|size| crate::llm::codex_image::is_supported_codex_image_size(size))
-                .map(|size| size.to_string());
-            let model_name = crate::llm::codex_image::codex_image_display_model();
-            bot.edit_message_text(
-                ChatId(request.chat_id),
-                processing_message_id,
-                if let Some(size) = size.as_deref() {
-                    format!("Generating your image with {} at {}...", model_name, size)
-                } else {
-                    format!("Generating your image with {}...", model_name)
-                },
-            )
-            .await?;
-            (
-                model_name,
-                generate_image_with_codex(
-                    &prompt,
-                    &request.image_urls,
-                    Some(CodexImageConfig { size }),
-                    !CONFIG.cwd_pw.api_key.is_empty(),
-                    audit_context.as_ref(),
-                )
-                .await,
-            )
-        }
-    };
 
-    let images = match image_result {
-        Ok(images) => images,
-        Err(err) => return Err(anyhow::anyhow!(err.0)),
-    };
-    let caption = build_image_caption(&model_name, &prompt).await;
-
-    super::image_delivery::deliver_generated_images(bot, ChatId(request.chat_id), processing_message_id, MessageId(request.message_id as i32), images.into_iter().map(InputFile::memory).collect(), &caption, false).await?;
-
-    Ok(())
-    }).await
+            Ok(())
+        },
+    )
+    .await
 }
 
 fn gif_reference_ids(message: &Message) -> Result<Vec<FileId>> {
@@ -536,12 +644,16 @@ pub async fn gif_handler(
         return Ok(());
     }
     if !crate::llm::codex_image::codex_image_available() {
-        bot.send_message(
-            message.chat.id,
-            "Codex is unavailable. Complete Codex setup with /codexlogin.",
-        )
-        .reply_parameters(ReplyParameters::new(message.id))
-        .await?;
+        let text = match crate::llm::codex_quota::active_limit() {
+            Some(limit) => format!(
+                "{} /gif runs on Codex only, so please try again then.",
+                limit.availability_note()
+            ),
+            None => "Codex is unavailable. Complete Codex setup with /codexlogin.".to_string(),
+        };
+        bot.send_message(message.chat.id, text)
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await?;
         return Ok(());
     }
     let permit = state.acquire_heavy_command_permit().await;
@@ -555,6 +667,12 @@ pub async fn gif_handler(
         let urls = gif_reference_urls(&bot, &message).await?;
         let _action = start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadVideo);
         let bytes = crate::llm::codex_gif::generate(&prompt, &urls, audit.as_ref()).await.map_err(|error| {
+            // A failure while Codex is on hold is the spent usage window (a hold
+            // is only set by one, and no new /gif starts during it). Nothing
+            // stands in for Codex here, so say when it is back.
+            if let Some(limit) = crate::llm::codex_quota::active_limit() {
+                return anyhow::Error::new(limit);
+            }
             let message = if error.0.starts_with("GIF_LAYOUT:") {
                 "The generated frame sheet could not be decoded or is too small. Please try again."
             } else if error.0.starts_with("GIF_LIMIT:") {
@@ -565,7 +683,7 @@ pub async fn gif_handler(
                 _ => "GIF generation failed. Please try again.",
             }};
             tracing::warn!("Codex GIF generation failed");
-            crate::utils::telegram::GifUserError(message)
+            crate::utils::telegram::GifUserError(message).into()
         })?;
         let caption = build_image_caption(&crate::llm::codex_gif::model(), &prompt).await;
         super::image_delivery::deliver_generated_gif(&bot, message.chat.id, status.id, bytes, &caption).await?;
@@ -613,7 +731,7 @@ pub async fn img_handler(
     if !gemini_available && !codex_available {
         bot.send_message(
             message.chat.id,
-            "No image model is configured. Enable Gemini or complete Codex setup with /codexlogin.",
+            no_image_model_message(crate::llm::codex_quota::active_limit()),
         )
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
@@ -624,6 +742,7 @@ pub async fn img_handler(
         &CONFIG.models.default_image_model,
         gemini_available,
         codex_available,
+        crate::llm::codex_quota::active_limit(),
     ) {
         Ok(model) => model,
         Err(_) if gemini_available => ImageGenerationModel::Gemini,
@@ -883,7 +1002,7 @@ pub async fn image_handler(
     if !gemini_available && !codex_available {
         bot.send_message(
             message.chat.id,
-            "No image model is configured. Enable Gemini or complete Codex setup with /codexlogin.",
+            no_image_model_message(crate::llm::codex_quota::active_limit()),
         )
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
@@ -893,6 +1012,7 @@ pub async fn image_handler(
         &CONFIG.models.default_image_model,
         gemini_available,
         codex_available,
+        crate::llm::codex_quota::active_limit(),
     ) {
         Ok(model) => model,
         Err(err) => {
@@ -1202,7 +1322,7 @@ mod tests {
 
     #[test]
     fn default_image_model_errors_when_codex_unavailable() {
-        let result = resolve_default_image_generation_model("codex", true, false);
+        let result = resolve_default_image_generation_model("codex", true, false, None);
 
         assert!(result.is_err());
         assert!(result
@@ -1210,10 +1330,47 @@ mod tests {
             .contains("Default image model codex is unavailable"));
     }
 
+    fn spent() -> crate::llm::codex_quota::CodexUsageLimitError {
+        crate::llm::codex_quota::CodexUsageLimitError {
+            until: crate::utils::timing::now_unix_seconds() + 3_600 + 30,
+        }
+    }
+
+    #[test]
+    fn codex_default_gives_way_to_gemini_during_a_quota_hold() {
+        assert_eq!(
+            resolve_default_image_generation_model("codex", true, false, Some(spent())),
+            Ok(ImageGenerationModel::Gemini)
+        );
+    }
+
+    #[test]
+    fn codex_default_on_a_quota_hold_without_gemini_says_when_codex_is_back() {
+        let error = resolve_default_image_generation_model("codex", false, false, Some(spent()))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "Codex has reached its usage limit and should be back in about 1h 0m. No other image model is available."
+        );
+    }
+
+    #[test]
+    fn codex_image_fallback_exists_only_for_a_quota_hold() {
+        assert_eq!(codex_image_fallback(None, true), CodexImageFallback::None);
+        assert_eq!(
+            codex_image_fallback(Some(spent()), true),
+            CodexImageFallback::Gemini(spent())
+        );
+        assert_eq!(
+            codex_image_fallback(Some(spent()), false),
+            CodexImageFallback::QuotaSpent(spent())
+        );
+    }
+
     #[test]
     fn default_image_model_accepts_available_codex() {
         assert_eq!(
-            resolve_default_image_generation_model("codex", true, true),
+            resolve_default_image_generation_model("codex", true, true, None),
             Ok(ImageGenerationModel::CodexGptImage2)
         );
     }
@@ -1221,7 +1378,7 @@ mod tests {
     #[test]
     fn default_image_model_uses_codex_when_gemini_disabled() {
         assert_eq!(
-            resolve_default_image_generation_model("gemini", false, true),
+            resolve_default_image_generation_model("gemini", false, true, None),
             Ok(ImageGenerationModel::CodexGptImage2)
         );
     }

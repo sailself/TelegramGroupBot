@@ -38,7 +38,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/codexlogout` - Remove cached ChatGPT Codex credentials (whitelisted users in private chats only).
 - `/codexmodel` - Fetch the live Codex model catalog and choose the active Codex model (whitelisted users in private chats only).
 - `/codexreasoning` - Choose the active Codex reasoning level supported by the selected Codex model (whitelisted users in private chats only).
-- `/codexusage` - Show the current ChatGPT Codex plan and usage windows (whitelisted users in private chats only).
+- `/codexusage` - Show the current ChatGPT Codex plan and usage windows, and bring the Codex quota hold in line with them (whitelisted users in private chats only).
 - `/support` - Show support message and link.
 - `/help` - Show command help.
 
@@ -332,6 +332,7 @@ After updating configuration, restart the bot and inspect startup validation war
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.
 - When the selected Codex model advertises native search support, ordinary `/q` and other existing paths use Codex's built-in `web_search` Responses tool instead of the local external function tool. `/qq` deliberately disables native Codex search and uses the bounded local `web_search` runtime so its one-round limit is enforceable.
 - Codex requests also include a condensed response-style addendum tuned for direct answers and shorter Chinese output.
+- **Quota hold.** When the ChatGPT account's usage window (5-hour or weekly) is spent, Codex answers `429 usage_limit_reached` with the time it resets. The bot then puts Codex on hold until that time: model pickers stop offering it, and a Codex `DEFAULT_TEXT_MODEL`, `DEFAULT_QUICK_TEXT_MODEL`, `AGENT_STEP_MODEL`, or `DEFAULT_IMAGE_MODEL` gives way to Gemini when Gemini is enabled, otherwise (text only) to the first ready third-party model that can serve the request. The request that ran into the limit is rerun once on that stand-in; `/gif`, which has no other model, says when Codex is back. The hold is bound to the ChatGPT account, expires on its own, and survives restarts in `openai_codex_quota.json` beside `OPENAI_CODEX_MODEL_PATH`. `/codexusage` sets or clears it from live usage (for an early reset or a plan change) and `/status` shows it.
 
 ### Hidden Img2 image generation (optional)
 - `/img2` is a hidden command: it is callable when enabled, but it is not published with `setMyCommands` and is not shown in `/help`.

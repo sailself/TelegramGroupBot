@@ -23,6 +23,32 @@ pub struct ErrorBodySummary {
     pub snippet: String,
 }
 
+/// A provider's statement, in a 429 body, that the account's usage window is
+/// spent. Waiting out the retry budget cannot help; only the reset can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageLimitNotice {
+    /// Unix seconds at which the window resets.
+    pub resets_at: Option<i64>,
+    /// Seconds until the reset, counted from when the response was produced.
+    pub resets_in_seconds: Option<i64>,
+}
+
+/// `error.type` Codex sends when a usage window (5-hour or weekly) is spent.
+const USAGE_LIMIT_ERROR_TYPE: &str = "usage_limit_reached";
+
+/// The usage-limit notice in an error body, when the body is one.
+pub fn usage_limit_notice(body: &str) -> Option<UsageLimitNotice> {
+    let value = serde_json::from_str::<Value>(body.trim()).ok()?;
+    let error = value.get("error")?;
+    if error.get("type").and_then(Value::as_str) != Some(USAGE_LIMIT_ERROR_TYPE) {
+        return None;
+    }
+    Some(UsageLimitNotice {
+        resets_at: error.get("resets_at").and_then(Value::as_i64),
+        resets_in_seconds: error.get("resets_in_seconds").and_then(Value::as_i64),
+    })
+}
+
 pub fn summarize_error_body(body: &str) -> ErrorBodySummary {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -175,6 +201,42 @@ mod tests {
 
         let flat = summarize_error_body(r#"{"message":"bad key"}"#);
         assert_eq!(flat.message.as_deref(), Some("bad key"));
+    }
+
+    #[test]
+    fn usage_limit_notice_reads_the_reset_from_a_usage_limit_body() {
+        let notice = usage_limit_notice(
+            r#"{"error":{"eligible_promo":null,"limit_window_minutes":300,"message":"The usage limit has been reached","plan_type":"plus","resets_at":1794726809,"resets_in_seconds":13974,"type":"usage_limit_reached"}}"#,
+        );
+        assert_eq!(
+            notice,
+            Some(UsageLimitNotice {
+                resets_at: Some(1794726809),
+                resets_in_seconds: Some(13974),
+            })
+        );
+
+        let bare = usage_limit_notice(r#"{"error":{"type":"usage_limit_reached"}}"#);
+        assert_eq!(
+            bare,
+            Some(UsageLimitNotice {
+                resets_at: None,
+                resets_in_seconds: None,
+            })
+        );
+    }
+
+    #[test]
+    fn other_error_bodies_carry_no_usage_limit_notice() {
+        for body in [
+            r#"{"error":{"message":"quota exceeded","code":429}}"#,
+            r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#,
+            r#"{"error":"slow down"}"#,
+            "usage_limit_reached",
+            "",
+        ] {
+            assert_eq!(usage_limit_notice(body), None, "{body}");
+        }
     }
 
     #[test]

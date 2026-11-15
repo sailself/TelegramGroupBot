@@ -689,7 +689,16 @@ pub async fn codex_usage_handler(bot: Bot, message: Message) -> Result<()> {
         Ok(snapshot) => snapshot,
         Err(err) => return report_admin_failure(&bot, &message, "usage fetch", &err).await,
     };
-    bot.send_message(message.chat.id, build_usage_report(&snapshot))
+    // The usage report doubles as the manual override for the quota hold.
+    let account_id = runtime_models::current_codex_account_id();
+    let reconciliation =
+        crate::llm::codex_quota::reconcile_with_usage(&snapshot, account_id.as_deref());
+    let mut report = build_usage_report(&snapshot);
+    if let Some(line) = reconciliation.report_line() {
+        report.push_str("\n\n");
+        report.push_str(&line);
+    }
+    bot.send_message(message.chat.id, report)
         .reply_parameters(ReplyParameters::new(message.id))
         .await?;
     Ok(())

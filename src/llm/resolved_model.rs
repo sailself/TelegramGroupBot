@@ -2,12 +2,15 @@
 use crate::config::{
     parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
 };
+use crate::llm::codex_quota::CodexUsageLimitError;
 use crate::llm::runtime_models::{
     CodexSelectedModelRecord, ResolvedExplicitCodexModel, OPENAI_CODEX_SELECTED_MODEL_ID,
 };
 use crate::llm::text_model::{
-    available_third_party_models_for_request, default_text_model_error, ready_runtime_providers,
-    resolve_default_text_model_with_models, ModelRequestCapabilities, MODEL_GEMINI,
+    available_third_party_models_for_request, default_text_model_error,
+    default_text_model_is_codex, ready_runtime_providers,
+    resolve_default_text_model_during_quota_hold, resolve_default_text_model_with_models,
+    ModelRequestCapabilities, MODEL_GEMINI,
 };
 use anyhow::{anyhow, Result};
 
@@ -16,8 +19,12 @@ use anyhow::{anyhow, Result};
 #[derive(Debug, Clone)]
 pub(crate) struct ModelCatalogSnapshot {
     pub models: Vec<ThirdPartyModelConfig>,
+    /// Providers a request may use now. Codex is absent while its quota is on
+    /// hold, which is what keeps it out of pickers and default resolution.
     pub ready_providers: Vec<ThirdPartyProvider>,
     pub codex_record: Option<CodexSelectedModelRecord>,
+    /// Unix seconds until which Codex is on a quota hold, when it is.
+    pub codex_quota_until: Option<i64>,
 }
 
 impl ModelCatalogSnapshot {
@@ -26,10 +33,27 @@ impl ModelCatalogSnapshot {
             (state.models.clone(), state.codex_selected_model.clone())
         });
         let ready_providers = ready_runtime_providers(&models);
+        let codex_quota_until = crate::llm::codex_quota::active_hold().map(|hold| hold.until);
+        Self::new(models, ready_providers, codex_record, codex_quota_until)
+    }
+
+    /// `ready_providers` are the configured, authenticated providers; a quota
+    /// hold takes Codex out of them for this snapshot.
+    pub fn new(
+        models: Vec<ThirdPartyModelConfig>,
+        ready_providers: Vec<ThirdPartyProvider>,
+        codex_record: Option<CodexSelectedModelRecord>,
+        codex_quota_until: Option<i64>,
+    ) -> Self {
+        let mut ready_providers = ready_providers;
+        if codex_quota_until.is_some() {
+            ready_providers.retain(|provider| *provider != ThirdPartyProvider::OpenAICodex);
+        }
         Self {
             models,
             ready_providers,
             codex_record,
+            codex_quota_until,
         }
     }
 
@@ -63,15 +87,47 @@ impl ModelCatalogSnapshot {
             .find(|config| config.id == OPENAI_CODEX_SELECTED_MODEL_ID)
     }
 
+    /// The model a request runs on when nobody picks one. While Codex is on a
+    /// quota hold a Codex default gives way to a stand-in, see
+    /// [`resolve_default_text_model_during_quota_hold`].
     pub fn resolve_default(&self, request: ModelRequestCapabilities) -> Result<String> {
-        resolve_default_text_model_with_models(
-            &CONFIG.models.default_text_model,
+        let default_model = &CONFIG.models.default_text_model;
+        let gemini_available = CONFIG.gemini_api_available();
+        if self.codex_quota_until.is_none() {
+            return resolve_default_text_model_with_models(
+                default_model,
+                &self.models,
+                &self.ready_providers,
+                gemini_available,
+                request,
+            )
+            .map_err(|message| anyhow!(message));
+        }
+        resolve_default_text_model_during_quota_hold(
+            default_model,
             &self.models,
             &self.ready_providers,
-            CONFIG.gemini_api_available(),
+            gemini_available,
             request,
         )
-        .map_err(|message| anyhow!(message))
+        .map_err(|message| self.default_resolution_error(message))
+    }
+
+    /// The error for a default model that did not resolve. On a quota hold
+    /// with a Codex default, "complete Codex setup" would mislead: Codex is
+    /// set up, its window is spent, and nothing else can take the request.
+    pub fn default_resolution_error(&self, message: String) -> anyhow::Error {
+        match self.codex_quota_until {
+            Some(until)
+                if default_text_model_is_codex(&CONFIG.models.default_text_model, &self.models) =>
+            {
+                anyhow!(
+                    "{} No other model is available for this request.",
+                    CodexUsageLimitError { until }.availability_note()
+                )
+            }
+            _ => anyhow!(message),
+        }
     }
     pub fn has_available(&self, request: ModelRequestCapabilities) -> bool {
         !available_third_party_models_for_request(&self.models, &self.ready_providers, request)
@@ -125,7 +181,76 @@ pub(crate) enum ResolvedTextModel {
     },
 }
 
+/// The model a request is rerun on after Codex refused it for a spent usage
+/// window, with the catalog it was resolved against.
+pub(crate) struct QuotaStandIn {
+    pub limit: CodexUsageLimitError,
+    pub model: ResolvedTextModel,
+    pub snapshot: ModelCatalogSnapshot,
+}
+
+impl QuotaStandIn {
+    /// `None` when the stand-in would be Codex again: the hold did not take
+    /// (the account changed mid-request, say) and a rerun would only fail the
+    /// same way.
+    fn new(
+        limit: CodexUsageLimitError,
+        model: ResolvedTextModel,
+        snapshot: ModelCatalogSnapshot,
+    ) -> Option<Self> {
+        (!model.is_codex()).then_some(Self {
+            limit,
+            model,
+            snapshot,
+        })
+    }
+
+    /// Status shown while the request is rerun on `model_label`.
+    pub fn status_text(&self, model_label: &str) -> String {
+        format!(
+            "{} Retrying with {model_label}...",
+            self.limit.availability_note()
+        )
+    }
+}
+
 impl ResolvedTextModel {
+    pub fn is_codex(&self) -> bool {
+        matches!(
+            self,
+            Self::ThirdParty { config, .. } if config.provider == ThirdPartyProvider::OpenAICodex
+        )
+    }
+
+    /// The usage limit that stopped this model, when `error` is Codex refusing
+    /// it for a spent window. `None` for any other failure, and for a model
+    /// that is not Codex: its own call did not hit the limit.
+    pub fn usage_limit_in(&self, error: &anyhow::Error) -> Option<CodexUsageLimitError> {
+        if !self.is_codex() {
+            return None;
+        }
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<CodexUsageLimitError>())
+            .copied()
+    }
+
+    /// The model to rerun a request on after Codex refused it for a spent
+    /// usage window: the default for `request` as it resolves now that Codex
+    /// is on hold. `None` when the failure was something else or nothing else
+    /// can take the request.
+    pub async fn quota_stand_in(
+        &self,
+        error: &anyhow::Error,
+        request: ModelRequestCapabilities,
+    ) -> Option<QuotaStandIn> {
+        let limit = self.usage_limit_in(error)?;
+        let mut snapshot = ModelCatalogSnapshot::load();
+        let id = snapshot.resolve_default(request).ok()?;
+        let model = Self::prepare(&id, &mut snapshot, None).await.ok()?;
+        QuotaStandIn::new(limit, model, snapshot)
+    }
+
     /// Refresh legacy metadata before freezing execution state. Modern records
     /// require no extra catalog read, and explicit quick models are already prepared.
     pub async fn prepare(
@@ -275,8 +400,72 @@ mod tests {
             models: vec![config()],
             ready_providers: vec![ThirdPartyProvider::OpenAICodex],
             codex_record: Some(record),
+            codex_quota_until: None,
         }
     }
+    #[test]
+    fn quota_hold_takes_codex_out_of_selection_and_leaves_other_providers() {
+        let mut other = config();
+        other.id = "openrouter:other".into();
+        other.provider = ThirdPartyProvider::OpenRouter;
+        let record = snapshot().codex_record;
+        let ready = vec![
+            ThirdPartyProvider::OpenAICodex,
+            ThirdPartyProvider::OpenRouter,
+        ];
+
+        let held = ModelCatalogSnapshot::new(
+            vec![config(), other.clone()],
+            ready.clone(),
+            record.clone(),
+            Some(1_794_726_869),
+        );
+        assert_eq!(held.ready_providers, vec![ThirdPartyProvider::OpenRouter]);
+        assert_eq!(held.codex_quota_until, Some(1_794_726_869));
+        assert!(!held.can_select(OPENAI_CODEX_SELECTED_MODEL_ID, Default::default()));
+        assert!(held.can_select("openrouter:other", Default::default()));
+
+        let free = ModelCatalogSnapshot::new(vec![config(), other], ready.clone(), record, None);
+        assert_eq!(free.ready_providers, ready);
+        assert!(free.can_select(OPENAI_CODEX_SELECTED_MODEL_ID, Default::default()));
+    }
+
+    fn codex_model() -> ResolvedTextModel {
+        ResolvedTextModel::from_snapshot(OPENAI_CODEX_SELECTED_MODEL_ID, &snapshot(), None).unwrap()
+    }
+
+    #[test]
+    fn only_a_codex_model_stopped_by_the_usage_limit_reports_it() {
+        let limit = CodexUsageLimitError {
+            until: 1_794_726_869,
+        };
+        let refused = anyhow::Error::new(limit).context("tool loop turn 2 failed");
+
+        assert_eq!(codex_model().usage_limit_in(&refused), Some(limit));
+        assert_eq!(
+            codex_model().usage_limit_in(&anyhow!("Telegram rejected the answer")),
+            None
+        );
+        // A Gemini request whose Codex step hit the limit did not itself fail on it.
+        assert_eq!(ResolvedTextModel::Gemini.usage_limit_in(&refused), None);
+    }
+
+    #[test]
+    fn stand_in_is_never_codex_and_says_what_it_is_doing() {
+        let limit = CodexUsageLimitError {
+            until: crate::utils::timing::now_unix_seconds() + 2 * 3_600 + 30,
+        };
+
+        assert!(QuotaStandIn::new(limit, codex_model(), snapshot()).is_none());
+
+        let stand_in = QuotaStandIn::new(limit, ResolvedTextModel::Gemini, snapshot())
+            .expect("Gemini can stand in");
+        assert_eq!(
+            stand_in.status_text("Gemini"),
+            "Codex has reached its usage limit and should be back in about 2h 0m. Retrying with Gemini..."
+        );
+    }
+
     #[test]
     fn running_model_keeps_configuration_and_metadata_when_catalog_changes() {
         let mut catalog = snapshot();

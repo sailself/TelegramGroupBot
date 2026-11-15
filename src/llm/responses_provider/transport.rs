@@ -559,7 +559,7 @@ where
     )
     .await;
 
-    let value = result.map_err(|err| responses_provider_error(display_name, err))?;
+    let value = result.map_err(|err| responses_provider_error(details, err))?;
     // Only a successful response carries model metadata worth acting on.
     let metadata = last_metadata.into_inner().unwrap_or_default();
     observe_response_metadata(details.provider, &metadata);
@@ -578,9 +578,21 @@ where
 }
 
 /// Keep remote error text out of user-facing messages: HTTP failures are
-/// summarised structurally and decode failures carry only our own wording.
-fn responses_provider_error(display_name: &str, err: ProviderError) -> anyhow::Error {
+/// summarised structurally and decode failures carry only our own wording. A
+/// spent Codex usage window puts Codex on hold and stays typed, so callers can
+/// say when it is back or rerun the request elsewhere.
+fn responses_provider_error(
+    details: &ResponsesRequestDetails,
+    err: ProviderError,
+) -> anyhow::Error {
+    let display_name = details.display_name;
     match err {
+        ProviderError::UsageLimit { notice, .. }
+            if details.provider == ThirdPartyProvider::OpenAICodex =>
+        {
+            crate::llm::codex_quota::note_usage_limit(notice, details.codex_account_id.as_deref())
+                .into()
+        }
         ProviderError::Http {
             status,
             body_snippet,
@@ -591,6 +603,7 @@ fn responses_provider_error(display_name: &str, err: ProviderError) -> anyhow::E
             status,
             summarize_error_body(&body_snippet)
         ),
+        ProviderError::UsageLimit { .. } => anyhow!("{display_name} usage limit reached"),
         ProviderError::Decode { detail, .. } => anyhow!("{detail}"),
         other => anyhow!("{other}"),
     }

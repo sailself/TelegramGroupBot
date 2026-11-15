@@ -124,6 +124,7 @@ fn snapshot_of(
         models,
         ready_providers: ready_providers.to_vec(),
         codex_record: None,
+        codex_quota_until: None,
     }
 }
 
@@ -1124,6 +1125,7 @@ fn explicit_codex_quick_readiness_does_not_require_a_global_selection() {
             enabled: true,
             auth_ready: true,
             current_account_id: Some("acct-1"),
+            quota_hold: false,
         },
     )
     .expect("the validated explicit model should be ready without /codexmodel state");
@@ -1148,11 +1150,114 @@ fn explicit_codex_quick_readiness_does_not_require_a_global_selection() {
             enabled: true,
             auth_ready: true,
             current_account_id: Some("acct-2"),
+            quota_hold: false,
         },
     )
     .expect("an account mismatch should use the configured fallback");
     assert_eq!(mismatched.model_id, MODEL_GEMINI);
     assert!(mismatched.explicit_codex.is_none());
+}
+
+fn explicit_quick_codex_model(
+    slug: &str,
+    account_id: &str,
+) -> crate::llm::runtime_models::ResolvedExplicitCodexModel {
+    crate::llm::runtime_models::ResolvedExplicitCodexModel {
+        config: model(ThirdPartyProvider::OpenAICodex, slug, slug),
+        record: crate::llm::runtime_models::CodexSelectedModelRecord {
+            metadata_version: crate::llm::runtime_models::CODEX_SELECTED_MODEL_METADATA_VERSION,
+            account_id: Some(account_id.to_string()),
+            slug: slug.to_string(),
+            display_name: slug.to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: Some("etag-1".to_string()),
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: Vec::new(),
+            selected_reasoning_level: None,
+            web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
+            supports_search_tool: true,
+            use_responses_lite: true,
+            fetched_at: chrono::Utc::now(),
+        },
+    }
+}
+
+/// An explicit Codex quick model over a Codex default, both on hold.
+#[test]
+fn quota_hold_moves_an_explicit_codex_quick_model_to_the_stand_in_default() {
+    let models = vec![
+        model(
+            ThirdPartyProvider::OpenAICodex,
+            "Codex Selected",
+            "selected",
+        ),
+        model(ThirdPartyProvider::OpenRouter, "Other", "openrouter/other"),
+    ];
+    let held = ExplicitCodexReadiness {
+        enabled: true,
+        auth_ready: true,
+        current_account_id: Some("acct-1"),
+        quota_hold: true,
+    };
+
+    let with_gemini = resolve_prepared_quick_text_model_with_models(
+        "openai-codex:gpt-6-luna",
+        "openai-codex",
+        &models,
+        &[ThirdPartyProvider::OpenRouter],
+        true,
+        ModelRequestCapabilities::default(),
+        Some(explicit_quick_codex_model("gpt-6-luna", "acct-1")),
+        held,
+    )
+    .expect("Gemini stands in during the hold");
+    assert_eq!(with_gemini.model_id, MODEL_GEMINI);
+    assert!(with_gemini.explicit_codex.is_none());
+
+    let without_gemini = resolve_prepared_quick_text_model_with_models(
+        "openai-codex:gpt-6-luna",
+        "openai-codex",
+        &models,
+        &[ThirdPartyProvider::OpenRouter],
+        false,
+        ModelRequestCapabilities::default(),
+        Some(explicit_quick_codex_model("gpt-6-luna", "acct-1")),
+        held,
+    )
+    .expect("the first ready third-party model stands in during the hold");
+    assert_eq!(without_gemini.model_id, "openrouter:openrouter/other");
+    assert!(without_gemini.explicit_codex.is_none());
+}
+
+#[test]
+fn quota_hold_keeps_a_quick_model_that_is_not_codex() {
+    let models = vec![
+        model(
+            ThirdPartyProvider::OpenAICodex,
+            "Codex Selected",
+            "selected",
+        ),
+        model(ThirdPartyProvider::OpenRouter, "Other", "openrouter/other"),
+    ];
+    let prepared = resolve_prepared_quick_text_model_with_models(
+        "openrouter:openrouter/other",
+        "openai-codex",
+        &models,
+        &[ThirdPartyProvider::OpenRouter],
+        true,
+        ModelRequestCapabilities::default(),
+        None,
+        ExplicitCodexReadiness {
+            enabled: true,
+            auth_ready: true,
+            current_account_id: Some("acct-1"),
+            quota_hold: true,
+        },
+    )
+    .expect("a ready non-Codex quick model is unaffected");
+    assert_eq!(prepared.model_id, "openrouter:openrouter/other");
 }
 
 #[test]
@@ -1744,6 +1849,42 @@ fn third_party_model_reads_the_original_youtube_link() {
 }
 
 #[test]
+fn request_rerun_on_gemini_gets_its_youtube_links_back_as_video_inputs() {
+    let mut request = youtube_pending_request();
+    let saved = request.gemini_youtube.clone();
+    let codex = QaModel::ThirdParty {
+        config: model(ThirdPartyProvider::OpenAICodex, "Codex", "selected"),
+        explicit_codex: None,
+    };
+    apply_youtube_inputs_for_model(&mut request, &codex);
+
+    super::process::retarget_request(&mut request, saved, &QaModel::Gemini);
+
+    assert_eq!(request.query, "watch this YouTube_dQw4w9WgXcQ");
+    assert_eq!(request.enrichment.youtube_urls, vec![YOUTUBE_URL]);
+}
+
+#[test]
+fn request_rerun_on_a_third_party_model_keeps_the_links_in_its_text() {
+    let mut request = youtube_pending_request();
+    let saved = request.gemini_youtube.clone();
+    let codex = QaModel::ThirdParty {
+        config: model(ThirdPartyProvider::OpenAICodex, "Codex", "selected"),
+        explicit_codex: None,
+    };
+    let other = QaModel::ThirdParty {
+        config: model(ThirdPartyProvider::OpenRouter, "Other", "openrouter/other"),
+        explicit_codex: None,
+    };
+    apply_youtube_inputs_for_model(&mut request, &codex);
+
+    super::process::retarget_request(&mut request, saved, &other);
+
+    assert_eq!(request.query, YOUTUBE_QUERY);
+    assert!(request.enrichment.youtube_urls.is_empty());
+}
+
+#[test]
 fn only_gemini_reports_youtube_videos_in_its_progress_message() {
     let request = youtube_pending_request();
     let codex = QaModel::ThirdParty {
@@ -1810,6 +1951,7 @@ fn model_catalog_snapshot_resolves_codex_aliases() {
         models: vec![selected.clone(), openrouter.clone()],
         ready_providers: vec![ThirdPartyProvider::OpenAICodex],
         codex_record: Some(selected_record("gpt-5.4")),
+        codex_quota_until: None,
     };
 
     assert_eq!(snapshot.count(), 2);
@@ -1857,6 +1999,7 @@ fn qa_model_resolve_keeps_the_explicit_codex_model_and_rejects_a_changed_one() {
         models: Vec::new(),
         ready_providers: Vec::new(),
         codex_record: None,
+        codex_quota_until: None,
     };
 
     let resolved = QaModel::resolve(&config.id, &snapshot, Some(&prepared))

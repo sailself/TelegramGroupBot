@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
+use tracing::warn;
 
 use crate::config::{parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider};
 use crate::llm::audit::LlmAuditContext;
-use crate::llm::media::{summarize_media_files, MediaSummary};
+use crate::llm::media::{summarize_media_files, MediaFile, MediaSummary};
 use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel};
 use crate::llm::runtime_models::{is_runtime_provider_ready, OPENAI_CODEX_SELECTED_MODEL_ID};
 use crate::llm::tool_runtime::ToolRuntime;
@@ -195,6 +196,59 @@ pub(crate) fn resolve_default_text_model_with_models(
     Ok(normalized)
 }
 
+/// The default text model while Codex is on a quota hold. A default that
+/// still resolves is kept. A Codex default cannot run, so Gemini stands in
+/// for it, or failing that the first ready third-party model that can serve
+/// the request. Any other unavailable default keeps its configuration error.
+pub(crate) fn resolve_default_text_model_during_quota_hold(
+    default_model: &str,
+    models: &[ThirdPartyModelConfig],
+    ready_providers: &[ThirdPartyProvider],
+    gemini_available: bool,
+    request: ModelRequestCapabilities,
+) -> std::result::Result<String, String> {
+    let configured = resolve_default_text_model_with_models(
+        default_model,
+        models,
+        ready_providers,
+        gemini_available,
+        request,
+    );
+    let Err(error) = configured else {
+        return configured;
+    };
+    if !default_text_model_is_codex(default_model, models) {
+        return Err(error);
+    }
+    if gemini_available {
+        return Ok(MODEL_GEMINI.to_string());
+    }
+    available_third_party_models_for_request(models, ready_providers, request)
+        .first()
+        .map(|config| config.id.clone())
+        .ok_or(error)
+}
+
+/// Whether the configured default names a Codex model, however it is spelled:
+/// the bare provider alias, a qualified id, or a slug the catalog resolves.
+pub(crate) fn default_text_model_is_codex(
+    default_model: &str,
+    models: &[ThirdPartyModelConfig],
+) -> bool {
+    let trimmed = default_model.trim();
+    if trimmed.eq_ignore_ascii_case("openai-codex") {
+        return true;
+    }
+    let normalized = normalize_model_identifier_with_models(trimmed, models, &[]);
+    match models.iter().find(|config| config.id == normalized) {
+        Some(config) => config.provider == ThirdPartyProvider::OpenAICodex,
+        None => matches!(
+            parse_third_party_model_id(&normalized),
+            Some((ThirdPartyProvider::OpenAICodex, _))
+        ),
+    }
+}
+
 pub(crate) fn third_party_model_matches_request_capabilities(
     config: &ThirdPartyModelConfig,
     request: ModelRequestCapabilities,
@@ -259,26 +313,45 @@ pub(crate) async fn call_configured_text_model(
         .as_ref()
         .map(|files| summarize_media_files(files))
         .unwrap_or_default();
+    let capabilities = ModelRequestCapabilities::from_media(&media_summary, tools_enabled);
     let mut snapshot = ModelCatalogSnapshot::load();
-    let id = snapshot.resolve_default(ModelRequestCapabilities::from_media(
-        &media_summary,
-        tools_enabled,
-    ))?;
+    let id = snapshot.resolve_default(capabilities)?;
     let model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
-    call_resolved_text_model(
-        &model,
-        crate::llm::text_model::TextCallRequest {
-            system_prompt,
-            user_content,
-            response_title,
-            tools_enabled,
-            use_pro,
-            media_files,
-            prompt_name,
-            audit_context,
-        },
-    )
-    .await
+    let call = |model: &ResolvedTextModel, media_files: Option<Vec<MediaFile>>| {
+        let model = model.clone();
+        async move {
+            call_resolved_text_model(
+                &model,
+                TextCallRequest {
+                    system_prompt,
+                    user_content,
+                    response_title,
+                    tools_enabled,
+                    use_pro,
+                    media_files,
+                    prompt_name,
+                    audit_context,
+                },
+            )
+            .await
+        }
+    };
+    // Only a Codex call can end in a rerun, so only it keeps a copy of the media.
+    let rerun_media = model.is_codex().then(|| media_files.clone());
+    let error = match call(&model, media_files).await {
+        Ok(answer) => return Ok(answer),
+        Err(error) => error,
+    };
+    // Codex refused the request for a spent usage window: answer on the model
+    // standing in for Codex rather than failing.
+    let Some(stand_in) = model.quota_stand_in(&error, capabilities).await else {
+        return Err(error);
+    };
+    warn!(
+        "Codex usage limit reached; rerunning the request on {}",
+        stand_in.snapshot.display_name(stand_in.model.model_id())
+    );
+    call(&stand_in.model, rerun_media.flatten()).await
 }
 
 pub(crate) async fn call_resolved_text_model(
@@ -503,6 +576,135 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("Default text model openai-codex:selected is unavailable"));
+    }
+
+    /// The catalog during a hold: Codex is configured but not among the ready
+    /// providers, and two third-party models follow it.
+    fn held_catalog() -> Vec<ThirdPartyModelConfig> {
+        let mut no_tools = model(ThirdPartyProvider::Nvidia, "No Tools", "nvidia/no-tools");
+        no_tools.tools = false;
+        vec![
+            model(
+                ThirdPartyProvider::OpenAICodex,
+                "Codex Selected",
+                "selected",
+            ),
+            no_tools,
+            model(
+                ThirdPartyProvider::OpenRouter,
+                "With Tools",
+                "openrouter/with-tools",
+            ),
+        ]
+    }
+
+    const READY_WITHOUT_CODEX: [ThirdPartyProvider; 2] =
+        [ThirdPartyProvider::Nvidia, ThirdPartyProvider::OpenRouter];
+
+    #[test]
+    fn quota_hold_swaps_a_codex_default_for_gemini() {
+        for default_model in ["openai-codex", "openai-codex:selected", "selected"] {
+            let result = resolve_default_text_model_during_quota_hold(
+                default_model,
+                &held_catalog(),
+                &READY_WITHOUT_CODEX,
+                true,
+                ModelRequestCapabilities::default(),
+            );
+            assert_eq!(result.as_deref(), Ok(MODEL_GEMINI), "{default_model}");
+        }
+    }
+
+    #[test]
+    fn quota_hold_without_gemini_uses_the_first_third_party_model_that_fits() {
+        let first = resolve_default_text_model_during_quota_hold(
+            "openai-codex",
+            &held_catalog(),
+            &READY_WITHOUT_CODEX,
+            false,
+            ModelRequestCapabilities::default(),
+        );
+        assert_eq!(first.as_deref(), Ok("nvidia:nvidia/no-tools"));
+
+        let with_tools = resolve_default_text_model_during_quota_hold(
+            "openai-codex",
+            &held_catalog(),
+            &READY_WITHOUT_CODEX,
+            false,
+            ModelRequestCapabilities {
+                require_tools: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            with_tools.as_deref(),
+            Ok("openrouter:openrouter/with-tools")
+        );
+
+        let only_openrouter_ready = resolve_default_text_model_during_quota_hold(
+            "openai-codex",
+            &held_catalog(),
+            &[ThirdPartyProvider::OpenRouter],
+            false,
+            ModelRequestCapabilities::default(),
+        );
+        assert_eq!(
+            only_openrouter_ready.as_deref(),
+            Ok("openrouter:openrouter/with-tools")
+        );
+    }
+
+    #[test]
+    fn quota_hold_reports_the_configuration_error_when_nothing_can_stand_in() {
+        let nothing_ready = resolve_default_text_model_during_quota_hold(
+            "openai-codex",
+            &held_catalog(),
+            &[],
+            false,
+            ModelRequestCapabilities::default(),
+        );
+        assert!(nothing_ready.is_err(), "{nothing_ready:?}");
+
+        // Documents are Gemini-only, so no third-party model stands in.
+        let documents = resolve_default_text_model_during_quota_hold(
+            "openai-codex",
+            &held_catalog(),
+            &READY_WITHOUT_CODEX,
+            false,
+            ModelRequestCapabilities {
+                has_documents: true,
+                ..Default::default()
+            },
+        );
+        assert!(documents.is_err(), "{documents:?}");
+    }
+
+    #[test]
+    fn quota_hold_leaves_other_defaults_alone() {
+        let ready_default = resolve_default_text_model_during_quota_hold(
+            "openrouter:openrouter/with-tools",
+            &held_catalog(),
+            &READY_WITHOUT_CODEX,
+            true,
+            ModelRequestCapabilities::default(),
+        );
+        assert_eq!(
+            ready_default.as_deref(),
+            Ok("openrouter:openrouter/with-tools")
+        );
+
+        // A non-Codex default that is unavailable is a configuration problem
+        // the hold must not paper over.
+        let misconfigured = resolve_default_text_model_during_quota_hold(
+            "openrouter:openrouter/with-tools",
+            &held_catalog(),
+            &[ThirdPartyProvider::Nvidia],
+            true,
+            ModelRequestCapabilities::default(),
+        );
+        assert!(misconfigured
+            .unwrap_err()
+            .contains("Default text model openrouter:openrouter/with-tools is unavailable"));
     }
 
     #[test]
