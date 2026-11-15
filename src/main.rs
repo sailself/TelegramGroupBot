@@ -38,83 +38,92 @@ use handlers::{media, qa};
 use state::AppState;
 use utils::logging::init_logging;
 
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase")]
-enum Command {
-    #[command(description = "介绍AI小喵和可用指令")]
-    Start,
-    #[command(description = "查看帮助与指令说明")]
-    Help,
-    #[command(description = "汇总最近 N 条消息（默认 100 条，可用 /tldr 50 指定数量）")]
-    Tldr(String),
-    #[command(
-        description = "回复一条文字/图片/视频/音频消息进行事实核查，支持消息内的 Telegraph/Twitter/YouTube 链接"
-    )]
-    Factcheck(String),
-    #[command(
-        description = "提问或分析媒体，弹出模型选择（默认 Gemini，自动隐藏不支持当前媒体的模型）"
-    )]
-    Q(String),
-    #[command(description = "询问本群聊里的历史内容，可检索当前聊天记录并在需要时联网搜索")]
-    Qc(String),
-    #[command(
-        description = "Quick Question（快问快答），跳过模型选择并用简短回答，必要时最多联网搜索一次"
-    )]
-    Qq(String),
-    #[command(
-        rename = "burn_baby_burn",
-        description = "show how many tokens you have used in this chat"
-    )]
-    BurnBabyBurn,
-    #[command(
-        rename = "token_devourers",
-        description = "rank the top token consumers in this group"
-    )]
-    TokenDevourers(String),
-    #[command(description = "搜索本群聊相关消息，返回命中的消息摘要和直达链接")]
-    S(String),
-    #[command(description = "用 Gemini 生成/编辑图片，可直接描述或回复图片/贴纸")]
-    Img(String),
-    #[command(description = "用 Codex 生成 GIF 动画，可回复静态图片作为参考")]
-    Gif(String),
-    #[command(description = "hidden image generation command")]
-    Img2(String),
-    #[command(description = "与 /img 相同，但附带分辨率与长宽比按钮")]
-    Image(String),
-    #[command(description = "用 Veo 生成视频")]
-    Vid(String),
-    #[command(description = "hidden video generation command")]
-    Vid2(String),
-    #[command(description = "基于你在本群的聊天记录生成你的主题歌")]
-    Mysong(String),
-    #[command(description = "基于你在本群的聊天记录生成个人简介")]
-    Profileme(String),
-    #[command(description = "基于你在本群的聊天记录生成艺术形象")]
-    Paintme,
-    #[command(description = "基于你在本群的聊天记录生成肖像")]
-    Portraitme,
-    #[command(description = "查看机器人状态（管理员）")]
-    Status,
-    #[command(description = "查看诊断信息（管理员）")]
-    Diagnose,
-    #[command(
-        rename = "token_stats",
-        description = "show bot-wide token statistics (admin)"
-    )]
-    TokenStats(String),
-    #[command(description = "登录 ChatGPT Codex（管理员）")]
-    Codexlogin,
-    #[command(description = "退出 ChatGPT Codex（管理员）")]
-    Codexlogout,
-    #[command(description = "选择当前 Codex 模型（管理员）")]
-    Codexmodel,
-    #[command(description = "set Codex reasoning level (admin)")]
-    Codexreasoning,
-    #[command(description = "show Codex usage and rate limits (admin)")]
-    Codexusage,
-    #[command(description = "投喂AI小喵")]
-    Support,
+// rustc 1.100 flags the `String` argument parsing that teloxide-macros
+// generates (a `map_err` on `Infallible`) as unreachable. The derived impl is a
+// sibling of the enum, so the allow has to sit on an enclosing module.
+#[allow(unreachable_code)]
+mod command {
+    use teloxide::utils::command::BotCommands;
+
+    #[derive(BotCommands, Clone)]
+    #[command(rename_rule = "lowercase")]
+    pub(super) enum Command {
+        #[command(description = "介绍AI小喵和可用指令")]
+        Start,
+        #[command(description = "查看帮助与指令说明")]
+        Help,
+        #[command(description = "汇总最近 N 条消息（默认 100 条，可用 /tldr 50 指定数量）")]
+        Tldr(String),
+        #[command(
+            description = "回复一条文字/图片/视频/音频消息进行事实核查，支持消息内的 Telegraph/Twitter/YouTube 链接"
+        )]
+        Factcheck(String),
+        #[command(
+            description = "提问或分析媒体，弹出模型选择（默认 Gemini，自动隐藏不支持当前媒体的模型）"
+        )]
+        Q(String),
+        #[command(description = "询问本群聊里的历史内容，可检索当前聊天记录并在需要时联网搜索")]
+        Qc(String),
+        #[command(
+            description = "Quick Question（快问快答），跳过模型选择并用简短回答，必要时最多联网搜索一次"
+        )]
+        Qq(String),
+        #[command(
+            rename = "burn_baby_burn",
+            description = "show how many tokens you have used in this chat"
+        )]
+        BurnBabyBurn,
+        #[command(
+            rename = "token_devourers",
+            description = "rank the top token consumers in this group"
+        )]
+        TokenDevourers(String),
+        #[command(description = "搜索本群聊相关消息，返回命中的消息摘要和直达链接")]
+        S(String),
+        #[command(description = "用 Gemini 生成/编辑图片，可直接描述或回复图片/贴纸")]
+        Img(String),
+        #[command(description = "用 Codex 生成 GIF 动画，可回复静态图片作为参考")]
+        Gif(String),
+        #[command(description = "hidden image generation command")]
+        Img2(String),
+        #[command(description = "与 /img 相同，但附带分辨率与长宽比按钮")]
+        Image(String),
+        #[command(description = "用 Veo 生成视频")]
+        Vid(String),
+        #[command(description = "hidden video generation command")]
+        Vid2(String),
+        #[command(description = "基于你在本群的聊天记录生成你的主题歌")]
+        Mysong(String),
+        #[command(description = "基于你在本群的聊天记录生成个人简介")]
+        Profileme(String),
+        #[command(description = "基于你在本群的聊天记录生成艺术形象")]
+        Paintme,
+        #[command(description = "基于你在本群的聊天记录生成肖像")]
+        Portraitme,
+        #[command(description = "查看机器人状态（管理员）")]
+        Status,
+        #[command(description = "查看诊断信息（管理员）")]
+        Diagnose,
+        #[command(
+            rename = "token_stats",
+            description = "show bot-wide token statistics (admin)"
+        )]
+        TokenStats(String),
+        #[command(description = "登录 ChatGPT Codex（管理员）")]
+        Codexlogin,
+        #[command(description = "退出 ChatGPT Codex（管理员）")]
+        Codexlogout,
+        #[command(description = "选择当前 Codex 模型（管理员）")]
+        Codexmodel,
+        #[command(description = "set Codex reasoning level (admin)")]
+        Codexreasoning,
+        #[command(description = "show Codex usage and rate limits (admin)")]
+        Codexusage,
+        #[command(description = "投喂AI小喵")]
+        Support,
+    }
 }
+use command::Command;
 
 type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
