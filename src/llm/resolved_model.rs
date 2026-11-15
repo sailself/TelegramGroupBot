@@ -181,7 +181,76 @@ pub(crate) enum ResolvedTextModel {
     },
 }
 
+/// The model a request is rerun on after Codex refused it for a spent usage
+/// window, with the catalog it was resolved against.
+pub(crate) struct QuotaStandIn {
+    pub limit: CodexUsageLimitError,
+    pub model: ResolvedTextModel,
+    pub snapshot: ModelCatalogSnapshot,
+}
+
+impl QuotaStandIn {
+    /// `None` when the stand-in would be Codex again: the hold did not take
+    /// (the account changed mid-request, say) and a rerun would only fail the
+    /// same way.
+    fn new(
+        limit: CodexUsageLimitError,
+        model: ResolvedTextModel,
+        snapshot: ModelCatalogSnapshot,
+    ) -> Option<Self> {
+        (!model.is_codex()).then_some(Self {
+            limit,
+            model,
+            snapshot,
+        })
+    }
+
+    /// Status shown while the request is rerun on `model_label`.
+    pub fn status_text(&self, model_label: &str) -> String {
+        format!(
+            "{} Retrying with {model_label}...",
+            self.limit.availability_note()
+        )
+    }
+}
+
 impl ResolvedTextModel {
+    pub fn is_codex(&self) -> bool {
+        matches!(
+            self,
+            Self::ThirdParty { config, .. } if config.provider == ThirdPartyProvider::OpenAICodex
+        )
+    }
+
+    /// The usage limit that stopped this model, when `error` is Codex refusing
+    /// it for a spent window. `None` for any other failure, and for a model
+    /// that is not Codex: its own call did not hit the limit.
+    pub fn usage_limit_in(&self, error: &anyhow::Error) -> Option<CodexUsageLimitError> {
+        if !self.is_codex() {
+            return None;
+        }
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<CodexUsageLimitError>())
+            .copied()
+    }
+
+    /// The model to rerun a request on after Codex refused it for a spent
+    /// usage window: the default for `request` as it resolves now that Codex
+    /// is on hold. `None` when the failure was something else or nothing else
+    /// can take the request.
+    pub async fn quota_stand_in(
+        &self,
+        error: &anyhow::Error,
+        request: ModelRequestCapabilities,
+    ) -> Option<QuotaStandIn> {
+        let limit = self.usage_limit_in(error)?;
+        let mut snapshot = ModelCatalogSnapshot::load();
+        let id = snapshot.resolve_default(request).ok()?;
+        let model = Self::prepare(&id, &mut snapshot, None).await.ok()?;
+        QuotaStandIn::new(limit, model, snapshot)
+    }
+
     /// Refresh legacy metadata before freezing execution state. Modern records
     /// require no extra catalog read, and explicit quick models are already prepared.
     pub async fn prepare(
@@ -359,6 +428,42 @@ mod tests {
         let free = ModelCatalogSnapshot::new(vec![config(), other], ready.clone(), record, None);
         assert_eq!(free.ready_providers, ready);
         assert!(free.can_select(OPENAI_CODEX_SELECTED_MODEL_ID, Default::default()));
+    }
+
+    fn codex_model() -> ResolvedTextModel {
+        ResolvedTextModel::from_snapshot(OPENAI_CODEX_SELECTED_MODEL_ID, &snapshot(), None).unwrap()
+    }
+
+    #[test]
+    fn only_a_codex_model_stopped_by_the_usage_limit_reports_it() {
+        let limit = CodexUsageLimitError {
+            until: 1_794_726_869,
+        };
+        let refused = anyhow::Error::new(limit).context("tool loop turn 2 failed");
+
+        assert_eq!(codex_model().usage_limit_in(&refused), Some(limit));
+        assert_eq!(
+            codex_model().usage_limit_in(&anyhow!("Telegram rejected the answer")),
+            None
+        );
+        // A Gemini request whose Codex step hit the limit did not itself fail on it.
+        assert_eq!(ResolvedTextModel::Gemini.usage_limit_in(&refused), None);
+    }
+
+    #[test]
+    fn stand_in_is_never_codex_and_says_what_it_is_doing() {
+        let limit = CodexUsageLimitError {
+            until: crate::utils::timing::now_unix_seconds() + 2 * 3_600 + 30,
+        };
+
+        assert!(QuotaStandIn::new(limit, codex_model(), snapshot()).is_none());
+
+        let stand_in = QuotaStandIn::new(limit, ResolvedTextModel::Gemini, snapshot())
+            .expect("Gemini can stand in");
+        assert_eq!(
+            stand_in.status_text("Gemini"),
+            "Codex has reached its usage limit and should be back in about 2h 0m. Retrying with Gemini..."
+        );
     }
 
     #[test]

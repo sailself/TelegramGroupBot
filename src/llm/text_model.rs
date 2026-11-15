@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
+use tracing::warn;
 
 use crate::config::{parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider};
 use crate::llm::audit::LlmAuditContext;
-use crate::llm::media::{summarize_media_files, MediaSummary};
+use crate::llm::media::{summarize_media_files, MediaFile, MediaSummary};
 use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel};
 use crate::llm::runtime_models::{is_runtime_provider_ready, OPENAI_CODEX_SELECTED_MODEL_ID};
 use crate::llm::tool_runtime::ToolRuntime;
@@ -312,26 +313,45 @@ pub(crate) async fn call_configured_text_model(
         .as_ref()
         .map(|files| summarize_media_files(files))
         .unwrap_or_default();
+    let capabilities = ModelRequestCapabilities::from_media(&media_summary, tools_enabled);
     let mut snapshot = ModelCatalogSnapshot::load();
-    let id = snapshot.resolve_default(ModelRequestCapabilities::from_media(
-        &media_summary,
-        tools_enabled,
-    ))?;
+    let id = snapshot.resolve_default(capabilities)?;
     let model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
-    call_resolved_text_model(
-        &model,
-        crate::llm::text_model::TextCallRequest {
-            system_prompt,
-            user_content,
-            response_title,
-            tools_enabled,
-            use_pro,
-            media_files,
-            prompt_name,
-            audit_context,
-        },
-    )
-    .await
+    let call = |model: &ResolvedTextModel, media_files: Option<Vec<MediaFile>>| {
+        let model = model.clone();
+        async move {
+            call_resolved_text_model(
+                &model,
+                TextCallRequest {
+                    system_prompt,
+                    user_content,
+                    response_title,
+                    tools_enabled,
+                    use_pro,
+                    media_files,
+                    prompt_name,
+                    audit_context,
+                },
+            )
+            .await
+        }
+    };
+    // Only a Codex call can end in a rerun, so only it keeps a copy of the media.
+    let rerun_media = model.is_codex().then(|| media_files.clone());
+    let error = match call(&model, media_files).await {
+        Ok(answer) => return Ok(answer),
+        Err(error) => error,
+    };
+    // Codex refused the request for a spent usage window: answer on the model
+    // standing in for Codex rather than failing.
+    let Some(stand_in) = model.quota_stand_in(&error, capabilities).await else {
+        return Err(error);
+    };
+    warn!(
+        "Codex usage limit reached; rerunning the request on {}",
+        stand_in.snapshot.display_name(stand_in.model.model_id())
+    );
+    call(&stand_in.model, rerun_media.flatten()).await
 }
 
 pub(crate) async fn call_resolved_text_model(

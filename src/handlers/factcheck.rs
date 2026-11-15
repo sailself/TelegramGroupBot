@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ReplyParameters};
+use teloxide::types::{ChatAction, MessageId, ReplyParameters};
 use tracing::info;
 
 use crate::agents::factcheck::{run_factcheck_pipeline, FactcheckOutcome};
@@ -10,7 +10,7 @@ use crate::agents::step::WallClock;
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::agent_model_picker::{
-    run_with_agent_model_choice, AgentModelRequest, ChosenAgentModel,
+    announce_quota_stand_in, run_with_agent_model_choice, AgentModelRequest, ChosenAgentModel,
 };
 use crate::handlers::enrichment::{
     count_sources, enrich_request, entity_link_urls, render_sources, Enrichment, EnrichmentBudget,
@@ -277,28 +277,79 @@ struct FactcheckJob {
     audit_context: Option<LlmAuditContext>,
 }
 
+impl FactcheckJob {
+    /// One attempt on `final_model` within `clock`: the agentic pipeline when
+    /// it is enabled and takes the request, otherwise the single call.
+    async fn check(
+        &self,
+        bot: &Bot,
+        status_message_id: MessageId,
+        clock: &WallClock,
+        final_model: &ResolvedTextModel,
+    ) -> Result<(String, String)> {
+        let user_language_code = self.user_language_code.as_deref();
+        let audit_context = self.audit_context.as_ref();
+        clock
+            .run(async {
+                if CONFIG.agents.enable_agentic_factcheck {
+                    let mut progress =
+                        ProgressReporter::new(bot.clone(), self.chat_id, status_message_id);
+                    match run_factcheck_pipeline(
+                        &self.statement,
+                        &self.media_files,
+                        &self.media_summary,
+                        user_language_code,
+                        audit_context,
+                        &mut progress,
+                        clock,
+                        final_model,
+                    )
+                    .await?
+                    {
+                        FactcheckOutcome::Answer(answer) => {
+                            return Ok((answer.text, answer.model_display))
+                        }
+                        FactcheckOutcome::UseLegacy(reason) => {
+                            info!("Agentic fact-check fell back: {reason}")
+                        }
+                    }
+                }
+                clock.check()?;
+                call_resolved_text_model(
+                    final_model,
+                    crate::llm::text_model::TextCallRequest {
+                        system_prompt: &build_factcheck_system_prompt(user_language_code),
+                        user_content: &self.statement,
+                        response_title: "Fact Check",
+                        tools_enabled: true,
+                        use_pro: self.media_summary.total > 0,
+                        media_files: Some(self.media_files.clone()),
+                        prompt_name: Some("FACTCHECK_SYSTEM_PROMPT"),
+                        audit_context,
+                    },
+                )
+                .await
+            })
+            .await
+    }
+}
+
 async fn run_factcheck(
     bot: Bot,
     state: AppState,
     job: FactcheckJob,
     model: ChosenAgentModel,
 ) -> Result<()> {
-    let FactcheckJob {
-        chat_id,
-        statement,
-        media_files,
-        media_summary,
-        user_language_code,
-        audit_context,
-    } = job;
+    let chat_id = job.chat_id;
+    let uses_pro = job.media_summary.total > 0;
     let ChosenAgentModel {
         id,
         mut snapshot,
+        capabilities,
         status_message_id,
         heavy_permit,
     } = model;
     let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
-    let user_language_code = user_language_code.as_deref();
     crate::utils::telegram::run_with_status_message(
         &bot,
         chat_id,
@@ -308,51 +359,38 @@ async fn run_factcheck(
             let _chat_action =
                 start_chat_action_heartbeat(bot.clone(), chat_id, ChatAction::Typing);
 
-            let clock =
-                WallClock::start().for_gemini_pipeline(id == "gemini", media_summary.total > 0);
-            let response = clock
-                .run(async {
-                    let final_model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
-                    if CONFIG.agents.enable_agentic_factcheck {
-                        let mut progress =
-                            ProgressReporter::new(bot.clone(), chat_id, status_message_id);
-                        match run_factcheck_pipeline(
-                            &statement,
-                            &media_files,
-                            &media_summary,
-                            user_language_code,
-                            audit_context.as_ref(),
-                            &mut progress,
-                            &clock,
-                            &final_model,
-                        )
-                        .await?
-                        {
-                            FactcheckOutcome::Answer(answer) => {
-                                return Ok((answer.text, answer.model_display))
-                            }
-                            FactcheckOutcome::UseLegacy(reason) => {
-                                info!("Agentic fact-check fell back: {reason}")
-                            }
-                        }
-                    }
-                    clock.check()?;
-                    call_resolved_text_model(
-                        &final_model,
-                        crate::llm::text_model::TextCallRequest {
-                            system_prompt: &build_factcheck_system_prompt(user_language_code),
-                            user_content: &statement,
-                            response_title: "Fact Check",
-                            tools_enabled: true,
-                            use_pro: media_summary.total > 0,
-                            media_files: Some(media_files),
-                            prompt_name: Some("FACTCHECK_SYSTEM_PROMPT"),
-                            audit_context: audit_context.as_ref(),
-                        },
-                    )
-                    .await
-                })
+            let clock = WallClock::start().for_gemini_pipeline(id == "gemini", uses_pro);
+            let final_model = clock
+                .run(ResolvedTextModel::prepare(&id, &mut snapshot, None))
                 .await?;
+            let response = match job
+                .check(&bot, status_message_id, &clock, &final_model)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    // Codex refused the request for a spent usage window: check
+                    // on the model standing in for Codex rather than failing.
+                    let Some(stand_in) = final_model.quota_stand_in(&error, capabilities).await
+                    else {
+                        return Err(error);
+                    };
+                    announce_quota_stand_in(
+                        &bot,
+                        chat_id,
+                        status_message_id,
+                        "factcheck",
+                        &stand_in,
+                    )
+                    .await;
+                    let clock = WallClock::start().for_gemini_pipeline(
+                        matches!(stand_in.model, ResolvedTextModel::Gemini),
+                        uses_pro,
+                    );
+                    job.check(&bot, status_message_id, &clock, &stand_in.model)
+                        .await?
+                }
+            };
 
             let (response_text, response_model) = response;
             let response_with_model =

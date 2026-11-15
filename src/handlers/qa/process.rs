@@ -572,6 +572,18 @@ async fn send_qa_answer(
     .await
 }
 
+/// Point a request at the model standing in for Codex. Its YouTube inputs were
+/// settled for Codex, which reads the links as text; `gemini_youtube` is the
+/// copy saved before that, so a Gemini stand-in still gets them as video.
+pub(super) fn retarget_request(
+    request: &mut PendingQRequest,
+    gemini_youtube: Option<crate::state::GeminiYoutubeInput>,
+    model: &QaModel,
+) {
+    request.gemini_youtube = gemini_youtube;
+    apply_youtube_inputs_for_model(request, model);
+}
+
 /// Run a prepared request against `model`. `heavy_permit` is the permit a
 /// caller already holds (the direct `/q` path throttles its own preparation);
 /// passing it through avoids taking a second slot from the same semaphore,
@@ -596,38 +608,114 @@ pub(super) async fn process_request(
         .await?;
         return Ok(());
     }
+    // Kept for a rerun: settling the inputs for Codex drops Gemini's version.
+    let gemini_youtube = request.gemini_youtube.clone();
     apply_youtube_inputs_for_model(&mut request, model);
 
     let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
-    crate::utils::telegram::run_with_status_message(bot, ChatId(request.chat_id), MessageId(request.selection_message_id as i32), "Failed to answer this request. Please try again.", async {
+    crate::utils::telegram::run_with_status_message(
+        bot,
+        ChatId(request.chat_id),
+        MessageId(request.selection_message_id as i32),
+        "Failed to answer this request. Please try again.",
+        async {
             let _heavy_permit = _heavy_permit;
 
-    let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
-    if request.mode.requires_chat_search_index() && !state.db.is_search_ready() {
-        bot.edit_message_text(
-            ChatId(request.chat_id),
-            MessageId(request.selection_message_id as i32),
-            chat_search_rebuilding_message(qa_mode_command_name(request.mode)),
-        )
-        .await?;
-        return Ok(());
-    }
+            let audit_context = audit_context_from_id(&state.db, request.llm_invocation_id);
+            if request.mode.requires_chat_search_index() && !state.db.is_search_ready() {
+                bot.edit_message_text(
+                    ChatId(request.chat_id),
+                    MessageId(request.selection_message_id as i32),
+                    chat_search_rebuilding_message(qa_mode_command_name(request.mode)),
+                )
+                .await?;
+                return Ok(());
+            }
 
+            let _chat_action = start_chat_action_heartbeat(
+                bot.clone(),
+                ChatId(request.chat_id),
+                ChatAction::Typing,
+            );
+
+            let error = match answer_request(
+                bot,
+                state,
+                &request,
+                model,
+                snapshot,
+                audit_context.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            // Codex refused the request for a spent usage window: answer it on the
+            // model standing in for Codex rather than failing it.
+            let summary = summarize_media_files(&request.enrichment.media_files);
+            let capabilities = crate::llm::text_model::ModelRequestCapabilities::from_media(
+                &summary,
+                request.mode.requires_custom_tools(),
+            );
+            let Some(stand_in) = model.quota_stand_in(&error, capabilities).await else {
+                return Err(error);
+            };
+            retarget_request(&mut request, gemini_youtube, &stand_in.model);
+            let stand_in_name = stand_in
+                .model
+                .display_name(&stand_in.snapshot, request.mode);
+            warn!("Codex usage limit reached; rerunning the QA request on {stand_in_name}");
+            let _ = bot
+                .edit_message_text(
+                    ChatId(request.chat_id),
+                    MessageId(request.selection_message_id as i32),
+                    stand_in.status_text(&stand_in_name),
+                )
+                .await;
+            answer_request(
+                bot,
+                state,
+                &request,
+                &stand_in.model,
+                &stand_in.snapshot,
+                audit_context.as_ref(),
+            )
+            .await
+        },
+    )
+    .await
+}
+
+/// One attempt at a request on `model`: call it and deliver the answer.
+async fn answer_request(
+    bot: &Bot,
+    state: &AppState,
+    request: &PendingQRequest,
+    model: &QaModel,
+    snapshot: &ModelCatalogSnapshot,
+    audit_context: Option<&LlmAuditContext>,
+) -> Result<()> {
     if let Some(config) = model.config() {
         let summary = summarize_media_files(&request.enrichment.media_files);
-        if !crate::llm::text_model::third_party_model_matches_request_capabilities(config, crate::llm::text_model::ModelRequestCapabilities::from_media(&summary, request.mode.requires_custom_tools())) {
-            return Err(anyhow::anyhow!("The selected model no longer supports this request"));
+        if !crate::llm::text_model::third_party_model_matches_request_capabilities(
+            config,
+            crate::llm::text_model::ModelRequestCapabilities::from_media(
+                &summary,
+                request.mode.requires_custom_tools(),
+            ),
+        ) {
+            return Err(anyhow::anyhow!(
+                "The selected model no longer supports this request"
+            ));
         }
     }
-    let system_prompt = build_mode_system_prompt(&request);
-    let query = build_user_content(&request);
+    let system_prompt = build_mode_system_prompt(request);
+    let query = build_user_content(request);
 
     let logged_model_name = model.display_name(snapshot, request.mode);
-    let summary = QaRequestSummary::new(model, &request, &logged_model_name, query.chars().count());
+    let summary = QaRequestSummary::new(model, request, &logged_model_name, query.chars().count());
     info!("Processing QA request: {summary}");
-
-    let _chat_action =
-        start_chat_action_heartbeat(bot.clone(), ChatId(request.chat_id), ChatAction::Typing);
 
     let mut qc_valid_message_ids: Vec<i64> = Vec::new();
     let mut quick_search_attempted = false;
@@ -636,34 +724,20 @@ pub(super) async fn process_request(
             return process_chat_search_request(
                 bot,
                 state,
-                &request,
+                request,
                 &query,
                 model,
                 snapshot,
-                audit_context.as_ref(),
+                audit_context,
             )
             .await;
         }
         QaCommandMode::Standard => {
-            run_standard_request(
-                model,
-                &request,
-                system_prompt,
-                query,
-                audit_context.as_ref(),
-            )
-            .await
+            run_standard_request(model, request, system_prompt, query, audit_context).await
         }
         QaCommandMode::Quick => {
-            let (result, web_search_attempted) = run_quick_request(
-                model,
-                state,
-                &request,
-                system_prompt,
-                query,
-                audit_context.as_ref(),
-            )
-            .await;
+            let (result, web_search_attempted) =
+                run_quick_request(model, state, request, system_prompt, query, audit_context).await;
             quick_search_attempted = web_search_attempted;
             result
         }
@@ -672,10 +746,10 @@ pub(super) async fn process_request(
                 bot,
                 state,
                 model,
-                &request,
+                request,
                 system_prompt,
                 query,
-                audit_context.as_ref(),
+                audit_context,
             )
             .await;
             qc_valid_message_ids = valid_message_ids;
@@ -703,10 +777,10 @@ pub(super) async fn process_request(
     }
 
     let answer_insert = (request.mode == QaCommandMode::Standard)
-        .then(|| answer_message_insert(state, &request, response.clone()));
+        .then(|| answer_message_insert(state, request, response.clone()));
     send_qa_answer(
         bot,
-        &request,
+        request,
         model,
         snapshot,
         response,
@@ -720,5 +794,4 @@ pub(super) async fn process_request(
         }
     }
     Ok(())
-    }).await
 }

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ReplyParameters};
+use teloxide::types::{ChatAction, MessageId, ReplyParameters};
 use tracing::{error, info, warn};
 
 use crate::agents::step::WallClock;
@@ -10,7 +10,7 @@ use crate::config::CONFIG;
 use crate::db::models::MessageRow;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::agent_model_picker::{
-    run_with_agent_model_choice, AgentModelRequest, ChosenAgentModel,
+    announce_quota_stand_in, run_with_agent_model_choice, AgentModelRequest, ChosenAgentModel,
 };
 use crate::handlers::content::create_telegraph_answer;
 use crate::handlers::image::generate_image_with_configured_default;
@@ -170,6 +170,56 @@ async fn fetch_tldr_messages(
     Ok(messages)
 }
 
+/// The inputs one summary attempt needs, so it can be repeated on another model.
+struct TldrAttempt<'a> {
+    bot: &'a Bot,
+    chat_id: ChatId,
+    status_message_id: MessageId,
+    messages: &'a [MessageRow],
+    audit_context: Option<&'a LlmAuditContext>,
+}
+
+impl TldrAttempt<'_> {
+    /// Summarize on `final_model` within `clock`: map-reduce above the
+    /// threshold, the single call below it or when the pipeline cannot start.
+    async fn summarize(
+        &self,
+        clock: &WallClock,
+        final_model: &ResolvedTextModel,
+    ) -> Result<(String, String)> {
+        clock
+            .run(async {
+                if self.messages.len() <= CONFIG.agents.tldr_map_reduce_threshold {
+                    return tldr_single_call(final_model, self.messages, self.audit_context).await;
+                }
+                let mut progress_reporter =
+                    ProgressReporter::new(self.bot.clone(), self.chat_id, self.status_message_id);
+                match crate::agents::tldr::summarize_messages_map_reduce(
+                    self.messages,
+                    self.audit_context,
+                    &mut progress_reporter,
+                    clock,
+                    final_model,
+                )
+                .await?
+                {
+                    crate::agents::tldr::TldrOutcome::Answer(
+                        crate::agents::common::ModelAnswer {
+                            text,
+                            model_display,
+                        },
+                    ) => Ok((text, model_display)),
+                    crate::agents::tldr::TldrOutcome::UseLegacy(reason) => {
+                        clock.check()?;
+                        info!("Map-reduce /tldr fell back to the single-call path: {reason}");
+                        tldr_single_call(final_model, self.messages, self.audit_context).await
+                    }
+                }
+            })
+            .await
+    }
+}
+
 /// What `/tldr` summarizes, gathered before the model is chosen.
 struct TldrJob {
     chat_id: ChatId,
@@ -190,6 +240,7 @@ async fn run_tldr(bot: Bot, state: AppState, job: TldrJob, model: ChosenAgentMod
     let ChosenAgentModel {
         id,
         mut snapshot,
+        capabilities,
         status_message_id,
         heavy_permit,
     } = model;
@@ -199,35 +250,28 @@ async fn run_tldr(bot: Bot, state: AppState, job: TldrJob, model: ChosenAgentMod
         start_chat_action_heartbeat(bot.clone(), chat_id, ChatAction::Typing);
 
     let clock = WallClock::start().for_gemini_pipeline(id == "gemini", true);
-    let response = clock.run(async {
-        let final_model = ResolvedTextModel::prepare(&id, &mut snapshot, None).await?;
-        if messages.len() > CONFIG.agents.tldr_map_reduce_threshold {
-        let mut progress_reporter =
-            ProgressReporter::new(bot.clone(), chat_id, status_message_id);
-        match crate::agents::tldr::summarize_messages_map_reduce(
-            &messages,
-            audit_context.as_ref(),
-            &mut progress_reporter,
-            &clock,
-            &final_model,
-        )
-        .await
-        {
-            Ok(crate::agents::tldr::TldrOutcome::Answer(crate::agents::common::ModelAnswer {
-                text,
-                model_display,
-            })) => Ok((text, model_display)),
-            Ok(crate::agents::tldr::TldrOutcome::UseLegacy(reason)) => {
-                clock.check()?;
-                info!("Map-reduce /tldr fell back to the single-call path: {reason}");
-                tldr_single_call(&final_model, &messages, audit_context.as_ref()).await
-            }
-            Err(err) => Err(err),
+    let final_model = clock.run(ResolvedTextModel::prepare(&id, &mut snapshot, None)).await?;
+    let attempt = TldrAttempt {
+        bot: &bot,
+        chat_id,
+        status_message_id,
+        messages: &messages,
+        audit_context: audit_context.as_ref(),
+    };
+    let response = match attempt.summarize(&clock, &final_model).await {
+        Ok(response) => response,
+        Err(error) => {
+            // Codex refused the request for a spent usage window: summarize on
+            // the model standing in for Codex rather than failing.
+            let Some(stand_in) = final_model.quota_stand_in(&error, capabilities).await else {
+                return Err(error);
+            };
+            announce_quota_stand_in(&bot, chat_id, status_message_id, "tldr", &stand_in).await;
+            let clock = WallClock::start()
+                .for_gemini_pipeline(matches!(stand_in.model, ResolvedTextModel::Gemini), true);
+            attempt.summarize(&clock, &stand_in.model).await?
         }
-    } else {
-        tldr_single_call(&final_model, &messages, audit_context.as_ref()).await
-    }
-    }).await?;
+    };
 
     let (mut summary_text, summary_model) = response;
     if truncated_to_cap {

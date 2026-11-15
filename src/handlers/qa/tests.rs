@@ -1849,6 +1849,42 @@ fn third_party_model_reads_the_original_youtube_link() {
 }
 
 #[test]
+fn request_rerun_on_gemini_gets_its_youtube_links_back_as_video_inputs() {
+    let mut request = youtube_pending_request();
+    let saved = request.gemini_youtube.clone();
+    let codex = QaModel::ThirdParty {
+        config: model(ThirdPartyProvider::OpenAICodex, "Codex", "selected"),
+        explicit_codex: None,
+    };
+    apply_youtube_inputs_for_model(&mut request, &codex);
+
+    super::process::retarget_request(&mut request, saved, &QaModel::Gemini);
+
+    assert_eq!(request.query, "watch this YouTube_dQw4w9WgXcQ");
+    assert_eq!(request.enrichment.youtube_urls, vec![YOUTUBE_URL]);
+}
+
+#[test]
+fn request_rerun_on_a_third_party_model_keeps_the_links_in_its_text() {
+    let mut request = youtube_pending_request();
+    let saved = request.gemini_youtube.clone();
+    let codex = QaModel::ThirdParty {
+        config: model(ThirdPartyProvider::OpenAICodex, "Codex", "selected"),
+        explicit_codex: None,
+    };
+    let other = QaModel::ThirdParty {
+        config: model(ThirdPartyProvider::OpenRouter, "Other", "openrouter/other"),
+        explicit_codex: None,
+    };
+    apply_youtube_inputs_for_model(&mut request, &codex);
+
+    super::process::retarget_request(&mut request, saved, &other);
+
+    assert_eq!(request.query, YOUTUBE_QUERY);
+    assert!(request.enrichment.youtube_urls.is_empty());
+}
+
+#[test]
 fn only_gemini_reports_youtube_videos_in_its_progress_message() {
     let request = youtube_pending_request();
     let codex = QaModel::ThirdParty {

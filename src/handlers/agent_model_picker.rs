@@ -16,7 +16,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tracing::{error, warn};
 
 use crate::config::{ThirdPartyProvider, CONFIG};
-use crate::llm::resolved_model::ModelCatalogSnapshot;
+use crate::llm::resolved_model::{ModelCatalogSnapshot, QuotaStandIn};
 use crate::llm::text_model::{
     available_third_party_models_for_request, resolve_default_text_model_with_models,
     ModelRequestCapabilities, MODEL_GEMINI,
@@ -32,6 +32,9 @@ pub const AGENT_MODEL_CALLBACK_PREFIX: &str = "agent_model:";
 pub(crate) struct ChosenAgentModel {
     pub id: String,
     pub snapshot: ModelCatalogSnapshot,
+    /// What the request needs from a model, for choosing a stand-in if Codex
+    /// refuses it mid-run.
+    pub capabilities: ModelRequestCapabilities,
     pub status_message_id: MessageId,
     /// The slot held since intake when no picker was shown. A picked request
     /// waits for a fresh one rather than holding a slot while its user decides.
@@ -220,6 +223,7 @@ pub(crate) async fn run_with_agent_model_choice(
         let chosen = ChosenAgentModel {
             id: model_id,
             snapshot,
+            capabilities: request.capabilities,
             status_message_id: status.id,
             heavy_permit: Some(heavy_permit),
         };
@@ -354,10 +358,28 @@ async fn run_on_model(
     let chosen = ChosenAgentModel {
         id: model_id,
         snapshot,
+        capabilities: request.capabilities,
         status_message_id: selection_message_id,
         heavy_permit: None,
     };
     (request.run)(bot, state, chosen).await
+}
+
+/// Codex refused a command for a spent usage window: say so in the command's
+/// status message before it is rerun on `stand_in`.
+pub(crate) async fn announce_quota_stand_in(
+    bot: &Bot,
+    chat_id: ChatId,
+    status_message_id: MessageId,
+    command: &str,
+    stand_in: &QuotaStandIn,
+) {
+    let label = stand_in.snapshot.display_name(stand_in.model.model_id());
+    warn!("Codex usage limit reached; rerunning /{command} on {label}");
+    // Best effort: the rerun reports into the same message either way.
+    let _ = bot
+        .edit_message_text(chat_id, status_message_id, stand_in.status_text(&label))
+        .await;
 }
 
 async fn close_picker(bot: &Bot, chat_id: ChatId, message_id: MessageId, text: &str) -> Result<()> {
