@@ -320,6 +320,7 @@ pub(super) fn build_chat_search_pending_request(
             .and_then(|user| user.language_code.as_deref())
             .map(str::to_string),
         enrichment: Enrichment::default(),
+        gemini_youtube: None,
         chat_id: message.chat.id.0,
         message_id: message.id.0 as i64,
         selection_message_id,

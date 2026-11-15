@@ -10,7 +10,7 @@ use crate::handlers::enrichment::Enrichment;
 use crate::llm::media::MediaSummary;
 use crate::llm::runtime_models::{codex_selected_model_label, ResolvedExplicitCodexModel};
 use crate::llm::text_model::{ModelRequestCapabilities, MODEL_GEMINI};
-use crate::state::{PendingQRequest, PendingRequests, QaCommandMode};
+use crate::state::{GeminiYoutubeInput, PendingQRequest, PendingRequests, QaCommandMode};
 use serde_json::json;
 use teloxide::prelude::*;
 use teloxide::types::InlineKeyboardButtonKind;
@@ -134,6 +134,7 @@ fn pending_q_request(original_user_id: i64, timestamp: i64) -> PendingQRequest {
         reply_context: None,
         telegram_language_code: None,
         enrichment: Enrichment::default(),
+        gemini_youtube: None,
         chat_id: 123,
         message_id: 456,
         selection_message_id: 789,
@@ -185,7 +186,7 @@ fn qa_input_keeps_ancestor_urls_out_of_automatic_preparation() {
         true,
     );
     assert_eq!(
-        extract_youtube_urls_for_available_models(ancestor, true)
+        crate::handlers::content::extract_youtube_urls(ancestor, 10)
             .1
             .len(),
         1
@@ -206,9 +207,19 @@ fn qa_input_keeps_ancestor_urls_out_of_automatic_preparation() {
         crate::handlers::content::discover_telegraph_urls(ancestor).len(),
         1
     );
-    assert_eq!(input.youtube_urls.len(), 2);
-    assert!(input.youtube_urls.iter().any(|u| u.contains("bbbbbbbbbbb")));
-    assert!(input.youtube_urls.iter().any(|u| u.contains("ccccccccccc")));
+    let gemini = input
+        .gemini_youtube
+        .as_ref()
+        .expect("Gemini reads the direct and current YouTube links");
+    assert_eq!(gemini.urls.len(), 2);
+    assert!(gemini.urls.iter().any(|u| u.contains("bbbbbbbbbbb")));
+    assert!(gemini.urls.iter().any(|u| u.contains("ccccccccccc")));
+    assert!(!gemini
+        .query
+        .contains("https://www.youtube.com/watch?v=ccccccccccc"));
+    assert!(input
+        .question
+        .contains("https://www.youtube.com/watch?v=ccccccccccc"));
     assert!(!input.question.contains("aaaaaaaaaaa"));
     let mut request = pending_q_request(1, 0);
     request.query = input.question;
@@ -1558,37 +1569,91 @@ fn video_request_without_capable_model_uses_error_path_predicate() {
     assert!(video_request_has_capable_model(false, true));
 }
 
+const YOUTUBE_QUERY: &str = "watch this https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+const YOUTUBE_URL: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+
 #[test]
 fn youtube_query_is_text_when_gemini_is_disabled() {
-    let query = "watch this https://www.youtube.com/watch?v=dQw4w9WgXcQ";
-    let (text, urls) = extract_youtube_urls_for_available_models(query, false);
+    let input = prepare_qa_input(
+        QaCommandMode::Standard,
+        YOUTUBE_QUERY,
+        None,
+        &MediaSummary::default(),
+        false,
+    );
 
-    assert_eq!(text, query);
-    assert!(urls.is_empty());
+    assert_eq!(input.question, YOUTUBE_QUERY);
+    assert!(input.gemini_youtube.is_none());
 }
 
 #[test]
-fn quick_third_party_youtube_query_preserves_original_url_when_gemini_is_available() {
-    let query = "watch this https://www.youtube.com/watch?v=dQw4w9WgXcQ";
-    let (text, urls) = prepare_youtube_inputs_for_qa(
-        query,
+fn youtube_query_keeps_its_link_and_prepares_a_gemini_variant_in_every_mode() {
+    for mode in [
+        QaCommandMode::Standard,
         QaCommandMode::Quick,
-        Some("openrouter:quick-model"),
+        QaCommandMode::ChatContext,
+    ] {
+        let input = prepare_qa_input(mode, YOUTUBE_QUERY, None, &MediaSummary::default(), true);
+
+        assert_eq!(input.question, YOUTUBE_QUERY, "{mode:?}");
+        assert_eq!(
+            input.gemini_youtube,
+            Some(GeminiYoutubeInput {
+                query: "watch this YouTube_dQw4w9WgXcQ".to_string(),
+                urls: vec![YOUTUBE_URL.to_string()],
+            }),
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn query_without_youtube_links_has_no_gemini_variant() {
+    let input = prepare_qa_input(
+        QaCommandMode::Standard,
+        "plain question",
+        None,
+        &MediaSummary::default(),
         true,
     );
 
-    assert_eq!(text, query);
-    assert!(urls.is_empty());
+    assert!(input.gemini_youtube.is_none());
+}
+
+fn youtube_pending_request() -> PendingQRequest {
+    let mut request = pending_q_request(1, 0);
+    request.query = YOUTUBE_QUERY.to_string();
+    request.gemini_youtube = Some(GeminiYoutubeInput {
+        query: "watch this YouTube_dQw4w9WgXcQ".to_string(),
+        urls: vec![YOUTUBE_URL.to_string()],
+    });
+    request
 }
 
 #[test]
-fn quick_gemini_youtube_query_keeps_existing_media_extraction() {
-    let query = "watch this https://www.youtube.com/watch?v=dQw4w9WgXcQ";
-    let (text, urls) =
-        prepare_youtube_inputs_for_qa(query, QaCommandMode::Quick, Some(MODEL_GEMINI), true);
+fn gemini_reads_youtube_links_as_video_inputs() {
+    let mut request = youtube_pending_request();
 
-    assert!(!text.contains("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
-    assert_eq!(urls, vec!["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]);
+    apply_youtube_inputs_for_model(&mut request, &QaModel::Gemini);
+
+    assert_eq!(request.query, "watch this YouTube_dQw4w9WgXcQ");
+    assert_eq!(request.enrichment.youtube_urls, vec![YOUTUBE_URL]);
+    assert!(request.gemini_youtube.is_none());
+}
+
+#[test]
+fn third_party_model_reads_the_original_youtube_link() {
+    let mut request = youtube_pending_request();
+    let codex = QaModel::ThirdParty {
+        config: model(ThirdPartyProvider::OpenAICodex, "Codex", "selected"),
+        explicit_codex: None,
+    };
+
+    apply_youtube_inputs_for_model(&mut request, &codex);
+
+    assert_eq!(request.query, YOUTUBE_QUERY);
+    assert!(request.enrichment.youtube_urls.is_empty());
+    assert!(request.gemini_youtube.is_none());
 }
 
 #[test]
