@@ -90,6 +90,16 @@ fn gemini_youtube_input(query_base: &str, question: &str) -> Option<GeminiYoutub
     Some(GeminiYoutubeInput { query, urls })
 }
 
+/// How many YouTube videos `model` watches, for the progress message.
+pub(super) fn youtube_video_count_for_model(
+    input: Option<&GeminiYoutubeInput>,
+    model: &QaModel,
+) -> usize {
+    input
+        .filter(|_| matches!(model, QaModel::Gemini))
+        .map_or(0, |input| input.urls.len())
+}
+
 /// Settle a request's YouTube inputs once its answering model is known:
 /// Gemini gets the links as video inputs, every other model keeps them in the
 /// question text.

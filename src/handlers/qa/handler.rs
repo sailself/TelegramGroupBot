@@ -35,7 +35,9 @@ use super::model_resolution::{
     ModelCatalogSnapshot, QaModel,
 };
 use super::process::process_request;
-use super::prompt::{prepare_qa_input, NO_VIDEO_CAPABLE_MODEL_MESSAGE};
+use super::prompt::{
+    prepare_qa_input, youtube_video_count_for_model, NO_VIDEO_CAPABLE_MODEL_MESSAGE,
+};
 use super::selection_ui::{
     create_model_selection_keyboard, process_timed_out_q_request_with_default_model,
 };
@@ -362,8 +364,6 @@ async fn q_handler_internal(
     let must_use_default_model = should_use_default_model_without_selection(
         mode,
         request_capabilities,
-        gemini_youtube.is_some(),
-        CONFIG.gemini_api_available(),
         third_party_models_available_for_request,
         snapshot.count(),
         query_message_is_from_bot,
@@ -437,10 +437,7 @@ async fn q_handler_internal(
             }
         };
         let display_name = model.display_name(&snapshot, mode);
-        let youtube_video_count = gemini_youtube
-            .as_ref()
-            .filter(|_| matches!(model, QaModel::Gemini))
-            .map_or(0, |input| input.urls.len());
+        let youtube_video_count = youtube_video_count_for_model(gemini_youtube.as_ref(), &model);
         let processing_message_text = if has_video {
             format!(
                 "Analyzing video and processing your question with {}...",
@@ -522,7 +519,8 @@ async fn q_handler_internal(
         selection_text.push_str("\n\n<i>Note: Only models that support media are shown.</i>");
     }
 
-    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities);
+    let keyboard =
+        create_model_selection_keyboard(&snapshot, request_capabilities, gemini_youtube.is_some());
     let selection_message = reply_with_retry(
         &bot,
         message.chat.id,
@@ -681,8 +679,6 @@ pub async fn s_handler(
     let must_use_default_model = should_use_default_model_without_selection(
         QaCommandMode::ChatSearch,
         request_capabilities,
-        false,
-        CONFIG.gemini_api_available(),
         third_party_models_available_for_request,
         snapshot.count(),
         false,
@@ -771,7 +767,7 @@ pub async fn s_handler(
         return Ok(());
     }
 
-    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities);
+    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities, false);
     let selection_message = reply_with_retry(
         &bot,
         message.chat.id,

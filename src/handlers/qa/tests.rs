@@ -1196,23 +1196,13 @@ fn quick_model_media_mismatch_falls_back_to_capable_default_model() {
 
 #[test]
 fn quick_mode_always_skips_model_selection() {
-    for (request, gemini_available, third_party_available, runtime_count) in [
-        (ModelRequestCapabilities::default(), false, true, 3),
+    for (request, third_party_available, runtime_count) in [
+        (ModelRequestCapabilities::default(), true, 3),
         (
             ModelRequestCapabilities {
                 has_video: true,
                 ..ModelRequestCapabilities::default()
             },
-            true,
-            true,
-            4,
-        ),
-        (
-            ModelRequestCapabilities {
-                has_video: true,
-                ..ModelRequestCapabilities::default()
-            },
-            false,
             true,
             4,
         ),
@@ -1220,8 +1210,6 @@ fn quick_mode_always_skips_model_selection() {
         assert!(should_use_default_model_without_selection(
             QaCommandMode::Quick,
             request,
-            false,
-            gemini_available,
             third_party_available,
             runtime_count,
             false,
@@ -1283,8 +1271,6 @@ fn audio_request_with_audio_capable_third_party_model_uses_picker() {
             has_audio: true,
             ..ModelRequestCapabilities::default()
         },
-        false,
-        true,
         true,
         1,
         false,
@@ -1296,12 +1282,29 @@ fn bot_query_message_uses_default_model_without_selection() {
     assert!(should_use_default_model_without_selection(
         QaCommandMode::Standard,
         ModelRequestCapabilities::default(),
-        false,
-        true,
         true,
         2,
         true,
     ));
+}
+
+#[test]
+fn youtube_request_uses_picker_when_other_models_are_available() {
+    for mode in [QaCommandMode::Standard, QaCommandMode::ChatContext] {
+        assert!(
+            !should_use_default_model_without_selection(
+                mode,
+                ModelRequestCapabilities {
+                    require_tools: mode.requires_custom_tools(),
+                    ..ModelRequestCapabilities::default()
+                },
+                true,
+                2,
+                false,
+            ),
+            "{mode:?}"
+        );
+    }
 }
 
 #[test]
@@ -1327,6 +1330,7 @@ fn audio_selection_includes_only_audio_capable_ready_models() {
         false,
         "gemini",
         media_request(false, false, true),
+        false,
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -1396,8 +1400,13 @@ fn gemini_coexists_with_codex_without_replacing_the_configured_default() {
     let request = ModelRequestCapabilities::default();
 
     for default_model in ["openai-codex", "openai-codex:selected"] {
-        let keyboard =
-            create_model_selection_keyboard_with_models(&snapshot, true, default_model, request);
+        let keyboard = create_model_selection_keyboard_with_models(
+            &snapshot,
+            true,
+            default_model,
+            request,
+            false,
+        );
         let callbacks = keyboard
             .inline_keyboard
             .iter()
@@ -1425,6 +1434,80 @@ fn gemini_coexists_with_codex_without_replacing_the_configured_default() {
     }
 }
 
+fn keyboard_callbacks(keyboard: &teloxide::types::InlineKeyboardMarkup) -> Vec<&str> {
+    keyboard
+        .inline_keyboard
+        .iter()
+        .flatten()
+        .filter_map(|button| match &button.kind {
+            InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn youtube_request_lists_gemini_first_then_the_default_model() {
+    let selected = model(
+        ThirdPartyProvider::OpenAICodex,
+        "Selected Codex",
+        "selected",
+    );
+    let nvidia = model(ThirdPartyProvider::Nvidia, "NVIDIA Qwen", "nv-qwen");
+    let snapshot = snapshot_of(
+        vec![nvidia, selected],
+        &[ThirdPartyProvider::OpenAICodex, ThirdPartyProvider::Nvidia],
+    );
+    let request = ModelRequestCapabilities::default();
+
+    let youtube = create_model_selection_keyboard_with_models(
+        &snapshot,
+        true,
+        "openai-codex:selected",
+        request,
+        true,
+    );
+    assert_eq!(
+        keyboard_callbacks(&youtube),
+        vec![
+            "model_select:gemini",
+            "model_select:openai-codex:selected",
+            "model_select:nvidia:nv-qwen",
+        ]
+    );
+
+    let plain = create_model_selection_keyboard_with_models(
+        &snapshot,
+        true,
+        "openai-codex:selected",
+        request,
+        false,
+    );
+    assert_eq!(
+        keyboard_callbacks(&plain),
+        vec![
+            "model_select:openai-codex:selected",
+            "model_select:gemini",
+            "model_select:nvidia:nv-qwen",
+        ]
+    );
+
+    let gemini_disabled = create_model_selection_keyboard_with_models(
+        &snapshot,
+        false,
+        "openai-codex:selected",
+        request,
+        true,
+    );
+    assert_eq!(
+        keyboard_callbacks(&gemini_disabled),
+        vec![
+            "model_select:openai-codex:selected",
+            "model_select:nvidia:nv-qwen",
+        ]
+    );
+}
+
 #[test]
 fn model_selection_keyboard_omits_gemini_when_disabled() {
     let snapshot = snapshot_of(Vec::new(), &[]);
@@ -1433,6 +1516,7 @@ fn model_selection_keyboard_omits_gemini_when_disabled() {
         false,
         "gemini",
         ModelRequestCapabilities::default(),
+        false,
     );
 
     let callbacks = keyboard
@@ -1469,6 +1553,7 @@ fn video_selection_includes_only_video_capable_ready_models() {
         false,
         "gemini",
         media_request(false, true, false),
+        false,
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -1498,6 +1583,7 @@ fn model_selection_keyboard_compacts_long_third_party_model_callbacks() {
         false,
         &long_model.id,
         ModelRequestCapabilities::default(),
+        false,
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -1537,6 +1623,7 @@ fn model_selection_keyboard_puts_default_third_party_model_first() {
         true,
         "nvidia:nv-qwen",
         ModelRequestCapabilities::default(),
+        false,
     );
     let callbacks = keyboard
         .inline_keyboard
@@ -1654,6 +1741,25 @@ fn third_party_model_reads_the_original_youtube_link() {
     assert_eq!(request.query, YOUTUBE_QUERY);
     assert!(request.enrichment.youtube_urls.is_empty());
     assert!(request.gemini_youtube.is_none());
+}
+
+#[test]
+fn only_gemini_reports_youtube_videos_in_its_progress_message() {
+    let request = youtube_pending_request();
+    let codex = QaModel::ThirdParty {
+        config: model(ThirdPartyProvider::OpenAICodex, "Codex", "selected"),
+        explicit_codex: None,
+    };
+
+    assert_eq!(
+        youtube_video_count_for_model(request.gemini_youtube.as_ref(), &QaModel::Gemini),
+        1
+    );
+    assert_eq!(
+        youtube_video_count_for_model(request.gemini_youtube.as_ref(), &codex),
+        0
+    );
+    assert_eq!(youtube_video_count_for_model(None, &QaModel::Gemini), 0);
 }
 
 #[test]

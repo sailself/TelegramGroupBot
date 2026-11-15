@@ -19,6 +19,7 @@ use super::model_resolution::{
     ModelCatalogSnapshot, QaModel,
 };
 use super::process::process_request;
+use super::prompt::youtube_video_count_for_model;
 
 pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 const MODEL_CALLBACK_COMPACT_PREFIX: &str = "m:";
@@ -118,17 +119,34 @@ where
         .unwrap_or(PendingQRequestCallbackAction::Missing)
 }
 
+fn move_model_to_front(model_ids: &mut Vec<String>, model_id: &str) {
+    if let Some(index) = model_ids.iter().position(|id| id == model_id) {
+        let model_id = model_ids.remove(index);
+        model_ids.insert(0, model_id);
+    }
+}
+
+/// The picker lists the default model first, the model an unanswered picker
+/// falls back to. Gemini watches YouTube links natively, so a request that
+/// carries them lists Gemini ahead of the default when Gemini is available.
 pub(super) fn create_model_selection_keyboard_with_models(
     snapshot: &ModelCatalogSnapshot,
     gemini_available: bool,
     default_model: &str,
     request: ModelRequestCapabilities,
+    has_youtube_urls: bool,
 ) -> InlineKeyboardMarkup {
-    let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
-    let default_model_key = default_model_selection_key(default_model, &snapshot.models);
-    let selectable_model_ids =
+    let mut model_ids =
         selectable_model_ids_for_request_with_models(snapshot, gemini_available, request);
-    let mut model_buttons = selectable_model_ids
+    move_model_to_front(
+        &mut model_ids,
+        &default_model_selection_key(default_model, &snapshot.models),
+    );
+    if has_youtube_urls {
+        move_model_to_front(&mut model_ids, MODEL_GEMINI);
+    }
+
+    let model_buttons = model_ids
         .iter()
         .map(|model_id| {
             InlineKeyboardButton::callback(
@@ -137,19 +155,10 @@ pub(super) fn create_model_selection_keyboard_with_models(
             )
         })
         .collect::<Vec<_>>();
-
-    let default_callback = model_selection_callback_data(&default_model_key);
-    if let Some(default_index) = model_buttons.iter().position(|button| match &button.kind {
-        teloxide::types::InlineKeyboardButtonKind::CallbackData(data) => data == &default_callback,
-        _ => false,
-    }) {
-        let default_button = model_buttons.remove(default_index);
-        model_buttons.insert(0, default_button);
-    }
-
-    for chunk in model_buttons.chunks(2) {
-        keyboard.push(chunk.to_vec());
-    }
+    let keyboard = model_buttons
+        .chunks(2)
+        .map(<[InlineKeyboardButton]>::to_vec)
+        .collect::<Vec<_>>();
 
     InlineKeyboardMarkup::new(keyboard)
 }
@@ -157,12 +166,14 @@ pub(super) fn create_model_selection_keyboard_with_models(
 pub(super) fn create_model_selection_keyboard(
     snapshot: &ModelCatalogSnapshot,
     request: ModelRequestCapabilities,
+    has_youtube_urls: bool,
 ) -> InlineKeyboardMarkup {
     create_model_selection_keyboard_with_models(
         snapshot,
         CONFIG.gemini_api_available(),
         &CONFIG.models.default_text_model,
         request,
+        has_youtube_urls,
     )
 }
 
@@ -310,6 +321,8 @@ pub async fn model_selection_callback(
     let summary = summarize_media_files(&request.enrichment.media_files);
 
     let display_name = model.display_name(&snapshot, request.mode);
+    let youtube_video_count =
+        youtube_video_count_for_model(request.gemini_youtube.as_ref(), &model);
 
     let processing_text = if request.mode == QaCommandMode::ChatSearch {
         format!("Searching this chat with {}...", display_name)
@@ -332,6 +345,11 @@ pub async fn model_selection_callback(
         format!(
             "Analyzing {} document(s) and processing your question with {}...",
             summary.documents, display_name
+        )
+    } else if youtube_video_count > 0 {
+        format!(
+            "Analyzing {} YouTube video(s) and processing your question with {}...",
+            youtube_video_count, display_name
         )
     } else {
         format!("Processing your question with {}...", display_name)
