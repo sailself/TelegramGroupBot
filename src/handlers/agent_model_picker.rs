@@ -431,6 +431,7 @@ mod tests {
                 ThirdPartyProvider::OpenRouter,
             ],
             codex_record: Some(codex_record()),
+            codex_quota_until: None,
         }
     }
 

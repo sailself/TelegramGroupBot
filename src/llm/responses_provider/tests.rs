@@ -1278,6 +1278,7 @@ fn pinned_model_metadata_drives_payload_after_catalog_replacement() {
         models: vec![config.clone()],
         ready_providers: vec![ThirdPartyProvider::OpenAICodex],
         codex_record: Some(record),
+        codex_quota_until: None,
     };
     let pinned = ResolvedTextModel::from_snapshot(&config.id, &snapshot, None).unwrap();
     snapshot.models[0].model = "replacement".into();
@@ -1296,4 +1297,59 @@ fn pinned_model_metadata_drives_payload_after_catalog_replacement() {
     assert_eq!(payload["model"], "pinned-model");
     assert_eq!(payload["reasoning"]["effort"], "high");
     assert!(lite);
+}
+
+#[tokio::test]
+async fn codex_usage_limit_sets_the_quota_hold_and_is_not_retried() {
+    use crate::llm::codex_quota::{self, CodexUsageLimitError};
+    use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
+    use crate::utils::timing::now_unix_seconds;
+
+    // One expected request: a retry would be answered with a 500 and lose the
+    // typed error asserted below.
+    let server = TestServer::new(vec![ExpectedRequest::new(
+        "POST",
+        "/responses",
+        response_with_status(
+            429,
+            br#"{"error":{"limit_window_minutes":300,"message":"The usage limit has been reached","plan_type":"plus","resets_at":1794726809,"resets_in_seconds":13974,"type":"usage_limit_reached"}}"#.to_vec(),
+        ),
+    )]);
+    let details = ResponsesRequestDetails {
+        provider: ThirdPartyProvider::OpenAICodex,
+        display_name: "OpenAI Codex",
+        url: server.url("/responses").to_string(),
+        headers: Vec::new(),
+        session_id: "test-session".to_string(),
+        codex_account_id: Some("acct-quota".to_string()),
+        payload: json!({ "model": "gpt-5.5", "stream": true }),
+        streaming_sse: true,
+        request_timeout_secs: 30,
+    };
+    let started = now_unix_seconds();
+    let mut turn_state = CodexTurnState::default();
+
+    let err = call_provider_api_with_auth_hooks(
+        &details,
+        None,
+        "test:usage-limit",
+        &mut turn_state,
+        || std::future::ready(Ok(Vec::new())),
+        || std::future::ready(Ok(())),
+    )
+    .await
+    .expect_err("a spent usage window fails the request");
+
+    let limit = err
+        .downcast_ref::<CodexUsageLimitError>()
+        .copied()
+        .unwrap_or_else(|| panic!("expected a usage-limit error, got: {err:#}"));
+    assert!(
+        (started + 13_974..=started + 13_974 + 120).contains(&limit.until),
+        "{limit:?}"
+    );
+    let hold = codex_quota::stored_hold_for_test().expect("the hold is recorded");
+    assert_eq!(hold.until, limit.until);
+    assert_eq!(hold.account_id.as_deref(), Some("acct-quota"));
+    server.join().expect("exactly one request was served");
 }

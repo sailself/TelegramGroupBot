@@ -2,12 +2,15 @@
 use crate::config::{
     parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
 };
+use crate::llm::codex_quota::CodexUsageLimitError;
 use crate::llm::runtime_models::{
     CodexSelectedModelRecord, ResolvedExplicitCodexModel, OPENAI_CODEX_SELECTED_MODEL_ID,
 };
 use crate::llm::text_model::{
-    available_third_party_models_for_request, default_text_model_error, ready_runtime_providers,
-    resolve_default_text_model_with_models, ModelRequestCapabilities, MODEL_GEMINI,
+    available_third_party_models_for_request, default_text_model_error,
+    default_text_model_is_codex, ready_runtime_providers,
+    resolve_default_text_model_during_quota_hold, resolve_default_text_model_with_models,
+    ModelRequestCapabilities, MODEL_GEMINI,
 };
 use anyhow::{anyhow, Result};
 
@@ -16,8 +19,12 @@ use anyhow::{anyhow, Result};
 #[derive(Debug, Clone)]
 pub(crate) struct ModelCatalogSnapshot {
     pub models: Vec<ThirdPartyModelConfig>,
+    /// Providers a request may use now. Codex is absent while its quota is on
+    /// hold, which is what keeps it out of pickers and default resolution.
     pub ready_providers: Vec<ThirdPartyProvider>,
     pub codex_record: Option<CodexSelectedModelRecord>,
+    /// Unix seconds until which Codex is on a quota hold, when it is.
+    pub codex_quota_until: Option<i64>,
 }
 
 impl ModelCatalogSnapshot {
@@ -26,10 +33,27 @@ impl ModelCatalogSnapshot {
             (state.models.clone(), state.codex_selected_model.clone())
         });
         let ready_providers = ready_runtime_providers(&models);
+        let codex_quota_until = crate::llm::codex_quota::active_hold().map(|hold| hold.until);
+        Self::new(models, ready_providers, codex_record, codex_quota_until)
+    }
+
+    /// `ready_providers` are the configured, authenticated providers; a quota
+    /// hold takes Codex out of them for this snapshot.
+    pub fn new(
+        models: Vec<ThirdPartyModelConfig>,
+        ready_providers: Vec<ThirdPartyProvider>,
+        codex_record: Option<CodexSelectedModelRecord>,
+        codex_quota_until: Option<i64>,
+    ) -> Self {
+        let mut ready_providers = ready_providers;
+        if codex_quota_until.is_some() {
+            ready_providers.retain(|provider| *provider != ThirdPartyProvider::OpenAICodex);
+        }
         Self {
             models,
             ready_providers,
             codex_record,
+            codex_quota_until,
         }
     }
 
@@ -63,15 +87,41 @@ impl ModelCatalogSnapshot {
             .find(|config| config.id == OPENAI_CODEX_SELECTED_MODEL_ID)
     }
 
+    /// The model a request runs on when nobody picks one. While Codex is on a
+    /// quota hold a Codex default gives way to a stand-in, see
+    /// [`resolve_default_text_model_during_quota_hold`].
     pub fn resolve_default(&self, request: ModelRequestCapabilities) -> Result<String> {
-        resolve_default_text_model_with_models(
-            &CONFIG.models.default_text_model,
+        let default_model = &CONFIG.models.default_text_model;
+        let gemini_available = CONFIG.gemini_api_available();
+        let Some(until) = self.codex_quota_until else {
+            return resolve_default_text_model_with_models(
+                default_model,
+                &self.models,
+                &self.ready_providers,
+                gemini_available,
+                request,
+            )
+            .map_err(|message| anyhow!(message));
+        };
+        resolve_default_text_model_during_quota_hold(
+            default_model,
             &self.models,
             &self.ready_providers,
-            CONFIG.gemini_api_available(),
+            gemini_available,
             request,
         )
-        .map_err(|message| anyhow!(message))
+        .map_err(|message| {
+            if default_text_model_is_codex(default_model, &self.models) {
+                // "Complete Codex setup" would mislead: Codex is set up, its
+                // window is spent, and nothing else can take the request.
+                anyhow!(
+                    "{} No other model is available for this request.",
+                    CodexUsageLimitError { until }.availability_note()
+                )
+            } else {
+                anyhow!(message)
+            }
+        })
     }
     pub fn has_available(&self, request: ModelRequestCapabilities) -> bool {
         !available_third_party_models_for_request(&self.models, &self.ready_providers, request)
@@ -275,8 +325,36 @@ mod tests {
             models: vec![config()],
             ready_providers: vec![ThirdPartyProvider::OpenAICodex],
             codex_record: Some(record),
+            codex_quota_until: None,
         }
     }
+    #[test]
+    fn quota_hold_takes_codex_out_of_selection_and_leaves_other_providers() {
+        let mut other = config();
+        other.id = "openrouter:other".into();
+        other.provider = ThirdPartyProvider::OpenRouter;
+        let record = snapshot().codex_record;
+        let ready = vec![
+            ThirdPartyProvider::OpenAICodex,
+            ThirdPartyProvider::OpenRouter,
+        ];
+
+        let held = ModelCatalogSnapshot::new(
+            vec![config(), other.clone()],
+            ready.clone(),
+            record.clone(),
+            Some(1_794_726_869),
+        );
+        assert_eq!(held.ready_providers, vec![ThirdPartyProvider::OpenRouter]);
+        assert_eq!(held.codex_quota_until, Some(1_794_726_869));
+        assert!(!held.can_select(OPENAI_CODEX_SELECTED_MODEL_ID, Default::default()));
+        assert!(held.can_select("openrouter:other", Default::default()));
+
+        let free = ModelCatalogSnapshot::new(vec![config(), other], ready.clone(), record, None);
+        assert_eq!(free.ready_providers, ready);
+        assert!(free.can_select(OPENAI_CODEX_SELECTED_MODEL_ID, Default::default()));
+    }
+
     #[test]
     fn running_model_keeps_configuration_and_metadata_when_catalog_changes() {
         let mut catalog = snapshot();

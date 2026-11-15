@@ -124,6 +124,7 @@ fn snapshot_of(
         models,
         ready_providers: ready_providers.to_vec(),
         codex_record: None,
+        codex_quota_until: None,
     }
 }
 
@@ -1810,6 +1811,7 @@ fn model_catalog_snapshot_resolves_codex_aliases() {
         models: vec![selected.clone(), openrouter.clone()],
         ready_providers: vec![ThirdPartyProvider::OpenAICodex],
         codex_record: Some(selected_record("gpt-5.4")),
+        codex_quota_until: None,
     };
 
     assert_eq!(snapshot.count(), 2);
@@ -1857,6 +1859,7 @@ fn qa_model_resolve_keeps_the_explicit_codex_model_and_rejects_a_changed_one() {
         models: Vec::new(),
         ready_providers: Vec::new(),
         codex_record: None,
+        codex_quota_until: None,
     };
 
     let resolved = QaModel::resolve(&config.id, &snapshot, Some(&prepared))

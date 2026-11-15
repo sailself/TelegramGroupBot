@@ -16,7 +16,9 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
-pub use body::{read_body_limited, read_body_limited_or_partial, read_json, BodyRead};
+pub use body::{
+    read_body_limited, read_body_limited_or_partial, read_json, BodyRead, UsageLimitNotice,
+};
 pub use error::ProviderError;
 pub use retry::RetryPolicy;
 

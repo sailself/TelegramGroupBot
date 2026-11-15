@@ -3,6 +3,7 @@ pub mod audit;
 pub mod brave_search;
 pub mod codex_gif;
 pub mod codex_image;
+pub mod codex_quota;
 pub mod codex_selected_model;
 pub mod exa_search;
 pub mod gemini;
