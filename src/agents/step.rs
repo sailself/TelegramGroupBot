@@ -57,20 +57,25 @@ impl StepModel {
 pub async fn resolve_step_model(final_model: &ResolvedTextModel) -> Result<StepModel> {
     let final_model_id = final_model.model_id();
     let mut snapshot = ModelCatalogSnapshot::load();
+    let lookup = |id: &str| {
+        if id == final_model_id {
+            final_model.config().cloned()
+        } else {
+            snapshot.config(id).cloned()
+        }
+    };
     let mut step_model = resolve_step_model_value(
-        &CONFIG.agents.step_model,
+        step_model_setting(
+            &CONFIG.agents.step_model,
+            snapshot.codex_quota_until.is_some(),
+            lookup,
+        ),
         &CONFIG.agents.step_reasoning,
         final_model_id,
         &CONFIG.gemini.lite_model,
         &CONFIG.gemini.model,
         CONFIG.gemini_api_available(),
-        |id| {
-            if id == final_model_id {
-                final_model.config().cloned()
-            } else {
-                snapshot.config(id).cloned()
-            }
-        },
+        lookup,
     )?;
     if let StepModel::ThirdParty {
         config,
@@ -96,6 +101,29 @@ pub async fn resolve_step_model(final_model: &ResolvedTextModel) -> Result<StepM
         final_model_id
     );
     Ok(step_model)
+}
+
+/// `AGENT_STEP_MODEL` as it applies now. A Codex step model cannot run during
+/// a quota hold, so it reads as unset: the step model is then derived from the
+/// final model instead of every step failing.
+fn step_model_setting(
+    configured: &str,
+    codex_on_hold: bool,
+    lookup: impl Fn(&str) -> Option<ThirdPartyModelConfig>,
+) -> &str {
+    let configured = configured.trim();
+    let is_codex = configured.eq_ignore_ascii_case("openai-codex")
+        || matches!(
+            parse_third_party_model_id(configured),
+            Some((ThirdPartyProvider::OpenAICodex, _))
+        )
+        || lookup(configured)
+            .is_some_and(|config| config.provider == ThirdPartyProvider::OpenAICodex);
+    if codex_on_hold && is_codex {
+        debug!("AGENT_STEP_MODEL '{configured}' is on a Codex quota hold; deriving the step model");
+        return "";
+    }
+    configured
 }
 
 fn resolve_step_model_value(
@@ -537,6 +565,44 @@ mod tests {
                 assert_eq!(reasoning_override.as_deref(), Some("low"));
             }
             other => panic!("unexpected step model: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quota_hold_unsets_a_codex_step_model() {
+        let selected = config(ThirdPartyProvider::OpenAICodex, "gpt-6-astra");
+        let lookup = |id: &str| (id == "openai-codex:selected").then(|| selected.clone());
+
+        // A foreign slug, the selected alias, and the bare provider name.
+        for configured in [
+            " openai-codex:gpt-6-luna ",
+            "openai-codex:selected",
+            "openai-codex",
+        ] {
+            assert_eq!(
+                step_model_setting(configured, true, lookup),
+                "",
+                "{configured}"
+            );
+            assert_eq!(
+                step_model_setting(configured, false, lookup),
+                configured.trim(),
+                "{configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_hold_keeps_a_step_model_that_is_not_codex() {
+        let nvidia = config(ThirdPartyProvider::Nvidia, "qwen/qwen3.5-397b-a17b");
+        let lookup = |id: &str| (id == "nvidia:qwen/qwen3.5-397b-a17b").then(|| nvidia.clone());
+
+        for configured in ["nvidia:qwen/qwen3.5-397b-a17b", "gemini", ""] {
+            assert_eq!(
+                step_model_setting(configured, true, lookup),
+                configured,
+                "{configured}"
+            );
         }
     }
 

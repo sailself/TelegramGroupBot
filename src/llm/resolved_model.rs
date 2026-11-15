@@ -93,7 +93,7 @@ impl ModelCatalogSnapshot {
     pub fn resolve_default(&self, request: ModelRequestCapabilities) -> Result<String> {
         let default_model = &CONFIG.models.default_text_model;
         let gemini_available = CONFIG.gemini_api_available();
-        let Some(until) = self.codex_quota_until else {
+        if self.codex_quota_until.is_none() {
             return resolve_default_text_model_with_models(
                 default_model,
                 &self.models,
@@ -102,7 +102,7 @@ impl ModelCatalogSnapshot {
                 request,
             )
             .map_err(|message| anyhow!(message));
-        };
+        }
         resolve_default_text_model_during_quota_hold(
             default_model,
             &self.models,
@@ -110,18 +110,24 @@ impl ModelCatalogSnapshot {
             gemini_available,
             request,
         )
-        .map_err(|message| {
-            if default_text_model_is_codex(default_model, &self.models) {
-                // "Complete Codex setup" would mislead: Codex is set up, its
-                // window is spent, and nothing else can take the request.
+        .map_err(|message| self.default_resolution_error(message))
+    }
+
+    /// The error for a default model that did not resolve. On a quota hold
+    /// with a Codex default, "complete Codex setup" would mislead: Codex is
+    /// set up, its window is spent, and nothing else can take the request.
+    pub fn default_resolution_error(&self, message: String) -> anyhow::Error {
+        match self.codex_quota_until {
+            Some(until)
+                if default_text_model_is_codex(&CONFIG.models.default_text_model, &self.models) =>
+            {
                 anyhow!(
                     "{} No other model is available for this request.",
                     CodexUsageLimitError { until }.availability_note()
                 )
-            } else {
-                anyhow!(message)
             }
-        })
+            _ => anyhow!(message),
+        }
     }
     pub fn has_available(&self, request: ModelRequestCapabilities) -> bool {
         !available_third_party_models_for_request(&self.models, &self.ready_providers, request)

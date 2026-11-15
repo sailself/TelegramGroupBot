@@ -1,7 +1,7 @@
 //! Resolving which model answers a `/q`-family request: default-model
 //! fallback, quick-mode explicit-Codex handling, and selectable-model lists.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use tracing::warn;
 
 use crate::config::{
@@ -15,8 +15,8 @@ use crate::llm::runtime_models::{
 };
 use crate::llm::text_model::{
     available_third_party_models_for_request, default_text_model_error,
-    normalize_model_identifier_with_models, resolve_default_text_model_with_models,
-    ModelRequestCapabilities, MODEL_GEMINI,
+    normalize_model_identifier_with_models, resolve_default_text_model_during_quota_hold,
+    resolve_default_text_model_with_models, ModelRequestCapabilities, MODEL_GEMINI,
 };
 use crate::state::QaCommandMode;
 
@@ -150,6 +150,9 @@ pub(super) struct ExplicitCodexReadiness<'a> {
     pub(super) enabled: bool,
     pub(super) auth_ready: bool,
     pub(super) current_account_id: Option<&'a str>,
+    /// Codex is on a quota hold: no Codex model is ready, and a Codex default
+    /// gives way to its stand-in.
+    pub(super) quota_hold: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +167,7 @@ fn explicit_codex_model_is_ready(
     resolved: &ResolvedExplicitCodexModel,
     readiness: ExplicitCodexReadiness<'_>,
 ) -> bool {
-    if !readiness.enabled || !readiness.auth_ready {
+    if !readiness.enabled || !readiness.auth_ready || readiness.quota_hold {
         return false;
     }
     let Some(current_account_id) = readiness
@@ -293,7 +296,22 @@ pub(super) fn resolve_prepared_quick_text_model_with_models(
         request,
         explicit_model_id,
         ready_explicit_model_id,
-    )?;
+    )
+    .or_else(|error| {
+        if !readiness.quota_hold {
+            return Err(error);
+        }
+        // The quick chain ends at the configured default, and on a quota hold
+        // a Codex default has a stand-in.
+        resolve_default_text_model_during_quota_hold(
+            default_model,
+            &models,
+            ready_providers,
+            gemini_available,
+            request,
+        )
+        .map_err(|_| error)
+    })?;
     let explicit_codex = explicit.filter(|resolved| resolved.config.id == model_id);
     Ok(PreparedQuickTextModel {
         model_id,
@@ -336,8 +354,13 @@ pub(super) async fn resolve_quick_text_model_for_request(
     request: ModelRequestCapabilities,
 ) -> Result<PreparedQuickTextModel> {
     let configured_model_id = CONFIG.models.default_quick_text_model.trim();
+    // On a quota hold no Codex model can run, so its catalog entry is not
+    // fetched either.
+    let on_quota_hold = snapshot.codex_quota_until.is_some();
     let explicit = match parse_third_party_model_id(configured_model_id) {
-        Some((ThirdPartyProvider::OpenAICodex, slug)) if !slug.eq_ignore_ascii_case("selected") => {
+        Some((ThirdPartyProvider::OpenAICodex, slug))
+            if !slug.eq_ignore_ascii_case("selected") && !on_quota_hold =>
+        {
             match ensure_explicit_codex_model(configured_model_id).await {
                 Ok(resolved) => Some(resolved),
                 Err(err) => {
@@ -365,9 +388,10 @@ pub(super) async fn resolve_quick_text_model_for_request(
             enabled: CONFIG.codex.enabled,
             auth_ready: crate::llm::openai_codex::is_auth_ready(),
             current_account_id: current_account_id.as_deref(),
+            quota_hold: on_quota_hold,
         },
     )
-    .map_err(|message| anyhow!(message))
+    .map_err(|message| snapshot.default_resolution_error(message))
 }
 
 pub(super) fn selectable_model_ids_for_request_with_models(
