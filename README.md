@@ -230,7 +230,7 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-4-argon`.
 - `GEMINI_IMAGE_MODEL` - Image model. Default: `gemini-3-pro-image-preview`.
 - `GEMINI_MUSIC_MODEL` - Music model for `/mysong`. Default: `lyria-3-pro-preview`.
-- `GEMINI_VIDEO_MODEL` - Video model. Default: `veo-3.1-generate-preview`.
+- `GEMINI_VIDEO_MODEL` - Video model for `/vid`, called through the Interactions API. Default: `gemini-omni-1.2-flash`. Veo models are no longer served by the Gemini API.
 - `GEMINI_TEMPERATURE` - Default: `0.7`. Argon omits this sampling parameter.
 - `GEMINI_TOP_K` - Default: `40`. Argon omits this sampling parameter.
 - `GEMINI_TOP_P` - Default: `0.95`. Argon omits this sampling parameter.

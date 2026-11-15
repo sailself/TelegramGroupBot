@@ -839,7 +839,7 @@ fn load_gemini() -> GeminiConfig {
         pro_model: env_string("GEMINI_PRO_MODEL", "gemini-4-argon"),
         image_model: env_string("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview"),
         music_model: env_string("GEMINI_MUSIC_MODEL", "lyria-3-pro-preview"),
-        video_model: env_string("GEMINI_VIDEO_MODEL", "veo-3.1-generate-preview"),
+        video_model: env_string("GEMINI_VIDEO_MODEL", "gemini-omni-1.2-flash"),
         temperature: env_f32("GEMINI_TEMPERATURE", 0.7),
         top_k: env_i32("GEMINI_TOP_K", 40),
         top_p: env_f32("GEMINI_TOP_P", 0.95),

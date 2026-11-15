@@ -75,7 +75,7 @@ TelegramGroupHelperBot 指令说明
 /image - 与 /img 相同；Gemini 可选分辨率和长宽比，Codex 可选图片尺寸
 用法：`/image [描述]`，然后选择模型和生成尺寸；Gemini 长宽比可选择 Auto
 
-/vid - 用 Veo 生成视频
+/vid - 用 Gemini Omni 生成视频
 用法：`/vid [文本提示词]`
 
 /profileme - 基于你在本群的聊天记录生成个人简介

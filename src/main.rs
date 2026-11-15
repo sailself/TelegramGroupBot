@@ -88,7 +88,7 @@ mod command {
         Img2(String),
         #[command(description = "与 /img 相同，但附带分辨率与长宽比按钮")]
         Image(String),
-        #[command(description = "用 Veo 生成视频")]
+        #[command(description = "用 Gemini Omni 生成视频")]
         Vid(String),
         #[command(description = "hidden video generation command")]
         Vid2(String),

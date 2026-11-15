@@ -22,8 +22,8 @@ use crate::llm::audit::create_command_audit_context;
 use crate::llm::gemini::ImageGenerationError;
 use crate::llm::{
     audit_context_from_id, generate_image_with_codex, generate_image_with_gemini,
-    generate_image_with_img2, generate_video_with_veo, CodexImageConfig, GeminiImageConfig,
-    LlmAuditContext,
+    generate_image_with_img2, generate_video_with_omni, CodexImageConfig, GeminiImageConfig,
+    LlmAuditContext, VideoGenerationRequest,
 };
 use crate::state::{
     AppState, ImageGenerationModel, ImageSelectionStage, PendingImageCommand, PendingImageRequest,
@@ -1176,28 +1176,22 @@ pub async fn vid_handler(
             let _heavy_permit = _heavy_permit;
             let _chat_action =
                 start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-            let (video_bytes, _mime_type) =
-                generate_video_with_veo(&prompt_text, audit_context.as_ref()).await?;
-
-            if let Some(video_bytes) = video_bytes {
-                send_video_with_retry(&bot, message.chat.id, &video_bytes, Some(message.id))
-                    .await?;
-                edit_message_text_with_retry(
-                    &bot,
-                    message.chat.id,
-                    processing_message.id,
-                    "Video generated below.",
-                )
-                .await?;
-            } else {
-                edit_message_text_with_retry(
-                    &bot,
-                    message.chat.id,
-                    processing_message.id,
-                    "Video generation is unavailable right now.",
-                )
-                .await?;
-            }
+            let video = generate_video_with_omni(
+                VideoGenerationRequest {
+                    prompt: &prompt_text,
+                    media: &[],
+                },
+                audit_context.as_ref(),
+            )
+            .await?;
+            send_video_with_retry(&bot, message.chat.id, &video, Some(message.id)).await?;
+            edit_message_text_with_retry(
+                &bot,
+                message.chat.id,
+                processing_message.id,
+                "Video generated below.",
+            )
+            .await?;
 
             Ok(())
         },

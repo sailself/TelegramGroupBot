@@ -3,13 +3,12 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
-use reqwest::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::config::{is_gemini_argon_model, CONFIG};
 use crate::llm::audit::{LlmAuditContext, LlmUsageRecord};
@@ -26,8 +25,10 @@ use crate::utils::http::get_http_client;
 use crate::utils::text::truncate_for_log;
 
 mod response;
+mod video;
 pub(crate) use response::GeminiTextResponseError;
 use response::{decode_text_response, remove_thought_parts, validate_text_response};
+pub use video::{generate_video_with_omni, VideoGenerationError, VideoGenerationRequest};
 
 #[derive(Debug, thiserror::Error)]
 #[error("Image generation failed: {0}")]
@@ -137,23 +138,13 @@ struct UploadedFileRef {
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
 /// generateContent: two attempts, 900ms apart (plus jitter / Retry-After).
 const GEMINI_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(2, Duration::from_millis(900));
-/// File API, operation polls and video download: cheap to repeat.
+/// File API calls and generated-video downloads: cheap to repeat.
 const GEMINI_FILE_RETRY_POLICY: RetryPolicy = RetryPolicy::linear(2, Duration::from_millis(500));
 const GEMINI_FILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Uploading a Telegram video or audio attachment can take a while.
 const GEMINI_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 const GEMINI_LITE_FALLBACK_MAX_ATTEMPTS: usize = 3;
 const LYRIA_GENERATION_TIMEOUT_SECS: u64 = 240;
-const VEO_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const VEO_VIDEO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
-/// Eight seconds of 1080p video is tens of MiB; refuse runaway bodies.
-const VEO_VIDEO_MAX_BYTES: usize = 256 * 1024 * 1024;
-const VEO_DEFAULT_RESOLUTION: &str = "1080p";
-const VEO_DEFAULT_DURATION_SECONDS: u32 = 8;
-const VEO_DEFAULT_ASPECT_RATIO: &str = "16:9";
-const VEO_POLL_INTERVAL_SECS: u64 = 20;
-const VEO_MAX_POLL_ATTEMPTS: usize = 30;
-
 fn redact_gemini_api_key(text: &str) -> String {
     let key = CONFIG.gemini.api_key.trim();
     if key.is_empty() {
@@ -573,7 +564,7 @@ async fn upload_file_bytes_at(
     Ok(payload.file)
 }
 
-/// Authenticated GET returning JSON (file metadata, Veo operation polls).
+/// Authenticated GET returning JSON (file metadata).
 async fn gemini_get_json(
     url: &str,
     api_key: &str,
@@ -598,16 +589,6 @@ async fn gemini_get_json(
     Ok(value)
 }
 
-async fn get_file_metadata(name: &str) -> Result<GeminiFileInfo> {
-    get_file_metadata_at(
-        GEMINI_API_BASE,
-        &CONFIG.gemini.api_key,
-        name,
-        GEMINI_FILE_REQUEST_TIMEOUT,
-    )
-    .await
-}
-
 async fn get_file_metadata_at(
     base: &str,
     api_key: &str,
@@ -622,6 +603,14 @@ async fn get_file_metadata_at(
 }
 
 async fn wait_for_file_active(file: GeminiFileInfo) -> Result<GeminiFileInfo> {
+    wait_for_file_active_at(GEMINI_API_BASE, &CONFIG.gemini.api_key, file).await
+}
+
+async fn wait_for_file_active_at(
+    base: &str,
+    api_key: &str,
+    file: GeminiFileInfo,
+) -> Result<GeminiFileInfo> {
     let name = file.name.clone();
     let mut latest = file;
 
@@ -633,7 +622,7 @@ async fn wait_for_file_active(file: GeminiFileInfo) -> Result<GeminiFileInfo> {
         }
 
         tokio::time::sleep(Duration::from_secs(2)).await;
-        latest = get_file_metadata(&name).await?;
+        latest = get_file_metadata_at(base, api_key, &name, GEMINI_FILE_REQUEST_TIMEOUT).await?;
     }
 
     Err(anyhow!(
@@ -1853,186 +1842,6 @@ pub async fn generate_music_with_lyria(
     .await?;
 
     extract_music_generation_result(response, model)
-}
-
-pub async fn generate_video_with_veo(
-    user_prompt: &str,
-    audit_context: Option<&LlmAuditContext>,
-) -> Result<(Option<Vec<u8>>, Option<String>), anyhow::Error> {
-    ensure_gemini_api_available()?;
-    let prompt = user_prompt.trim();
-    if prompt.is_empty() {
-        return Ok((None, None));
-    }
-
-    let model = CONFIG.gemini.video_model.trim();
-    if model.is_empty() {
-        return Err(anyhow!("GEMINI_VIDEO_MODEL is not configured"));
-    }
-
-    let mut instance = Map::new();
-    instance.insert("prompt".to_string(), json!(prompt));
-
-    let mut parameters = Map::new();
-    parameters.insert("resolution".to_string(), json!(VEO_DEFAULT_RESOLUTION));
-    parameters.insert(
-        "durationSeconds".to_string(),
-        json!(VEO_DEFAULT_DURATION_SECONDS),
-    );
-    parameters.insert("aspectRatio".to_string(), json!(VEO_DEFAULT_ASPECT_RATIO));
-
-    let payload = json!({
-        "instances": [Value::Object(instance)],
-        "parameters": Value::Object(parameters),
-    });
-
-    let url = format!("{GEMINI_API_BASE}/v1beta/models/{model}:predictLongRunning");
-    let metadata = json!({
-        "resolution": VEO_DEFAULT_RESOLUTION,
-        "duration_seconds": VEO_DEFAULT_DURATION_SECONDS,
-    });
-    let operation = veo_start_operation(&url, &payload, model, &metadata, audit_context).await?;
-
-    let operation_name = operation
-        .get("name")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow!("Veo operation response missing name"))?
-        .to_string();
-    let operation_url = format!("{GEMINI_API_BASE}/v1beta/{operation_name}");
-
-    let mut current_operation = operation;
-    for attempt in 0..VEO_MAX_POLL_ATTEMPTS {
-        let done = current_operation
-            .get("done")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        if done {
-            if let Some(error) = current_operation.get("error") {
-                let message = error
-                    .get("message")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown error");
-                warn!("Veo operation failed: {}", message);
-                return Ok((None, None));
-            }
-
-            let video = current_operation
-                .pointer("/response/generateVideoResponse/generatedSamples/0/video");
-            let video_uri = video
-                .and_then(|value| value.get("uri"))
-                .and_then(|value| value.as_str());
-            let declared_mime_type = video
-                .and_then(|value| value.get("mimeType"))
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-
-            let Some(video_uri) = video_uri else {
-                warn!("Veo operation completed without a video uri");
-                return Ok((None, None));
-            };
-
-            let (bytes, mime_type) = veo_download_video(video_uri, declared_mime_type).await?;
-            info!(
-                "Veo video download completed (bytes={}, mime={:?})",
-                bytes.len(),
-                mime_type
-            );
-            return Ok((Some(bytes), mime_type));
-        }
-
-        if attempt + 1 < VEO_MAX_POLL_ATTEMPTS {
-            info!(
-                "Polling Veo operation (attempt {}/{})",
-                attempt + 1,
-                VEO_MAX_POLL_ATTEMPTS
-            );
-            tokio::time::sleep(Duration::from_secs(VEO_POLL_INTERVAL_SECS)).await;
-            current_operation = gemini_get_json(
-                &operation_url,
-                &CONFIG.gemini.api_key,
-                "veo-operation-poll",
-                VEO_REQUEST_TIMEOUT,
-            )
-            .await?;
-        }
-    }
-
-    warn!("Veo operation timed out after polling");
-    Ok((None, None))
-}
-
-/// Start the long-running Veo generation. The audit row records the
-/// operation name as its response id.
-async fn veo_start_operation(
-    url: &str,
-    payload: &Value,
-    model: &str,
-    metadata: &Value,
-    audit_context: Option<&LlmAuditContext>,
-) -> Result<Value> {
-    let call = LlmCall::begin(
-        "gemini",
-        model,
-        "veo_predict_long_running",
-        audit_context,
-        Some(metadata),
-    )
-    .with_redaction(redact_gemini_api_key);
-    let operation = call_with_retry(
-        &call,
-        &GEMINI_RETRY_POLICY,
-        |_| async move {
-            Ok(get_http_client()
-                .post(url)
-                .header("x-goog-api-key", CONFIG.gemini.api_key.as_str())
-                .timeout(VEO_REQUEST_TIMEOUT)
-                .json(payload))
-        },
-        |_| {},
-        |response| read_json::<Value>(response, "gemini"),
-        |operation: &Value| LlmUsageRecord {
-            response_id: operation
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            ..LlmUsageRecord::default()
-        },
-    )
-    .await?;
-    Ok(operation)
-}
-
-/// Fetch the finished video, preferring the operation's declared MIME type
-/// over the download's `Content-Type`.
-async fn veo_download_video(
-    video_uri: &str,
-    declared_mime_type: Option<String>,
-) -> Result<(Vec<u8>, Option<String>)> {
-    let call =
-        LlmCall::untracked("gemini", "veo-video-download").with_redaction(redact_gemini_api_key);
-    let (bytes, header_mime_type) = call_with_retry(
-        &call,
-        &GEMINI_FILE_RETRY_POLICY,
-        |_| async move {
-            Ok(get_http_client()
-                .get(video_uri)
-                .header("x-goog-api-key", CONFIG.gemini.api_key.as_str())
-                .timeout(VEO_VIDEO_DOWNLOAD_TIMEOUT))
-        },
-        |_| {},
-        |response| async move {
-            let mime_type = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let bytes = read_body_limited(response, "gemini", VEO_VIDEO_MAX_BYTES).await?;
-            Ok((bytes, mime_type))
-        },
-        |_| LlmUsageRecord::default(),
-    )
-    .await?;
-    Ok((bytes, declared_mime_type.or(header_mime_type)))
 }
 
 #[cfg(test)]
