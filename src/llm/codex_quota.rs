@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::llm::openai_codex::CodexUsageSnapshot;
 use crate::llm::transport::UsageLimitNotice;
 use crate::utils::timing::now_unix_seconds;
 
@@ -239,9 +240,12 @@ pub fn note_usage_limit(
 /// The hold in force for the signed-in ChatGPT account, if any.
 pub fn active_hold() -> Option<CodexQuotaHold> {
     // The account id costs an auth-file read, so it is only looked up while a
-    // hold exists.
+    // hold exists that is bound to an account.
     let hold = with_store(|store| store.unexpired(now_unix_seconds()))?;
-    let current_account = crate::llm::runtime_models::current_codex_account_id();
+    let current_account = hold
+        .account_id
+        .as_ref()
+        .and_then(|_| crate::llm::runtime_models::current_codex_account_id());
     hold.covers(now_unix_seconds(), current_account.as_deref())
         .then_some(hold)
 }
@@ -249,6 +253,105 @@ pub fn active_hold() -> Option<CodexQuotaHold> {
 /// The hold in force, as the error a Codex request would fail with.
 pub fn active_limit() -> Option<CodexUsageLimitError> {
     active_hold().map(|hold| CodexUsageLimitError { until: hold.until })
+}
+
+/// What a usage snapshot says about the account's windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageVerdict {
+    /// A window is used up and nothing else pays for requests.
+    Spent { until: i64 },
+    /// No window is used up.
+    Available,
+    /// A window is used up but the account has credits, which may still pay
+    /// for requests. The snapshot cannot settle it; the next request will.
+    Unclear,
+}
+
+pub(crate) fn usage_verdict(snapshot: &CodexUsageSnapshot, now: i64) -> UsageVerdict {
+    let spent_resets = [snapshot.primary.as_ref(), snapshot.secondary.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|window| window.used_percent >= 100.0)
+        .map(|window| window.reset_at)
+        .collect::<Vec<_>>();
+    if spent_resets.is_empty() {
+        return UsageVerdict::Available;
+    }
+    if snapshot
+        .credits
+        .as_ref()
+        .is_some_and(|credits| credits.unlimited || credits.has_credits)
+    {
+        return UsageVerdict::Unclear;
+    }
+    // Every spent window blocks requests, so the hold lasts until the last
+    // of them resets.
+    let until = spent_resets
+        .into_iter()
+        .map(|reset_at| {
+            hold_until(
+                UsageLimitNotice {
+                    resets_at: reset_at,
+                    resets_in_seconds: None,
+                },
+                now,
+            )
+        })
+        .max()
+        .unwrap_or(now);
+    UsageVerdict::Spent { until }
+}
+
+/// The hold before and after a usage snapshot was applied to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldReconciliation {
+    pub before: Option<CodexUsageLimitError>,
+    pub after: Option<CodexUsageLimitError>,
+}
+
+impl HoldReconciliation {
+    /// One line for the usage report, or `None` when there was and is no hold.
+    pub fn report_line(&self) -> Option<String> {
+        match (self.before, self.after) {
+            (_, Some(limit)) => Some(format!(
+                "Quota hold: Codex is out of model selection for about {}.",
+                limit.wait_label(now_unix_seconds())
+            )),
+            (Some(_), None) => Some("Quota hold: cleared, Codex is selectable again.".to_string()),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Bring the hold in line with a live usage snapshot. This is the manual
+/// override: it sets a hold the bot has not run into yet and clears one the
+/// backend lifted early (an early reset, a plan change).
+pub fn reconcile_with_usage(
+    snapshot: &CodexUsageSnapshot,
+    account_id: Option<&str>,
+) -> HoldReconciliation {
+    let before = active_limit();
+    match usage_verdict(snapshot, now_unix_seconds()) {
+        UsageVerdict::Spent { until } => {
+            let account_id = account_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            with_store(|store| store.set(CodexQuotaHold { until, account_id }));
+            info!("Codex usage shows a spent window; Codex is on hold until unix time {until}");
+        }
+        UsageVerdict::Available => {
+            if before.is_some() {
+                with_store(HoldStore::clear);
+                info!("Codex usage shows no spent window; the quota hold is cleared");
+            }
+        }
+        UsageVerdict::Unclear => {}
+    }
+    HoldReconciliation {
+        before,
+        after: active_limit(),
+    }
 }
 
 /// The hold this test thread recorded, expired or not.
@@ -400,6 +503,147 @@ mod tests {
         fs::write(&path, "not json").unwrap();
         assert_eq!(HoldStore::open(path.clone()).unexpired(NOW), None);
         let _ = fs::remove_file(&path);
+    }
+
+    fn window(
+        used_percent: f64,
+        reset_at: Option<i64>,
+    ) -> crate::llm::openai_codex::CodexUsageWindow {
+        crate::llm::openai_codex::CodexUsageWindow {
+            used_percent,
+            limit_window_seconds: None,
+            reset_at,
+        }
+    }
+
+    fn usage(
+        primary: Option<crate::llm::openai_codex::CodexUsageWindow>,
+        secondary: Option<crate::llm::openai_codex::CodexUsageWindow>,
+    ) -> CodexUsageSnapshot {
+        CodexUsageSnapshot {
+            plan_type: Some("plus".to_string()),
+            primary,
+            secondary,
+            credits: None,
+            additional_limits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn spent_window_holds_until_it_resets() {
+        let snapshot = usage(
+            Some(window(100.0, Some(NOW + 600))),
+            Some(window(45.0, Some(NOW + 90_000))),
+        );
+        assert_eq!(
+            usage_verdict(&snapshot, NOW),
+            UsageVerdict::Spent {
+                until: NOW + 600 + RESET_MARGIN_SECS
+            }
+        );
+    }
+
+    #[test]
+    fn two_spent_windows_hold_until_the_later_reset() {
+        let snapshot = usage(
+            Some(window(100.0, Some(NOW + 600))),
+            Some(window(100.0, Some(NOW + 90_000))),
+        );
+        assert_eq!(
+            usage_verdict(&snapshot, NOW),
+            UsageVerdict::Spent {
+                until: NOW + 90_000 + RESET_MARGIN_SECS
+            }
+        );
+    }
+
+    #[test]
+    fn spent_window_without_a_reset_gets_the_short_hold() {
+        let snapshot = usage(Some(window(100.0, None)), None);
+        assert_eq!(
+            usage_verdict(&snapshot, NOW),
+            UsageVerdict::Spent {
+                until: NOW + UNKNOWN_RESET_HOLD_SECS
+            }
+        );
+    }
+
+    #[test]
+    fn windows_with_room_left_are_available() {
+        assert_eq!(
+            usage_verdict(
+                &usage(
+                    Some(window(99.9, Some(NOW + 600))),
+                    Some(window(45.0, None))
+                ),
+                NOW
+            ),
+            UsageVerdict::Available
+        );
+        assert_eq!(
+            usage_verdict(&usage(None, None), NOW),
+            UsageVerdict::Available
+        );
+    }
+
+    #[test]
+    fn spent_window_with_credits_is_left_to_the_next_request() {
+        let mut snapshot = usage(Some(window(100.0, Some(NOW + 600))), None);
+        snapshot.credits = Some(crate::llm::openai_codex::CodexUsageCredits {
+            has_credits: true,
+            unlimited: false,
+            balance: Some("12".to_string()),
+        });
+        assert_eq!(usage_verdict(&snapshot, NOW), UsageVerdict::Unclear);
+    }
+
+    #[test]
+    fn reconciling_sets_clears_and_reports_the_hold() {
+        let now = now_unix_seconds();
+        let spent = usage(Some(window(100.0, Some(now + 7_200))), None);
+        let free = usage(Some(window(20.0, Some(now + 7_200))), None);
+
+        // No hold and nothing spent: nothing to say.
+        let idle = reconcile_with_usage(&free, None);
+        assert_eq!(idle.report_line(), None);
+
+        // The usage report reveals a spent window the bot has not hit yet.
+        let set = reconcile_with_usage(&spent, None);
+        assert_eq!(set.before, None);
+        assert_eq!(
+            set.after.map(|limit| limit.until),
+            Some(now + 7_200 + RESET_MARGIN_SECS)
+        );
+        assert_eq!(
+            set.report_line().as_deref(),
+            Some("Quota hold: Codex is out of model selection for about 2h 1m.")
+        );
+
+        // The backend lifted the limit early: the hold goes with it.
+        let cleared = reconcile_with_usage(&free, None);
+        assert!(cleared.before.is_some());
+        assert_eq!(cleared.after, None);
+        assert_eq!(
+            cleared.report_line().as_deref(),
+            Some("Quota hold: cleared, Codex is selectable again.")
+        );
+        assert_eq!(stored_hold_for_test(), None);
+    }
+
+    #[test]
+    fn reconciling_an_unclear_snapshot_leaves_the_hold_alone() {
+        let now = now_unix_seconds();
+        note_usage_limit(notice(None, Some(600)), None);
+        let mut with_credits = usage(Some(window(100.0, Some(now + 7_200))), None);
+        with_credits.credits = Some(crate::llm::openai_codex::CodexUsageCredits {
+            has_credits: false,
+            unlimited: true,
+            balance: None,
+        });
+
+        let result = reconcile_with_usage(&with_credits, None);
+        assert_eq!(result.before, result.after);
+        assert!(result.after.is_some());
     }
 
     #[test]
