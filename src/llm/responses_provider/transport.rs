@@ -591,6 +591,7 @@ fn responses_provider_error(display_name: &str, err: ProviderError) -> anyhow::E
             status,
             summarize_error_body(&body_snippet)
         ),
+        ProviderError::UsageLimit { .. } => anyhow!("{display_name} usage limit reached"),
         ProviderError::Decode { detail, .. } => anyhow!("{detail}"),
         other => anyhow!("{other}"),
     }
