@@ -28,7 +28,10 @@ mod response;
 mod video;
 pub(crate) use response::GeminiTextResponseError;
 use response::{decode_text_response, remove_thought_parts, validate_text_response};
-pub use video::{generate_video_with_omni, VideoGenerationError, VideoGenerationRequest};
+pub use video::{
+    check_video_input_counts, generate_video_with_omni, VideoGenerationError,
+    VideoGenerationRequest,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("Image generation failed: {0}")]

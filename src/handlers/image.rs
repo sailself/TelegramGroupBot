@@ -1,5 +1,5 @@
-//! Image and video generation commands: `/img`, `/img2`, `/image`, `/vid`,
-//! and the shared image-generation helpers used by `/tldr`, `/paintme`, and
+//! Image generation commands: `/img`, `/img2`, `/image`, `/gif`, and the
+//! shared image-generation helpers used by `/tldr`, `/paintme`, and
 //! `/portraitme`.
 
 use std::collections::HashSet;
@@ -22,15 +22,13 @@ use crate::llm::audit::create_command_audit_context;
 use crate::llm::gemini::ImageGenerationError;
 use crate::llm::{
     audit_context_from_id, generate_image_with_codex, generate_image_with_gemini,
-    generate_image_with_img2, generate_video_with_omni, CodexImageConfig, GeminiImageConfig,
-    LlmAuditContext, VideoGenerationRequest,
+    generate_image_with_img2, CodexImageConfig, GeminiImageConfig, LlmAuditContext,
 };
 use crate::state::{
     AppState, ImageGenerationModel, ImageSelectionStage, PendingImageCommand, PendingImageRequest,
 };
 use crate::utils::telegram::{
-    edit_message_text_with_retry, message_entities_for_text, retry_telegram,
-    send_message_with_retry, start_chat_action_heartbeat, strip_command_prefix,
+    message_entities_for_text, start_chat_action_heartbeat, strip_command_prefix,
 };
 use crate::utils::text::{escape_html, truncate_with_ellipsis};
 use tracing::{info, warn};
@@ -89,24 +87,6 @@ pub(super) async fn build_image_caption(model_name: &str, prompt: &str) -> Strin
     } else {
         base_caption
     }
-}
-
-async fn send_video_with_retry(
-    bot: &Bot,
-    chat_id: ChatId,
-    video_bytes: &[u8],
-    reply_to: Option<MessageId>,
-) -> Result<Message> {
-    retry_telegram("send_video", || {
-        let input = InputFile::memory(video_bytes.to_vec()).file_name("video.mp4");
-        let mut request = bot.send_video(chat_id, input);
-        if let Some(reply_to) = reply_to {
-            request = request.reply_parameters(ReplyParameters::new(reply_to));
-        }
-        request
-    })
-    .await
-    .map_err(Into::into)
 }
 
 async fn prepare_image_request(
@@ -1089,114 +1069,6 @@ pub async fn image_handler(
     );
 
     Ok(())
-}
-
-pub async fn vid_handler(
-    bot: Bot,
-    state: AppState,
-    message: Message,
-    prompt: Option<String>,
-) -> Result<()> {
-    if !check_access_control(&bot, &message, "vid").await {
-        return Ok(());
-    }
-    if !CONFIG.gemini_api_available() {
-        bot.send_message(
-            message.chat.id,
-            "The /vid command requires Gemini and is disabled.",
-        )
-        .reply_parameters(ReplyParameters::new(message.id))
-        .await?;
-        return Ok(());
-    }
-
-    let user_id = message
-        .from
-        .as_ref()
-        .and_then(|user| i64::try_from(user.id.0).ok())
-        .unwrap_or_default();
-    if is_rate_limited(user_id) {
-        bot.send_message(
-            message.chat.id,
-            "Rate limit exceeded. Please try again later.",
-        )
-        .reply_parameters(ReplyParameters::new(message.id))
-        .await?;
-        return Ok(());
-    }
-
-    let reply_has_image = message
-        .reply_to_message()
-        .map(message_has_image)
-        .unwrap_or(false);
-    if message_has_image(&message) || reply_has_image {
-        send_message_with_retry(
-            &bot,
-            message.chat.id,
-            "Image input isn't supported for /vid right now. Please send a text-only prompt.\nUsage: /vid [text prompt]",
-            Some(message.id),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let original_message_text = message
-        .text()
-        .map(|value| value.to_string())
-        .or_else(|| message.caption().map(|value| value.to_string()))
-        .unwrap_or_default();
-
-    let prompt_text =
-        prompt.unwrap_or_else(|| strip_command_prefix(&original_message_text, "/vid"));
-    if prompt_text.trim().is_empty() {
-        bot.send_message(
-            message.chat.id,
-            "Please provide a prompt for the video.\nUsage: /vid [text prompt]",
-        )
-        .reply_parameters(ReplyParameters::new(message.id))
-        .await?;
-        return Ok(());
-    }
-    let _heavy_permit = state.acquire_heavy_command_permit().await;
-    let audit_context = create_command_audit_context(&state, &message, "vid").await;
-
-    let processing_message = send_message_with_retry(
-        &bot,
-        message.chat.id,
-        "Processing video request... This may take a few minutes.",
-        Some(message.id),
-    )
-    .await?;
-    crate::utils::telegram::run_with_status_message(
-        &bot,
-        processing_message.chat.id,
-        processing_message.id,
-        "Failed to generate your video. Please try again.",
-        async {
-            let _heavy_permit = _heavy_permit;
-            let _chat_action =
-                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-            let video = generate_video_with_omni(
-                VideoGenerationRequest {
-                    prompt: &prompt_text,
-                    media: &[],
-                },
-                audit_context.as_ref(),
-            )
-            .await?;
-            send_video_with_retry(&bot, message.chat.id, &video, Some(message.id)).await?;
-            edit_message_text_with_retry(
-                &bot,
-                message.chat.id,
-                processing_message.id,
-                "Video generated below.",
-            )
-            .await?;
-
-            Ok(())
-        },
-    )
-    .await
 }
 
 #[cfg(test)]

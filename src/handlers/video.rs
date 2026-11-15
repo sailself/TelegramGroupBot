@@ -1,29 +1,42 @@
-//! Hidden `/vid2` command and local MP4 delivery.
+//! Video commands: `/vid` (Gemini Omni, with optional image and video
+//! inputs) and the hidden `/vid2` with its local MP4 delivery.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, FileId, InputFile, MessageId, ParseMode, ReplyParameters};
+use teloxide::types::{
+    ChatAction, FileId, InputFile, MediaGroupId, MessageId, ParseMode, ReplyParameters,
+};
 use tracing::{info, warn};
 
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::media::get_file_url;
 use crate::llm::audit::create_command_audit_context;
+use crate::llm::gemini::check_video_input_counts;
+use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
 use crate::llm::vid2_video::{
     download_source_image, generate_video_with_vid2, Vid2Error, Vid2GenerationRequest, Vid2Phase,
 };
-use crate::state::AppState;
+use crate::llm::{generate_video_with_omni, VideoGenerationError, VideoGenerationRequest};
+use crate::state::{AppState, MediaGroupItem};
 use crate::utils::telegram::{
     edit_message_text_with_retry, message_text_or_caption, retry_telegram, run_with_status_message,
     send_message_with_retry, start_chat_action_heartbeat, strip_command_prefix, VideoDeliveryError,
 };
 use crate::utils::text::escape_html;
 
-fn prompt_for_message(message: &Message) -> String {
+const VID_USAGE: &str = "Please provide a prompt for the video.\n\
+Usage: /vid [prompt]\n\
+Reply to, or attach, images or a video to animate, edit, or extend them.";
+
+/// The prompt after the command, or the replied-to text when the command
+/// stands alone.
+fn command_prompt(message: &Message, command_prefix: &str) -> String {
     let prompt = message_text_or_caption(message)
-        .map(|text| strip_command_prefix(text, "/vid2"))
+        .map(|text| strip_command_prefix(text, command_prefix))
         .unwrap_or_default();
     if !prompt.is_empty() {
         return prompt;
@@ -34,6 +47,248 @@ fn prompt_for_message(message: &Message) -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+/// One Telegram file to hand to the `/vid` model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VidInput {
+    file_id: FileId,
+    kind: MediaKind,
+    /// The type Telegram declares, when it declares one.
+    mime_type: Option<String>,
+}
+
+fn document_kind(mime_type: Option<&str>, file_name: Option<&str>) -> Option<MediaKind> {
+    match mime_type {
+        Some(mime) if mime.starts_with("image/") => return Some(MediaKind::Image),
+        Some(mime) if mime.starts_with("video/") => return Some(MediaKind::Video),
+        _ => {}
+    }
+    let name = file_name?.to_ascii_lowercase();
+    let has_suffix = |suffixes: &[&str]| suffixes.iter().any(|suffix| name.ends_with(suffix));
+    if has_suffix(&[".jpg", ".jpeg", ".png", ".webp"]) {
+        Some(MediaKind::Image)
+    } else if has_suffix(&[".mp4", ".mov", ".webm"]) {
+        Some(MediaKind::Video)
+    } else {
+        None
+    }
+}
+
+/// The image or video one message carries, if it carries a usable one.
+fn message_vid_input(message: &Message) -> Result<Option<VidInput>, &'static str> {
+    let input = |file_id: &FileId, kind, mime_type: Option<&str>| {
+        Ok(Some(VidInput {
+            file_id: file_id.clone(),
+            kind,
+            mime_type: mime_type.map(str::to_string),
+        }))
+    };
+
+    if let Some(photo) = message.photo().and_then(|sizes| sizes.last()) {
+        return input(&photo.file.id, MediaKind::Image, None);
+    }
+    if let Some(video) = message.video() {
+        let mime_type = video.mime_type.as_ref().map(|mime| mime.essence_str());
+        return input(&video.file.id, MediaKind::Video, mime_type);
+    }
+    if let Some(animation) = message.animation() {
+        let mime_type = animation.mime_type.as_ref().map(|mime| mime.essence_str());
+        return input(&animation.file.id, MediaKind::Video, mime_type);
+    }
+    if let Some(note) = message.video_note() {
+        return input(&note.file.id, MediaKind::Video, None);
+    }
+    if let Some(sticker) = message.sticker() {
+        return if sticker.flags.is_video {
+            input(&sticker.file.id, MediaKind::Video, Some("video/webm"))
+        } else if sticker.flags.is_animated {
+            Err("animated stickers cannot be used as an input")
+        } else {
+            input(&sticker.file.id, MediaKind::Image, Some("image/webp"))
+        };
+    }
+    if let Some(document) = message.document() {
+        let mime_type = document.mime_type.as_ref().map(|mime| mime.essence_str());
+        if let Some(kind) = document_kind(mime_type, document.file_name.as_deref()) {
+            // Keep the declared type only when it agrees with the kind; a
+            // generic one would hide the real format from detection.
+            let mime_type =
+                mime_type.filter(|mime| mime.starts_with("image/") || mime.starts_with("video/"));
+            return input(&document.file.id, kind, mime_type);
+        }
+    }
+    Ok(None)
+}
+
+/// Inputs in the order the model reads them: the replied-to message first
+/// (what is being animated, edited or extended), then what the command
+/// message attaches. An album contributes all of its cached photos.
+fn vid_inputs(
+    message: &Message,
+    album_photos: impl Fn(&MediaGroupId) -> Vec<MediaGroupItem>,
+) -> Result<Vec<VidInput>, &'static str> {
+    let mut inputs: Vec<VidInput> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add = |input: VidInput| {
+        if seen.insert(input.file_id.clone()) {
+            inputs.push(input);
+        }
+    };
+
+    for source in message.reply_to_message().into_iter().chain([message]) {
+        let own = message_vid_input(source)?;
+        let album = source
+            .media_group_id()
+            .map(&album_photos)
+            .unwrap_or_default();
+        // A captioned album item is dispatched as the command and never
+        // cached, so it leads; a cached one keeps its place in the album.
+        if let Some(own) = own {
+            if !album.iter().any(|item| item.file_id == own.file_id) {
+                add(own);
+            }
+        }
+        for item in album {
+            add(VidInput {
+                file_id: item.file_id,
+                kind: MediaKind::Image,
+                mime_type: None,
+            });
+        }
+    }
+    Ok(inputs)
+}
+
+async fn download_vid_inputs(bot: &Bot, inputs: &[VidInput]) -> Result<Vec<MediaFile>> {
+    let mut files = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let bytes = match get_file_url(bot, &input.file_id).await {
+            Ok(url) => download_media(&url).await,
+            Err(error) => {
+                warn!("Could not resolve a /vid input file: {error}");
+                None
+            }
+        }
+        .ok_or_else(|| {
+            VideoGenerationError(
+                "an attached file could not be downloaded from Telegram, which serves bots files of up to 20 MB"
+                    .to_string(),
+            )
+        })?;
+        let mime_type = input
+            .mime_type
+            .clone()
+            .or_else(|| detect_mime_type(&bytes))
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        files.push(MediaFile::new(bytes, mime_type, input.kind, None));
+    }
+    Ok(files)
+}
+
+async fn send_generated_video(
+    bot: &Bot,
+    chat_id: ChatId,
+    video_bytes: &[u8],
+    reply_to: MessageId,
+) -> Result<Message> {
+    retry_telegram("send_video", || {
+        let input = InputFile::memory(video_bytes.to_vec()).file_name("video.mp4");
+        bot.send_video(chat_id, input)
+            .reply_parameters(ReplyParameters::new(reply_to))
+    })
+    .await
+    .map_err(Into::into)
+}
+
+/// `/vid`: generate a clip from the prompt, using any image or video the
+/// request replies to or attaches.
+pub async fn vid_handler(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    _prompt: Option<String>,
+) -> Result<()> {
+    if !check_access_control(&bot, &message, "vid").await {
+        return Ok(());
+    }
+    if !CONFIG.gemini_api_available() {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "The /vid command requires Gemini and is disabled.",
+            Some(message.id),
+        )
+        .await?;
+        return Ok(());
+    }
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+    if is_rate_limited(user_id) {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+            Some(message.id),
+        )
+        .await?;
+        return Ok(());
+    }
+    let prompt = command_prompt(&message, "/vid");
+    if prompt.is_empty() {
+        send_message_with_retry(&bot, message.chat.id, VID_USAGE, Some(message.id)).await?;
+        return Ok(());
+    }
+
+    let permit = state.acquire_heavy_command_permit().await;
+    let audit = create_command_audit_context(&state, &message, "vid").await;
+    let status = send_message_with_retry(
+        &bot,
+        message.chat.id,
+        "Processing video request... This may take a few minutes.",
+        Some(message.id),
+    )
+    .await?;
+    run_with_status_message(
+        &bot,
+        message.chat.id,
+        status.id,
+        "Failed to generate your video. Please try again.",
+        async {
+            let _permit = permit;
+            let _chat_action =
+                start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
+            // Read the album cache only now: the siblings of a captioned
+            // album item are separate updates that land just after it.
+            let inputs = vid_inputs(&message, |album| state.media_group_items(album))
+                .map_err(|reason| VideoGenerationError(reason.to_string()))?;
+            let count = |kind| inputs.iter().filter(|input| input.kind == kind).count();
+            check_video_input_counts(count(MediaKind::Image), count(MediaKind::Video))?;
+            let media = download_vid_inputs(&bot, &inputs).await?;
+
+            let video = generate_video_with_omni(
+                VideoGenerationRequest {
+                    prompt: &prompt,
+                    media: &media,
+                },
+                audit.as_ref(),
+            )
+            .await?;
+            send_generated_video(&bot, message.chat.id, &video, message.id).await?;
+            edit_message_text_with_retry(
+                &bot,
+                message.chat.id,
+                status.id,
+                "Video generated below.",
+            )
+            .await?;
+            Ok(())
+        },
+    )
+    .await
 }
 
 fn attached_image(message: &Message) -> Result<Option<FileId>, Vid2Error> {
@@ -209,7 +464,7 @@ pub async fn vid2_handler(
         send_message_with_retry(&bot, message.chat.id, "Vid2 video generation is disabled or unconfigured. Set ENABLE_VID2=true, VID2_BASE_URL, and VID2_API_KEY to enable it.", Some(message.id)).await?;
         return Ok(());
     }
-    let prompt = prompt_for_message(&message);
+    let prompt = command_prompt(&message, "/vid2");
     if prompt.trim().is_empty() {
         send_message_with_retry(
             &bot,
@@ -321,24 +576,28 @@ mod tests {
         json!({"file_id":id,"file_unique_id":id,"width":size,"height":size})
     }
 
+    fn vid2_prompt(message: &Message) -> String {
+        command_prompt(message, "/vid2")
+    }
+
     #[test]
     fn prompt_comes_from_command_text_or_caption_then_replied_text() {
         assert_eq!(
-            prompt_for_message(&message(json!({"text":"/vid2@test_bot a fox"}))),
+            vid2_prompt(&message(json!({"text":"/vid2@test_bot a fox"}))),
             "a fox"
         );
         assert_eq!(
-            prompt_for_message(&message(
+            vid2_prompt(&message(
                 json!({"photo":[photo("x",1)],"caption":"/vid2 wind"})
             )),
             "wind"
         );
         let reply = message(json!({"text":"snowy woods"}));
         assert_eq!(
-            prompt_for_message(&message(json!({"text":"/vid2","reply_to_message":reply}))),
+            vid2_prompt(&message(json!({"text":"/vid2","reply_to_message":reply}))),
             "snowy woods"
         );
-        assert!(prompt_for_message(&message(json!({"text":"/vid2"}))).is_empty());
+        assert!(vid2_prompt(&message(json!({"text":"/vid2"}))).is_empty());
     }
 
     #[test]
@@ -441,6 +700,173 @@ mod tests {
         let over = video_caption(&format!("{boundary}🦊"));
         assert!(visible_caption(&over).encode_utf16().count() <= 1024);
         assert!(over.ends_with("…</pre>"));
+    }
+
+    fn vid_input(id: &str, kind: MediaKind, mime_type: Option<&str>) -> VidInput {
+        VidInput {
+            file_id: FileId(id.to_string()),
+            kind,
+            mime_type: mime_type.map(str::to_string),
+        }
+    }
+
+    fn file(id: &str) -> Value {
+        json!({"file_id":id,"file_unique_id":id})
+    }
+
+    fn video(id: &str) -> Value {
+        json!({"file_id":id,"file_unique_id":id,"width":640,"height":360,"duration":5,"mime_type":"video/mp4"})
+    }
+
+    fn sticker(id: &str, animated: bool, video: bool) -> Message {
+        message(
+            json!({"sticker":{"file_id":id,"file_unique_id":id,"type":"regular","width":512,"height":512,"is_animated":animated,"is_video":video}}),
+        )
+    }
+
+    fn no_albums(_: &MediaGroupId) -> Vec<MediaGroupItem> {
+        Vec::new()
+    }
+
+    fn ids(inputs: &[VidInput]) -> Vec<&str> {
+        inputs
+            .iter()
+            .map(|input| input.file_id.0.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn vid_prompt_comes_from_the_command_then_the_replied_text() {
+        assert_eq!(
+            command_prompt(&message(json!({"text":"/vid@test_bot a fox"})), "/vid"),
+            "a fox"
+        );
+        let reply = message(json!({"photo":[photo("x",1)],"caption":"make it rain"}));
+        assert_eq!(
+            command_prompt(
+                &message(json!({"text":"/vid","reply_to_message":reply})),
+                "/vid"
+            ),
+            "make it rain"
+        );
+    }
+
+    #[test]
+    fn vid_reads_every_kind_of_image_and_video_message() {
+        let cases = [
+            (
+                json!({"photo":[photo("small",2),photo("large",30)]}),
+                vid_input("large", MediaKind::Image, None),
+            ),
+            (
+                json!({"video":video("clip")}),
+                vid_input("clip", MediaKind::Video, Some("video/mp4")),
+            ),
+            (
+                json!({"animation":video("gif"),"document":file("gif")}),
+                vid_input("gif", MediaKind::Video, Some("video/mp4")),
+            ),
+            (
+                json!({"video_note":{"file_id":"round","file_unique_id":"round","length":240,"duration":4}}),
+                vid_input("round", MediaKind::Video, None),
+            ),
+            (
+                json!({"document":{"file_id":"png","file_unique_id":"png","file_name":"a.bin","mime_type":"image/png"}}),
+                vid_input("png", MediaKind::Image, Some("image/png")),
+            ),
+            (
+                json!({"document":{"file_id":"mov","file_unique_id":"mov","file_name":"Clip.MOV"}}),
+                vid_input("mov", MediaKind::Video, None),
+            ),
+            (
+                json!({"document":{"file_id":"jpg","file_unique_id":"jpg","file_name":"scan.jpeg","mime_type":"application/octet-stream"}}),
+                vid_input("jpg", MediaKind::Image, None),
+            ),
+        ];
+        for (fields, expected) in cases {
+            let source = message(fields);
+            assert_eq!(
+                message_vid_input(&source).unwrap(),
+                Some(expected),
+                "{source:?}"
+            );
+        }
+
+        for unrelated in [
+            json!({"text":"just words"}),
+            json!({"document":{"file_id":"pdf","file_unique_id":"pdf","file_name":"a.pdf","mime_type":"application/pdf"}}),
+        ] {
+            assert_eq!(message_vid_input(&message(unrelated)).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn vid_takes_static_and_video_stickers_but_refuses_animated_ones() {
+        assert_eq!(
+            message_vid_input(&sticker("static", false, false)).unwrap(),
+            Some(vid_input("static", MediaKind::Image, Some("image/webp")))
+        );
+        assert_eq!(
+            message_vid_input(&sticker("moving", false, true)).unwrap(),
+            Some(vid_input("moving", MediaKind::Video, Some("video/webm")))
+        );
+        assert!(message_vid_input(&sticker("lottie", true, false)).is_err());
+    }
+
+    #[test]
+    fn vid_reads_the_replied_message_before_the_attached_one() {
+        let reply = message(json!({"video":video("base")}));
+        let request = message(
+            json!({"photo":[photo("reference",10)],"caption":"/vid add her","reply_to_message":reply}),
+        );
+        let inputs = vid_inputs(&request, no_albums).unwrap();
+        assert_eq!(ids(&inputs), ["base", "reference"]);
+        assert_eq!(inputs[0].kind, MediaKind::Video);
+        assert_eq!(inputs[1].kind, MediaKind::Image);
+
+        assert!(
+            vid_inputs(&message(json!({"text":"/vid a fox"})), no_albums)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn vid_uses_a_whole_album_in_order_without_repeating_a_file() {
+        let album = |id: &MediaGroupId| {
+            assert_eq!(id.0, "album");
+            ["second", "third"]
+                .into_iter()
+                .map(|id| MediaGroupItem {
+                    file_id: FileId(id.to_string()),
+                })
+                .collect()
+        };
+        // The captioned item is dispatched as the command, so the cache holds
+        // only its siblings: it leads, and they follow in album order.
+        let captioned = message(
+            json!({"photo":[photo("first",10)],"caption":"/vid morph","media_group_id":"album"}),
+        );
+        assert_eq!(
+            ids(&vid_inputs(&captioned, album).unwrap()),
+            ["first", "second", "third"]
+        );
+
+        // A reply to a cached album item keeps the album order and lists the
+        // replied item once.
+        let reply = message(json!({"photo":[photo("third",10)],"media_group_id":"album"}));
+        let request = message(json!({"text":"/vid morph","reply_to_message":reply}));
+        assert_eq!(
+            ids(&vid_inputs(&request, album).unwrap()),
+            ["second", "third"]
+        );
+    }
+
+    #[test]
+    fn vid_reports_an_unusable_sticker_wherever_it_is() {
+        let request =
+            message(json!({"text":"/vid dance","reply_to_message":sticker("lottie", true, false)}));
+        assert!(vid_inputs(&request, no_albums).is_err());
     }
 
     fn telegram_response(ok: bool, retry: bool) -> Vec<u8> {

@@ -88,7 +88,7 @@ mod command {
         Img2(String),
         #[command(description = "与 /img 相同，但附带分辨率与长宽比按钮")]
         Image(String),
-        #[command(description = "用 Gemini Omni 生成视频")]
+        #[command(description = "用 Gemini Omni 生成视频，可回复图片或视频")]
         Vid(String),
         #[command(description = "hidden video generation command")]
         Vid2(String),
@@ -375,7 +375,7 @@ async fn handle_command(
         Command::Vid(arg) => {
             spawn_logged(
                 "vid",
-                handlers::image::vid_handler(bot, state, message, optional_arg(arg)),
+                handlers::video::vid_handler(bot, state, message, optional_arg(arg)),
             );
         }
         Command::Vid2(arg) => {
