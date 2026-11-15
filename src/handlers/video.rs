@@ -20,7 +20,9 @@ use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
 use crate::llm::vid2_video::{
     download_source_image, generate_video_with_vid2, Vid2Error, Vid2GenerationRequest, Vid2Phase,
 };
-use crate::llm::{generate_video_with_omni, VideoGenerationError, VideoGenerationRequest};
+use crate::llm::{
+    generate_video_with_omni, VideoGenerationError, VideoGenerationRequest, VideoTask,
+};
 use crate::state::{AppState, MediaGroupItem};
 use crate::utils::telegram::{
     edit_message_text_with_retry, message_text_or_caption, retry_telegram, run_with_status_message,
@@ -30,7 +32,17 @@ use crate::utils::text::escape_html;
 
 const VID_USAGE: &str = "Please provide a prompt for the video.\n\
 Usage: /vid [prompt]\n\
-Reply to, or attach, images or a video to animate, edit, or extend them.";
+Reply to, or attach, images or a video to animate, edit, or extend them.\n\
+If the model picks the wrong mode, start the prompt with --t2v, --i2v, --ref, --edit, or --extend.";
+
+fn replied_text(message: &Message) -> String {
+    message
+        .reply_to_message()
+        .and_then(message_text_or_caption)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
 
 /// The prompt after the command, or the replied-to text when the command
 /// stands alone.
@@ -41,12 +53,58 @@ fn command_prompt(message: &Message, command_prefix: &str) -> String {
     if !prompt.is_empty() {
         return prompt;
     }
-    message
-        .reply_to_message()
-        .and_then(message_text_or_caption)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+    replied_text(message)
+}
+
+/// `--<name>` options that name the generation task outright.
+const VID_TASK_OPTIONS: [(&str, VideoTask); 5] = [
+    ("t2v", VideoTask::TextToVideo),
+    ("i2v", VideoTask::ImageToVideo),
+    ("ref", VideoTask::ReferenceToVideo),
+    ("edit", VideoTask::Edit),
+    ("extend", VideoTask::Extend),
+];
+
+/// Split a leading `--<task>` option off the prompt. Phones turn a typed
+/// `--` into a dash, so a dash counts as well.
+fn split_task_option(prompt: &str) -> Result<(Option<VideoTask>, &str), String> {
+    let prompt = prompt.trim();
+    let option = ["--", "\u{2014}", "\u{2013}"]
+        .iter()
+        .find_map(|marker| prompt.strip_prefix(marker));
+    let Some(option) = option else {
+        return Ok((None, prompt));
+    };
+    let (name, rest) = option
+        .split_once(char::is_whitespace)
+        .unwrap_or((option, ""));
+    if name.is_empty() {
+        // A dash followed by a space opens the prompt; it is not an option.
+        return Ok((None, prompt));
+    }
+    let task = VID_TASK_OPTIONS
+        .iter()
+        .find(|(option, _)| name.eq_ignore_ascii_case(option))
+        .map(|(_, task)| *task)
+        .ok_or_else(|| {
+            format!("Unknown option --{name}. Use --t2v, --i2v, --ref, --edit, or --extend.")
+        })?;
+    Ok((Some(task), rest.trim_start()))
+}
+
+/// The task option and prompt of a `/vid` request. A command without a
+/// prompt of its own takes the replied-to text.
+fn vid_request_text(message: &Message) -> Result<(Option<VideoTask>, String), String> {
+    let own = message_text_or_caption(message)
+        .map(|text| strip_command_prefix(text, "/vid"))
+        .unwrap_or_default();
+    let (task, prompt) = split_task_option(&own)?;
+    let prompt = if prompt.is_empty() {
+        replied_text(message)
+    } else {
+        prompt.to_string()
+    };
+    Ok((task, prompt))
 }
 
 /// One Telegram file to hand to the `/vid` model.
@@ -237,7 +295,13 @@ pub async fn vid_handler(
         .await?;
         return Ok(());
     }
-    let prompt = command_prompt(&message, "/vid");
+    let (task, prompt) = match vid_request_text(&message) {
+        Ok(request) => request,
+        Err(reason) => {
+            send_message_with_retry(&bot, message.chat.id, &reason, Some(message.id)).await?;
+            return Ok(());
+        }
+    };
     if prompt.is_empty() {
         send_message_with_retry(&bot, message.chat.id, VID_USAGE, Some(message.id)).await?;
         return Ok(());
@@ -273,6 +337,7 @@ pub async fn vid_handler(
                 VideoGenerationRequest {
                     prompt: &prompt,
                     media: &media,
+                    task,
                 },
                 audit.as_ref(),
             )
@@ -736,19 +801,74 @@ mod tests {
     }
 
     #[test]
-    fn vid_prompt_comes_from_the_command_then_the_replied_text() {
-        assert_eq!(
-            command_prompt(&message(json!({"text":"/vid@test_bot a fox"})), "/vid"),
-            "a fox"
-        );
-        let reply = message(json!({"photo":[photo("x",1)],"caption":"make it rain"}));
-        assert_eq!(
-            command_prompt(
-                &message(json!({"text":"/vid","reply_to_message":reply})),
-                "/vid"
+    fn vid_task_option_is_split_off_the_front_of_the_prompt() {
+        let cases = [
+            ("--t2v a fox", Some(VideoTask::TextToVideo), "a fox"),
+            (
+                "--i2v make it move",
+                Some(VideoTask::ImageToVideo),
+                "make it move",
             ),
-            "make it rain"
+            (
+                "--ref  the cat plays",
+                Some(VideoTask::ReferenceToVideo),
+                "the cat plays",
+            ),
+            (
+                "--edit\nmake it snow",
+                Some(VideoTask::Edit),
+                "make it snow",
+            ),
+            ("--EXTEND keep going", Some(VideoTask::Extend), "keep going"),
+            // Phones turn a typed `--` into a dash.
+            (
+                "\u{2014}extend keep going",
+                Some(VideoTask::Extend),
+                "keep going",
+            ),
+            (
+                "\u{2013}edit make it snow",
+                Some(VideoTask::Edit),
+                "make it snow",
+            ),
+            ("--extend", Some(VideoTask::Extend), ""),
+            ("  a fox --edit  ", None, "a fox --edit"),
+            ("\u{2014} a quiet morning", None, "\u{2014} a quiet morning"),
+            ("", None, ""),
+        ];
+        for (prompt, task, rest) in cases {
+            assert_eq!(split_task_option(prompt), Ok((task, rest)), "{prompt:?}");
+        }
+
+        let unknown = split_task_option("--cinematic a fox").unwrap_err();
+        assert!(unknown.contains("--cinematic"), "{unknown}");
+        assert!(unknown.contains("--extend"), "{unknown}");
+    }
+
+    #[test]
+    fn vid_prompt_follows_the_option_or_falls_back_to_the_replied_text() {
+        let reply = message(json!({"text":"a storm rolls in"}));
+        let request = message(json!({"text":"/vid --t2v","reply_to_message":reply}));
+        assert_eq!(
+            vid_request_text(&request),
+            Ok((Some(VideoTask::TextToVideo), "a storm rolls in".to_string()))
         );
+        assert_eq!(
+            vid_request_text(&message(json!({"text":"/vid@test_bot a fox"}))),
+            Ok((None, "a fox".to_string()))
+        );
+        let captioned = message(json!({"photo":[photo("x",1)],"caption":"make it rain"}));
+        assert_eq!(
+            vid_request_text(&message(
+                json!({"text":"/vid","reply_to_message":captioned})
+            )),
+            Ok((None, "make it rain".to_string()))
+        );
+        assert_eq!(
+            vid_request_text(&message(json!({"text":"/vid"}))),
+            Ok((None, String::new()))
+        );
+        assert!(vid_request_text(&message(json!({"text":"/vid --nope x"}))).is_err());
     }
 
     #[test]

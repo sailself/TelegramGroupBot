@@ -40,11 +40,36 @@ const VIDEO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const VIDEO_MAX_BYTES: usize = 256 * 1024 * 1024;
 const VIDEO_ERROR_DETAIL_CHARS: usize = 400;
 
+/// The generation mode. Omni infers it from the prompt and the attached media;
+/// naming one is the documented fallback for when it infers the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoTask {
+    TextToVideo,
+    ImageToVideo,
+    ReferenceToVideo,
+    Edit,
+    Extend,
+}
+
+impl VideoTask {
+    pub fn api_name(self) -> &'static str {
+        match self {
+            Self::TextToVideo => "text_to_video",
+            Self::ImageToVideo => "image_to_video",
+            Self::ReferenceToVideo => "reference_to_video",
+            Self::Edit => "edit",
+            Self::Extend => "extend",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct VideoGenerationRequest<'a> {
     pub prompt: &'a str,
     /// Images and videos in the order the model should read them.
     pub media: &'a [MediaFile],
+    /// `None` leaves the mode to the model.
+    pub task: Option<VideoTask>,
 }
 
 /// A failure whose detail is safe and useful to show the requester: a
@@ -130,8 +155,9 @@ async fn generate_video_at(
         });
     }
 
-    let payload = build_interaction_payload(model, prompt, media_parts);
+    let payload = build_interaction_payload(model, prompt, media_parts, request.task);
     let metadata = json!({
+        "task": request.task.map(VideoTask::api_name),
         "input_images": images,
         "input_videos": videos,
     });
@@ -181,18 +207,27 @@ async fn video_part_at(base: &str, api_key: &str, index: usize, file: &MediaFile
     Ok(json!({ "type": "video", "uri": uploaded.uri }))
 }
 
-fn build_interaction_payload(model: &str, prompt: &str, mut media_parts: Vec<Value>) -> Value {
+fn build_interaction_payload(
+    model: &str,
+    prompt: &str,
+    mut media_parts: Vec<Value>,
+    task: Option<VideoTask>,
+) -> Value {
     let input = if media_parts.is_empty() {
         Value::String(prompt.to_string())
     } else {
         media_parts.push(json!({ "type": "text", "text": prompt }));
         Value::Array(media_parts)
     };
-    json!({
+    let mut payload = json!({
         "model": model,
         "input": input,
         "response_format": { "type": "video", "delivery": "uri" },
-    })
+    });
+    if let Some(task) = task {
+        payload["generation_config"] = json!({ "video_config": { "task": task.api_name() } });
+    }
+    payload
 }
 
 async fn create_interaction_at(
@@ -410,7 +445,11 @@ mod tests {
     }
 
     fn text_request(prompt: &str) -> VideoGenerationRequest<'_> {
-        VideoGenerationRequest { prompt, media: &[] }
+        VideoGenerationRequest {
+            prompt,
+            media: &[],
+            task: None,
+        }
     }
 
     fn base_of(server: &TestServer) -> String {
@@ -459,8 +498,8 @@ mod tests {
     }
 
     #[test]
-    fn a_text_only_prompt_is_sent_as_a_string_with_uri_delivery() {
-        let payload = build_interaction_payload("gemini-omni-1.2-flash", "a fox", vec![]);
+    fn a_text_only_prompt_is_sent_as_a_string_with_uri_delivery_and_no_task() {
+        let payload = build_interaction_payload("gemini-omni-1.2-flash", "a fox", vec![], None);
         assert_eq!(
             payload,
             json!({
@@ -477,7 +516,7 @@ mod tests {
             json!({ "type": "video", "uri": "https://files/v1" }),
             image_part(&image("image/jpg", b"\xFF\xD8\xFFjpeg")).unwrap(),
         ];
-        let payload = build_interaction_payload("m", "extend it", parts);
+        let payload = build_interaction_payload("m", "extend it", parts, None);
         assert_eq!(
             payload["input"],
             json!([
@@ -485,6 +524,36 @@ mod tests {
                 { "type": "image", "data": "/9j/anBlZw==", "mime_type": "image/jpeg" },
                 { "type": "text", "text": "extend it" },
             ])
+        );
+    }
+
+    #[test]
+    fn a_named_task_is_sent_as_the_video_config_task() {
+        let names: Vec<_> = [
+            VideoTask::TextToVideo,
+            VideoTask::ImageToVideo,
+            VideoTask::ReferenceToVideo,
+            VideoTask::Edit,
+            VideoTask::Extend,
+        ]
+        .into_iter()
+        .map(|task| {
+            let payload = build_interaction_payload("m", "go", vec![], Some(task));
+            payload["generation_config"]["video_config"]["task"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "text_to_video",
+                "image_to_video",
+                "reference_to_video",
+                "edit",
+                "extend"
+            ]
+            .map(|name| Some(name.to_string()))
         );
     }
 
@@ -672,6 +741,7 @@ mod tests {
             VideoGenerationRequest {
                 prompt: "x",
                 media: &images,
+                task: None,
             },
             None,
         )
