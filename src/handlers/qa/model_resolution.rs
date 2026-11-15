@@ -314,11 +314,12 @@ pub(super) fn add_explicit_quick_model(
     }
 }
 
+/// Whether a request skips the picker and goes straight to the default model.
+/// YouTube links do not skip it: the picker lists Gemini first for them (see
+/// `create_model_selection_keyboard_with_models`).
 pub(super) fn should_use_default_model_without_selection(
     mode: QaCommandMode,
     request: ModelRequestCapabilities,
-    has_youtube_urls: bool,
-    gemini_available: bool,
     third_party_models_available_for_request: bool,
     runtime_model_count: usize,
     query_message_is_from_bot: bool,
@@ -326,7 +327,6 @@ pub(super) fn should_use_default_model_without_selection(
     mode == QaCommandMode::Quick
         || query_message_is_from_bot
         || request.has_documents
-        || (has_youtube_urls && gemini_available)
         || (!request.has_video && !third_party_models_available_for_request)
         || (!request.has_video && runtime_model_count == 0)
 }

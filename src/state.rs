@@ -37,6 +37,7 @@ impl QaCommandMode {
 #[derive(Debug)]
 pub struct PendingQRequest {
     pub user_id: i64,
+    /// The question every model but Gemini reads: YouTube links stay in the text.
     pub query: String,
     /// Chronological reply history frozen at intake for standard /q requests.
     pub reply_context: Option<Vec<crate::db::models::MessageRow>>,
@@ -45,6 +46,10 @@ pub struct PendingQRequest {
     /// fetched text is structured, never pre-spliced into `query`: it reaches
     /// the prompt only through `handlers::enrichment::render_sources`.
     pub enrichment: Enrichment,
+    /// Gemini's version of `query` when it carries YouTube links. It replaces
+    /// `query` only once Gemini is known to answer, so a request still waiting
+    /// on the picker or its timeout keeps the links every other model needs.
+    pub gemini_youtube: Option<GeminiYoutubeInput>,
     pub chat_id: i64,
     pub message_id: i64,
     pub selection_message_id: i64,
@@ -53,6 +58,14 @@ pub struct PendingQRequest {
     pub timestamp: i64,
     pub command_timer: Option<CommandTimer>,
     pub mode: QaCommandMode,
+}
+
+/// A question as Gemini reads it: its YouTube links lifted out of the text
+/// (each left as a `YouTube_<id>` marker) and attached as video inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeminiYoutubeInput {
+    pub query: String,
+    pub urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

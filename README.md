@@ -16,7 +16,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/tldr` - Summarize recent chat history in the thread.
 - `/factcheck` - Fact-check a statement (text or reply).
 - When Gemini and a ready Codex model can both serve a `/tldr` or `/factcheck` request, the bot first asks the sender to pick one (default model first). Without an answer within `MODEL_SELECTION_TIMEOUT`, it runs on `DEFAULT_TEXT_MODEL`. Requests Codex cannot serve (such as video, audio, or documents it does not support) skip the picker.
-- `/q` - Ask a question (uses model selection when third-party models are configured).
+- `/q` - Ask a question (uses model selection when third-party models are configured). For a question with a YouTube link, the picker lists Gemini first when it is enabled, because only Gemini watches the video. Other models receive the link as text. Without an answer within `MODEL_SELECTION_TIMEOUT`, the question runs on `DEFAULT_TEXT_MODEL`.
 - `/qc` - Ask about this chat through independently routed recall, analytics whose results are exact only for the normalized query over eligible stored-text rows, or LLM-assisted topic discovery.
 - Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically. Replies to the bot's generated images or videos (including `/img2` and `/vid2` results) do not, unless the reply also mentions the bot.
 - `/qq` - Provider-neutral quick answer: skips model selection, stays brief, and may use one bounded web-search round for genuinely current facts. Use `/q` for deeper verification or research.

@@ -36,7 +36,7 @@ use super::model_resolution::{
 };
 use super::process::process_request;
 use super::prompt::{
-    prepare_qa_input, prepare_youtube_inputs_for_qa, NO_VIDEO_CAPABLE_MODEL_MESSAGE,
+    prepare_qa_input, youtube_video_count_for_model, NO_VIDEO_CAPABLE_MODEL_MESSAGE,
 };
 use super::selection_ui::{
     create_model_selection_keyboard, process_timed_out_q_request_with_default_model,
@@ -263,9 +263,8 @@ async fn q_handler_internal(
         return Ok(());
     }
 
-    let query_base = prepared.query_base;
-    let mut query_text = prepared.question;
-    let mut youtube_urls = prepared.youtube_urls;
+    let query_text = prepared.question;
+    let gemini_youtube = prepared.gemini_youtube;
 
     let user_language_code = message
         .from
@@ -315,7 +314,7 @@ async fn q_handler_internal(
     let enrichment_budget = EnrichmentBudget::for_question();
     let reply_entity_urls = entity_link_urls(reply_entities.as_deref());
     let query_entity_urls = entity_link_urls(query_entities.as_deref());
-    let mut enrichment = enrich_request(
+    let enrichment = enrich_request(
         &[
             &reply_text,
             &reply_entity_urls,
@@ -365,8 +364,6 @@ async fn q_handler_internal(
     let must_use_default_model = should_use_default_model_without_selection(
         mode,
         request_capabilities,
-        !youtube_urls.is_empty(),
-        CONFIG.gemini_api_available(),
         third_party_models_available_for_request,
         snapshot.count(),
         query_message_is_from_bot,
@@ -416,14 +413,6 @@ async fn q_handler_internal(
     };
 
     if let Some((selected_model, timer_detail, prepared)) = direct_model {
-        if mode == QaCommandMode::Quick {
-            (query_text, youtube_urls) = prepare_youtube_inputs_for_qa(
-                &query_base,
-                mode,
-                Some(&selected_model),
-                CONFIG.gemini_api_available(),
-            );
-        }
         let model = match QaModel::prepare(
             &selected_model,
             &mut snapshot,
@@ -448,6 +437,7 @@ async fn q_handler_internal(
             }
         };
         let display_name = model.display_name(&snapshot, mode);
+        let youtube_video_count = youtube_video_count_for_model(gemini_youtube.as_ref(), &model);
         let processing_message_text = if has_video {
             format!(
                 "Analyzing video and processing your question with {}...",
@@ -473,11 +463,10 @@ async fn q_handler_internal(
                 "Analyzing {} Twitter post(s) and processing your question with {}...",
                 twitter_source_count, display_name
             )
-        } else if !youtube_urls.is_empty() {
+        } else if youtube_video_count > 0 {
             format!(
                 "Analyzing {} YouTube video(s) and processing your question with {}...",
-                youtube_urls.len(),
-                display_name
+                youtube_video_count, display_name
             )
         } else {
             format!("Processing your question with {}...", display_name)
@@ -492,13 +481,13 @@ async fn q_handler_internal(
         )
         .await?;
         let mut timer = start_command_timer(command_name, &message);
-        enrichment.youtube_urls = youtube_urls;
         let pending_request = PendingQRequest {
             user_id,
             query: query_text.clone(),
             reply_context: reply_context.clone(),
             telegram_language_code: user_language_code.map(str::to_string),
             enrichment,
+            gemini_youtube,
             chat_id: message.chat.id.0,
             message_id: message.id.0 as i64,
             selection_message_id: processing_message.id.0 as i64,
@@ -530,7 +519,8 @@ async fn q_handler_internal(
         selection_text.push_str("\n\n<i>Note: Only models that support media are shown.</i>");
     }
 
-    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities);
+    let keyboard =
+        create_model_selection_keyboard(&snapshot, request_capabilities, gemini_youtube.is_some());
     let selection_message = reply_with_retry(
         &bot,
         message.chat.id,
@@ -544,13 +534,13 @@ async fn q_handler_internal(
     let request_key = format!("{}_{}", message.chat.id.0, selection_message.id.0);
     let timer = start_command_timer(command_name, &message);
 
-    enrichment.youtube_urls = youtube_urls;
     let pending_request = PendingQRequest {
         user_id,
         query: query_text.clone(),
         reply_context,
         telegram_language_code: user_language_code.map(str::to_string),
         enrichment,
+        gemini_youtube,
         chat_id: message.chat.id.0,
         message_id: message.id.0 as i64,
         selection_message_id: selection_message.id.0 as i64,
@@ -689,8 +679,6 @@ pub async fn s_handler(
     let must_use_default_model = should_use_default_model_without_selection(
         QaCommandMode::ChatSearch,
         request_capabilities,
-        false,
-        CONFIG.gemini_api_available(),
         third_party_models_available_for_request,
         snapshot.count(),
         false,
@@ -779,7 +767,7 @@ pub async fn s_handler(
         return Ok(());
     }
 
-    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities);
+    let keyboard = create_model_selection_keyboard(&snapshot, request_capabilities, false);
     let selection_message = reply_with_retry(
         &bot,
         message.chat.id,

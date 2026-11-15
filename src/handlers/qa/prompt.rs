@@ -1,22 +1,32 @@
-//! System-prompt templating and YouTube-URL extraction shared across QA modes.
+//! System-prompt templating and the per-model YouTube inputs shared across QA
+//! modes.
 
 use crate::handlers::content::extract_youtube_urls;
 use crate::llm::media::MediaSummary;
-use crate::llm::text_model::MODEL_GEMINI;
 use crate::prompts::{LANGUAGE_POLICY, QUICK_Q_SYSTEM_PROMPT, Q_SYSTEM_PROMPT};
-use crate::state::QaCommandMode;
+use crate::state::{GeminiYoutubeInput, PendingQRequest, QaCommandMode};
+
+use super::model_resolution::QaModel;
 
 pub(super) const NO_VIDEO_CAPABLE_MODEL_MESSAGE: &str =
     "No video-capable AI model is available. Enable Gemini or configure a ready third-party model with video=true.";
 
+/// Most YouTube links one request hands Gemini as video inputs.
+const MAX_YOUTUBE_URLS: usize = 10;
+
 pub(super) struct PreparedQaInput {
     pub original: String,
-    pub query_base: String,
+    /// The question every model but Gemini reads, YouTube links included.
     pub question: String,
-    pub youtube_urls: Vec<String>,
+    /// Gemini's version of `question`, when the question or the direct reply
+    /// carries YouTube links and Gemini is available.
+    pub gemini_youtube: Option<GeminiYoutubeInput>,
 }
 
 /// Only the current question and direct reply enter automatic URL extraction.
+/// Which model answers is not known yet, so the YouTube links stay in the
+/// question; Gemini's variant is prepared beside it for
+/// [`apply_youtube_inputs_for_model`].
 pub(super) fn prepare_qa_input(
     mode: QaCommandMode,
     query: &str,
@@ -44,22 +54,62 @@ pub(super) fn prepare_qa_input(
             reply, query
         )
     };
-    let (mut question, youtube_urls) =
-        prepare_youtube_inputs_for_qa(&query_base, mode, None, gemini_available);
-    if mode == QaCommandMode::Standard && direct.is_some() {
-        question = if query.trim().is_empty() && !reply.trim().is_empty() {
+    // Standard /q passes the reply chain separately, so its question is the
+    // current text alone.
+    let question = if mode == QaCommandMode::Standard && direct.is_some() {
+        if query.trim().is_empty() && !reply.trim().is_empty() {
             "Please respond to the directly replied message.".to_string()
         } else if query.trim().is_empty() {
             original.clone()
         } else {
-            prepare_youtube_inputs_for_qa(query, mode, None, gemini_available).0
-        };
-    }
+            query.to_string()
+        }
+    } else {
+        query_base.clone()
+    };
+    let gemini_youtube = if gemini_available {
+        gemini_youtube_input(&query_base, &question)
+    } else {
+        None
+    };
     PreparedQaInput {
         original,
-        query_base,
         question,
-        youtube_urls,
+        gemini_youtube,
+    }
+}
+
+/// Gemini watches the YouTube links found in `query_base` (the question plus
+/// the direct reply) and reads `question` with its own links lifted out.
+fn gemini_youtube_input(query_base: &str, question: &str) -> Option<GeminiYoutubeInput> {
+    let (_, urls) = extract_youtube_urls(query_base, MAX_YOUTUBE_URLS);
+    if urls.is_empty() {
+        return None;
+    }
+    let (query, _) = extract_youtube_urls(question, MAX_YOUTUBE_URLS);
+    Some(GeminiYoutubeInput { query, urls })
+}
+
+/// How many YouTube videos `model` watches, for the progress message.
+pub(super) fn youtube_video_count_for_model(
+    input: Option<&GeminiYoutubeInput>,
+    model: &QaModel,
+) -> usize {
+    input
+        .filter(|_| matches!(model, QaModel::Gemini))
+        .map_or(0, |input| input.urls.len())
+}
+
+/// Settle a request's YouTube inputs once its answering model is known:
+/// Gemini gets the links as video inputs, every other model keeps them in the
+/// question text.
+pub(super) fn apply_youtube_inputs_for_model(request: &mut PendingQRequest, model: &QaModel) {
+    let Some(input) = request.gemini_youtube.take() else {
+        return;
+    };
+    if matches!(model, QaModel::Gemini) {
+        request.query = input.query;
+        request.enrichment.youtube_urls = input.urls;
     }
 }
 
@@ -112,33 +162,4 @@ pub(super) fn build_chat_context_system_prompt(
     telegram_user_language_hint: Option<&str>,
 ) -> String {
     build_prompt_from_template(QC_SYSTEM_PROMPT, telegram_user_language_hint)
-}
-
-pub(super) fn extract_youtube_urls_for_available_models(
-    query_base: &str,
-    gemini_available: bool,
-) -> (String, Vec<String>) {
-    if gemini_available {
-        extract_youtube_urls(query_base, 10)
-    } else {
-        (query_base.to_string(), Vec::new())
-    }
-}
-
-pub(super) fn prepare_youtube_inputs_for_qa(
-    query_base: &str,
-    mode: QaCommandMode,
-    selected_model: Option<&str>,
-    gemini_available: bool,
-) -> (String, Vec<String>) {
-    let use_gemini_youtube_inputs = match mode {
-        QaCommandMode::Quick => {
-            gemini_available && selected_model.is_some_and(|model| model == MODEL_GEMINI)
-        }
-        QaCommandMode::Standard | QaCommandMode::ChatContext | QaCommandMode::ChatSearch => {
-            gemini_available
-        }
-    };
-
-    extract_youtube_urls_for_available_models(query_base, use_gemini_youtube_inputs)
 }

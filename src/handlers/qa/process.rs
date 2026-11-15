@@ -27,7 +27,8 @@ use super::chat_search::{
 };
 use super::model_resolution::{ModelCatalogSnapshot, QaModel};
 use super::prompt::{
-    build_chat_context_system_prompt, build_quick_system_prompt, build_system_prompt,
+    apply_youtube_inputs_for_model, build_chat_context_system_prompt, build_quick_system_prompt,
+    build_system_prompt,
 };
 
 pub(super) const QUICK_SEARCH_FOOTER: &str =
@@ -578,7 +579,7 @@ async fn send_qa_answer(
 pub(super) async fn process_request(
     bot: &Bot,
     state: &AppState,
-    request: PendingQRequest,
+    mut request: PendingQRequest,
     model: &QaModel,
     snapshot: &ModelCatalogSnapshot,
     heavy_permit: Option<OwnedSemaphorePermit>,
@@ -595,6 +596,7 @@ pub(super) async fn process_request(
         .await?;
         return Ok(());
     }
+    apply_youtube_inputs_for_model(&mut request, model);
 
     let _heavy_permit = state.reuse_or_acquire_heavy_permit(heavy_permit).await;
     crate::utils::telegram::run_with_status_message(bot, ChatId(request.chat_id), MessageId(request.selection_message_id as i32), "Failed to answer this request. Please try again.", async {
