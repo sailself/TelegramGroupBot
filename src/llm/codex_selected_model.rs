@@ -338,10 +338,7 @@ fn build_codex_selected_model_record(
         input_modalities: model
             .input_modalities
             .iter()
-            .map(|modality| match modality {
-                CodexInputModality::Text => "text".to_string(),
-                CodexInputModality::Image => "image".to_string(),
-            })
+            .map(|modality| modality.as_str().to_owned())
             .collect(),
         priority: model.priority,
         etag,
@@ -1190,6 +1187,33 @@ mod tests {
             CODEX_SELECTED_MODEL_METADATA_VERSION
         );
         assert!(record.use_responses_lite);
+    }
+
+    #[test]
+    fn codex_catalog_modalities_persist_without_enabling_unsupported_media() {
+        let model = remote_model(
+            "gpt-6-astra",
+            true,
+            false,
+            &[
+                CodexInputModality::Text,
+                CodexInputModality::Audio,
+                CodexInputModality::Other("future_modality".to_string()),
+            ],
+        );
+        let (explicit_config, record) =
+            build_explicit_codex_runtime_entry("openai-codex:gpt-6-astra", &model, None, "acct-1")
+                .expect("catalog entry should map");
+
+        assert_eq!(
+            record.input_modalities,
+            ["text", "audio", "future_modality"]
+        );
+        for config in [explicit_config, dynamic_codex_model_config(&record)] {
+            assert!(!config.image);
+            assert!(!config.audio);
+            assert!(!config.video);
+        }
     }
 
     #[test]

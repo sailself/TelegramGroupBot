@@ -210,11 +210,25 @@ pub enum CodexModelVisibility {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CodexInputModality {
     Text,
     Image,
+    Audio,
+    #[serde(untagged)]
+    Other(String),
+}
+
+impl CodexInputModality {
+    pub(super) fn as_str(&self) -> &str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Other(value) => value,
+        }
+    }
 }
 
 fn default_input_modalities() -> Vec<CodexInputModality> {
@@ -2187,6 +2201,30 @@ mod tests {
     }
 
     #[test]
+    fn codex_catalog_accepts_audio_and_future_input_modalities() {
+        let body = r#"{
+            "models": [{
+                "slug": "gpt-6-astra",
+                "display_name": "GPT-6-Astra",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 1,
+                "input_modalities": ["text", "image", "audio", "future_modality"]
+            }]
+        }"#;
+
+        let catalog: CodexModelsResponse =
+            serde_json::from_str(body).expect("catalog should parse");
+        let model = &catalog.models[0];
+        assert!(model.input_modalities.contains(&CodexInputModality::Image));
+        assert!(model.input_modalities.contains(&CodexInputModality::Audio));
+        assert_eq!(
+            serde_json::to_value(&model.input_modalities).expect("modalities should serialize"),
+            json!(["text", "image", "audio", "future_modality"])
+        );
+    }
+
+    #[test]
     fn codex_remote_model_deserializes_responses_lite_capability() {
         let model: CodexRemoteModel = serde_json::from_value(json!({
             "slug": "gpt-5.6-luna",
@@ -2213,5 +2251,9 @@ mod tests {
         .expect("legacy catalog model should deserialize");
 
         assert!(!model.use_responses_lite);
+        assert_eq!(
+            model.input_modalities,
+            [CodexInputModality::Text, CodexInputModality::Image]
+        );
     }
 }
