@@ -111,12 +111,21 @@ fn keyboard_model_label(model: &CodexRemoteModel) -> String {
     truncate_with_ellipsis(model.display_name.trim(), 28)
 }
 
-fn modality_summary(model: &CodexRemoteModel) -> String {
-    let mut parts = vec!["text".to_string()];
-    if model.input_modalities.contains(&CodexInputModality::Image) {
-        parts.push("image".to_string());
-    }
-    parts.join(", ")
+fn format_model_selection_confirmation(model: &CodexRemoteModel, runtime_alias: &str) -> String {
+    let telegram_inputs = if model.input_modalities.contains(&CodexInputModality::Image) {
+        "text, image"
+    } else {
+        "text"
+    };
+    let catalog_note = if model.input_modalities.contains(&CodexInputModality::Audio) {
+        "\nCatalog also advertises: audio"
+    } else {
+        ""
+    };
+    format!(
+        "Active Codex model updated.\n\nName: {}\nSlug: {}\nTelegram inputs: {telegram_inputs}{catalog_note}\nRuntime alias: {runtime_alias}",
+        model.display_name, model.slug,
+    )
 }
 
 fn build_model_selection_text(models: &[CodexRemoteModel], page: usize) -> String {
@@ -965,17 +974,10 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                         return Ok(());
                     }
                 };
-            let summary = modality_summary(&model);
             bot.edit_message_text(
                 message.chat().id,
                 message.id(),
-                format!(
-                    "Active Codex model updated.\n\nName: {}\nSlug: {}\nCapabilities: {}\nRuntime alias: {}",
-                    model.display_name,
-                    model.slug,
-                    summary,
-                    config.id
-                ),
+                format_model_selection_confirmation(&model, &config.id),
             )
             .reply_markup(InlineKeyboardMarkup::new(
                 Vec::<Vec<InlineKeyboardButton>>::new(),
@@ -1008,6 +1010,21 @@ mod tests {
             supports_search_tool: false,
             use_responses_lite: false,
         }
+    }
+
+    #[test]
+    fn model_selection_confirmation_shows_audio_when_advertised() {
+        let mut model = remote_model("gpt-6.2-sol");
+        model.input_modalities.push(CodexInputModality::Image);
+        let alias = "openai-codex:selected";
+        let without_audio = format_model_selection_confirmation(&model, alias);
+        assert!(without_audio.contains("Telegram inputs: text, image\nRuntime alias:"));
+
+        model.input_modalities.push(CodexInputModality::Audio);
+        let with_audio = format_model_selection_confirmation(&model, alias);
+        assert!(
+            with_audio.contains("Telegram inputs: text, image\nCatalog also advertises: audio\n")
+        );
     }
 
     #[test]
