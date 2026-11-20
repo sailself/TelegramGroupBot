@@ -184,7 +184,10 @@ fn qa_input_keeps_ancestor_urls_out_of_automatic_preparation() {
     let input = prepare_qa_input(
         QaCommandMode::Standard,
         current,
-        Some(direct),
+        Some(QaReplyInput {
+            text: direct,
+            enrich_links: true,
+        }),
         &MediaSummary::default(),
         true,
     );
@@ -266,7 +269,10 @@ fn qa_input_preserves_bare_media_and_nonstandard_behavior() {
     let bare = prepare_qa_input(
         QaCommandMode::Standard,
         "",
-        Some("direct text"),
+        Some(QaReplyInput {
+            text: "direct text",
+            enrich_links: true,
+        }),
         &empty,
         true,
     );
@@ -277,17 +283,26 @@ fn qa_input_preserves_bare_media_and_nonstandard_behavior() {
         images: 1,
         ..MediaSummary::default()
     };
-    let media_input = prepare_qa_input(QaCommandMode::Standard, "", Some(""), &media, true);
+    let empty_reply = || {
+        Some(QaReplyInput {
+            text: "",
+            enrich_links: true,
+        })
+    };
+    let media_input = prepare_qa_input(QaCommandMode::Standard, "", empty_reply(), &media, true);
     assert_eq!(
         media_input.question,
         "Please analyze the attached image(s)."
     );
-    let none = prepare_qa_input(QaCommandMode::Standard, "", Some(""), &empty, true);
+    let none = prepare_qa_input(QaCommandMode::Standard, "", empty_reply(), &empty, true);
     assert!(none.original.is_empty());
     let quick = prepare_qa_input(
         QaCommandMode::Quick,
         "question",
-        Some("direct"),
+        Some(QaReplyInput {
+            text: "direct",
+            enrich_links: true,
+        }),
         &empty,
         true,
     );
@@ -509,6 +524,111 @@ fn text_message_from(
         "entities": entities
     }))
     .expect("test message should deserialize")
+}
+
+#[test]
+fn skips_reply_links_from_configured_sender_and_forward_origin() {
+    let skip_ids = [1234567890, -1001234567890].into_iter().collect();
+    let original = text_message_from(1234567890, true, "A repost", vec![]);
+    assert!(reply_link_inputs(&original, &skip_ids).is_none());
+    assert!(reply_link_inputs(&original, &Default::default()).is_some());
+
+    let forwarder = text_message_from(42, false, "A repost", vec![]);
+    assert!(reply_link_inputs(&forwarder, &skip_ids).is_some());
+    let mut forwarded = serde_json::to_value(forwarder).unwrap();
+    forwarded["forward_origin"] = json!({
+        "type": "user", "date": 1, "sender_user": original.from.unwrap()
+    });
+    let reply = serde_json::from_value(forwarded.clone()).unwrap();
+    assert!(reply_link_inputs(&reply, &skip_ids).is_none());
+
+    forwarded["forward_origin"] =
+        json!({"type": "hidden_user", "date": 1, "sender_user_name": "PeerBot"});
+    let reply = serde_json::from_value(forwarded.clone()).unwrap();
+    assert!(reply_link_inputs(&reply, &skip_ids).is_some());
+
+    let channel = json!({"id": -1001234567890_i64, "type": "channel", "title": "Reposts"});
+    forwarded["forward_origin"] =
+        json!({"type": "channel", "date": 1, "chat": channel, "message_id": 9});
+    let reply = serde_json::from_value(forwarded.clone()).unwrap();
+    assert!(reply_link_inputs(&reply, &skip_ids).is_none());
+
+    forwarded.as_object_mut().unwrap().remove("forward_origin");
+    forwarded["sender_chat"] = channel;
+    let reply = serde_json::from_value(forwarded).unwrap();
+    assert!(reply_link_inputs(&reply, &skip_ids).is_none());
+}
+
+#[test]
+fn forwarded_photo_caption_links_are_excluded_from_enrichment_by_sender_id() {
+    use crate::handlers::enrichment::{unique_source_urls, SourceKind};
+
+    let visible_url = "https://x.com/example/status/111";
+    let hidden_url = "https://x.com/example/status/222";
+    let question_url = "https://x.com/example/status/333";
+    let caption = format!("link\n{visible_url}");
+    let reply: Message = serde_json::from_value(json!({
+        "message_id": 42,
+        "date": 1,
+        "chat": {"id": -100123, "type": "group", "title": "test group"},
+        "from": {"id": 42, "is_bot": false, "first_name": "Forwarder"},
+        "forward_origin": {
+            "type": "user", "date": 1,
+            "sender_user": {"id": 1234567890, "is_bot": true, "first_name": "Repost bot"}
+        },
+        "photo": [{"file_id": "photo-id", "file_unique_id": "photo-unique", "width": 640, "height": 360}],
+        "caption": caption,
+        "caption_entities": [{"type": "text_link", "offset": 0, "length": 4, "url": hidden_url}]
+    }))
+    .unwrap();
+
+    let (text, entity_urls) = reply_link_inputs(&reply, &Default::default()).unwrap();
+    assert_eq!(
+        unique_source_urls(&[text, &entity_urls, question_url]),
+        [visible_url, hidden_url, question_url].map(|url| (SourceKind::Twitter, url.to_string()))
+    );
+    let (text, entity_urls) =
+        reply_link_inputs(&reply, &[1234567890].into_iter().collect()).unwrap_or_default();
+    assert_eq!(
+        unique_source_urls(&[text, &entity_urls, question_url]),
+        [(SourceKind::Twitter, question_url.to_string())]
+    );
+    assert_eq!(reply.caption(), Some(caption.as_str()));
+    assert!(reply.photo().is_some());
+}
+
+#[test]
+fn skips_reply_youtube_input_and_preserves_caption_and_question_video() {
+    let reply_url = "https://www.youtube.com/watch?v=aaaaaaaaaaa";
+    let reply_caption = format!("A repost with {reply_url}");
+    let direct = || {
+        Some(QaReplyInput {
+            text: &reply_caption,
+            enrich_links: false,
+        })
+    };
+
+    let bare = prepare_qa_input(
+        QaCommandMode::Standard,
+        "",
+        direct(),
+        &MediaSummary::default(),
+        true,
+    );
+    assert!(bare.gemini_youtube.is_none());
+    assert_eq!(bare.original, reply_caption);
+
+    let quick = prepare_qa_input(
+        QaCommandMode::Quick,
+        YOUTUBE_QUERY,
+        direct(),
+        &MediaSummary::default(),
+        true,
+    );
+    let gemini_input = quick.gemini_youtube.unwrap();
+    assert_eq!(gemini_input.urls, vec![YOUTUBE_URL]);
+    assert!(gemini_input.query.contains(&reply_caption));
+    assert!(gemini_input.query.contains("YouTube_dQw4w9WgXcQ"));
 }
 
 #[test]

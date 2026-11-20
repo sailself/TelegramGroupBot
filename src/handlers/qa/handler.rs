@@ -1,11 +1,12 @@
 //! `/q`, `/qc`, `/qq`, and `/s` command entry points: request intake, media
 //! and link extraction, direct-model vs. picker routing.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{MessageOrigin, ParseMode};
 use tracing::warn;
 
 use crate::config::CONFIG;
@@ -35,10 +36,49 @@ use super::model_resolution::{
     video_request_has_capable_model, ModelCatalogSnapshot, QaModel, NO_VIDEO_CAPABLE_MODEL_MESSAGE,
 };
 use super::process::process_request;
-use super::prompt::{prepare_qa_input, youtube_video_count_for_model};
+use super::prompt::{prepare_qa_input, youtube_video_count_for_model, QaReplyInput};
 use super::selection_ui::{
     create_model_selection_keyboard, process_timed_out_q_request_with_default_model,
 };
+
+fn reply_links_allowed(reply: &Message, skip_ids: &HashSet<i64>) -> bool {
+    if skip_ids.is_empty() {
+        return true;
+    }
+
+    let sender_id = reply
+        .sender_chat
+        .as_ref()
+        .map(|chat| chat.id.0)
+        .or_else(|| {
+            reply
+                .from
+                .as_ref()
+                .and_then(|user| i64::try_from(user.id.0).ok())
+        });
+    let origin_id = match reply.forward_origin() {
+        Some(MessageOrigin::User { sender_user, .. }) => i64::try_from(sender_user.id.0).ok(),
+        Some(MessageOrigin::Chat { sender_chat, .. }) => Some(sender_chat.id.0),
+        Some(MessageOrigin::Channel { chat, .. }) => Some(chat.id.0),
+        Some(MessageOrigin::HiddenUser { .. }) | None => None,
+    };
+    ![sender_id, origin_id]
+        .into_iter()
+        .flatten()
+        .any(|id| skip_ids.contains(&id))
+}
+
+pub(super) fn reply_link_inputs<'a>(
+    reply: &'a Message,
+    skip_ids: &HashSet<i64>,
+) -> Option<(&'a str, String)> {
+    reply_links_allowed(reply, skip_ids).then(|| {
+        (
+            message_text_or_caption(reply).unwrap_or_default(),
+            entity_link_urls(message_entities_for_text(reply).as_deref()),
+        )
+    })
+}
 
 pub(super) async fn snapshot_reply_context(
     state: &AppState,
@@ -190,17 +230,9 @@ async fn q_handler_internal(
     let reply_message = message
         .reply_to_message()
         .filter(|reply| reply.chat.id == message.chat.id);
-    let mut reply_text = String::new();
-    let mut reply_entities = None;
-
-    if let Some(reply) = reply_message {
-        reply_text = reply
-            .text()
-            .map(|value| value.to_string())
-            .or_else(|| reply.caption().map(|value| value.to_string()))
-            .unwrap_or_default();
-        reply_entities = message_entities_for_text(reply);
-    }
+    let reply_links = reply_message.and_then(|reply| {
+        reply_link_inputs(reply, &CONFIG.limits.q_skip_reply_link_enrichment_ids)
+    });
 
     let media =
         collect_message_media(&bot, &state, &message, MediaCollectionOptions::for_qa()).await;
@@ -209,7 +241,10 @@ async fn q_handler_internal(
     let prepared = prepare_qa_input(
         mode,
         &query_text_raw,
-        reply_message.map(|_| reply_text.as_str()),
+        reply_message.map(|reply| QaReplyInput {
+            text: message_text_or_caption(reply).unwrap_or_default(),
+            enrich_links: reply_links.is_some(),
+        }),
         &initial_media_summary,
         CONFIG.gemini_api_available(),
     );
@@ -310,11 +345,11 @@ async fn q_handler_internal(
     }
 
     let enrichment_budget = EnrichmentBudget::for_question();
-    let reply_entity_urls = entity_link_urls(reply_entities.as_deref());
+    let (reply_link_text, reply_entity_urls) = reply_links.unwrap_or_default();
     let query_entity_urls = entity_link_urls(query_entities.as_deref());
     let enrichment = enrich_request(
         &[
-            &reply_text,
+            reply_link_text,
             &reply_entity_urls,
             &query_text_raw,
             &query_entity_urls,
