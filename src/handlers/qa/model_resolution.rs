@@ -1,7 +1,7 @@
 //! Resolving which model answers a `/q`-family request: default-model
 //! fallback, quick-mode explicit-Codex handling, and selectable-model lists.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tracing::warn;
 
 use crate::config::{
@@ -21,6 +21,9 @@ use crate::llm::text_model::{
 use crate::state::QaCommandMode;
 
 pub(super) use crate::llm::resolved_model::{ModelCatalogSnapshot, ResolvedTextModel as QaModel};
+
+pub(super) const NO_VIDEO_CAPABLE_MODEL_MESSAGE: &str =
+    "No video-capable AI model is available. Enable Gemini or configure a ready third-party model with video=true.";
 
 impl QaModel {
     #[cfg(test)]
@@ -425,6 +428,37 @@ pub(super) fn selectable_model_ids_for_request(
     request: ModelRequestCapabilities,
 ) -> Vec<String> {
     selectable_model_ids_for_request_with_models(snapshot, CONFIG.gemini_api_available(), request)
+}
+
+/// Automatic QA routing uses the configured default when it can serve the
+/// request. For video, the first compatible picker option is the fallback.
+pub(super) fn resolve_qa_default_model(
+    snapshot: &ModelCatalogSnapshot,
+    request: ModelRequestCapabilities,
+) -> Result<String> {
+    qa_default_model_or_video_fallback(
+        snapshot.resolve_default(request),
+        snapshot,
+        CONFIG.gemini_api_available(),
+        request,
+    )
+}
+
+pub(super) fn qa_default_model_or_video_fallback(
+    configured_default: Result<String>,
+    snapshot: &ModelCatalogSnapshot,
+    gemini_available: bool,
+    request: ModelRequestCapabilities,
+) -> Result<String> {
+    configured_default.or_else(|error| {
+        if !request.has_video {
+            return Err(error);
+        }
+        selectable_model_ids_for_request_with_models(snapshot, gemini_available, request)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!(NO_VIDEO_CAPABLE_MODEL_MESSAGE))
+    })
 }
 
 pub(super) fn default_model_selection_key(

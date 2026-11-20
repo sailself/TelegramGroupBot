@@ -30,14 +30,12 @@ use crate::utils::timing::{complete_command_timer, now_unix_seconds, start_comma
 
 use super::chat_search::{build_chat_search_pending_request, chat_search_rebuilding_message};
 use super::model_resolution::{
-    resolve_quick_text_model_for_request, selectable_model_ids_for_request,
-    should_use_default_model_without_selection, video_request_has_capable_model,
-    ModelCatalogSnapshot, QaModel,
+    resolve_qa_default_model, resolve_quick_text_model_for_request,
+    selectable_model_ids_for_request, should_use_default_model_without_selection,
+    video_request_has_capable_model, ModelCatalogSnapshot, QaModel, NO_VIDEO_CAPABLE_MODEL_MESSAGE,
 };
 use super::process::process_request;
-use super::prompt::{
-    prepare_qa_input, youtube_video_count_for_model, NO_VIDEO_CAPABLE_MODEL_MESSAGE,
-};
+use super::prompt::{prepare_qa_input, youtube_video_count_for_model};
 use super::selection_ui::{
     create_model_selection_keyboard, process_timed_out_q_request_with_default_model,
 };
@@ -380,8 +378,7 @@ async fn q_handler_internal(
                     )
                 })
         } else {
-            snapshot
-                .resolve_default(request_capabilities)
+            resolve_qa_default_model(&snapshot, request_capabilities)
                 .map(|model| (model, "default_text_model", None))
         };
         match resolved {
