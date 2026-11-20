@@ -8,9 +8,6 @@ use crate::state::{GeminiYoutubeInput, PendingQRequest, QaCommandMode};
 
 use super::model_resolution::QaModel;
 
-pub(super) const NO_VIDEO_CAPABLE_MODEL_MESSAGE: &str =
-    "No video-capable AI model is available. Enable Gemini or configure a ready third-party model with video=true.";
-
 /// Most YouTube links one request hands Gemini as video inputs.
 const MAX_YOUTUBE_URLS: usize = 10;
 

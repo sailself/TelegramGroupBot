@@ -15,8 +15,8 @@ use crate::state::{AppState, PendingEntryGuard, PendingQRequest, QaCommandMode};
 use crate::utils::timing::{complete_command_timer, now_unix_seconds};
 
 use super::model_resolution::{
-    default_model_selection_key, selectable_model_ids_for_request_with_models,
-    ModelCatalogSnapshot, QaModel,
+    default_model_selection_key, resolve_qa_default_model,
+    selectable_model_ids_for_request_with_models, ModelCatalogSnapshot, QaModel,
 };
 use super::process::process_request;
 use super::prompt::youtube_video_count_for_model;
@@ -185,10 +185,8 @@ pub(super) async fn process_timed_out_q_request_with_default_model(
     let mut snapshot = ModelCatalogSnapshot::load();
     let summary = summarize_media_files(&request.enrichment.media_files);
     let mode = request.mode;
-    let resolved = match snapshot.resolve_default(ModelRequestCapabilities::from_media(
-        &summary,
-        mode.requires_custom_tools(),
-    )) {
+    let capabilities = ModelRequestCapabilities::from_media(&summary, mode.requires_custom_tools());
+    let resolved = match resolve_qa_default_model(&snapshot, capabilities) {
         Ok(model_id) => QaModel::prepare(&model_id, &mut snapshot, None).await,
         Err(error) => Err(error),
     };
@@ -216,11 +214,12 @@ pub(super) async fn process_timed_out_q_request_with_default_model(
         }
     };
 
+    let display_name = model.display_name(&snapshot, mode);
     let _ = bot
         .edit_message_text(
             ChatId(request.chat_id),
             MessageId(request.selection_message_id as i32),
-            "No model selected in time. Using default model...",
+            format!("No model selected in time. Using {display_name}..."),
         )
         .reply_markup(InlineKeyboardMarkup::new(
             Vec::<Vec<InlineKeyboardButton>>::new(),
@@ -228,7 +227,6 @@ pub(super) async fn process_timed_out_q_request_with_default_model(
         .await;
 
     let command_timer = request.command_timer.take();
-    let display_name = model.display_name(&snapshot, mode);
     let result = process_request(bot, state, request, &model, &snapshot, None).await;
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };

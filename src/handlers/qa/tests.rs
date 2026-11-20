@@ -9,7 +9,9 @@ use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider};
 use crate::handlers::enrichment::Enrichment;
 use crate::llm::media::MediaSummary;
 use crate::llm::runtime_models::{codex_selected_model_label, ResolvedExplicitCodexModel};
-use crate::llm::text_model::{ModelRequestCapabilities, MODEL_GEMINI};
+use crate::llm::text_model::{
+    resolve_default_text_model_with_models, ModelRequestCapabilities, MODEL_GEMINI,
+};
 use crate::state::{GeminiYoutubeInput, PendingQRequest, PendingRequests, QaCommandMode};
 use serde_json::json;
 use teloxide::prelude::*;
@@ -1671,6 +1673,82 @@ fn video_selection_includes_only_video_capable_ready_models() {
         .collect::<Vec<_>>();
 
     assert_eq!(callbacks, vec!["model_select:nvidia:qwen-video"]);
+}
+
+#[test]
+fn video_default_prefers_the_configured_model_then_gemini_then_a_ready_video_model() {
+    let codex = model(ThirdPartyProvider::OpenAICodex, "Codex", "selected");
+    let mut unavailable = model(ThirdPartyProvider::OpenRouter, "Unavailable", "video");
+    unavailable.video = true;
+    let mut video = model(ThirdPartyProvider::Nvidia, "Video model", "video");
+    video.video = true;
+    let snapshot = snapshot_of(
+        vec![codex, unavailable, video],
+        &[ThirdPartyProvider::OpenAICodex, ThirdPartyProvider::Nvidia],
+    );
+    let request = ModelRequestCapabilities {
+        require_tools: true,
+        ..media_request(false, true, false)
+    };
+
+    for (default, gemini_available, expected) in [
+        ("openai-codex:selected", true, MODEL_GEMINI),
+        ("openai-codex:selected", false, "nvidia:video"),
+        ("nvidia:video", true, "nvidia:video"),
+    ] {
+        let configured_default = resolve_default_text_model_with_models(
+            default,
+            &snapshot.models,
+            &snapshot.ready_providers,
+            gemini_available,
+            request,
+        )
+        .map_err(anyhow::Error::msg);
+        if default == "openai-codex:selected" {
+            assert!(configured_default
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported for this request"));
+        }
+        let resolved = qa_default_model_or_video_fallback(
+            configured_default,
+            &snapshot,
+            gemini_available,
+            request,
+        )
+        .unwrap();
+        assert_eq!(resolved, expected);
+    }
+}
+
+#[test]
+fn qa_video_fallback_requires_a_compatible_model_and_preserves_other_default_errors() {
+    let mut video = model(ThirdPartyProvider::Nvidia, "Video model", "video");
+    video.video = true;
+    let snapshot = snapshot_of(vec![video], &[ThirdPartyProvider::Nvidia]);
+    let video_with_image = media_request(true, true, false);
+    let result = qa_default_model_or_video_fallback(
+        Err(anyhow::anyhow!("configured model is unavailable")),
+        &snapshot,
+        false,
+        video_with_image,
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        NO_VIDEO_CAPABLE_MODEL_MESSAGE
+    );
+
+    let result = qa_default_model_or_video_fallback(
+        Err(anyhow::anyhow!("configured model is unavailable")),
+        &snapshot,
+        true,
+        ModelRequestCapabilities::default(),
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "configured model is unavailable"
+    );
 }
 
 #[test]
