@@ -20,18 +20,27 @@ pub(super) struct PreparedQaInput {
     pub gemini_youtube: Option<GeminiYoutubeInput>,
 }
 
-/// Only the current question and direct reply enter automatic URL extraction.
+pub(super) struct QaReplyInput<'a> {
+    pub text: &'a str,
+    pub enrich_links: bool,
+}
+
+fn with_reply_context(reply: &str, query: &str) -> String {
+    format!("Context from replied message: \"{reply}\"\n\nQuestion: {query}")
+}
+
+/// Only the current question and eligible direct reply enter URL extraction.
 /// Which model answers is not known yet, so the YouTube links stay in the
 /// question; Gemini's variant is prepared beside it for
 /// [`apply_youtube_inputs_for_model`].
 pub(super) fn prepare_qa_input(
     mode: QaCommandMode,
     query: &str,
-    direct: Option<&str>,
+    direct: Option<QaReplyInput<'_>>,
     media: &MediaSummary,
     gemini_available: bool,
 ) -> PreparedQaInput {
-    let reply = direct.unwrap_or_default();
+    let reply = direct.as_ref().map_or("", |reply| reply.text);
     let original = if query.trim().is_empty() {
         if reply.trim().is_empty() {
             build_media_only_qa_prompt(media).unwrap_or_default()
@@ -46,10 +55,7 @@ pub(super) fn prepare_qa_input(
     } else if reply.trim().is_empty() {
         query.to_string()
     } else {
-        format!(
-            "Context from replied message: \"{}\"\n\nQuestion: {}",
-            reply, query
-        )
+        with_reply_context(reply, query)
     };
     // Standard /q passes the reply chain separately, so its question is the
     // current text alone.
@@ -64,10 +70,17 @@ pub(super) fn prepare_qa_input(
     } else {
         query_base.clone()
     };
-    let gemini_youtube = if gemini_available {
-        gemini_youtube_input(&query_base, &question)
-    } else {
+    let gemini_youtube = if !gemini_available {
         None
+    } else if direct.is_some_and(|reply| !reply.enrich_links) {
+        gemini_youtube_input(query, query).map(|mut input| {
+            if mode != QaCommandMode::Standard && !reply.trim().is_empty() {
+                input.query = with_reply_context(reply, &input.query);
+            }
+            input
+        })
+    } else {
+        gemini_youtube_input(&query_base, &question)
     };
     PreparedQaInput {
         original,

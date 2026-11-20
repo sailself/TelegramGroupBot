@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -330,6 +331,7 @@ pub struct RuntimeLimits {
     pub max_tool_context_items: usize,
     pub user_history_message_count: i64,
     pub q_reply_chain_max_messages: usize,
+    pub q_skip_reply_link_enrichment_ids: HashSet<i64>,
 }
 
 /// Agentic pipeline tuning: the step model/reasoning used by the agent
@@ -1113,12 +1115,26 @@ fn load_models() -> ModelDefaults {
 }
 
 fn load_limits() -> RuntimeLimits {
+    const SKIP_REPLY_LINK_IDS: &str = "Q_SKIP_REPLY_LINK_ENRICHMENT_IDS";
+    let q_skip_reply_link_enrichment_ids = env_string(SKIP_REPLY_LINK_IDS, "")
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| match entry.parse::<i64>() {
+            Ok(id) if id != 0 => Some(id),
+            _ => {
+                warn!(env = SKIP_REPLY_LINK_IDS, "Ignoring invalid Telegram ID");
+                None
+            }
+        })
+        .collect();
     RuntimeLimits {
         heavy_command_max_concurrency: env_usize("HEAVY_COMMAND_MAX_CONCURRENCY", 5).max(1),
         model_selection_timeout: env_u64("MODEL_SELECTION_TIMEOUT", 30),
         max_tool_context_items: env_usize("MAX_TOOL_CONTEXT_ITEMS", 10).max(1),
         user_history_message_count: env_u64("USER_HISTORY_MESSAGE_COUNT", 200) as i64,
         q_reply_chain_max_messages: env_usize("Q_REPLY_CHAIN_MAX_MESSAGES", 10).max(1),
+        q_skip_reply_link_enrichment_ids,
     }
 }
 
@@ -1265,6 +1281,21 @@ pub(crate) fn gemini_api_available_from(enable_gemini: bool, api_key: &str) -> b
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn skip_reply_link_ids_load_as_a_list_of_telegram_ids() {
+        let _guard = lock_env_and_force_config();
+        let name = "Q_SKIP_REPLY_LINK_ENRICHMENT_IDS";
+        {
+            let _env = set_env_var_for_test(name, "");
+            assert!(load_limits().q_skip_reply_link_enrichment_ids.is_empty());
+        }
+        let _env = set_env_var_for_test(name, " 1234567890, ,bad,-1001234567890,1234567890,0 ");
+        assert_eq!(
+            load_limits().q_skip_reply_link_enrichment_ids,
+            HashSet::from([1234567890, -1001234567890])
+        );
+    }
 
     #[test]
     fn gif_frame_settings_boundaries_and_fallback() {
