@@ -24,7 +24,7 @@ use crate::llm::resolved_model::ResolvedTextModel;
 use crate::llm::text_model::{call_resolved_text_model, ModelRequestCapabilities};
 use crate::prompts::{FACTCHECK_SYSTEM_PROMPT, LANGUAGE_POLICY};
 use crate::state::AppState;
-use crate::utils::progress::ProgressReporter;
+use crate::utils::progress::{status_with_note, ProgressReporter};
 use crate::utils::telegram::{message_entities_for_text, start_chat_action_heartbeat};
 
 fn build_factcheck_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
@@ -124,11 +124,22 @@ fn append_source_progress(processing_message_text: &mut String, counts: SourceCo
     };
 }
 
+fn skipped_attachment_note(skipped: usize) -> Option<String> {
+    match skipped {
+        0 => None,
+        1 => Some("1 rich-message attachment could not be included in the fact-check.".into()),
+        count => Some(format!(
+            "{count} rich-message attachments could not be included in the fact-check."
+        )),
+    }
+}
+
 pub async fn factcheck_handler(
     bot: Bot,
     state: AppState,
     message: Message,
     query: Option<String>,
+    rich: crate::utils::telegram::rich_message::RichUpdate,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, "factcheck").await {
         return Ok(());
@@ -171,7 +182,8 @@ pub async fn factcheck_handler(
 
     let mut media_options = MediaCollectionOptions::for_commands();
     media_options.include_reply = true;
-    let collected_media = collect_message_media(&bot, &state, &message, media_options).await;
+    let collected_media = collect_message_media(&bot, &state, &message, media_options, &rich).await;
+    let status_note = skipped_attachment_note(collected_media.rich_attachments_skipped);
 
     let budget = EnrichmentBudget::for_factcheck();
     let reply_entity_urls = entity_link_urls(reply_entities.as_deref());
@@ -196,9 +208,17 @@ pub async fn factcheck_handler(
     let statement = build_factcheck_statement(&query_text, &reply_text, &media_summary);
 
     if statement.trim().is_empty() {
-        bot.send_message(message.chat.id, "Please reply to a message to fact-check.")
-            .reply_parameters(ReplyParameters::new(message.id))
-            .await?;
+        let text = if status_note.is_some() {
+            "There is no text or available media to fact-check."
+        } else {
+            "Please reply to a message to fact-check."
+        };
+        bot.send_message(
+            message.chat.id,
+            status_with_note(text, status_note.as_deref()).into_owned(),
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
         return Ok(());
     }
     // Fetched link content is quoted after the statement, fenced and budgeted,
@@ -251,6 +271,7 @@ pub async fn factcheck_handler(
         media_summary,
         user_language_code: user_language_code.map(str::to_string),
         audit_context,
+        status_note: status_note.clone(),
     };
     run_with_agent_model_choice(
         &bot,
@@ -261,6 +282,7 @@ pub async fn factcheck_handler(
             command: "factcheck",
             capabilities,
             processing_text: processing_message_text,
+            status_note,
             run: Box::new(move |bot, state, model| Box::pin(run_factcheck(bot, state, job, model))),
         },
     )
@@ -275,6 +297,7 @@ struct FactcheckJob {
     media_summary: MediaSummary,
     user_language_code: Option<String>,
     audit_context: Option<LlmAuditContext>,
+    status_note: Option<String>,
 }
 
 impl FactcheckJob {
@@ -293,7 +316,8 @@ impl FactcheckJob {
             .run(async {
                 if CONFIG.agents.enable_agentic_factcheck {
                     let mut progress =
-                        ProgressReporter::new(bot.clone(), self.chat_id, status_message_id);
+                        ProgressReporter::new(bot.clone(), self.chat_id, status_message_id)
+                            .with_note(self.status_note.as_deref());
                     match run_factcheck_pipeline(
                         &self.statement,
                         &self.media_files,
@@ -342,6 +366,11 @@ async fn run_factcheck(
 ) -> Result<()> {
     let chat_id = job.chat_id;
     let uses_pro = job.media_summary.total > 0;
+    let failure_text = status_with_note(
+        "Failed to fact-check this message. Please try again.",
+        job.status_note.as_deref(),
+    )
+    .into_owned();
     let ChosenAgentModel {
         id,
         mut snapshot,
@@ -354,7 +383,7 @@ async fn run_factcheck(
         &bot,
         chat_id,
         status_message_id,
-        "Failed to fact-check this message. Please try again.",
+        &failure_text,
         async {
             let _chat_action =
                 start_chat_action_heartbeat(bot.clone(), chat_id, ChatAction::Typing);
@@ -381,6 +410,7 @@ async fn run_factcheck(
                         status_message_id,
                         "factcheck",
                         &stand_in,
+                        job.status_note.as_deref(),
                     )
                     .await;
                     let clock = WallClock::start().for_gemini_pipeline(
@@ -393,8 +423,9 @@ async fn run_factcheck(
             };
 
             let (response_text, response_model) = response;
-            let response_with_model =
-                ResponseContent::new(response_text).with_model(response_model);
+            let response_with_model = ResponseContent::new(response_text)
+                .with_model(response_model)
+                .with_notice(job.status_note);
 
             send_response(
                 &bot,
@@ -414,6 +445,9 @@ async fn run_factcheck(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
+    use crate::utils::telegram::rich_message::RichUpdate;
+    use serde_json::json;
 
     #[test]
     fn factcheck_prompt_renders_without_placeholders() {
@@ -429,5 +463,57 @@ mod tests {
         assert!(rendered.contains("untrusted material under evaluation"));
         assert!(rendered.contains("default to Chinese"));
         assert!(rendered.contains("ja"));
+    }
+
+    #[tokio::test]
+    async fn media_only_rich_reply_explains_why_it_cannot_be_checked() {
+        let server = TestServer::new(vec![
+            ExpectedRequest::new(
+                "POST",
+                "/bot123:test/GetFile",
+                response_with_status(
+                    400,
+                    br#"{"ok":false,"error_code":400,"description":"Bad Request: file unavailable"}"#
+                        .to_vec(),
+                ),
+            )
+            .with_body_fragment(br#""file_id":"unavailable""#),
+            ExpectedRequest::new(
+                "POST",
+                "/bot123:test/SendMessage",
+                response_with_status(
+                    200,
+                    br#"{"ok":true,"result":{"message_id":3,"date":1,"chat":{"id":2,"type":"private"},"text":"notice"}}"#
+                        .to_vec(),
+                ),
+            )
+            .with_body_fragment(b"There is no text or available media to fact-check.")
+            .with_body_fragment(b"1 rich-message attachment could not be included"),
+        ]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        let db = crate::db::test_support::init_test_db("factcheck-skipped-rich-reply").await;
+        let state = AppState::new(db.clone(), 1, "test_bot".to_string());
+        let chat = json!({"id": 2, "type": "private"});
+        let mut raw = json!({
+            "update_id": 2,
+            "message": {
+                "message_id": 2, "date": 1, "chat": chat, "text": "/factcheck",
+                "from": {"id": 2468, "is_bot": false, "first_name": "fixture"},
+                "reply_to_message": {
+                    "message_id": 1, "date": 1, "chat": chat,
+                    "rich_message": {"blocks": [{
+                        "type": "photo", "photo": [{"file_id": "unavailable", "width": 1, "height": 1}]
+                    }]}
+                }
+            }
+        });
+        let rich = RichUpdate::from_update(&mut raw);
+        let message = serde_json::from_value(raw["message"].take()).unwrap();
+
+        factcheck_handler(bot, state, message, None, rich)
+            .await
+            .unwrap();
+        server.join().unwrap();
+        db.shutdown().await;
     }
 }

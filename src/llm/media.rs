@@ -27,8 +27,7 @@ pub fn detect_mime_type(data: &[u8]) -> Option<String> {
 /// be logged safely. Other URLs pass through unchanged.
 pub fn redact_url_for_log(url: &str) -> String {
     static TELEGRAM_FILE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(https?://api\.telegram\.org/file/bot)[^/]+/")
-            .expect("valid telegram file url regex")
+        Regex::new(r"(https?://[^/\s]+/file/bot)[^/]+/").expect("valid telegram file url regex")
     });
     TELEGRAM_FILE_TOKEN
         .replace(url, "${1}<redacted>/")

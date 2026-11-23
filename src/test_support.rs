@@ -129,6 +129,13 @@ impl TestServer {
     }
 
     pub(crate) fn new(expected: Vec<ExpectedRequest>) -> Self {
+        Self::with_unordered_expectations(expected, Vec::new())
+    }
+
+    pub(crate) fn with_unordered_expectations(
+        expected: Vec<ExpectedRequest>,
+        unordered: Vec<ExpectedRequest>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let address = listener.local_addr().expect("test server address");
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -139,6 +146,7 @@ impl TestServer {
             serve(
                 listener,
                 expected,
+                unordered,
                 worker_shutdown,
                 worker_allow_client_disconnect,
             )
@@ -188,6 +196,7 @@ impl TestServer {
 fn serve(
     listener: TcpListener,
     expected: Vec<ExpectedRequest>,
+    mut unordered: Vec<ExpectedRequest>,
     shutdown: Arc<AtomicBool>,
     allow_client_disconnect: Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -204,8 +213,14 @@ fn serve(
         {
             break;
         }
-
-        let expectation = expected.pop_front();
+        let unordered_match = request.as_ref().ok().and_then(|request| {
+            unordered
+                .iter()
+                .position(|expectation| expectation.verify(request).is_ok())
+        });
+        let expectation = unordered_match
+            .map(|index| unordered.swap_remove(index))
+            .or_else(|| expected.pop_front());
         match expectation {
             Some(expectation) => {
                 let mut dynamic_response = None;
@@ -262,13 +277,17 @@ fn serve(
         }
     }
 
-    if !expected.is_empty() {
+    let remaining = expected.len() + unordered.len();
+    if remaining > 0 {
         // When the client is allowed to give up (deadline tests), it may do so
         // before the request ever reaches this server; that is not a failure.
         if allow_client_disconnect.load(Ordering::Acquire) {
             return Ok(());
         }
-        return Err(format!("unmet expectations: {}", expected.len()));
+        return Err(first_error.map_or_else(
+            || format!("unmet expectations: {remaining}"),
+            |error| format!("unmet expectations: {remaining}, first failure: {error}"),
+        ));
     }
     first_error.map_or(Ok(()), |error| {
         if allow_client_disconnect.load(Ordering::Acquire) && error.is_client_disconnect() {
@@ -525,6 +544,11 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestError> {
         path,
         headers,
     })
+}
+
+pub(crate) fn read_http_request(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
+    let request = read_request(stream).unwrap_or_else(|error| panic!("{error}"));
+    (request.method, request.path, request.body)
 }
 
 pub(crate) fn response_with_content_length(declared_length: usize, body: Vec<u8>) -> Vec<u8> {
