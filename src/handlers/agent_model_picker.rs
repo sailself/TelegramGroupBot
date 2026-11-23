@@ -22,6 +22,7 @@ use crate::llm::text_model::{
     ModelRequestCapabilities, MODEL_GEMINI,
 };
 use crate::state::{AppState, PendingEntryGuard};
+use crate::utils::progress::status_with_note;
 use crate::utils::telegram::{reply_with_retry, retry_telegram, send_message_with_retry};
 use crate::utils::timing::now_unix_seconds;
 
@@ -52,6 +53,8 @@ pub(crate) struct AgentModelRequest {
     pub capabilities: ModelRequestCapabilities,
     /// Status shown while the command runs, e.g. "Summarizing recent messages...".
     pub processing_text: String,
+    /// Optional notice kept below the picker prompt and the processing status.
+    pub status_note: Option<String>,
     pub run: AgentModelRun,
 }
 
@@ -208,15 +211,20 @@ pub(crate) async fn run_with_agent_model_choice(
         let model_id = match snapshot.resolve_default(request.capabilities) {
             Ok(model_id) => model_id,
             Err(err) => {
-                send_message_with_retry(bot, message.chat.id, &err.to_string(), Some(message.id))
-                    .await?;
+                send_message_with_retry(
+                    bot,
+                    message.chat.id,
+                    &status_with_note(&err.to_string(), request.status_note.as_deref()),
+                    Some(message.id),
+                )
+                .await?;
                 return Ok(());
             }
         };
         let status = send_message_with_retry(
             bot,
             message.chat.id,
-            &request.processing_text,
+            &status_with_note(&request.processing_text, request.status_note.as_deref()),
             Some(message.id),
         )
         .await?;
@@ -234,9 +242,12 @@ pub(crate) async fn run_with_agent_model_choice(
     let selection = reply_with_retry(
         bot,
         message.chat.id,
-        &format!(
-            "Please select which AI model to use for /{}:",
-            request.command
+        &status_with_note(
+            &format!(
+                "Please select which AI model to use for /{}:",
+                request.command
+            ),
+            request.status_note.as_deref(),
         ),
         Some(message.id),
         None,
@@ -317,7 +328,7 @@ async fn run_on_default_model(bot: Bot, state: AppState, pending: PendingAgentMo
                 &bot,
                 pending.chat_id,
                 pending.selection_message_id,
-                &err.to_string(),
+                &status_with_note(&err.to_string(), pending.request.status_note.as_deref()),
             )
             .await
         }
@@ -347,6 +358,7 @@ async fn run_on_model(
     } else {
         status
     };
+    let status = status_with_note(&status, request.status_note.as_deref());
     // The picker becomes the command's status message. A failed relabel must
     // not stop the run: the command reports into this message as it goes.
     if let Err(err) = close_picker(&bot, chat_id, selection_message_id, &status).await {
@@ -373,12 +385,17 @@ pub(crate) async fn announce_quota_stand_in(
     status_message_id: MessageId,
     command: &str,
     stand_in: &QuotaStandIn,
+    status_note: Option<&str>,
 ) {
     let label = stand_in.snapshot.display_name(stand_in.model.model_id());
     warn!("Codex usage limit reached; rerunning /{command} on {label}");
     // Best effort: the rerun reports into the same message either way.
     let _ = bot
-        .edit_message_text(chat_id, status_message_id, stand_in.status_text(&label))
+        .edit_message_text(
+            chat_id,
+            status_message_id,
+            status_with_note(&stand_in.status_text(&label), status_note).into_owned(),
+        )
         .await;
 }
 
@@ -620,6 +637,7 @@ mod tests {
                 command: "tldr",
                 capabilities: tools(),
                 processing_text: "Summarizing recent messages...".to_string(),
+                status_note: None,
                 run,
             },
         };
@@ -712,14 +730,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_chosen_model_turns_the_picker_into_the_status_message_and_runs() {
+    async fn a_chosen_model_turns_the_picker_into_the_status_message_and_keeps_the_note() {
         let server = TestServer::new(vec![ExpectedRequest::new(
             "POST",
             "/bot123:test/EditMessageText",
             edit_ok(),
         )
         .with_body_fragment(br#""message_id":4"#)
-        .with_body_fragment(b"Summarizing recent messages with gpt-5.4 high...")
+        .with_body_fragment(b"Fact-checking message with gpt-5.4 high...")
+        .with_body_fragment(b"1 rich-message attachment could not be included")
         .with_body_fragment(br#""reply_markup":{"inline_keyboard":[]}"#)]);
         let bot = Bot::new("123:test").set_api_url(server.base_url());
         let state = AppState::new(
@@ -727,7 +746,11 @@ mod tests {
             1,
             "test_bot".into(),
         );
-        let (pending, ran) = pending_request(10, 100);
+        let (mut pending, ran) = pending_request(10, 100);
+        pending.request.command = "factcheck";
+        pending.request.processing_text = "Fact-checking message...".into();
+        pending.request.status_note =
+            Some("1 rich-message attachment could not be included".into());
         run_on_model(
             bot,
             state,

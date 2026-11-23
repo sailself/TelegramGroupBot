@@ -7,6 +7,7 @@
 //! answers and error messages are NOT delivered through this type — they keep
 //! going through `send_response` / the handlers' error edits.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -36,6 +37,14 @@ pub struct ProgressReporter {
     /// `RetryAfter`, so flood-control waits are respected across updates).
     next_edit_allowed_at: Option<Instant>,
     last_text: String,
+    note: Option<String>,
+}
+
+pub(crate) fn status_with_note<'a>(text: &'a str, note: Option<&str>) -> Cow<'a, str> {
+    match note {
+        Some(note) => Cow::Owned(format!("{text}\n\n{note}")),
+        None => Cow::Borrowed(text),
+    }
 }
 
 /// Pure throttle decision: emit only when the text changed and the
@@ -64,7 +73,13 @@ impl ProgressReporter {
             min_interval: MIN_EDIT_INTERVAL,
             next_edit_allowed_at: None,
             last_text: String::new(),
+            note: None,
         }
+    }
+
+    pub(crate) fn with_note(mut self, note: Option<&str>) -> Self {
+        self.note = note.map(str::to_owned);
+        self
     }
 
     /// Throttled, best-effort progress edit. Skips when called too soon after
@@ -103,7 +118,11 @@ impl ProgressReporter {
     async fn try_edit(&mut self, text: &str) -> bool {
         match self
             .bot
-            .edit_message_text(self.chat_id, self.message_id, text)
+            .edit_message_text(
+                self.chat_id,
+                self.message_id,
+                status_with_note(text, self.note.as_deref()).into_owned(),
+            )
             .await
         {
             Ok(_) => {
@@ -140,6 +159,7 @@ impl ProgressSink for ProgressReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
 
     #[test]
     fn emits_first_update_immediately() {
@@ -164,5 +184,35 @@ mod tests {
             "old",
             "new"
         ));
+    }
+
+    #[tokio::test]
+    async fn phase_updates_keep_the_status_note() {
+        let server = TestServer::new(
+            ["Extracting claims", "Composing the report"]
+                .into_iter()
+                .map(|phase| {
+                    ExpectedRequest::new(
+                        "POST",
+                        "/bot123:test/EditMessageText",
+                        response_with_status(
+                            200,
+                            br#"{"ok":true,"result":{"message_id":3,"date":1,"chat":{"id":2,"type":"private"},"text":"status"}}"#
+                                .to_vec(),
+                        ),
+                    )
+                    .with_body_fragment(phase.as_bytes())
+                    .with_body_fragment(b"1 rich-message attachment could not be included")
+                })
+                .collect(),
+        );
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        let mut progress = ProgressReporter::new(bot, ChatId(2), MessageId(3))
+            .with_note(Some("1 rich-message attachment could not be included"));
+
+        progress.update("Extracting claims").await;
+        progress.update_now("Composing the report").await;
+
+        server.join().unwrap();
     }
 }

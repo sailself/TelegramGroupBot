@@ -24,6 +24,7 @@ use crate::llm::audit::{
 use crate::llm::media::summarize_media_files;
 use crate::llm::text_model::ModelRequestCapabilities;
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
+use crate::utils::telegram::rich_message::RichUpdate;
 use crate::utils::telegram::{
     message_entities_for_text, message_text_or_caption, reply_with_retry,
 };
@@ -201,6 +202,7 @@ async fn q_handler_internal(
     query: Option<String>,
     command_name: &str,
     mode: QaCommandMode,
+    rich: RichUpdate,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, command_name).await {
         return Ok(());
@@ -234,9 +236,21 @@ async fn q_handler_internal(
         reply_link_inputs(reply, &CONFIG.limits.q_skip_reply_link_enrichment_ids)
     });
 
-    let media =
-        collect_message_media(&bot, &state, &message, MediaCollectionOptions::for_qa()).await;
+    let media = collect_message_media(
+        &bot,
+        &state,
+        &message,
+        MediaCollectionOptions::for_qa(),
+        &rich,
+    )
+    .await;
     let initial_media_summary = summarize_media_files(&media.files);
+    let skipped = media.rich_attachments_skipped;
+    let media_note = if skipped > 0 {
+        format!("\n\n{skipped} rich-message attachment(s) could not be included.")
+    } else {
+        String::new()
+    };
 
     let prepared = prepare_qa_input(
         mode,
@@ -255,8 +269,7 @@ async fn q_handler_internal(
             &bot,
             message.chat.id,
             &format!(
-                "Please provide a question or reply to a message with /{}.",
-                command_name
+                "Please provide a question or reply to a message with /{command_name}.{media_note}",
             ),
             Some(message.id),
             None,
@@ -506,7 +519,7 @@ async fn q_handler_internal(
         let processing_message = reply_with_retry(
             &bot,
             message.chat.id,
-            &processing_message_text,
+            &(processing_message_text + &media_note),
             Some(message.id),
             None,
             None,
@@ -550,6 +563,7 @@ async fn q_handler_internal(
     if has_media {
         selection_text.push_str("\n\n<i>Note: Only models that support media are shown.</i>");
     }
+    selection_text.push_str(&media_note);
 
     let keyboard =
         create_model_selection_keyboard(&snapshot, request_capabilities, gemini_youtube.is_some());
@@ -603,15 +617,16 @@ pub async fn q_handler(
     state: AppState,
     message: Message,
     query: Option<String>,
-    command_name: &str,
+    rich: RichUpdate,
 ) -> Result<()> {
     q_handler_internal(
         bot,
         state,
         message,
         query,
-        command_name,
+        "q",
         QaCommandMode::Standard,
+        rich,
     )
     .await
 }
@@ -621,8 +636,18 @@ pub async fn qc_handler(
     state: AppState,
     message: Message,
     query: Option<String>,
+    rich: RichUpdate,
 ) -> Result<()> {
-    q_handler_internal(bot, state, message, query, "qc", QaCommandMode::ChatContext).await
+    q_handler_internal(
+        bot,
+        state,
+        message,
+        query,
+        "qc",
+        QaCommandMode::ChatContext,
+        rich,
+    )
+    .await
 }
 
 pub async fn s_handler(
@@ -840,6 +865,7 @@ pub async fn qq_handler(
     state: AppState,
     message: Message,
     query: Option<String>,
+    rich: RichUpdate,
 ) -> Result<()> {
-    q_handler_internal(bot, state, message, query, "qq", QaCommandMode::Quick).await
+    q_handler_internal(bot, state, message, query, "qq", QaCommandMode::Quick, rich).await
 }

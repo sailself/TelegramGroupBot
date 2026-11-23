@@ -143,6 +143,7 @@ pub async fn tldr_handler(
                 ..Default::default()
             },
             processing_text: "Summarizing recent messages...".to_string(),
+            status_note: None,
             run: Box::new(move |bot, state, model| Box::pin(run_tldr(bot, state, job, model))),
         },
     )
@@ -266,7 +267,7 @@ async fn run_tldr(bot: Bot, state: AppState, job: TldrJob, model: ChosenAgentMod
             let Some(stand_in) = final_model.quota_stand_in(&error, capabilities).await else {
                 return Err(error);
             };
-            announce_quota_stand_in(&bot, chat_id, status_message_id, "tldr", &stand_in).await;
+            announce_quota_stand_in(&bot, chat_id, status_message_id, "tldr", &stand_in, None).await;
             let clock = WallClock::start()
                 .for_gemini_pipeline(matches!(stand_in.model, ResolvedTextModel::Gemini), true);
             attempt.summarize(&clock, &stand_in.model).await?
@@ -365,7 +366,7 @@ Use the same language as the summary text for any labels.\
             url, summary_text
         );
         telegraph_url =
-            create_telegraph_answer("Message Summary with Infographic", &telegraph_content, Some(&summary_model)).await;
+            create_telegraph_answer("Message Summary with Infographic", &telegraph_content, Some(&summary_model), None).await;
     }
 
     let final_message = if let Some(url) = telegraph_url {

@@ -37,6 +37,8 @@ use handlers::qa::MODEL_CALLBACK_PREFIX;
 use handlers::{media, qa};
 use state::AppState;
 use utils::logging::init_logging;
+use utils::telegram::polling::{RichPolling, RichUpdates};
+use utils::telegram::rich_message::RichUpdate;
 
 // rustc 1.100 flags the `String` argument parsing that teloxide-macros
 // generates (a `map_err` on `Infallible`) as unreachable. The derived impl is a
@@ -242,11 +244,15 @@ async fn main() -> HandlerResult {
         );
     }
 
-    let command_handler = dptree::entry()
+    let rich_updates = RichUpdates::default();
+    let listener = RichPolling::new(bot.clone(), rich_updates.clone()).await;
+
+    let command_handler = dptree::filter(|rich: RichUpdate| rich.message.is_none())
         .filter_command::<Command>()
         .endpoint(handle_command);
 
     let message_handler = Update::filter_message()
+        .map(move |update: Update| rich_updates.take(update.id))
         .branch(command_handler)
         .branch(
             dptree::filter(|msg: Message| msg.media_group_id().is_some())
@@ -273,7 +279,10 @@ async fn main() -> HandlerResult {
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
         .build()
-        .dispatch()
+        .dispatch_with_listener(
+            listener,
+            LoggingErrorHandler::with_custom_text("An error from the update listener"),
+        )
         .await;
 
     // The dispatcher has stopped taking updates; flush what handlers already
@@ -289,6 +298,7 @@ async fn handle_command(
     state: AppState,
     message: Message,
     command: Command,
+    rich: RichUpdate,
 ) -> HandlerResult {
     fn optional_arg(arg: String) -> Option<String> {
         if arg.trim().is_empty() {
@@ -313,20 +323,32 @@ async fn handle_command(
         Command::Factcheck(arg) => {
             spawn_logged(
                 "factcheck",
-                handlers::factcheck::factcheck_handler(bot, state, message, optional_arg(arg)),
+                handlers::factcheck::factcheck_handler(
+                    bot,
+                    state,
+                    message,
+                    optional_arg(arg),
+                    rich,
+                ),
             );
         }
         Command::Q(arg) => {
             spawn_logged(
                 "q",
-                qa::q_handler(bot, state, message, optional_arg(arg), "q"),
+                qa::q_handler(bot, state, message, optional_arg(arg), rich),
             );
         }
         Command::Qc(arg) => {
-            spawn_logged("qc", qa::qc_handler(bot, state, message, optional_arg(arg)));
+            spawn_logged(
+                "qc",
+                qa::qc_handler(bot, state, message, optional_arg(arg), rich),
+            );
         }
         Command::Qq(arg) => {
-            spawn_logged("qq", qa::qq_handler(bot, state, message, optional_arg(arg)));
+            spawn_logged(
+                "qq",
+                qa::qq_handler(bot, state, message, optional_arg(arg), rich),
+            );
         }
         Command::BurnBabyBurn => {
             spawn_logged(
@@ -503,16 +525,31 @@ async fn handle_media_group(state: AppState, message: Message) -> HandlerResult 
     Ok(())
 }
 
-async fn handle_text_message(bot: Bot, state: AppState, message: Message) -> HandlerResult {
+async fn handle_text_message(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    rich: RichUpdate,
+) -> HandlerResult {
     if let Some(text) = message.text().or_else(|| message.caption()) {
-        if text.trim_start().starts_with('/') {
+        if text.trim_start().starts_with('/') && rich.message.is_none() {
             return Ok(());
         }
     }
 
-    if qa::should_auto_q_trigger(&message, state.bot_user_id, &state.bot_username_lower) {
-        let query = qa::build_auto_q_query(&message, state.bot_user_id, &state.bot_username_lower);
-        spawn_logged("auto q", qa::q_handler(bot, state, message, query, "q"));
+    if qa::should_auto_q_trigger(
+        &message,
+        state.bot_user_id,
+        &state.bot_username_lower,
+        &rich.message_mentions,
+    ) {
+        let query = qa::build_auto_q_query(
+            &message,
+            state.bot_user_id,
+            &state.bot_username_lower,
+            &rich.message_mentions,
+        );
+        spawn_logged("auto q", qa::q_handler(bot, state, message, query, rich));
         return Ok(());
     }
 

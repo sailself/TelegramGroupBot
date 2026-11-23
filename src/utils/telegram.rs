@@ -10,6 +10,9 @@ use teloxide::RequestError;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+pub(crate) mod polling;
+pub(crate) mod rich_message;
+
 const CHAT_ACTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 
 /// How many times a Telegram request is attempted before its error is

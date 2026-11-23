@@ -504,11 +504,18 @@ struct TelegraphCreateResult {
 }
 
 pub async fn create_telegraph_page(title: &str, content: &str) -> Option<String> {
-    create_telegraph_answer(title, content, None).await
+    create_telegraph_answer(title, content, None, None).await
 }
 
-fn telegraph_answer_nodes(content: &str, model_label: Option<&str>) -> Vec<serde_json::Value> {
+fn telegraph_answer_nodes(
+    content: &str,
+    model_label: Option<&str>,
+    notice: Option<&str>,
+) -> Vec<serde_json::Value> {
     let mut nodes = markdown_to_telegraph_nodes(content);
+    if let Some(notice) = notice {
+        nodes.insert(0, json!({"tag":"p", "children":[notice]}));
+    }
     if let Some(label) = model_label {
         nodes.push(json!({"tag":"p", "children":[format!("Model: {label}")]}));
     }
@@ -519,13 +526,14 @@ pub async fn create_telegraph_answer(
     title: &str,
     content: &str,
     model_label: Option<&str>,
+    notice: Option<&str>,
 ) -> Option<String> {
     if CONFIG.telegraph.access_token.trim().is_empty() {
         warn!("Telegraph access token missing; skipping page creation");
         return None;
     }
 
-    let nodes = telegraph_answer_nodes(content, model_label);
+    let nodes = telegraph_answer_nodes(content, model_label, notice);
     let content_json = serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".to_string());
     let form = vec![
         (
@@ -969,8 +977,16 @@ mod overflow_regressions {
 mod footer_tests {
     use super::*;
     #[test]
-    fn model_label_is_a_literal_separate_paragraph() {
-        let nodes = telegraph_answer_nodes("```\nunfinished", Some("model_[test]*"));
+    fn answer_metadata_uses_separate_literal_paragraphs() {
+        let nodes = telegraph_answer_nodes(
+            "```\nunfinished",
+            Some("model_[test]*"),
+            Some("Missing *media* & text"),
+        );
+        assert_eq!(
+            nodes.first().unwrap(),
+            &json!({"tag":"p", "children":["Missing *media* & text"]})
+        );
         assert_eq!(
             nodes.last().unwrap(),
             &json!({"tag":"p", "children":["Model: model_[test]*"]})

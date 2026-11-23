@@ -1,9 +1,12 @@
 //! Auto-`/q` trigger detection: bot mentions, replies to this bot, and query extraction.
 
+use std::ops::Range;
+
 use teloxide::types::{Message, MessageEntityKind, MessageEntityRef};
 
 use crate::config::CONFIG;
 use crate::handlers::media::message_has_image;
+use crate::utils::telegram::rich_message::RichMention;
 use crate::utils::telegram::{message_entities_for_text, message_text_or_caption};
 
 fn is_bot_mention_entity(
@@ -28,30 +31,45 @@ fn is_bot_mention_entity(
     }
 }
 
+fn rich_bot_mention_ranges<'a>(
+    mentions: &'a [RichMention],
+    bot_username_lower: &'a str,
+) -> impl Iterator<Item = Range<usize>> + 'a {
+    mentions
+        .iter()
+        .filter(move |mention| mention.username.eq_ignore_ascii_case(bot_username_lower))
+        .map(|mention| mention.range.clone())
+}
+
 fn strip_bot_mentions_from_query(
     text: &str,
     entities: Option<&[MessageEntityRef<'_>]>,
     bot_user_id: i64,
     bot_username_lower: &str,
+    rich_mentions: &[RichMention],
 ) -> String {
-    let Some(entities) = entities else {
-        return text.trim().to_string();
-    };
-
     let mut ranges = entities
-        .iter()
+        .into_iter()
+        .flatten()
         .filter(|entity| is_bot_mention_entity(entity, bot_user_id, bot_username_lower))
-        .map(|entity| entity.start()..entity.end())
+        .map(MessageEntityRef::range)
+        .chain(rich_bot_mention_ranges(rich_mentions, bot_username_lower))
         .collect::<Vec<_>>();
     if ranges.is_empty() {
         return text.trim().to_string();
     }
 
-    ranges.sort_by_key(|range| range.start);
-    let mut stripped = text.to_string();
-    for range in ranges.into_iter().rev() {
-        stripped.replace_range(range, " ");
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut stripped = String::with_capacity(text.len());
+    let mut end = 0;
+    for range in ranges {
+        if range.end > end {
+            stripped.push_str(&text[end..range.start.max(end)]);
+            stripped.push(' ');
+            end = range.end;
+        }
     }
+    stripped.push_str(&text[end..]);
 
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -95,12 +113,14 @@ pub fn should_auto_q_trigger(
     message: &Message,
     bot_user_id: i64,
     bot_username_lower: &str,
+    rich_mentions: &[RichMention],
 ) -> bool {
     should_auto_q_trigger_with_config(
         message,
         bot_user_id,
         bot_username_lower,
         CONFIG.telegram.enable_bot_to_bot_auto_q,
+        rich_mentions,
     )
 }
 
@@ -109,6 +129,7 @@ pub(super) fn should_auto_q_trigger_with_config(
     bot_user_id: i64,
     bot_username_lower: &str,
     enable_bot_to_bot_auto_q: bool,
+    rich_mentions: &[RichMention],
 ) -> bool {
     if message
         .from
@@ -136,7 +157,10 @@ pub(super) fn should_auto_q_trigger_with_config(
         return false;
     }
 
-    is_mentioning_this_bot(message, bot_user_id, bot_username_lower)
+    rich_bot_mention_ranges(rich_mentions, bot_username_lower)
+        .next()
+        .is_some()
+        || is_mentioning_this_bot(message, bot_user_id, bot_username_lower)
         || (is_reply_to_this_bot(message, bot_user_id) && !reply_target_has_image_or_video(message))
 }
 
@@ -144,6 +168,7 @@ pub fn build_auto_q_query(
     message: &Message,
     bot_user_id: i64,
     bot_username_lower: &str,
+    rich_mentions: &[RichMention],
 ) -> Option<String> {
     let text = message_text_or_caption(message)?;
     if text.trim().is_empty() {
@@ -151,11 +176,87 @@ pub fn build_auto_q_query(
     }
 
     let entities = message_entities_for_text(message);
-    let stripped =
-        strip_bot_mentions_from_query(text, entities.as_deref(), bot_user_id, bot_username_lower);
+    let stripped = strip_bot_mentions_from_query(
+        text,
+        entities.as_deref(),
+        bot_user_id,
+        bot_username_lower,
+        rich_mentions,
+    );
     if stripped.is_empty() {
         None
     } else {
         Some(stripped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::telegram::rich_message::RichUpdate;
+    use serde_json::{json, Value};
+
+    fn project_rich_message(text: Value) -> (Message, RichUpdate) {
+        let mut update = json!({"message": {
+            "message_id": 1,
+            "date": 1,
+            "from": {"id": 10, "is_bot": false, "first_name": "Hum"},
+            "chat": {"id": 10, "type": "private"},
+            "rich_message": {"blocks": [{"type": "paragraph", "text": text}]}
+        }});
+        let rich = RichUpdate::from_update(&mut update);
+        let message = serde_json::from_value(update["message"].take()).unwrap();
+        (message, rich)
+    }
+
+    #[test]
+    fn rich_mention_matches_username_and_strips_nested_display_spans() {
+        let (message, rich) = project_rich_message(json!([
+            "🧭 ",
+            {"type": "mention", "username": "HelperBot", "text": [
+                "the ",
+                {"type": "text_mention", "text": "🛠 assistant", "user": {
+                    "id": 42, "is_bot": true, "first_name": "Helper"
+                }},
+                " here"
+            ]},
+            " please review this"
+        ]));
+
+        assert_eq!(
+            message.text(),
+            Some("🧭 the 🛠 assistant here please review this")
+        );
+        assert!(should_auto_q_trigger_with_config(
+            &message,
+            42,
+            "helperbot",
+            false,
+            &rich.message_mentions,
+        ));
+        assert_eq!(
+            build_auto_q_query(&message, 42, "helperbot", &rich.message_mentions).as_deref(),
+            Some("🧭 please review this")
+        );
+    }
+
+    #[test]
+    fn rich_mention_uses_target_even_when_display_names_this_bot() {
+        let (message, rich) = project_rich_message(json!([
+            {"type": "mention", "username": "OtherBot", "text": "@HelperBot"},
+            " please review this"
+        ]));
+
+        assert!(!should_auto_q_trigger_with_config(
+            &message,
+            42,
+            "helperbot",
+            false,
+            &rich.message_mentions,
+        ));
+        assert_eq!(
+            build_auto_q_query(&message, 42, "helperbot", &rich.message_mentions).as_deref(),
+            Some("@HelperBot please review this")
+        );
     }
 }

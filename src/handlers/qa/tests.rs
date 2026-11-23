@@ -438,6 +438,162 @@ async fn reply_snapshot_uses_queued_history_and_freezes_live_direct() {
     assert_eq!(fallback[0].text.as_deref(), Some("live direct"));
 }
 
+#[tokio::test]
+async fn rich_reply_delivers_text_and_all_fourteen_slides_to_qa() {
+    use crate::handlers::media::{collect_message_media, MediaCollectionOptions};
+    use crate::llm::media::MediaKind;
+    use crate::test_support::{response_with_content_length, ExpectedRequest, TestServer};
+    use crate::utils::telegram::polling::{RichPolling, RichUpdates};
+    use futures_util::StreamExt;
+    use teloxide::types::{AllowedUpdate, UpdateKind};
+    use teloxide::update_listeners::{AsUpdateStream, UpdateListener};
+
+    let fixture_chat = json!({"id": 90007, "type": "private"});
+    let fixture_user = json!({"id": 7, "is_bot": false, "first_name": "Reader"});
+    let slides: Vec<_> = (1..=14)
+        .map(|index| {
+            json!({
+                "type": "photo",
+                "photo": [
+                    { "file_id": format!("rich-large-{index}"), "width": 1200, "height": 800 },
+                    { "file_id": format!("rich-small-{index}"), "width": 128, "height": 128 }
+                ],
+                "caption": { "text": format!("Slide {index}") }
+            })
+        })
+        .collect();
+    let batch = json!({
+        "ok": true,
+        "result": [
+            {"update_id": 100, "message": {
+                "message_id": 42, "date": 123, "chat": fixture_chat, "from": fixture_user,
+                "text": "/q How many photos?",
+                "reply_to_message": {
+                    "message_id": 41, "date": 122, "chat": fixture_chat, "from": fixture_user,
+                    "forward_origin": {
+                        "type": "channel", "date": 121, "message_id": 55,
+                        "chat": {"id": -10090008i64, "type": "channel", "title": "Source"}
+                    },
+                    "rich_message": {"blocks": [
+                        {"type": "paragraph", "text": ["📷 ", {"type": "bold", "text": "Photo post"}]},
+                        {"type": "details", "summary": "Gallery", "blocks": [
+                            {"type": "slideshow", "blocks": slides, "caption": {"text": "All photos"}}
+                        ]},
+                        {"type": "footer", "text": ["Source: ", {
+                            "type": "url", "text": "original", "url": "https://x.com/example/status/99"
+                        }]}
+                    ]}
+                }
+            }},
+            {"update_id": 101, "callback_query": {
+                "id": "callback", "from": fixture_user, "chat_instance": "chat",
+                "inline_message_id": "inline", "data": "picker"
+            }}
+        ]
+    });
+    let response = |value: serde_json::Value| {
+        let body = serde_json::to_vec(&value).unwrap();
+        response_with_content_length(body.len(), body)
+    };
+    let mut expected = vec![
+        ExpectedRequest::new(
+            "POST",
+            "/botfixture-token/GetWebhookInfo",
+            response(
+                json!({"ok": true, "result": {"url": "", "has_custom_certificate": false, "pending_update_count": 0}}),
+            ),
+        ),
+        ExpectedRequest::new("POST", "/botfixture-token/GetUpdates", response(batch))
+            .with_body_fragment(br#""allowed_updates":["message","callback_query"]"#),
+    ];
+    let mut file_lookups = Vec::new();
+    for index in 1..=14 {
+        let file_id = format!("rich-large-{index}");
+        file_lookups.push(
+            ExpectedRequest::new(
+                "POST",
+                "/botfixture-token/GetFile",
+                response(json!({
+                    "ok": true, "result": {
+                        "file_id": file_id, "file_unique_id": file_id,
+                        "file_path": format!("photos/{index}.png")
+                    }
+                })),
+            )
+            .with_body_fragment(format!("\"{file_id}\"").as_bytes()),
+        );
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.push(index);
+        expected.push(ExpectedRequest::new(
+            "GET",
+            &format!("/file/botfixture-token/photos/{index}.png"),
+            response_with_content_length(bytes.len(), bytes),
+        ));
+    }
+    expected.push(
+        ExpectedRequest::new(
+            "POST",
+            "/botfixture-token/GetUpdates",
+            response(json!({"ok": true, "result": []})),
+        )
+        .with_body_fragment(br#""offset":102"#)
+        .with_body_fragment(br#""timeout":0"#),
+    );
+
+    let server = TestServer::with_unordered_expectations(expected, file_lookups);
+    let bot = Bot::new("fixture-token").set_api_url(server.base_url());
+    let rich_updates = RichUpdates::default();
+    let mut listener = RichPolling::new(bot.clone(), rich_updates.clone()).await;
+    listener.hint_allowed_updates(
+        &mut [AllowedUpdate::Message, AllowedUpdate::CallbackQuery].into_iter(),
+    );
+    let stop = listener.stop_token();
+    let mut stream = listener.as_stream();
+    let update = stream.next().await.unwrap().unwrap();
+    let rich = rich_updates.take(update.id);
+    let UpdateKind::Message(message) = update.kind else {
+        panic!("expected a Telegram message");
+    };
+    assert_eq!(message.text(), Some("/q How many photos?"));
+    let reply = message.reply_to_message().unwrap();
+    let (text, urls) = reply_link_inputs(reply, &Default::default()).unwrap();
+    assert!(text.starts_with("📷 Photo post\nGallery\nSlide 1\n"));
+    assert!(text.ends_with("Slide 14\nAll photos\nSource: original"));
+    assert_eq!(urls, "https://x.com/example/status/99");
+    assert!(reply_link_inputs(reply, &[-10090008].into_iter().collect()).is_none());
+
+    let db = crate::db::test_support::init_test_db("qa-rich-reply").await;
+    let state = crate::state::AppState::new(db.clone(), 42, "test_bot".into());
+    let context = snapshot_reply_context(&state, message.chat.id.0, reply, 10)
+        .await
+        .unwrap();
+    assert_eq!(context[0].text.as_deref(), Some(text));
+
+    let media = collect_message_media(
+        &bot,
+        &state,
+        &message,
+        MediaCollectionOptions::for_qa(),
+        &rich,
+    )
+    .await;
+    stop.stop();
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap().kind,
+        UpdateKind::CallbackQuery(_)
+    ));
+    let last = stream.next().await;
+    server.join().unwrap();
+    assert!(last.is_none(), "unexpected final polling result: {last:?}");
+    assert_eq!(media.rich_attachments_skipped, 0);
+    assert_eq!(media.files.len(), 14);
+    for (index, file) in (1..=14).zip(&media.files) {
+        assert_eq!(file.kind, MediaKind::Image);
+        assert_eq!(file.bytes().last(), Some(&index));
+    }
+    db.shutdown().await;
+}
+
 fn pending_with_request(original_user_id: i64, timestamp: i64) -> PendingRequests<PendingQRequest> {
     let pending = PendingRequests::new();
     pending.insert(
@@ -677,10 +833,11 @@ fn auto_q_triggers_for_other_bot_mentioning_this_bot() {
         &message,
         42,
         "helperbot",
-        true
+        true,
+        &[],
     ));
     assert_eq!(
-        build_auto_q_query(&message, 42, "helperbot").as_deref(),
+        build_auto_q_query(&message, 42, "helperbot", &[]).as_deref(),
         Some("please review this")
     );
 }
@@ -702,7 +859,8 @@ fn auto_q_ignores_other_bot_mentions_when_bot_to_bot_auto_q_disabled() {
         &message,
         42,
         "helperbot",
-        false
+        false,
+        &[],
     ));
 }
 
@@ -723,7 +881,8 @@ fn auto_q_ignores_messages_from_this_bot() {
         &message,
         42,
         "helperbot",
-        true
+        true,
+        &[],
     ));
 }
 
@@ -816,7 +975,8 @@ fn auto_q_triggers_when_replying_to_bot_text_message() {
         &message,
         42,
         "helperbot",
-        true
+        true,
+        &[],
     ));
 }
 
@@ -828,7 +988,8 @@ fn auto_q_skips_reply_to_bot_image_message() {
         &message,
         42,
         "helperbot",
-        true
+        true,
+        &[],
     ));
 }
 
@@ -850,7 +1011,8 @@ fn auto_q_still_triggers_when_mentioning_bot_despite_reply_image() {
         &message,
         42,
         "helperbot",
-        true
+        true,
+        &[],
     ));
 }
 
@@ -862,7 +1024,8 @@ fn auto_q_skips_reply_to_bot_animation() {
         &message,
         42,
         "helperbot",
-        true
+        true,
+        &[],
     ));
 }
 
@@ -874,7 +1037,8 @@ fn auto_q_skips_reply_to_bot_video_message() {
         &message,
         42,
         "helperbot",
-        true
+        true,
+        &[],
     ));
 }
 
@@ -896,7 +1060,8 @@ fn auto_q_still_triggers_when_mentioning_bot_despite_reply_video() {
         &message,
         42,
         "helperbot",
-        true
+        true,
+        &[],
     ));
 }
 

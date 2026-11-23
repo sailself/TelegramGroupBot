@@ -38,20 +38,29 @@ async fn edit_text_with_retry(
 pub struct ResponseContent {
     pub markdown: String,
     pub model_label: Option<String>,
+    notice: Option<String>,
 }
 impl ResponseContent {
     pub fn new(markdown: impl Into<String>) -> Self {
         Self {
             markdown: markdown.into(),
             model_label: None,
+            notice: None,
         }
     }
     pub fn with_model(mut self, label: impl Into<String>) -> Self {
         self.model_label = Some(label.into());
         self
     }
+    pub(crate) fn with_notice(mut self, notice: Option<String>) -> Self {
+        self.notice = notice;
+        self
+    }
     fn plain_text(&self, include_link_destinations: bool) -> String {
         let mut body = markdown_to_plain_text(&self.markdown, include_link_destinations);
+        if let Some(notice) = &self.notice {
+            body.insert_str(0, &format!("{notice}\n\n"));
+        }
         if let Some(label) = &self.model_label {
             body.push_str(&format!("\n\nModel: {label}"));
         }
@@ -59,6 +68,9 @@ impl ResponseContent {
     }
     fn html(&self) -> String {
         let mut body = markdown_to_telegram_html(&self.markdown);
+        if let Some(notice) = &self.notice {
+            body.insert_str(0, &format!("{}\n\n", escape_html(notice)));
+        }
         if let Some(label) = &self.model_label {
             body.push_str(&format!("\n\nModel: {}", escape_html(label)));
         }
@@ -97,7 +109,9 @@ pub async fn send_response(
     title: &str,
 ) -> Result<()> {
     deliver_response(response, CONFIG.telegram.max_length,
-        |markdown, label: Option<String>| async move { create_telegraph_answer(title, &markdown, label.as_deref()).await },
+        |markdown, label, notice| async move {
+            create_telegraph_answer(title, &markdown, label.as_deref(), notice.as_deref()).await
+        },
         |text, mode| async move { edit_text_with_retry(bot, chat_id, message_id, &text, mode).await },
     ).await
 }
@@ -110,22 +124,28 @@ async fn deliver_response<P, PF, E, EF>(
     mut edit: E,
 ) -> Result<()>
 where
-    P: FnOnce(String, Option<String>) -> PF,
+    P: FnOnce(String, Option<String>, Option<String>) -> PF,
     PF: std::future::Future<Output = Option<String>>,
     E: FnMut(String, Option<ParseMode>) -> EF,
     EF: std::future::Future<Output = Result<()>>,
 {
     let visible = response.plain_text(false);
     if needs_overflow_delivery(&visible, max_chars) {
-        if let Some(url) = publish(response.markdown.clone(), response.model_label.clone()).await {
-            edit(
-                format!(
-                    "I have too much to say. <a href=\"{}\">View it here</a>",
-                    escape_html(&url)
-                ),
-                Some(ParseMode::Html),
-            )
-            .await?;
+        if let Some(url) = publish(
+            response.markdown.clone(),
+            response.model_label.clone(),
+            response.notice.clone(),
+        )
+        .await
+        {
+            let mut link = format!(
+                "I have too much to say. <a href=\"{}\">View it here</a>",
+                escape_html(&url)
+            );
+            if let Some(notice) = &response.notice {
+                link.insert_str(0, &format!("{}\n\n", escape_html(notice)));
+            }
+            edit(link, Some(ParseMode::Html)).await?;
         } else {
             edit(
                 overflow_fallback_text(&response.plain_text(true), max_chars),
@@ -262,11 +282,14 @@ mod content_tests {
     #[test]
     fn destinations_keep_markdown_and_literal_model_labels() {
         let content = ResponseContent::new("**Important** & [source](https://example.com)")
-            .with_model("a_[b]*");
+            .with_model("a_[b]*")
+            .with_notice(Some("Missing *media* & text".into()));
         let html = content.html();
         let plain = content.plain_text(true);
         assert!(html.contains("<b>Important</b>"));
         assert!(html.contains("Model: a_[b]*"));
+        assert!(html.starts_with("Missing *media* &amp; text\n\n"));
+        assert!(plain.starts_with("Missing *media* & text\n\n"));
         assert!(plain.contains("source (https://example.com)"));
         assert!(!plain.contains("<b>"));
         assert!(content.markdown.starts_with("**Important**"));
@@ -289,14 +312,16 @@ mod delivery_tests {
     use super::*;
     #[tokio::test]
     async fn overflow_publishes_markdown_and_sends_a_link() {
-        let content = ResponseContent::new("**bold** [source](https://example.com)\n".repeat(23));
+        let content = ResponseContent::new("**bold** [source](https://example.com)\n".repeat(23))
+            .with_notice(Some("Missing *media* & text".into()));
         let mut sent = Vec::new();
         deliver_response(
             &content,
             4000,
-            |markdown, _| async move {
+            |markdown, _, notice| async move {
                 assert!(markdown.contains("**bold**"));
                 assert!(!markdown.contains("<b>"));
+                assert_eq!(notice.as_deref(), Some("Missing *media* & text"));
                 Some("https://telegra.ph/test".to_string())
             },
             |text, mode| {
@@ -307,6 +332,7 @@ mod delivery_tests {
         .await
         .unwrap();
         assert_eq!(sent.len(), 1);
+        assert!(sent[0].0.starts_with("Missing *media* &amp; text\n\n"));
         assert!(sent[0].0.contains("href=\"https://telegra.ph/test\""));
         assert_eq!(sent[0].1, Some(ParseMode::Html));
     }
@@ -316,7 +342,7 @@ mod delivery_tests {
         deliver_response(
             &ResponseContent::new("**bold** [source](https://example.com)"),
             4000,
-            |_, _| async { panic!("short answer should not publish") },
+            |_, _, _| async { panic!("short answer should not publish") },
             |text, mode| {
                 sent.push((text, mode));
                 async move {
@@ -339,9 +365,10 @@ mod delivery_tests {
     async fn failed_publishing_truncates_plain_text_including_notice() {
         let mut sent = Vec::new();
         deliver_response(
-            &ResponseContent::new(format!("**{}**", "好".repeat(400))),
+            &ResponseContent::new(format!("**{}**", "好".repeat(400)))
+                .with_notice(Some("Missing *media* & text".into())),
             100,
-            |_, _| async { None },
+            |_, _, _| async { None },
             |text, mode| {
                 sent.push((text, mode));
                 async { Ok(()) }
@@ -351,6 +378,7 @@ mod delivery_tests {
         .unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0.chars().count(), 100);
+        assert!(sent[0].0.starts_with("Missing *media* & text\n\n"));
         assert!(!sent[0].0.contains("<b>"));
         assert_eq!(sent[0].1, None);
     }
