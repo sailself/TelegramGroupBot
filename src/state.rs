@@ -100,7 +100,7 @@ pub struct PendingImageRequest {
     pub command: PendingImageCommand,
     pub prompt: String,
     pub image_urls: Vec<String>,
-    pub telegraph_contents: Vec<String>,
+    pub link_context: String,
     pub selection_message_id: i64,
     pub llm_invocation_id: Option<i64>,
     pub model: Option<ImageGenerationModel>,

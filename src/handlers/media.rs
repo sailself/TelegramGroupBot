@@ -108,6 +108,22 @@ fn extension_mime_hint(file_name: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn rich_media_kind(attachment: &RichMedia) -> MediaKind {
+    attachment.kind.unwrap_or_else(|| {
+        let declared = attachment.mime_type.as_deref().map(kind_for_mime);
+        declared
+            .filter(|kind| *kind != MediaKind::Document)
+            .or_else(|| {
+                attachment
+                    .file_name
+                    .as_deref()
+                    .and_then(extension_mime_hint)
+                    .map(kind_for_mime)
+            })
+            .unwrap_or(MediaKind::Document)
+    })
+}
+
 fn animation_media_hint(
     mime_type_hint: Option<&str>,
     file_name_hint: Option<&str>,

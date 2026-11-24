@@ -14,12 +14,14 @@ use teloxide::types::{
 
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
-use crate::handlers::content::{
-    create_telegraph_page, extract_telegraph_urls_and_content, extract_twitter_urls_and_content,
+use crate::handlers::content::{create_telegraph_page, extract_twitter_urls_and_content};
+use crate::handlers::enrichment::generation_telegraph_context;
+use crate::handlers::media::{
+    get_file_url, message_has_image, rich_media_kind, MediaCollectionOptions,
 };
-use crate::handlers::media::{get_file_url, message_has_image};
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::gemini::ImageGenerationError;
+use crate::llm::media::MediaKind;
 use crate::llm::{
     audit_context_from_id, generate_image_with_codex, generate_image_with_gemini,
     generate_image_with_img2, CodexImageConfig, GeminiImageConfig, LlmAuditContext,
@@ -27,8 +29,10 @@ use crate::llm::{
 use crate::state::{
     AppState, ImageGenerationModel, ImageSelectionStage, PendingImageCommand, PendingImageRequest,
 };
+use crate::utils::telegram::rich_message::RichUpdate;
 use crate::utils::telegram::{
-    message_entities_for_text, start_chat_action_heartbeat, strip_command_prefix,
+    message_entities_for_text, message_text_or_caption, start_chat_action_heartbeat,
+    strip_command_prefix,
 };
 use crate::utils::text::{escape_html, truncate_with_ellipsis};
 use tracing::{info, warn};
@@ -45,7 +49,7 @@ const IMAGE_CAPTION_PROMPT_PREVIEW: usize = 900;
 struct ImageRequestContext {
     prompt: String,
     image_urls: Vec<String>,
-    telegraph_contents: Vec<String>,
+    link_context: String,
 }
 
 pub(super) async fn build_image_caption(model_name: &str, prompt: &str) -> String {
@@ -94,17 +98,13 @@ async fn prepare_image_request(
     state: &AppState,
     message: &Message,
     command_prefix: &str,
+    rich: &RichUpdate,
 ) -> Result<ImageRequestContext> {
-    let original_message_text = message
-        .text()
-        .map(|value| value.to_string())
-        .or_else(|| message.caption().map(|value| value.to_string()))
-        .unwrap_or_default();
-
-    let prompt_raw = strip_command_prefix(&original_message_text, command_prefix);
+    let _permit = state.acquire_heavy_command_permit().await;
+    let original_message_text = message_text_or_caption(message).unwrap_or_default();
+    let prompt_raw = strip_command_prefix(original_message_text, command_prefix);
     let mut image_urls = Vec::new();
     let mut seen_file_ids: HashSet<FileId> = HashSet::new();
-    let mut telegraph_texts = Vec::new();
     let prompt_entities = message_entities_for_text(message);
 
     if let Some(media_group_id) = message.media_group_id() {
@@ -128,20 +128,12 @@ async fn prepare_image_request(
         }
     }
 
-    let (prompt, telegraph_contents) =
-        extract_telegraph_urls_and_content(&prompt_raw, prompt_entities.as_deref(), 5).await;
     let (mut prompt, twitter_contents) =
-        extract_twitter_urls_and_content(&prompt, prompt_entities.as_deref(), 5).await;
-    telegraph_texts.extend(
-        telegraph_contents
-            .iter()
-            .map(|content| content.text_content.clone()),
-    );
-    telegraph_texts.extend(
-        twitter_contents
-            .iter()
-            .map(|content| content.text_content.clone()),
-    );
+        extract_twitter_urls_and_content(&prompt_raw, prompt_entities.as_deref(), 5).await;
+    let mut twitter_texts: Vec<String> = twitter_contents
+        .into_iter()
+        .map(|content| content.text_content)
+        .collect();
 
     if let Some(reply) = message.reply_to_message() {
         let reply_has_images = message_has_image(reply);
@@ -168,26 +160,31 @@ async fn prepare_image_request(
             }
         }
 
-        let reply_text = reply
-            .text()
-            .map(|value| value.to_string())
-            .or_else(|| reply.caption().map(|value| value.to_string()))
-            .unwrap_or_default();
-        if !reply_text.trim().is_empty() && !reply_has_images {
+        if let Some(attachments) = &rich.reply {
+            let remaining = MediaCollectionOptions::for_commands()
+                .max_files
+                .saturating_sub(image_urls.len());
+            let images = attachments
+                .iter()
+                .filter(|attachment| rich_media_kind(attachment) == MediaKind::Image)
+                .filter(|attachment| seen_file_ids.insert(attachment.file_id.clone()))
+                .take(remaining);
+            for image in images {
+                if let Ok(url) = get_file_url(bot, &image.file_id).await {
+                    image_urls.push(url);
+                }
+            }
+        }
+
+        let reply_text = message_text_or_caption(reply).unwrap_or_default();
+        if !reply_text.trim().is_empty() && (!reply_has_images || rich.reply.is_some()) {
             let reply_entities = message_entities_for_text(reply);
-            let (reply_text, reply_telegraph) =
-                extract_telegraph_urls_and_content(&reply_text, reply_entities.as_deref(), 5).await;
             let (reply_text, reply_twitter) =
-                extract_twitter_urls_and_content(&reply_text, reply_entities.as_deref(), 5).await;
-            telegraph_texts.extend(
-                reply_telegraph
-                    .iter()
-                    .map(|content| content.text_content.clone()),
-            );
-            telegraph_texts.extend(
+                extract_twitter_urls_and_content(reply_text, reply_entities.as_deref(), 5).await;
+            twitter_texts.extend(
                 reply_twitter
-                    .iter()
-                    .map(|content| content.text_content.clone()),
+                    .into_iter()
+                    .map(|content| content.text_content),
             );
 
             if prompt.trim().is_empty() {
@@ -198,10 +195,24 @@ async fn prepare_image_request(
         }
     }
 
+    let mut link_context = String::new();
+    if !twitter_texts.is_empty() {
+        link_context.push_str("\n\nAdditional context:\n");
+        for text in twitter_texts {
+            link_context.push_str(&text);
+            link_context.push('\n');
+        }
+    }
+    let telegraph_context = generation_telegraph_context(message).await;
+    if !telegraph_context.is_empty() {
+        link_context.push_str("\n\n");
+        link_context.push_str(&telegraph_context);
+    }
+
     Ok(ImageRequestContext {
         prompt,
         image_urls,
-        telegraph_contents: telegraph_texts,
+        link_context,
     })
 }
 
@@ -399,14 +410,7 @@ async fn finalize_image_request(
         selected_model
     };
 
-    let mut prompt = request.prompt.clone();
-    if !request.telegraph_contents.is_empty() {
-        prompt.push_str("\n\nAdditional context:\n");
-        for content in &request.telegraph_contents {
-            prompt.push_str(content);
-            prompt.push('\n');
-        }
-    }
+    let prompt = format!("{}{}", request.prompt, request.link_context);
 
     let processing_message_id = MessageId(request.selection_message_id as i32);
     crate::utils::telegram::run_with_status_message(
@@ -502,7 +506,7 @@ async fn finalize_image_request(
                 Ok(images) => images,
                 Err(err) => return Err(anyhow::anyhow!(err.0)),
             };
-            let caption = build_image_caption(&model_name, &prompt).await;
+            let caption = build_image_caption(&model_name, &request.prompt).await;
 
             super::image_delivery::deliver_generated_images(
                 bot,
@@ -676,6 +680,7 @@ pub async fn img_handler(
     state: AppState,
     message: Message,
     _prompt: Option<String>,
+    rich: RichUpdate,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, "img").await {
         return Ok(());
@@ -695,8 +700,11 @@ pub async fn img_handler(
         return Ok(());
     }
 
-    let context = prepare_image_request(&bot, &state, &message, "/img").await?;
-    if context.prompt.trim().is_empty() && context.image_urls.is_empty() {
+    let context = prepare_image_request(&bot, &state, &message, "/img", &rich).await?;
+    if context.prompt.trim().is_empty()
+        && context.image_urls.is_empty()
+        && context.link_context.is_empty()
+    {
         bot.send_message(
             message.chat.id,
             "Please provide a prompt or reply to an image.",
@@ -753,7 +761,7 @@ pub async fn img_handler(
             command: PendingImageCommand::Img,
             prompt: context.prompt,
             image_urls: context.image_urls,
-            telegraph_contents: context.telegraph_contents,
+            link_context: context.link_context,
             selection_message_id: selection_message.id.0 as i64,
             llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
             model: None,
@@ -791,14 +799,7 @@ pub async fn img_handler(
         "Failed to generate your image. Please try again.",
         async {
             let _heavy_permit = _heavy_permit;
-            let mut prompt_text = context.prompt.clone();
-            if !context.telegraph_contents.is_empty() {
-                prompt_text.push_str("\n\nAdditional context:\n");
-                for content in &context.telegraph_contents {
-                    prompt_text.push_str(content);
-                    prompt_text.push('\n');
-                }
-            }
+            let prompt_text = format!("{}{}", context.prompt, context.link_context);
             let _chat_action =
                 start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
 
@@ -817,7 +818,7 @@ pub async fn img_handler(
                 Err(err) => return Err(anyhow::anyhow!(err.0)),
             };
 
-            let caption = build_image_caption(&model_name, &prompt_text).await;
+            let caption = build_image_caption(&model_name, &context.prompt).await;
             super::image_delivery::deliver_generated_images(
                 &bot,
                 message.chat.id,
@@ -840,6 +841,7 @@ pub async fn img2_handler(
     state: AppState,
     message: Message,
     _prompt: Option<String>,
+    rich: RichUpdate,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, "img2").await {
         return Ok(());
@@ -869,8 +871,8 @@ pub async fn img2_handler(
         return Ok(());
     }
 
-    let context = prepare_image_request(&bot, &state, &message, "/img2").await?;
-    if context.prompt.trim().is_empty() {
+    let context = prepare_image_request(&bot, &state, &message, "/img2", &rich).await?;
+    if context.prompt.trim().is_empty() && context.link_context.is_empty() {
         bot.send_message(message.chat.id, "Please provide a prompt for /img2.")
             .reply_parameters(ReplyParameters::new(message.id))
             .await?;
@@ -891,14 +893,7 @@ pub async fn img2_handler(
         "Failed to generate your image. Please try again.",
         async {
             let _heavy_permit = _heavy_permit;
-            let mut prompt_text = context.prompt.clone();
-            if !context.telegraph_contents.is_empty() {
-                prompt_text.push_str("\n\nAdditional context:\n");
-                for content in &context.telegraph_contents {
-                    prompt_text.push_str(content);
-                    prompt_text.push('\n');
-                }
-            }
+            let prompt_text = format!("{}{}", context.prompt, context.link_context);
 
             let _chat_action =
                 start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadPhoto);
@@ -922,7 +917,7 @@ pub async fn img2_handler(
         result.content_type,
         result.path.display()
     );
-            let caption = build_image_caption("img2", &prompt_text).await;
+            let caption = build_image_caption("img2", &context.prompt).await;
             super::image_delivery::deliver_generated_images(
                 &bot,
                 message.chat.id,
@@ -945,6 +940,7 @@ pub async fn image_handler(
     state: AppState,
     message: Message,
     _prompt: Option<String>,
+    rich: RichUpdate,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, "image").await {
         return Ok(());
@@ -965,8 +961,11 @@ pub async fn image_handler(
         return Ok(());
     }
 
-    let context = prepare_image_request(&bot, &state, &message, "/image").await?;
-    if context.prompt.trim().is_empty() && context.image_urls.is_empty() {
+    let context = prepare_image_request(&bot, &state, &message, "/image", &rich).await?;
+    if context.prompt.trim().is_empty()
+        && context.image_urls.is_empty()
+        && context.link_context.is_empty()
+    {
         bot.send_message(
             message.chat.id,
             "Please provide a prompt or reply to an image.",
@@ -1041,7 +1040,7 @@ pub async fn image_handler(
         command: PendingImageCommand::Image,
         prompt: context.prompt,
         image_urls: context.image_urls,
-        telegraph_contents: context.telegraph_contents,
+        link_context: context.link_context,
         selection_message_id: selection_message.id.0 as i64,
         llm_invocation_id: audit_context.as_ref().map(|context| context.invocation_id),
         stage: match initial_model {
@@ -1075,6 +1074,56 @@ pub async fn image_handler(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn image_commands_keep_rich_reply_text_and_reference_photo() {
+        use crate::db::test_support::init_test_db;
+        use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
+        use serde_json::json;
+
+        let server = TestServer::new(vec![ExpectedRequest::new(
+            "POST",
+            "/bot123:test/GetFile",
+            response_with_status(
+                200,
+                br#"{"ok":true,"result":{"file_id":"rich-img-reference","file_unique_id":"ref","file_size":3,"file_path":"photos/ref.jpg"}}"#.to_vec(),
+            ),
+        )]);
+        let bot = Bot::new("123:test").set_api_url(server.base_url());
+        let state = AppState::new(init_test_db("rich-image-reply").await, 1, "bot".to_string());
+        let mut update = json!({"message": {
+            "message_id": 2, "date": 1, "chat": {"id": 1, "type": "private"},
+            "reply_to_message": {
+                "message_id": 1, "date": 1, "chat": {"id": 1, "type": "private"},
+                "rich_message": {"blocks": [
+                    {"type": "heading", "text": "A white owl"},
+                    {"type": "photo", "photo": [
+                        {"file_id": "rich-img-thumb", "width": 1, "height": 1},
+                        {"file_id": "rich-img-reference", "width": 3, "height": 3}
+                    ]},
+                    {"type": "audio", "audio": {"file_id": "rich-img-audio"}}
+                ]}
+            }
+        }});
+        let rich = RichUpdate::from_update(&mut update);
+        for (prefix, text, expected) in [
+            ("/img", "/img", "A white owl"),
+            ("/img2", "/img2 paint it", "A white owl\n\npaint it"),
+        ] {
+            update["message"]["text"] = json!(text);
+            let message: Message = serde_json::from_value(update["message"].clone()).unwrap();
+            let context = prepare_image_request(&bot, &state, &message, prefix, &rich)
+                .await
+                .unwrap();
+            assert_eq!(context.prompt, expected);
+            assert_eq!(
+                context.image_urls,
+                [server.url("/file/bot123:test/photos/ref.jpg").to_string()]
+            );
+        }
+        server.join().unwrap();
+        state.db.shutdown().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn picker_validation_checks_owner_message_stage_and_expiry() {
         for stage in [
@@ -1093,7 +1142,7 @@ mod tests {
                 command: PendingImageCommand::Image,
                 prompt: String::new(),
                 image_urls: vec![],
-                telegraph_contents: vec![],
+                link_context: String::new(),
                 selection_message_id: 4,
                 llm_invocation_id: None,
                 model: None,
@@ -1262,7 +1311,7 @@ mod tests {
             command: PendingImageCommand::Image,
             prompt: "test".to_string(),
             image_urls: Vec::new(),
-            telegraph_contents: Vec::new(),
+            link_context: String::new(),
             selection_message_id: 4,
             llm_invocation_id: None,
             model: Some(ImageGenerationModel::Gemini),
@@ -1291,7 +1340,7 @@ mod tests {
             command: PendingImageCommand::Image,
             prompt: "test".to_string(),
             image_urls: Vec::new(),
-            telegraph_contents: Vec::new(),
+            link_context: String::new(),
             selection_message_id: 4,
             llm_invocation_id: None,
             model: Some(ImageGenerationModel::Gemini),

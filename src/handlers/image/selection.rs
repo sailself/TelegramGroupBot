@@ -532,7 +532,7 @@ mod tests {
             command: PendingImageCommand::Image,
             prompt: "prompt".into(),
             image_urls: vec![],
-            telegraph_contents: vec![],
+            link_context: String::new(),
             selection_message_id: 4,
             llm_invocation_id: None,
             model: Some(ImageGenerationModel::Gemini),

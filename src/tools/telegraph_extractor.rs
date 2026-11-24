@@ -6,6 +6,8 @@ use tracing::info;
 
 use crate::utils::http::get_http_client;
 
+pub(crate) const TELEGRAPH_HOSTS: &[&str] = &["telegra.ph", "graph.org"];
+
 #[derive(Debug, Deserialize)]
 struct TelegraphResponse {
     ok: bool,
@@ -27,11 +29,8 @@ pub struct TelegraphContent {
 
 pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
     info!("Starting Telegraph extraction for url: {}", url);
-    let parsed = crate::utils::http::parse_https_allowlisted(
-        "Telegraph",
-        url,
-        Some(&["telegra.ph", "graph.org"]),
-    )?;
+    let parsed =
+        crate::utils::http::parse_https_allowlisted("Telegraph", url, Some(TELEGRAPH_HOSTS))?;
     let path = parsed.path().trim_start_matches('/');
     if path.is_empty() {
         return Err(anyhow!("Invalid Telegraph URL: Missing path component"));
