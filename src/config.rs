@@ -245,7 +245,6 @@ pub struct Vid2Config {
     pub api_key: String,
     pub width: u32,
     pub height: u32,
-    pub seconds: u64,
     pub request_timeout_secs: u64,
     pub generation_timeout_secs: u64,
     pub poll_interval_secs: u64,
@@ -992,7 +991,6 @@ fn load_vid2() -> Result<Vid2Config> {
         api_key: env_string("VID2_API_KEY", ""),
         width: env_positive_u32("VID2_WIDTH", 1344),
         height: env_positive_u32("VID2_HEIGHT", 768),
-        seconds: env_positive_u64("VID2_SECONDS", 5),
         request_timeout_secs: env_positive_u64("VID2_REQUEST_TIMEOUT_SECS", 120),
         generation_timeout_secs: env_positive_u64("VID2_GENERATION_TIMEOUT_SECS", 1800),
         poll_interval_secs: env_positive_u64("VID2_POLL_INTERVAL_SECS", 5),
@@ -1730,7 +1728,6 @@ mod tests {
             set_env_var_for_test("VID2_API_KEY", ""),
             set_env_var_for_test("VID2_WIDTH", ""),
             set_env_var_for_test("VID2_HEIGHT", ""),
-            set_env_var_for_test("VID2_SECONDS", ""),
             set_env_var_for_test("VID2_REQUEST_TIMEOUT_SECS", ""),
             set_env_var_for_test("VID2_GENERATION_TIMEOUT_SECS", ""),
             set_env_var_for_test("VID2_POLL_INTERVAL_SECS", ""),
@@ -1742,7 +1739,6 @@ mod tests {
         assert!(config.api_key.is_empty());
         assert_eq!(config.width, 1344);
         assert_eq!(config.height, 768);
-        assert_eq!(config.seconds, 5);
         assert_eq!(config.request_timeout_secs, 120);
         assert_eq!(config.generation_timeout_secs, 1800);
         assert_eq!(config.poll_interval_secs, 5);
@@ -1801,7 +1797,6 @@ mod tests {
             set_env_var_for_test("VID2_BASE_URL", ""),
             set_env_var_for_test("VID2_WIDTH", "0"),
             set_env_var_for_test("VID2_HEIGHT", "4294967296"),
-            set_env_var_for_test("VID2_SECONDS", "0"),
             set_env_var_for_test("VID2_REQUEST_TIMEOUT_SECS", "slow"),
             set_env_var_for_test("VID2_GENERATION_TIMEOUT_SECS", "0"),
             set_env_var_for_test("VID2_POLL_INTERVAL_SECS", "-1"),
@@ -1810,12 +1805,11 @@ mod tests {
             let config = load_vid2().expect("invalid numeric settings use safe defaults");
             assert_eq!(config.width, 1344);
             assert_eq!(config.height, 768);
-            assert_eq!(config.seconds, 5);
             assert_eq!(config.request_timeout_secs, 120);
             assert_eq!(config.generation_timeout_secs, 1800);
             assert_eq!(config.poll_interval_secs, 5);
         });
-        assert_eq!(events.len(), 6, "{events:?}");
+        assert_eq!(events.len(), 5, "{events:?}");
         let names = events
             .iter()
             .map(|event| event["fields"]["env"].as_str().unwrap())
@@ -1825,7 +1819,6 @@ mod tests {
             [
                 "VID2_WIDTH",
                 "VID2_HEIGHT",
-                "VID2_SECONDS",
                 "VID2_REQUEST_TIMEOUT_SECS",
                 "VID2_GENERATION_TIMEOUT_SECS",
                 "VID2_POLL_INTERVAL_SECS",

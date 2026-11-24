@@ -538,19 +538,34 @@ pub(crate) fn message_has_image(message: &Message) -> bool {
     false
 }
 
-pub async fn handle_media_group(state: AppState, message: Message) {
-    if let Some(media_group_id) = message.media_group_id() {
-        if let Some(photo_sizes) = message.photo() {
-            if let Some(photo) = photo_sizes.last() {
-                state.store_media_group_item(
-                    media_group_id,
-                    MediaGroupItem {
-                        file_id: photo.file.id.clone(),
-                    },
-                );
-            }
-        }
-    }
+pub(crate) fn is_vid2_image_document(document: &teloxide::types::Document) -> bool {
+    let mime = document.mime_type.as_ref().map(|mime| mime.essence_str());
+    matches!(mime, Some("image/jpeg" | "image/png" | "image/webp"))
+        || matches!(
+            extension_mime_hint(document.file_name.as_deref().unwrap_or("")),
+            Some("image/jpeg" | "image/png" | "image/webp")
+        )
+}
+
+pub fn handle_media_group(state: &AppState, message: &Message) {
+    let Some(media_group_id) = message.media_group_id() else {
+        return;
+    };
+    let (file, is_document) = if let Some(photo) = message.photo().and_then(|sizes| sizes.last()) {
+        (&photo.file, false)
+    } else if let Some(document) = message.document().filter(|doc| is_vid2_image_document(doc)) {
+        (&document.file, true)
+    } else {
+        return;
+    };
+    state.store_media_group_item(
+        media_group_id,
+        MediaGroupItem {
+            message_id: message.id,
+            file_id: file.id.clone(),
+            is_document,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -654,7 +669,9 @@ mod tests {
             state.store_media_group_item(
                 &group_id,
                 MediaGroupItem {
+                    message_id: teloxide::types::MessageId(41),
                     file_id: FileId(id.into()),
+                    is_document: false,
                 },
             );
         }

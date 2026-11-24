@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, MutexGuard};
-use teloxide::types::{FileId, MediaGroupId};
+use teloxide::types::{FileId, MediaGroupId, MessageId};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 
@@ -13,6 +13,7 @@ use crate::config::CONFIG;
 use crate::db::database::Database;
 use crate::handlers::agent_model_picker::PendingAgentModelRequest;
 use crate::handlers::enrichment::Enrichment;
+use crate::handlers::video::selection::Vid2MenuCallbacks;
 use crate::llm::openai_codex::{CodexReasoningEffortOption, CodexRemoteModel};
 use crate::utils::timing::CommandTimer;
 
@@ -361,7 +362,9 @@ impl<T> PendingEntryGuard<'_, T> {
 
 #[derive(Debug, Clone)]
 pub struct MediaGroupItem {
+    pub message_id: MessageId,
     pub file_id: FileId,
+    pub is_document: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -378,6 +381,7 @@ pub struct AppState {
     pub pending_q_requests: PendingRequests<PendingQRequest>,
     pub pending_image_requests: PendingRequests<PendingImageRequest>,
     pub pending_agent_model_requests: PendingRequests<PendingAgentModelRequest>,
+    pub pending_vid2_menus: PendingRequests<Vid2MenuCallbacks>,
     pub pending_codex_model_requests: PendingRequests<PendingCodexModelRequest>,
     pub pending_codex_reasoning_requests: PendingRequests<PendingCodexReasoningRequest>,
     pub active_codex_login: Arc<Mutex<Option<ActiveCodexLogin>>>,
@@ -396,6 +400,7 @@ impl AppState {
             pending_q_requests: PendingRequests::new(),
             pending_image_requests: PendingRequests::new(),
             pending_agent_model_requests: PendingRequests::new(),
+            pending_vid2_menus: PendingRequests::new(),
             pending_codex_model_requests: PendingRequests::new(),
             pending_codex_reasoning_requests: PendingRequests::new(),
             active_codex_login: Arc::new(Mutex::new(None)),
@@ -459,13 +464,26 @@ impl AppState {
     }
 
     pub fn media_group_items(&self, media_group_id: &MediaGroupId) -> Vec<MediaGroupItem> {
+        self.album_images(media_group_id, false)
+    }
+
+    pub fn album_images(
+        &self,
+        media_group_id: &MediaGroupId,
+        include_documents: bool,
+    ) -> Vec<MediaGroupItem> {
         let mut groups = self.media_groups.lock();
         prune_media_groups(&mut groups);
         groups
             .get_mut(media_group_id)
             .map(|group| {
                 group.last_updated = Instant::now();
-                group.items.clone()
+                group
+                    .items
+                    .iter()
+                    .filter(|item| include_documents || !item.is_document)
+                    .cloned()
+                    .collect()
             })
             .unwrap_or_default()
     }
