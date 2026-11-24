@@ -500,6 +500,13 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
         );
         return Ok(());
     }
+    if data.starts_with(handlers::video::selection::VID2_CALLBACK_PREFIX) {
+        spawn_logged(
+            "vid2 selection callback",
+            handlers::video::selection::handle_callback(bot, state, query),
+        );
+        return Ok(());
+    }
     if data.starts_with(CODEX_MODEL_SELECT_CALLBACK_PREFIX)
         || data.starts_with(CODEX_MODEL_PAGE_CALLBACK_PREFIX)
         || data.starts_with(CODEX_REASONING_SELECT_CALLBACK_PREFIX)
@@ -520,8 +527,8 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
 }
 
 async fn handle_media_group(state: AppState, message: Message) -> HandlerResult {
+    media::handle_media_group(&state, &message);
     handlers::responses::log_message(&state, &message).await;
-    media::handle_media_group(state, message).await;
     Ok(())
 }
 

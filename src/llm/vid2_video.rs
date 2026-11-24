@@ -25,6 +25,9 @@ const PROVIDER: &str = "vid2";
 const JSON_MAX_BYTES: usize = 64 * 1024;
 const VIDEO_MAX_BYTES: usize = 50_000_000;
 const SOURCE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const REF_IMAGE_MAX_BYTES: usize = 10_000_000;
+pub(crate) const MAX_REF_IMAGES: usize = 9;
+const MAX_REF_PROMPT_CHARS: usize = 2000;
 const REJECTION_REASON_MAX_CHARS: usize = 512;
 const VIDEO_DIMENSION_STEP: u32 = 32;
 const VIDEO_MIN_EDGE: u32 = 256;
@@ -49,8 +52,87 @@ pub enum Vid2Phase {
     Downloading,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Vid2Mode {
+    #[default]
+    FirstFrame,
+    Ref2Va,
+}
+
+impl Vid2Mode {
+    fn route(self) -> &'static str {
+        match self {
+            Self::FirstFrame => "videos",
+            Self::Ref2Va => "ref2va",
+        }
+    }
+
+    fn image_field(self) -> &'static str {
+        match self {
+            Self::FirstFrame => "first_frame",
+            Self::Ref2Va => "ref_images",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Vid2Quality {
+    #[default]
+    Fast,
+    High,
+}
+
+impl Vid2Quality {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Vid2LoraStrength {
+    Half,
+    #[default]
+    One,
+    OneAndHalf,
+    Two,
+}
+
+impl Vid2LoraStrength {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Half => "0.5",
+            Self::One => "1.0",
+            Self::OneAndHalf => "1.5",
+            Self::Two => "2.0",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vid2Options {
+    pub mode: Vid2Mode,
+    pub lora: Option<Vid2LoraStrength>,
+    pub quality: Vid2Quality,
+    pub seconds: u8,
+}
+
+impl Default for Vid2Options {
+    fn default() -> Self {
+        Self {
+            mode: Vid2Mode::FirstFrame,
+            lora: None,
+            quality: Vid2Quality::Fast,
+            seconds: 5,
+        }
+    }
+}
+
 pub struct Vid2GenerationRequest<'a> {
     pub prompt: &'a str,
+    pub options: Vid2Options,
     pub chat_id: i64,
     pub message_id: i64,
 }
@@ -177,7 +259,15 @@ fn structured_rejection_reason(value: &Value) -> Option<String> {
                 .filter(|field| {
                     matches!(
                         *field,
-                        "width" | "height" | "seconds" | "prompt" | "first_frame"
+                        "width"
+                            | "height"
+                            | "seconds"
+                            | "prompt"
+                            | "first_frame"
+                            | "ref_images"
+                            | "quality"
+                            | "lora"
+                            | "lora_strength"
                     )
                 });
             Some(field.map_or(reason.clone(), |field| format!("{field}: {reason}")))
@@ -247,12 +337,17 @@ fn transport_error(error: ProviderError, phase: &str) -> Vid2Error {
     generation_error(detail)
 }
 
-fn endpoint(base: &str, job_id: Option<&str>, file: bool) -> Result<Url, Vid2Error> {
+fn endpoint(
+    base: &str,
+    mode: Vid2Mode,
+    job_id: Option<&str>,
+    file: bool,
+) -> Result<Url, Vid2Error> {
     let mut url = Url::parse(base).map_err(|_| generation_error("invalid base URL"))?;
     let mut segments = url
         .path_segments_mut()
         .map_err(|_| generation_error("invalid base URL path"))?;
-    segments.pop_if_empty().extend(["v1", "videos"]);
+    segments.pop_if_empty().extend(["v1", mode.route()]);
     if let Some(job_id) = job_id {
         // URL's path-segment API deliberately ignores literal dot segments.
         if job_id.trim().is_empty()
@@ -275,21 +370,37 @@ fn endpoint(base: &str, job_id: Option<&str>, file: bool) -> Result<Url, Vid2Err
 
 fn build_form(
     prompt: &str,
-    seconds: u64,
+    options: Vid2Options,
     resolution: VideoResolution,
-    source: Option<Vid2SourceImage>,
+    sources: Vec<Vid2SourceImage>,
 ) -> Result<Form, Vid2Error> {
     let mut form = Form::new()
         .text("prompt", prompt.to_string())
-        .text("seconds", seconds.to_string())
+        .text("seconds", options.seconds.to_string())
         .text("width", resolution.width.to_string())
-        .text("height", resolution.height.to_string());
-    if let Some(source) = source {
+        .text("height", resolution.height.to_string())
+        .text("quality", options.quality.as_str())
+        .text(
+            "lora",
+            if options.lora.is_some() {
+                "hmnsfw"
+            } else {
+                "none"
+            },
+        );
+    if let Some(strength) = options.lora {
+        form = form.text("lora_strength", strength.as_str());
+    }
+    for source in sources {
+        let filename = match options.mode {
+            Vid2Mode::FirstFrame => source.file_name.to_string(),
+            Vid2Mode::Ref2Va => source.file_name.replace("first_frame", "reference"),
+        };
         let part = Part::bytes(source.bytes)
-            .file_name(source.file_name)
+            .file_name(filename)
             .mime_str(source.mime_type)
-            .map_err(|_| generation_error("could not prepare the first frame"))?;
-        form = form.part("first_frame", part);
+            .map_err(|_| generation_error("could not prepare an input image"))?;
+        form = form.part(options.mode.image_field(), part);
     }
     Ok(form)
 }
@@ -303,27 +414,29 @@ async fn read_json(response: reqwest::Response) -> Result<Value, ProviderError> 
 async fn submit(
     settings: &Vid2Config,
     prompt: &str,
+    options: Vid2Options,
     resolution: VideoResolution,
-    source: Option<Vid2SourceImage>,
+    sources: Vec<Vid2SourceImage>,
 ) -> Result<String, Vid2Error> {
-    let url = endpoint(&settings.base_url, None, false)?;
-    let source_image = source.is_some();
-    let source_mime = source.as_ref().map(|image| image.mime_type);
-    let source_bytes = source.as_ref().map(|image| image.bytes.len());
-    let source_width = source.as_ref().map(|image| image.resolution.width);
-    let source_height = source.as_ref().map(|image| image.resolution.height);
+    let url = endpoint(&settings.base_url, options.mode, None, false)?;
+    let source_count = sources.len();
+    let source_bytes: usize = sources.iter().map(|image| image.bytes.len()).sum();
+    let source_mime = sources.first().map(|image| image.mime_type);
+    let source_width = sources.first().map(|image| image.resolution.width);
+    let source_height = sources.first().map(|image| image.resolution.height);
     info!(
-        source_image,
-        source_mime,
+        mode = options.mode.route(),
+        source_count,
         source_bytes,
+        source_mime,
         source_width,
         source_height,
         target_width = resolution.width,
         target_height = resolution.height,
-        seconds = settings.seconds,
+        seconds = options.seconds,
         "Submitting Vid2 video"
     );
-    let form = build_form(prompt, settings.seconds, resolution, source)?;
+    let form = build_form(prompt, options, resolution, sources)?;
     // Send exactly once. The API has no idempotency key, so even a lost
     // response must never trigger a second submission or fallback request.
     let response = get_http_client_no_redirect()
@@ -347,14 +460,15 @@ async fn submit(
         error!(
             status = status.as_u16(),
             reason,
-            source_image,
-            source_mime,
+            mode = options.mode.route(),
+            source_count,
             source_bytes,
+            source_mime,
             source_width,
             source_height,
             target_width = resolution.width,
             target_height = resolution.height,
-            seconds = settings.seconds,
+            seconds = options.seconds,
             "Vid2 submission rejected"
         );
         return Err(generation_error(format!("submission: HTTP {status}")));
@@ -367,7 +481,7 @@ async fn submit(
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| generation_error("submission returned no job ID"))?;
-    endpoint(&settings.base_url, Some(id), false)?;
+    endpoint(&settings.base_url, options.mode, Some(id), false)?;
     Ok(id.to_string())
 }
 
@@ -510,8 +624,13 @@ async fn save_video(
 pub async fn download_source_image(
     url: &str,
     timeout_secs: u64,
+    mode: Vid2Mode,
 ) -> Result<Vid2SourceImage, Vid2Error> {
-    let call = LlmCall::untracked(PROVIDER, "first frame").with_redaction(omit_transport_detail);
+    let (phase, limit) = match mode {
+        Vid2Mode::FirstFrame => ("first frame download", SOURCE_MAX_BYTES),
+        Vid2Mode::Ref2Va => ("reference image download", REF_IMAGE_MAX_BYTES),
+    };
+    let call = LlmCall::untracked(PROVIDER, phase).with_redaction(omit_transport_detail);
     let bytes = call_with_retry(
         &call,
         &GET_POLICY,
@@ -521,25 +640,25 @@ pub async fn download_source_image(
                 .timeout(Duration::from_secs(timeout_secs)))
         },
         |_| {},
-        |response| read_body_limited(response, PROVIDER, SOURCE_MAX_BYTES),
+        |response| read_body_limited(response, PROVIDER, limit),
         |_| LlmUsageRecord::default(),
     )
     .await
-    .map_err(|error| transport_error(error, "first frame download"))?;
+    .map_err(|error| transport_error(error, phase))?;
     tokio::task::spawn_blocking(move || validate_source_image(bytes))
         .await
-        .map_err(|_| generation_error("first frame validation failed"))?
+        .map_err(|_| generation_error("input image validation failed"))?
 }
 
 fn validate_source_image(bytes: Vec<u8>) -> Result<Vid2SourceImage, Vid2Error> {
     let mut reader = image::ImageReader::new(Cursor::new(&bytes))
         .with_guessed_format()
-        .map_err(|_| generation_error("invalid first frame"))?;
+        .map_err(|_| generation_error("invalid input image"))?;
     let (mime_type, file_name) = match reader.format() {
         Some(image::ImageFormat::Jpeg) => ("image/jpeg", "first_frame.jpg"),
         Some(image::ImageFormat::Png) => ("image/png", "first_frame.png"),
         Some(image::ImageFormat::WebP) => ("image/webp", "first_frame.webp"),
-        _ => return Err(generation_error("first frame must be JPEG, PNG, or WebP")),
+        _ => return Err(generation_error("input images must be JPEG, PNG, or WebP")),
     };
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8192);
@@ -548,7 +667,7 @@ fn validate_source_image(bytes: Vec<u8>) -> Result<Vid2SourceImage, Vid2Error> {
     reader.limits(limits);
     let decoded = reader
         .decode()
-        .map_err(|_| generation_error("first frame is invalid or too large"))?;
+        .map_err(|_| generation_error("input image is invalid or too large"))?;
     Ok(Vid2SourceImage {
         bytes,
         mime_type,
@@ -564,17 +683,17 @@ fn validate_source_image(bytes: Vec<u8>) -> Result<Vid2SourceImage, Vid2Error> {
 /// and download. Phase notifications must be synchronous and nonblocking.
 pub async fn generate_video_with_vid2(
     request: Vid2GenerationRequest<'_>,
-    load_source: impl Future<Output = Result<Option<Vid2SourceImage>, Vid2Error>>,
+    load_sources: impl Future<Output = Result<Vec<Vid2SourceImage>, Vid2Error>>,
     on_phase: impl FnMut(Vid2Phase),
     audit: Option<&LlmAuditContext>,
 ) -> Result<Vid2GeneratedVideo, Vid2Error> {
-    generate_with_settings(&CONFIG.vid2, request, load_source, on_phase, audit).await
+    generate_with_settings(&CONFIG.vid2, request, load_sources, on_phase, audit).await
 }
 
 async fn generate_with_settings(
     settings: &Vid2Config,
     request: Vid2GenerationRequest<'_>,
-    load_source: impl Future<Output = Result<Option<Vid2SourceImage>, Vid2Error>>,
+    load_sources: impl Future<Output = Result<Vec<Vid2SourceImage>, Vid2Error>>,
     mut on_phase: impl FnMut(Vid2Phase),
     audit: Option<&LlmAuditContext>,
 ) -> Result<Vid2GeneratedVideo, Vid2Error> {
@@ -585,32 +704,48 @@ async fn generate_with_settings(
     if prompt.is_empty() {
         return Err(generation_error("a prompt is required"));
     }
+    let options = request.options;
+    if options.mode == Vid2Mode::Ref2Va && prompt.chars().count() > MAX_REF_PROMPT_CHARS {
+        return Err(generation_error(
+            "the Ref2Va prompt must be at most 2000 characters",
+        ));
+    }
     let call = LlmCall::begin(
         PROVIDER,
         PROVIDER,
         "generate_video_with_vid2",
         audit,
         Some(
-            &json!({"seconds": settings.seconds, "default_width": settings.width, "default_height": settings.height, "timeout_secs": settings.generation_timeout_secs}),
+            &json!({"mode": options.mode.route(), "quality": options.quality.as_str(), "seconds": options.seconds, "default_width": settings.width, "default_height": settings.height, "timeout_secs": settings.generation_timeout_secs}),
         ),
     );
     let mut job_id = None;
     let mut target_resolution = None;
     let started = std::time::Instant::now();
     let work = async {
-        let source = load_source.await?;
-        let resolution = video_resolution(
-            VideoResolution {
-                width: settings.width,
-                height: settings.height,
-            },
-            source.as_ref().map(|image| image.resolution),
-        )?;
+        let sources = load_sources.await?;
+        let configured_resolution = VideoResolution {
+            width: settings.width,
+            height: settings.height,
+        };
+        let resolution = match (options.mode, sources.as_slice()) {
+            (Vid2Mode::FirstFrame, []) => video_resolution(configured_resolution, None)?,
+            (Vid2Mode::FirstFrame, [source]) => {
+                video_resolution(configured_resolution, Some(source.resolution))?
+            }
+            (Vid2Mode::FirstFrame, _) => {
+                return Err(generation_error("1st Frame accepts at most one image"))
+            }
+            (Vid2Mode::Ref2Va, sources) if (1..=MAX_REF_IMAGES).contains(&sources.len()) => {
+                configured_resolution
+            }
+            (Vid2Mode::Ref2Va, _) => return Err(generation_error("Ref2Va requires 1 to 9 images")),
+        };
         target_resolution = Some(resolution);
         on_phase(Vid2Phase::Submitting);
-        let id = submit(settings, prompt, resolution, source).await?;
+        let id = submit(settings, prompt, options, resolution, sources).await?;
         job_id = Some(id.clone());
-        let status_url = endpoint(&settings.base_url, Some(&id), false)?;
+        let status_url = endpoint(&settings.base_url, options.mode, Some(&id), false)?;
         let mut last_phase = None;
         loop {
             let status: Value = get(settings, status_url.clone(), "status", read_json).await?;
@@ -618,7 +753,15 @@ async fn generate_with_settings(
                 Some("queued") => Vid2Phase::Queued,
                 Some("running") => Vid2Phase::Running,
                 Some("success") => break,
-                Some("error") => return Err(generation_error("the server reported a failed job")),
+                Some("error") => {
+                    let reason = (options.mode == Vid2Mode::Ref2Va)
+                        .then(|| status.get("error").and_then(structured_rejection_reason))
+                        .flatten()
+                        .map(|reason| redact_rejection_reason(&reason, &settings.api_key, prompt));
+                    return Err(generation_error(
+                        reason.unwrap_or_else(|| "the server reported a failed job".to_string()),
+                    ));
+                }
                 _ => {
                     return Err(generation_error(
                         "the server returned an invalid job status",
@@ -634,7 +777,7 @@ async fn generate_with_settings(
         on_phase(Vid2Phase::Downloading);
         get(
             settings,
-            endpoint(&settings.base_url, Some(&id), true)?,
+            endpoint(&settings.base_url, options.mode, Some(&id), true)?,
             "video download",
             |response| async {
                 let bytes = read_body_limited(response, PROVIDER, VIDEO_MAX_BYTES).await?;
@@ -670,7 +813,7 @@ async fn generate_with_settings(
         Ok(video) => {
             call.succeed(LlmUsageRecord {
                 response_id: safe_id.clone(),
-                raw_usage_json: Some(json!({"job_id": safe_id, "seconds": settings.seconds, "width": target_resolution.map(|size| size.width), "height": target_resolution.map(|size| size.height), "bytes": video.byte_len}).to_string()),
+                raw_usage_json: Some(json!({"job_id": safe_id, "seconds": options.seconds, "width": target_resolution.map(|size| size.width), "height": target_resolution.map(|size| size.height), "bytes": video.byte_len}).to_string()),
                 ..LlmUsageRecord::default()
             }).await;
             info!(
@@ -708,7 +851,6 @@ mod tests {
             api_key: "synthetic-vid2-key".into(),
             width: 1344,
             height: 768,
-            seconds: 5,
             request_timeout_secs: 5,
             generation_timeout_secs: 5,
             poll_interval_secs: 0,
@@ -719,6 +861,7 @@ mod tests {
     fn request() -> Vid2GenerationRequest<'static> {
         Vid2GenerationRequest {
             prompt: "a fox in snow",
+            options: Vid2Options::default(),
             chat_id: -100123,
             message_id: 42,
         }
@@ -738,6 +881,8 @@ mod tests {
             .with_body_fragment(b"name=\"prompt\"")
             .with_body_fragment(b"a fox in snow")
             .with_body_fragment(b"name=\"seconds\"\r\n\r\n5")
+            .with_body_fragment(b"name=\"quality\"\r\n\r\nfast\r\n")
+            .with_body_fragment(b"name=\"lora\"\r\n\r\nnone\r\n")
             .with_body_fragment(format!("name=\"width\"\r\n\r\n{width}\r\n").as_bytes())
             .with_body_fragment(format!("name=\"height\"\r\n\r\n{height}\r\n").as_bytes())
     }
@@ -748,6 +893,69 @@ mod tests {
 
     fn png() -> Vec<u8> {
         png_at_resolution(1, 1)
+    }
+
+    #[tokio::test]
+    async fn ref2va_sends_ordered_images_and_options_then_downloads_from_the_same_route() {
+        let first = png_at_resolution(2, 3);
+        let second = png_at_resolution(4, 5);
+        let server = TestServer::new(vec![
+            expected(
+                "POST",
+                "/v1/ref2va/generate",
+                200,
+                br#"{"id":"ref-job","status":"queued"}"#,
+            )
+            .with_body_fragment(b"name=\"seconds\"\r\n\r\n15\r\n")
+            .with_body_fragment(b"name=\"quality\"\r\n\r\nhigh\r\n")
+            .with_body_fragment(b"name=\"lora\"\r\n\r\nhmnsfw\r\n")
+            .with_body_fragment(b"name=\"lora_strength\"\r\n\r\n1.5\r\n")
+            .with_response_from_body(|body| {
+                let field = b"name=\"ref_images\"";
+                let parts = body
+                    .windows(field.len())
+                    .enumerate()
+                    .filter(|(_, window)| *window == field)
+                    .map(|(offset, _)| offset)
+                    .collect::<Vec<_>>();
+                assert_eq!(parts.len(), 2);
+                let first = png_at_resolution(2, 3);
+                let second = png_at_resolution(4, 5);
+                assert!(body[parts[0]..parts[1]]
+                    .windows(first.len())
+                    .any(|bytes| bytes == first));
+                assert!(body[parts[1]..]
+                    .windows(second.len())
+                    .any(|bytes| bytes == second));
+                response_with_status(200, br#"{"id":"ref-job","status":"queued"}"#.to_vec())
+            }),
+            expected("GET", "/v1/ref2va/ref-job", 200, br#"{"status":"success"}"#),
+            expected("GET", "/v1/ref2va/ref-job/file", 200, &mp4()),
+        ]);
+        let mut request = request();
+        request.options = Vid2Options {
+            mode: Vid2Mode::Ref2Va,
+            lora: Some(Vid2LoraStrength::OneAndHalf),
+            quality: Vid2Quality::High,
+            seconds: 15,
+        };
+        let video = generate_with_settings(
+            &settings(&server),
+            request,
+            async {
+                Ok(vec![
+                    validate_source_image(first)?,
+                    validate_source_image(second)?,
+                ])
+            },
+            |_| {},
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokio::fs::read(&video.path).await.unwrap(), mp4());
+        tokio::fs::remove_file(video.path).await.unwrap();
+        server.join().unwrap();
     }
 
     fn png_at_resolution(width: u32, height: u32) -> Vec<u8> {
@@ -802,7 +1010,7 @@ mod tests {
             crate::utils::log_capture::capture_json_events_async(generate_with_settings(
                 &settings(&server),
                 request(),
-                async { Ok(Some(source)) },
+                async { Ok(vec![source]) },
                 |_| {},
                 None,
             ))
@@ -837,7 +1045,7 @@ mod tests {
         let video = generate_with_settings(
             &settings(&server),
             request(),
-            async { Ok(None) },
+            async { Ok(Vec::new()) },
             |phase| phases.push(phase),
             None,
         )
@@ -881,7 +1089,7 @@ mod tests {
         let video = generate_with_settings(
             &settings(&server),
             request(),
-            async { Ok(None) },
+            async { Ok(Vec::new()) },
             |_| {},
             None,
         )
@@ -908,7 +1116,7 @@ mod tests {
         let video = generate_with_settings(
             &settings(&server),
             request(),
-            async { Ok(Some(source)) },
+            async { Ok(vec![source]) },
             |_| {},
             None,
         )
@@ -938,7 +1146,7 @@ mod tests {
             let video = generate_with_settings(
                 &settings(&server),
                 request(),
-                async { Ok(Some(source)) },
+                async { Ok(vec![source]) },
                 |_| {},
                 None,
             )
@@ -959,9 +1167,10 @@ mod tests {
         let mut config = settings(&server);
         config.width = 768;
         config.height = 1280;
-        let video = generate_with_settings(&config, request(), async { Ok(None) }, |_| {}, None)
-            .await
-            .unwrap();
+        let video =
+            generate_with_settings(&config, request(), async { Ok(Vec::new()) }, |_| {}, None)
+                .await
+                .unwrap();
         tokio::fs::remove_file(video.path).await.unwrap();
         server.join().unwrap();
     }
@@ -1185,10 +1394,15 @@ mod tests {
             let source = image_size.map(|(width, height)| {
                 validate_source_image(png_at_resolution(width, height)).unwrap()
             });
-            let error =
-                generate_with_settings(&config, request(), async { Ok(source) }, |_| {}, None)
-                    .await
-                    .unwrap_err();
+            let error = generate_with_settings(
+                &config,
+                request(),
+                async { Ok(source.into_iter().collect()) },
+                |_| {},
+                None,
+            )
+            .await
+            .unwrap_err();
             if image_size.is_none() {
                 assert!(error.to_string().contains("VID2_WIDTH/VID2_HEIGHT"));
             }
@@ -1209,7 +1423,7 @@ mod tests {
                 crate::utils::log_capture::capture_json_events_async(generate_with_settings(
                     &settings(&server),
                     request(),
-                    async { Ok(None) },
+                    async { Ok(Vec::new()) },
                     |_| {},
                     None,
                 ))
@@ -1260,11 +1474,12 @@ mod tests {
             let (result, events) = crate::utils::log_capture::capture_json_events_async(submit(
                 &config,
                 PROMPT,
+                Vid2Options::default(),
                 VideoResolution {
                     width: 1280,
                     height: 800,
                 },
-                Some(source),
+                vec![source],
             ))
             .await;
             server.join().unwrap();
@@ -1337,11 +1552,12 @@ mod tests {
             let (result, events) = crate::utils::log_capture::capture_json_events_async(submit(
                 &config,
                 "private prompt",
+                Vid2Options::default(),
                 VideoResolution {
                     width: 1344,
                     height: 768,
                 },
-                None,
+                Vec::new(),
             ))
             .await;
             server.join().unwrap();
@@ -1366,11 +1582,12 @@ mod tests {
         let error = submit(
             &config,
             request().prompt,
+            Vid2Options::default(),
             VideoResolution {
                 width: 1344,
                 height: 768,
             },
-            None,
+            Vec::new(),
         )
         .await
         .unwrap_err();
@@ -1400,7 +1617,7 @@ mod tests {
         let video = generate_with_settings(
             &settings(&server),
             request(),
-            async { Ok(None) },
+            async { Ok(Vec::new()) },
             |_| {},
             None,
         )
@@ -1427,7 +1644,7 @@ mod tests {
             assert!(generate_with_settings(
                 &settings(&server),
                 request(),
-                async { Ok(None) },
+                async { Ok(Vec::new()) },
                 |_| {},
                 None
             )
@@ -1450,7 +1667,7 @@ mod tests {
             assert!(generate_with_settings(
                 &settings(&server),
                 request(),
-                async { Ok(None) },
+                async { Ok(Vec::new()) },
                 |_| {},
                 None
             )
@@ -1471,7 +1688,7 @@ mod tests {
             let error = generate_with_settings(
                 &settings(&server),
                 request(),
-                async { Ok(None) },
+                async { Ok(Vec::new()) },
                 |_| {},
                 None,
             )
@@ -1494,7 +1711,7 @@ mod tests {
         assert!(generate_with_settings(
             &settings(&server),
             request(),
-            async { Ok(None) },
+            async { Ok(Vec::new()) },
             |_| {},
             None
         )
@@ -1516,7 +1733,11 @@ mod tests {
         let error = generate_with_settings(
             &settings(&server),
             request(),
-            async { download_source_image(&url, 5).await.map(Some) },
+            async {
+                download_source_image(&url, 5, Vid2Mode::FirstFrame)
+                    .await
+                    .map(|image| vec![image])
+            },
             |_| {},
             None,
         )
@@ -1536,7 +1757,7 @@ mod tests {
             request(),
             async {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                Ok(None)
+                Ok(Vec::new())
             },
             |_| {},
             None,
@@ -1557,7 +1778,8 @@ mod tests {
         config.generation_timeout_secs = 1;
         config.poll_interval_secs = 2;
         assert!(matches!(
-            generate_with_settings(&config, request(), async { Ok(None) }, |_| {}, None).await,
+            generate_with_settings(&config, request(), async { Ok(Vec::new()) }, |_| {}, None)
+                .await,
             Err(Vid2Error::Timeout)
         ));
         server.join().unwrap();
@@ -1574,7 +1796,8 @@ mod tests {
         let mut config = settings(&server);
         config.generation_timeout_secs = 1;
         assert!(matches!(
-            generate_with_settings(&config, request(), async { Ok(None) }, |_| {}, None).await,
+            generate_with_settings(&config, request(), async { Ok(Vec::new()) }, |_| {}, None)
+                .await,
             Err(Vid2Error::Timeout)
         ));
         server.join_allowing_client_disconnect().unwrap();
@@ -1590,7 +1813,7 @@ mod tests {
         let error = generate_with_settings(
             &settings(&server),
             request(),
-            async { Ok(None) },
+            async { Ok(Vec::new()) },
             |_| {},
             None,
         )
@@ -1610,7 +1833,7 @@ mod tests {
         let error = generate_with_settings(
             &settings(&server),
             request(),
-            async { Ok(None) },
+            async { Ok(Vec::new()) },
             |_| {},
             None,
         )
@@ -1644,25 +1867,46 @@ mod tests {
     #[test]
     fn endpoints_preserve_base_paths_and_encode_untrusted_job_ids() {
         assert_eq!(
-            endpoint("https://example.test:8443/api/", None, false)
-                .unwrap()
-                .as_str(),
+            endpoint(
+                "https://example.test:8443/api/",
+                Vid2Mode::FirstFrame,
+                None,
+                false
+            )
+            .unwrap()
+            .as_str(),
             "https://example.test:8443/api/v1/videos/generate"
         );
         assert_eq!(
-            endpoint("https://example.test", Some("../a?b#c"), true)
-                .unwrap()
-                .as_str(),
+            endpoint(
+                "https://example.test",
+                Vid2Mode::FirstFrame,
+                Some("../a?b#c"),
+                true
+            )
+            .unwrap()
+            .as_str(),
             "https://example.test/v1/videos/..%2Fa%3Fb%23c/file"
         );
         assert_eq!(
-            endpoint("https://example.test", Some("%2e%2e"), false)
-                .unwrap()
-                .as_str(),
+            endpoint(
+                "https://example.test",
+                Vid2Mode::FirstFrame,
+                Some("%2e%2e"),
+                false
+            )
+            .unwrap()
+            .as_str(),
             "https://example.test/v1/videos/%252e%252e"
         );
         for id in ["", " ", ".", "..", "bad\njob"] {
-            assert!(endpoint("https://example.test", Some(id), false).is_err());
+            assert!(endpoint(
+                "https://example.test",
+                Vid2Mode::FirstFrame,
+                Some(id),
+                false
+            )
+            .is_err());
         }
         let path = output_path(Path::new("data/media/vid2"), &request(), 1);
         assert!(path.starts_with("data/media/vid2"));
@@ -1715,7 +1959,7 @@ mod tests {
             let result = generate_with_settings(
                 &settings(&server),
                 request(),
-                async { Ok(source) },
+                async { Ok(source.into_iter().collect()) },
                 |_| {},
                 Some(&audit),
             )

@@ -90,14 +90,22 @@ impl ImageDeliveryError {
 pub(crate) struct VideoDeliveryError {
     #[source]
     pub source: RequestError,
+    pub file_name: Option<String>,
 }
 
 impl VideoDeliveryError {
-    fn user_message(&self) -> &'static str {
-        if telegram_error_is_retryable(&self.source) {
+    fn user_message(&self) -> String {
+        let message = if telegram_error_is_retryable(&self.source) {
             "Your video was generated and saved locally, but a temporary Telegram error prevented delivery after retries."
         } else {
             "Your video was generated and saved locally, but Telegram rejected its delivery."
+        };
+        if let Some(file_name) = &self.file_name {
+            format!(
+                "{message}\n\nAsk my almighty master to fetch {file_name} for you if he pleases."
+            )
+        } else {
+            message.to_owned()
         }
     }
 }
@@ -137,7 +145,7 @@ pub async fn run_with_status_message<T>(
         } else if error.is::<GifDeliveryError>() {
             "The GIF was generated, but Telegram did not confirm the update. It may already be visible; check the existing message before trying again.".to_string()
         } else if let Some(delivery_error) = error.downcast_ref::<VideoDeliveryError>() {
-            delivery_error.user_message().to_string()
+            delivery_error.user_message()
         } else if let Some(video_error) = error.downcast_ref::<crate::llm::VideoGenerationError>()
         {
             format!("Failed to generate your video: {}", video_error.0)
@@ -578,7 +586,7 @@ mod status_tests {
     async fn video_status_distinguishes_generation_timeout_and_delivery_failures() {
         use crate::llm::vid2_video::Vid2Error;
         use crate::test_support::{response_with_status, ExpectedRequest, TestServer};
-        let cases: [(anyhow::Error, &str); 4] = [
+        let cases: [(anyhow::Error, &str); 5] = [
             (
                 Vid2Error::Generation("first frame download failed".into()).into(),
                 "Failed to generate your video: first frame download failed.",
@@ -590,9 +598,18 @@ mod status_tests {
             (
                 VideoDeliveryError {
                     source: RequestError::Api(teloxide::ApiError::MessageNotModified),
+                    file_name: None,
                 }
                 .into(),
                 "Your video was generated and saved locally, but Telegram rejected its delivery.",
+            ),
+            (
+                VideoDeliveryError {
+                    source: RequestError::RetryAfter(teloxide::types::Seconds::from_seconds(0)),
+                    file_name: Some("vid2_saved.mp4".into()),
+                }
+                .into(),
+                "Your video was generated and saved locally, but a temporary Telegram error prevented delivery after retries.\n\nAsk my almighty master to fetch vid2_saved.mp4 for you if he pleases.",
             ),
             (
                 crate::llm::VideoGenerationError(
@@ -603,10 +620,11 @@ mod status_tests {
             ),
         ];
         for (error, expected_text) in cases {
+            let expected_json = serde_json::to_vec(expected_text).unwrap();
             let server = TestServer::new(vec![ExpectedRequest::new(
                 "POST", "/bot123:test/EditMessageText",
                 response_with_status(200, br#"{"ok":true,"result":{"message_id":9,"date":0,"chat":{"id":1,"type":"private"}}}"#.to_vec()),
-            ).with_body_fragment(expected_text.as_bytes())]);
+            ).with_body_fragment(&expected_json)]);
             let bot = Bot::new("123:test").set_api_url(server.base_url());
             let original = error.to_string();
             let result =

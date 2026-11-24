@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use anyhow::Result;
 use teloxide::prelude::*;
@@ -14,12 +16,13 @@ use tracing::{info, warn};
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
 use crate::handlers::enrichment::generation_telegraph_context;
-use crate::handlers::media::{get_file_url, rich_media_kind};
+use crate::handlers::media::{get_file_url, is_vid2_image_document, rich_media_kind};
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::gemini::check_video_input_counts;
 use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
 use crate::llm::vid2_video::{
-    download_source_image, generate_video_with_vid2, Vid2Error, Vid2GenerationRequest, Vid2Phase,
+    download_source_image, generate_video_with_vid2, Vid2Error, Vid2GenerationRequest, Vid2Mode,
+    Vid2Phase, MAX_REF_IMAGES,
 };
 use crate::llm::{
     generate_video_with_omni, VideoGenerationError, VideoGenerationRequest, VideoTask,
@@ -32,10 +35,20 @@ use crate::utils::telegram::{
 };
 use crate::utils::text::escape_html;
 
+pub(crate) mod selection;
+
 const VID_USAGE: &str = "Please provide a prompt for the video.\n\
 Usage: /vid [prompt]\n\
 Reply to, or attach, images or a video to animate, edit, or extend them.\n\
 If the model picks the wrong mode, start the prompt with --t2v, --i2v, --ref, --edit, or --extend.";
+
+const VID2_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+static VID2_UPLOAD_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> =
+    LazyLock::new(|| {
+        teloxide::net::default_reqwest_settings()
+            .timeout(VID2_UPLOAD_TIMEOUT)
+            .build()
+    });
 
 fn with_replied_text(message: &Message, prompt: &str, rich: &RichUpdate) -> String {
     let reply = message
@@ -391,13 +404,13 @@ pub async fn vid_handler(
     .await
 }
 
-fn attached_image(message: &Message) -> Result<Option<FileId>, Vid2Error> {
+fn attached_image(message: &Message) -> Result<Option<FileId>, &'static str> {
     if let Some(photos) = message.photo() {
         return photos
             .iter()
             .max_by_key(|photo| u64::from(photo.width) * u64::from(photo.height))
             .map(|photo| Some(photo.file.id.clone()))
-            .ok_or_else(|| Vid2Error::Generation("the attached photo is empty".into()));
+            .ok_or("the attached photo is empty");
     }
     let Some(document) = message.document() else {
         return Ok(None);
@@ -408,47 +421,68 @@ fn attached_image(message: &Message) -> Result<Option<FileId>, Vid2Error> {
         .as_deref()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let supported_name = [".jpg", ".jpeg", ".png", ".webp"]
-        .iter()
-        .any(|suffix| name.ends_with(suffix));
-    if mime.is_some_and(|mime| matches!(mime, "image/jpeg" | "image/png" | "image/webp"))
-        || supported_name
-    {
+    if is_vid2_image_document(document) {
         return Ok(Some(document.file.id.clone()));
     }
     if mime.is_some_and(|mime| mime.starts_with("image/")) || name.ends_with(".gif") {
-        return Err(Vid2Error::Generation(
-            "first frame must be JPEG, PNG, or WebP".into(),
-        ));
+        return Err("Input images must be JPEG, PNG, or WebP.");
     }
     Ok(None)
 }
 
-fn selected_image(
+fn vid2_images(
     message: &Message,
     rich_reply: Option<&[RichMedia]>,
-) -> Result<Option<FileId>, Vid2Error> {
-    // Deliberately do not consult the media-group cache: the particular item
-    // carrying the command/reply is the first frame chosen by the user.
-    if let Some(image) = attached_image(message)? {
-        return Ok(Some(image));
-    }
-    if let Some(attachments) = rich_reply {
-        return Ok(attachments
-            .iter()
-            .find(|attachment| rich_media_kind(attachment) == MediaKind::Image)
-            .map(|attachment| attachment.file_id.clone()));
-    }
-    message
+    album_images: impl Fn(&MediaGroupId) -> Vec<MediaGroupItem>,
+) -> Result<Vec<FileId>, &'static str> {
+    let mut images = Vec::new();
+    let mut seen_albums = HashSet::new();
+    for (source, rich_media) in message
         .reply_to_message()
-        .map(attached_image)
-        .transpose()
-        .map(Option::flatten)
+        .map(|reply| (reply, rich_reply))
+        .into_iter()
+        .chain([(message, None)])
+    {
+        if let Some(attachments) = rich_media {
+            images.extend(
+                attachments
+                    .iter()
+                    .filter(|attachment| rich_media_kind(attachment) == MediaKind::Image)
+                    .map(|attachment| attachment.file_id.clone()),
+            );
+            continue;
+        }
+        let image = attached_image(source)?;
+        if let Some(album) = source.media_group_id() {
+            if !seen_albums.insert(album) {
+                continue;
+            }
+            let mut items = album_images(album);
+            if let Some(image) = image {
+                // Use the command/reply's rendition for its album item.
+                items.retain(|item| item.message_id != source.id);
+                items.push(MediaGroupItem {
+                    message_id: source.id,
+                    file_id: image,
+                    is_document: source.document().is_some(),
+                });
+            }
+            items.sort_by_key(|item| item.message_id.0);
+            items.dedup_by_key(|item| item.message_id);
+            images.extend(items.into_iter().map(|item| item.file_id));
+        } else {
+            images.extend(image);
+        }
+    }
+    if images.len() > MAX_REF_IMAGES {
+        return Err("Ref2Va accepts up to 9 images. Please send fewer images.");
+    }
+    Ok(images)
 }
 
 fn phase_text(phase: Vid2Phase) -> &'static str {
     match phase {
-        Vid2Phase::PreparingImage => "Preparing the first frame for your video...",
+        Vid2Phase::PreparingImage => "Preparing the images for your video...",
         Vid2Phase::Submitting => "Submitting your video request...",
         Vid2Phase::Queued => "Your video is queued...",
         Vid2Phase::Running => "Generating your video...",
@@ -518,8 +552,18 @@ async fn deliver_video(
 ) -> Result<()> {
     // Blurred like img2: the video and its prompt caption stay hidden until tapped.
     let caption = format!("<tg-spoiler>{caption}</tg-spoiler>");
+    // Give the multipart upload its own deadline. Polling and status edits
+    // continue using the command's existing Bot API client.
+    let upload_bot = match VID2_UPLOAD_CLIENT.as_ref() {
+        Ok(client) => Bot::with_client(bot.token(), client.clone()).set_api_url(bot.api_url()),
+        Err(error) => {
+            warn!("Could not initialize the Vid2 upload client: {error}");
+            bot.clone()
+        }
+    };
     retry_telegram("vid2 send_video", || {
-        bot.send_video(chat_id, InputFile::file(path.to_path_buf()))
+        upload_bot
+            .send_video(chat_id, InputFile::file(path.to_path_buf()))
             .caption(caption.clone())
             .parse_mode(ParseMode::Html)
             .disable_notification(false)
@@ -528,7 +572,12 @@ async fn deliver_video(
             .reply_parameters(ReplyParameters::new(reply_to))
     })
     .await
-    .map_err(|source| VideoDeliveryError { source })?;
+    .map_err(|source| VideoDeliveryError {
+        source,
+        file_name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+    })?;
     // The new video reply is the success notification. Never remove the
     // progress message until Telegram confirms that reply was delivered.
     if let Err(error) = retry_telegram("vid2 delete progress", || {
@@ -586,6 +635,27 @@ pub async fn vid2_handler(
         .await?;
         return Ok(());
     }
+    if message.media_group_id().is_some() {
+        // A captioned command can arrive before the other album updates.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let images = match vid2_images(&message, rich.reply.as_deref(), |album| {
+        state.album_images(album, true)
+    }) {
+        Ok(images) => images,
+        Err(detail) => {
+            send_message_with_retry(&bot, message.chat.id, detail, Some(message.id)).await?;
+            return Ok(());
+        }
+    };
+    let options = selection::select_options(
+        &bot,
+        &state,
+        &message,
+        images.len(),
+        Duration::from_secs(CONFIG.limits.model_selection_timeout),
+    )
+    .await?;
     let permit = state.acquire_heavy_command_permit().await;
     let audit = create_command_audit_context(&state, &message, "vid2").await;
     let status = send_message_with_retry(
@@ -606,26 +676,39 @@ pub async fn vid2_handler(
                 start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadVideo);
             let model_prompt = video_model_prompt(&message, &prompt).await;
             let (phases, reporter) = start_phase_reporter(bot.clone(), message.chat.id, status.id);
-            let source = async {
-                let file = selected_image(&message, rich.reply.as_deref())?;
-                let Some(file) = file else {
-                    return Ok(None);
-                };
-                phases.send_replace(Vid2Phase::PreparingImage);
-                let url = get_file_url(&bot, &file).await.map_err(|_| {
-                    Vid2Error::Generation("could not retrieve the selected first frame".into())
-                })?;
-                download_source_image(&url, CONFIG.vid2.request_timeout_secs)
-                    .await
-                    .map(Some)
+            let sources = async {
+                if !images.is_empty() {
+                    phases.send_replace(Vid2Phase::PreparingImage);
+                }
+                let mut sources = Vec::with_capacity(images.len());
+                for (index, image) in images.iter().enumerate() {
+                    let url = get_file_url(&bot, image).await.map_err(|_| {
+                        Vid2Error::Generation(format!(
+                            "could not retrieve image {} from Telegram",
+                            index + 1
+                        ))
+                    })?;
+                    let source =
+                        download_source_image(&url, CONFIG.vid2.request_timeout_secs, options.mode)
+                            .await
+                            .map_err(|error| match (options.mode, error) {
+                                (Vid2Mode::Ref2Va, Vid2Error::Generation(detail)) => {
+                                    Vid2Error::Generation(format!("image {}: {detail}", index + 1))
+                                }
+                                (_, error) => error,
+                            })?;
+                    sources.push(source);
+                }
+                Ok(sources)
             };
             let generated = generate_video_with_vid2(
                 Vid2GenerationRequest {
                     prompt: &model_prompt,
+                    options,
                     chat_id: message.chat.id.0,
                     message_id: i64::from(message.id.0),
                 },
-                source,
+                sources,
                 |phase| {
                     phases.send_replace(phase);
                 },
@@ -713,25 +796,53 @@ mod tests {
     }
 
     #[test]
-    fn attached_photo_wins_over_replied_photo_and_chooses_largest_size() {
+    fn vid2_keeps_the_replied_image_and_uses_the_largest_attached_photo() {
         let reply = message(json!({"photo":[photo("reply",20)],"media_group_id":"reply-album"}));
         let attached = message(
             json!({"photo":[photo("large",30),photo("small",2)],"caption":"/vid2 smile","reply_to_message":reply,"media_group_id":"attached-album"}),
         );
         assert_eq!(
-            selected_image(&attached, None)
-                .unwrap()
-                .unwrap()
-                .to_string(),
-            "large"
+            vid2_images(&attached, None, no_albums).unwrap(),
+            [FileId("reply".into()), FileId("large".into())]
         );
         let replied = message(
             json!({"text":"/vid2 smile","reply_to_message":message(json!({"photo":[photo("specific-reply",10)],"media_group_id":"another-album"}))}),
         );
         assert_eq!(
-            selected_image(&replied, None).unwrap().unwrap().to_string(),
-            "specific-reply"
+            vid2_images(&replied, None, no_albums).unwrap(),
+            [FileId("specific-reply".into())]
         );
+    }
+
+    #[test]
+    fn vid2_orders_cached_album_images_and_rejects_a_tenth() {
+        let command = message(json!({
+            "photo": [photo("captioned", 10)],
+            "caption": "/vid2 smile",
+            "media_group_id": "album",
+        }));
+        let item = |id, file: &str, is_document| MediaGroupItem {
+            message_id: MessageId(id),
+            file_id: FileId(file.into()),
+            is_document,
+        };
+        let images = vid2_images(&command, None, |_| {
+            vec![
+                item(45, "image document", true),
+                item(40, "first", false),
+                item(42, "cached", false),
+            ]
+        })
+        .unwrap();
+        assert_eq!(
+            images,
+            ["first", "captioned", "image document"].map(|id| FileId(id.into()))
+        );
+        assert!(vid2_images(&command, None, |_| {
+            (50..59).map(|id| item(id, "extra", false)).collect()
+        })
+        .unwrap_err()
+        .contains("up to 9"));
     }
 
     #[test]
@@ -746,14 +857,14 @@ mod tests {
                 json!({"document":{"file_id":"document","file_unique_id":"document","file_name":name,"mime_type":mime},"caption":"/vid2 smile"}),
             );
             assert_eq!(
-                selected_image(&msg, None).unwrap().unwrap().to_string(),
-                "document"
+                vid2_images(&msg, None, no_albums).unwrap(),
+                [FileId("document".into())]
             );
         }
         let gif = message(
             json!({"document":{"file_id":"gif","file_unique_id":"gif","file_name":"photo.gif","mime_type":"image/gif"},"caption":"/vid2 smile"}),
         );
-        assert!(selected_image(&gif, None).is_err());
+        assert!(vid2_images(&gif, None, no_albums).is_err());
     }
 
     #[test]
@@ -944,16 +1055,16 @@ mod tests {
             ["clip", "frame", "second-frame", "attached"]
         );
         assert_eq!(
-            selected_image(&vid, rich.reply.as_deref()).unwrap(),
-            Some(FileId("attached".into()))
+            vid2_images(&vid, rich.reply.as_deref(), no_albums).unwrap(),
+            ["frame", "second-frame", "attached"].map(|id| FileId(id.into()))
         );
 
         let reply = &update["message"]["reply_to_message"];
         let vid2 = message(json!({"text": "/vid2", "reply_to_message": reply}));
         assert_eq!(command_prompt(&vid2, "/vid2", &rich), "A frozen lake");
         assert_eq!(
-            selected_image(&vid2, rich.reply.as_deref()).unwrap(),
-            Some(FileId("frame".into()))
+            vid2_images(&vid2, rich.reply.as_deref(), no_albums).unwrap(),
+            ["frame", "second-frame"].map(|id| FileId(id.into()))
         );
         let vid2 = message(json!({"text": "/vid2 add snowfall", "reply_to_message": reply}));
         assert_eq!(
@@ -1050,8 +1161,11 @@ mod tests {
             assert_eq!(id.0, "album");
             ["second", "third"]
                 .into_iter()
-                .map(|id| MediaGroupItem {
+                .zip([43, 44])
+                .map(|(id, message_id)| MediaGroupItem {
+                    message_id: MessageId(message_id),
                     file_id: FileId(id.to_string()),
+                    is_document: false,
                 })
                 .collect()
         };
@@ -1201,6 +1315,10 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_failure_is_distinct_and_keeps_the_completed_file() {
+        let path = saved_file().await;
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        let recovery_text =
+            format!("Ask my almighty master to fetch {file_name} for you if he pleases.");
         let server = TestServer::new(vec![
             ExpectedRequest::new(
                 "POST",
@@ -1216,10 +1334,10 @@ mod tests {
             .with_body_fragment(br#""message_id":7"#)
             .with_body_fragment(
                 b"Your video was generated and saved locally, but Telegram rejected its delivery.",
-            ),
+            )
+            .with_body_fragment(recovery_text.as_bytes()),
         ]);
         let bot = Bot::new("123:test").set_api_url(server.base_url());
-        let path = saved_file().await;
         let caption = video_caption("a fox");
         let error = run_with_status_message(
             &bot,
