@@ -14,7 +14,9 @@ use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use crate::config::CONFIG;
-use crate::tools::telegraph_extractor::{extract_telegraph_content, TelegraphContent};
+use crate::tools::telegraph_extractor::{
+    extract_telegraph_content, TelegraphContent, TELEGRAPH_HOSTS,
+};
 use crate::tools::twitter_extractor::{
     canonical_status_key, extract_twitter_content, is_supported_status_url, TwitterContent,
 };
@@ -31,16 +33,10 @@ static YOUTUBE_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("valid youtube regex")
 });
-static TELEGRAPH_URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"https?://(?:telegra\.ph|t\.me)/[^\s\)>"]+"#).expect("valid telegraph url regex")
-});
 static HTTP_URL_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)https?://[^\s<>\"']+"#).expect("valid HTTP URL regex"));
-static MARKDOWN_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\[[^\]]*\]\((https?://[^)]+)\)"#).expect("valid markdown link regex")
-});
-static HTML_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"href=["'](https?://[^"']+)["']"#).expect("valid html link regex")
+static TELEGRAPH_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)https?://[^\s<>"'()\[\]]+"#).expect("valid Telegraph link regex")
 });
 
 static TELEGRAPH_CACHE: LazyLock<Mutex<TtlCache<String, TelegraphContent>>> = LazyLock::new(|| {
@@ -633,35 +629,25 @@ pub(crate) fn discover_supported_status_urls(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_telegraph_url(url: &str) -> bool {
-    let lowered = url.to_lowercase();
-    lowered.contains("telegra.ph") || lowered.contains("t.me/")
-}
-
-/// Telegraph/`t.me` URLs mentioned in `text`, in scan order: bare URLs first,
-/// then Markdown and HTML link targets. Callers deduplicate.
+/// Telegraph page URLs in their text order. Callers deduplicate.
 pub(crate) fn discover_telegraph_urls(text: &str) -> Vec<String> {
-    let mut urls = Vec::new();
-    for matched in TELEGRAPH_URL_REGEX.find_iter(text) {
-        urls.push(matched.as_str().to_string());
-    }
-    for caps in MARKDOWN_LINK_REGEX.captures_iter(text) {
-        if let Some(url) = caps.get(1) {
-            let candidate = clean_url_candidate(url.as_str());
-            if is_telegraph_url(candidate) {
-                urls.push(candidate.to_string());
-            }
-        }
-    }
-    for caps in HTML_LINK_REGEX.captures_iter(text) {
-        if let Some(url) = caps.get(1) {
-            let candidate = clean_url_candidate(url.as_str());
-            if is_telegraph_url(candidate) {
-                urls.push(candidate.to_string());
-            }
-        }
-    }
-    urls
+    TELEGRAPH_LINK_REGEX
+        .find_iter(text)
+        .filter_map(|matched| {
+            let mut url = url::Url::parse(clean_url_candidate(matched.as_str())).ok()?;
+            // getPage needs only the article path, including for old HTTP links.
+            url.set_scheme("https").ok()?;
+            url.set_query(None);
+            url.set_fragment(None);
+            let url = crate::utils::http::parse_https_allowlisted(
+                "Telegraph",
+                url.as_str(),
+                Some(TELEGRAPH_HOSTS),
+            )
+            .ok()?;
+            (!url.path().trim_matches('/').is_empty()).then(|| url.to_string())
+        })
+        .collect()
 }
 
 pub(crate) async fn extract_cached_telegraph_content(
@@ -691,96 +677,6 @@ pub(crate) async fn extract_cached_twitter_content(url: &str) -> anyhow::Result<
         TWITTER_CACHE.lock().insert(cache_key, content.clone());
     }
     Ok(content)
-}
-
-pub async fn extract_telegraph_urls_and_content(
-    text: &str,
-    message_entities: Option<&[MessageEntityRef<'_>]>,
-    max_urls: usize,
-) -> (String, Vec<TelegraphContent>) {
-    if text.is_empty() {
-        return (text.to_string(), Vec::new());
-    }
-
-    let mut urls = Vec::new();
-
-    if let Some(entities) = message_entities {
-        for entity in entities {
-            if urls.len() >= max_urls {
-                break;
-            }
-            let candidate = match entity.kind() {
-                MessageEntityKind::Url => entity.text(),
-                MessageEntityKind::TextLink { url } => url.as_str(),
-                _ => continue,
-            };
-            let candidate = clean_url_candidate(candidate);
-            if is_telegraph_url(candidate) {
-                urls.push(candidate.to_string());
-            }
-        }
-    }
-
-    urls.extend(discover_telegraph_urls(text));
-
-    urls.sort();
-    urls.dedup();
-
-    let ordered_urls = urls.into_iter().take(max_urls).collect::<Vec<_>>();
-    let semaphore = Arc::new(Semaphore::new(CONFIG.external_media.enrich_fanout));
-    let mut join_set = JoinSet::new();
-    for url in ordered_urls.iter().cloned() {
-        let semaphore = semaphore.clone();
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("external enrich semaphore should remain open");
-            let result = extract_cached_telegraph_content(&url).await;
-            (url, result)
-        });
-    }
-    let mut fetched = HashMap::new();
-    while let Some(result) = join_set.join_next().await {
-        if let Ok((url, content)) = result {
-            fetched.insert(url, content);
-        }
-    }
-
-    let mut new_text = text.to_string();
-    let mut extracted = Vec::new();
-    for url in ordered_urls {
-        match fetched
-            .remove(&url)
-            .unwrap_or_else(|| Err(anyhow::anyhow!("Telegraph extraction task failed")))
-        {
-            Ok(content) => {
-                log_extracted_content(
-                    "telegraph",
-                    &url,
-                    &content.text_content,
-                    content.image_urls.len(),
-                    content.video_urls.len(),
-                    0,
-                );
-                let formatted = format!(
-                    "\n[Telegraph content extracted from {}]\n{}\n",
-                    url, content.text_content
-                );
-                new_text.push_str(&formatted);
-                extracted.push(content);
-            }
-            Err(err) => {
-                warn!("Telegraph extraction failed for {}: {}", url, err);
-                new_text.push_str(&format!(
-                    "\n[Telegraph content extraction failed for {}]\n",
-                    url
-                ));
-            }
-        }
-    }
-
-    (new_text, extracted)
 }
 
 pub async fn extract_twitter_urls_and_content(
@@ -871,6 +767,65 @@ pub async fn extract_twitter_urls_and_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn generation_reads_telegraph_links_from_commands_and_direct_reply_entities() {
+        use crate::handlers::enrichment::generation_telegraph_context;
+        use crate::utils::telegram::rich_message::RichUpdate;
+        use teloxide::types::Message;
+
+        let mut update = json!({"message": {
+            "message_id": 3, "date": 1, "chat": {"id": 1, "type": "private"},
+            "text": "/vid make a clip from [the brief](http://graph.org/Generation-Brief-01-02#section). https://t.me/c/1/2",
+            "reply_to_message": {
+                "message_id": 2, "date": 1, "chat": {"id": 1, "type": "private"},
+                "rich_message": {"blocks": [
+                    {"type": "paragraph", "text": [
+                        "🧭 ", {"type": "url", "text": "setting", "url": "https://telegra.ph/Generation-Setting-01-02"},
+                        " and https://graph.org/Generation-Brief-01-02?from=reply"
+                    ]}
+                ]},
+                "reply_to_message": {
+                    "message_id": 1, "date": 1, "chat": {"id": 1, "type": "private"},
+                    "text": "https://telegra.ph/Generation-Ancestor-01-02"
+                }
+            }
+        }});
+        for (url, text) in [
+            ("https://graph.org/Generation-Brief-01-02", "make it foggy"),
+            (
+                "https://telegra.ph/Generation-Setting-01-02",
+                "a forest at dawn",
+            ),
+            ("https://telegra.ph/Generation-Ancestor-01-02", "older post"),
+        ] {
+            TELEGRAPH_CACHE.lock().insert(
+                url.to_string(),
+                TelegraphContent {
+                    text_content: text.to_string(),
+                    ..TelegraphContent::default()
+                },
+            );
+        }
+        RichUpdate::from_update(&mut update);
+        let message: Message = serde_json::from_value(update["message"].clone()).unwrap();
+        let context = generation_telegraph_context(&message).await;
+        assert!(context.contains("a forest at dawn"));
+        assert_eq!(context.matches("make it foggy").count(), 1);
+        assert!(!context.contains("older post"));
+        assert!(!context.contains("https://t.me"));
+
+        update["message"]["reply_to_message"] = json!({
+            "message_id": 2, "date": 1, "chat": {"id": 1, "type": "private"},
+            "photo": [{"file_id": "ref", "file_unique_id": "ref", "width": 1, "height": 1}],
+            "caption": "🧭 setting",
+            "caption_entities": [{"type": "text_link", "offset": 3, "length": 7, "url": "https://telegra.ph/Generation-Setting-01-02"}]
+        });
+        let message: Message = serde_json::from_value(update["message"].clone()).unwrap();
+        assert!(generation_telegraph_context(&message)
+            .await
+            .contains("a forest at dawn"));
+    }
 
     #[test]
     fn markdown_tables_render_as_readable_telegraph_lists() {

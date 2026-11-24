@@ -373,7 +373,7 @@ async fn handle_command(
         Command::Img(arg) => {
             spawn_logged(
                 "img",
-                handlers::image::img_handler(bot, state, message, optional_arg(arg)),
+                handlers::image::img_handler(bot, state, message, optional_arg(arg), rich),
             );
         }
         Command::Gif(arg) => {
@@ -385,25 +385,25 @@ async fn handle_command(
         Command::Img2(arg) => {
             spawn_logged(
                 "img2",
-                handlers::image::img2_handler(bot, state, message, optional_arg(arg)),
+                handlers::image::img2_handler(bot, state, message, optional_arg(arg), rich),
             );
         }
         Command::Image(arg) => {
             spawn_logged(
                 "image",
-                handlers::image::image_handler(bot, state, message, optional_arg(arg)),
+                handlers::image::image_handler(bot, state, message, optional_arg(arg), rich),
             );
         }
         Command::Vid(arg) => {
             spawn_logged(
                 "vid",
-                handlers::video::vid_handler(bot, state, message, optional_arg(arg)),
+                handlers::video::vid_handler(bot, state, message, optional_arg(arg), rich),
             );
         }
         Command::Vid2(arg) => {
             spawn_logged(
                 "vid2",
-                handlers::video::vid2_handler(bot, state, message, optional_arg(arg)),
+                handlers::video::vid2_handler(bot, state, message, optional_arg(arg), rich),
             );
         }
         Command::Mysong(arg) => {

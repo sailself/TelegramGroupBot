@@ -13,10 +13,11 @@ use tracing::{info, warn};
 
 use crate::config::CONFIG;
 use crate::handlers::access::{check_access_control, is_rate_limited};
-use crate::handlers::media::get_file_url;
+use crate::handlers::enrichment::generation_telegraph_context;
+use crate::handlers::media::{get_file_url, rich_media_kind};
 use crate::llm::audit::create_command_audit_context;
 use crate::llm::gemini::check_video_input_counts;
-use crate::llm::media::{detect_mime_type, download_media, MediaFile, MediaKind};
+use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
 use crate::llm::vid2_video::{
     download_source_image, generate_video_with_vid2, Vid2Error, Vid2GenerationRequest, Vid2Phase,
 };
@@ -24,6 +25,7 @@ use crate::llm::{
     generate_video_with_omni, VideoGenerationError, VideoGenerationRequest, VideoTask,
 };
 use crate::state::{AppState, MediaGroupItem};
+use crate::utils::telegram::rich_message::{RichMedia, RichUpdate};
 use crate::utils::telegram::{
     edit_message_text_with_retry, message_text_or_caption, retry_telegram, run_with_status_message,
     send_message_with_retry, start_chat_action_heartbeat, strip_command_prefix, VideoDeliveryError,
@@ -35,25 +37,26 @@ Usage: /vid [prompt]\n\
 Reply to, or attach, images or a video to animate, edit, or extend them.\n\
 If the model picks the wrong mode, start the prompt with --t2v, --i2v, --ref, --edit, or --extend.";
 
-fn replied_text(message: &Message) -> String {
-    message
+fn with_replied_text(message: &Message, prompt: &str, rich: &RichUpdate) -> String {
+    let reply = message
         .reply_to_message()
         .and_then(message_text_or_caption)
         .unwrap_or_default()
-        .trim()
-        .to_string()
+        .trim();
+    if prompt.is_empty() {
+        reply.to_string()
+    } else if rich.reply.is_some() && !reply.is_empty() {
+        format!("{prompt}\n\nReplied-to message:\n{reply}")
+    } else {
+        prompt.to_string()
+    }
 }
 
-/// The prompt after the command, or the replied-to text when the command
-/// stands alone.
-fn command_prompt(message: &Message, command_prefix: &str) -> String {
+fn command_prompt(message: &Message, command_prefix: &str, rich: &RichUpdate) -> String {
     let prompt = message_text_or_caption(message)
         .map(|text| strip_command_prefix(text, command_prefix))
         .unwrap_or_default();
-    if !prompt.is_empty() {
-        return prompt;
-    }
-    replied_text(message)
+    with_replied_text(message, &prompt, rich)
 }
 
 /// `--<name>` options that name the generation task outright.
@@ -94,17 +97,24 @@ fn split_task_option(prompt: &str) -> Result<(Option<VideoTask>, &str), String> 
 
 /// The task option and prompt of a `/vid` request. A command without a
 /// prompt of its own takes the replied-to text.
-fn vid_request_text(message: &Message) -> Result<(Option<VideoTask>, String), String> {
+fn vid_request_text(
+    message: &Message,
+    rich: &RichUpdate,
+) -> Result<(Option<VideoTask>, String), String> {
     let own = message_text_or_caption(message)
         .map(|text| strip_command_prefix(text, "/vid"))
         .unwrap_or_default();
     let (task, prompt) = split_task_option(&own)?;
-    let prompt = if prompt.is_empty() {
-        replied_text(message)
-    } else {
+    Ok((task, with_replied_text(message, prompt, rich)))
+}
+
+async fn video_model_prompt(message: &Message, prompt: &str) -> String {
+    let context = generation_telegraph_context(message).await;
+    if context.is_empty() {
         prompt.to_string()
-    };
-    Ok((task, prompt))
+    } else {
+        format!("{prompt}\n\n{context}")
+    }
 }
 
 /// One Telegram file to hand to the `/vid` model.
@@ -184,6 +194,7 @@ fn message_vid_input(message: &Message) -> Result<Option<VidInput>, &'static str
 /// message attaches. An album contributes all of its cached photos.
 fn vid_inputs(
     message: &Message,
+    rich: &RichUpdate,
     album_photos: impl Fn(&MediaGroupId) -> Vec<MediaGroupItem>,
 ) -> Result<Vec<VidInput>, &'static str> {
     let mut inputs: Vec<VidInput> = Vec::new();
@@ -194,7 +205,29 @@ fn vid_inputs(
         }
     };
 
-    for source in message.reply_to_message().into_iter().chain([message]) {
+    for (source, rich_media) in message
+        .reply_to_message()
+        .map(|reply| (reply, rich.reply.as_deref()))
+        .into_iter()
+        .chain([(message, None)])
+    {
+        if let Some(attachments) = rich_media {
+            for attachment in attachments {
+                let kind = rich_media_kind(attachment);
+                if matches!(kind, MediaKind::Image | MediaKind::Video) {
+                    add(VidInput {
+                        file_id: attachment.file_id.clone(),
+                        kind,
+                        mime_type: attachment
+                            .mime_type
+                            .as_ref()
+                            .filter(|mime| kind_for_mime(mime) == kind)
+                            .cloned(),
+                    });
+                }
+            }
+            continue;
+        }
         let own = message_vid_input(source)?;
         let album = source
             .media_group_id()
@@ -266,6 +299,7 @@ pub async fn vid_handler(
     state: AppState,
     message: Message,
     _prompt: Option<String>,
+    rich: RichUpdate,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, "vid").await {
         return Ok(());
@@ -295,7 +329,7 @@ pub async fn vid_handler(
         .await?;
         return Ok(());
     }
-    let (task, prompt) = match vid_request_text(&message) {
+    let (task, prompt) = match vid_request_text(&message, &rich) {
         Ok(request) => request,
         Err(reason) => {
             send_message_with_retry(&bot, message.chat.id, &reason, Some(message.id)).await?;
@@ -327,11 +361,12 @@ pub async fn vid_handler(
                 start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
             // Read the album cache only now: the siblings of a captioned
             // album item are separate updates that land just after it.
-            let inputs = vid_inputs(&message, |album| state.media_group_items(album))
+            let inputs = vid_inputs(&message, &rich, |album| state.media_group_items(album))
                 .map_err(|reason| VideoGenerationError(reason.to_string()))?;
             let count = |kind| inputs.iter().filter(|input| input.kind == kind).count();
             check_video_input_counts(count(MediaKind::Image), count(MediaKind::Video))?;
             let media = download_vid_inputs(&bot, &inputs).await?;
+            let prompt = video_model_prompt(&message, &prompt).await;
 
             let video = generate_video_with_omni(
                 VideoGenerationRequest {
@@ -389,11 +424,20 @@ fn attached_image(message: &Message) -> Result<Option<FileId>, Vid2Error> {
     Ok(None)
 }
 
-fn selected_image(message: &Message) -> Result<Option<FileId>, Vid2Error> {
+fn selected_image(
+    message: &Message,
+    rich_reply: Option<&[RichMedia]>,
+) -> Result<Option<FileId>, Vid2Error> {
     // Deliberately do not consult the media-group cache: the particular item
     // carrying the command/reply is the first frame chosen by the user.
     if let Some(image) = attached_image(message)? {
         return Ok(Some(image));
+    }
+    if let Some(attachments) = rich_reply {
+        return Ok(attachments
+            .iter()
+            .find(|attachment| rich_media_kind(attachment) == MediaKind::Image)
+            .map(|attachment| attachment.file_id.clone()));
     }
     message
         .reply_to_message()
@@ -507,6 +551,7 @@ pub async fn vid2_handler(
     state: AppState,
     message: Message,
     _prompt: Option<String>,
+    rich: RichUpdate,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, "vid2").await {
         return Ok(());
@@ -530,7 +575,7 @@ pub async fn vid2_handler(
         send_message_with_retry(&bot, message.chat.id, "Vid2 video generation is disabled or unconfigured. Set ENABLE_VID2=true, VID2_BASE_URL, and VID2_API_KEY to enable it.", Some(message.id)).await?;
         return Ok(());
     }
-    let prompt = command_prompt(&message, "/vid2");
+    let prompt = command_prompt(&message, "/vid2", &rich);
     if prompt.trim().is_empty() {
         send_message_with_retry(
             &bot,
@@ -559,9 +604,10 @@ pub async fn vid2_handler(
             let permit = permit;
             let _heartbeat =
                 start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadVideo);
+            let model_prompt = video_model_prompt(&message, &prompt).await;
             let (phases, reporter) = start_phase_reporter(bot.clone(), message.chat.id, status.id);
             let source = async {
-                let file = selected_image(&message)?;
+                let file = selected_image(&message, rich.reply.as_deref())?;
                 let Some(file) = file else {
                     return Ok(None);
                 };
@@ -575,7 +621,7 @@ pub async fn vid2_handler(
             };
             let generated = generate_video_with_vid2(
                 Vid2GenerationRequest {
-                    prompt: &prompt,
+                    prompt: &model_prompt,
                     chat_id: message.chat.id.0,
                     message_id: i64::from(message.id.0),
                 },
@@ -643,7 +689,7 @@ mod tests {
     }
 
     fn vid2_prompt(message: &Message) -> String {
-        command_prompt(message, "/vid2")
+        command_prompt(message, "/vid2", &RichUpdate::default())
     }
 
     #[test]
@@ -673,14 +719,17 @@ mod tests {
             json!({"photo":[photo("large",30),photo("small",2)],"caption":"/vid2 smile","reply_to_message":reply,"media_group_id":"attached-album"}),
         );
         assert_eq!(
-            selected_image(&attached).unwrap().unwrap().to_string(),
+            selected_image(&attached, None)
+                .unwrap()
+                .unwrap()
+                .to_string(),
             "large"
         );
         let replied = message(
             json!({"text":"/vid2 smile","reply_to_message":message(json!({"photo":[photo("specific-reply",10)],"media_group_id":"another-album"}))}),
         );
         assert_eq!(
-            selected_image(&replied).unwrap().unwrap().to_string(),
+            selected_image(&replied, None).unwrap().unwrap().to_string(),
             "specific-reply"
         );
     }
@@ -697,14 +746,14 @@ mod tests {
                 json!({"document":{"file_id":"document","file_unique_id":"document","file_name":name,"mime_type":mime},"caption":"/vid2 smile"}),
             );
             assert_eq!(
-                selected_image(&msg).unwrap().unwrap().to_string(),
+                selected_image(&msg, None).unwrap().unwrap().to_string(),
                 "document"
             );
         }
         let gif = message(
             json!({"document":{"file_id":"gif","file_unique_id":"gif","file_name":"photo.gif","mime_type":"image/gif"},"caption":"/vid2 smile"}),
         );
-        assert!(selected_image(&gif).is_err());
+        assert!(selected_image(&gif, None).is_err());
     }
 
     #[test]
@@ -839,28 +888,78 @@ mod tests {
 
     #[test]
     fn vid_prompt_follows_the_option_or_falls_back_to_the_replied_text() {
+        let rich = RichUpdate::default();
         let reply = message(json!({"text":"a storm rolls in"}));
         let request = message(json!({"text":"/vid --t2v","reply_to_message":reply}));
         assert_eq!(
-            vid_request_text(&request),
+            vid_request_text(&request, &rich),
             Ok((Some(VideoTask::TextToVideo), "a storm rolls in".to_string()))
         );
         assert_eq!(
-            vid_request_text(&message(json!({"text":"/vid@test_bot a fox"}))),
+            vid_request_text(&message(json!({"text":"/vid@test_bot a fox"})), &rich),
             Ok((None, "a fox".to_string()))
         );
         let captioned = message(json!({"photo":[photo("x",1)],"caption":"make it rain"}));
         assert_eq!(
-            vid_request_text(&message(
-                json!({"text":"/vid","reply_to_message":captioned})
-            )),
+            vid_request_text(
+                &message(json!({"text":"/vid","reply_to_message":captioned})),
+                &rich,
+            ),
             Ok((None, "make it rain".to_string()))
         );
         assert_eq!(
-            vid_request_text(&message(json!({"text":"/vid"}))),
+            vid_request_text(&message(json!({"text":"/vid"})), &rich),
             Ok((None, String::new()))
         );
-        assert!(vid_request_text(&message(json!({"text":"/vid --nope x"}))).is_err());
+        assert!(vid_request_text(&message(json!({"text":"/vid --nope x"})), &rich).is_err());
+    }
+
+    #[test]
+    fn video_commands_use_rich_reply_text_and_compatible_attachments() {
+        let mut update = json!({"message": {
+            "caption": "/vid --ref pan up",
+            "photo": [photo("attached", 5)],
+            "reply_to_message": {
+                "message_id": 2, "date": 0, "chat": {"id": 1, "type":"private"},
+                "rich_message": {"blocks": [
+                    {"type": "heading", "text": "A frozen lake"},
+                    {"type": "video", "video": {"file_id": "clip", "mime_type": "video/mp4"}},
+                    {"type": "photo", "photo": [photo("frame", 10), photo("thumb", 1)]},
+                    {"type": "audio", "audio": {"file_id": "sound"}},
+                    {"type": "document", "document": {"file_id": "second-frame", "file_name": "frame.PNG"}}
+                ]}
+            }
+        }});
+        let rich = RichUpdate::from_update(&mut update);
+        let vid = message(update["message"].clone());
+        assert_eq!(
+            vid_request_text(&vid, &rich),
+            Ok((
+                Some(VideoTask::ReferenceToVideo),
+                "pan up\n\nReplied-to message:\nA frozen lake".into()
+            ))
+        );
+        assert_eq!(
+            ids(&vid_inputs(&vid, &rich, no_albums).unwrap()),
+            ["clip", "frame", "second-frame", "attached"]
+        );
+        assert_eq!(
+            selected_image(&vid, rich.reply.as_deref()).unwrap(),
+            Some(FileId("attached".into()))
+        );
+
+        let reply = &update["message"]["reply_to_message"];
+        let vid2 = message(json!({"text": "/vid2", "reply_to_message": reply}));
+        assert_eq!(command_prompt(&vid2, "/vid2", &rich), "A frozen lake");
+        assert_eq!(
+            selected_image(&vid2, rich.reply.as_deref()).unwrap(),
+            Some(FileId("frame".into()))
+        );
+        let vid2 = message(json!({"text": "/vid2 add snowfall", "reply_to_message": reply}));
+        assert_eq!(
+            command_prompt(&vid2, "/vid2", &rich),
+            "add snowfall\n\nReplied-to message:\nA frozen lake"
+        );
     }
 
     #[test]
@@ -931,16 +1030,18 @@ mod tests {
         let request = message(
             json!({"photo":[photo("reference",10)],"caption":"/vid add her","reply_to_message":reply}),
         );
-        let inputs = vid_inputs(&request, no_albums).unwrap();
+        let inputs = vid_inputs(&request, &RichUpdate::default(), no_albums).unwrap();
         assert_eq!(ids(&inputs), ["base", "reference"]);
         assert_eq!(inputs[0].kind, MediaKind::Video);
         assert_eq!(inputs[1].kind, MediaKind::Image);
 
-        assert!(
-            vid_inputs(&message(json!({"text":"/vid a fox"})), no_albums)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(vid_inputs(
+            &message(json!({"text":"/vid a fox"})),
+            &RichUpdate::default(),
+            no_albums,
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -960,7 +1061,7 @@ mod tests {
             json!({"photo":[photo("first",10)],"caption":"/vid morph","media_group_id":"album"}),
         );
         assert_eq!(
-            ids(&vid_inputs(&captioned, album).unwrap()),
+            ids(&vid_inputs(&captioned, &RichUpdate::default(), album).unwrap()),
             ["first", "second", "third"]
         );
 
@@ -969,7 +1070,7 @@ mod tests {
         let reply = message(json!({"photo":[photo("third",10)],"media_group_id":"album"}));
         let request = message(json!({"text":"/vid morph","reply_to_message":reply}));
         assert_eq!(
-            ids(&vid_inputs(&request, album).unwrap()),
+            ids(&vid_inputs(&request, &RichUpdate::default(), album).unwrap()),
             ["second", "third"]
         );
     }
@@ -978,7 +1079,7 @@ mod tests {
     fn vid_reports_an_unusable_sticker_wherever_it_is() {
         let request =
             message(json!({"text":"/vid dance","reply_to_message":sticker("lottie", true, false)}));
-        assert!(vid_inputs(&request, no_albums).is_err());
+        assert!(vid_inputs(&request, &RichUpdate::default(), no_albums).is_err());
     }
 
     fn telegram_response(ok: bool, retry: bool) -> Vec<u8> {
@@ -1002,12 +1103,16 @@ mod tests {
     }
 
     async fn saved_file() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_DELIVERY_FILE: AtomicU64 = AtomicU64::new(0);
         let directory = Path::new("target/test-vid2-media");
         tokio::fs::create_dir_all(directory).await.unwrap();
         let path = directory.join(format!(
-            "delivery_{}_{}.mp4",
+            "delivery_{}_{}_{}.mp4",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+            NEXT_DELIVERY_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         tokio::fs::write(&path, b"SAVED_VIDEO_BYTES").await.unwrap();
         path

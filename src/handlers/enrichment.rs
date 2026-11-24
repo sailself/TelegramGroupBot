@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use teloxide::types::{MessageEntityKind, MessageEntityRef};
+use teloxide::types::{Message, MessageEntityKind, MessageEntityRef};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -27,6 +27,7 @@ use crate::tools::external_media::{
 };
 use crate::tools::telegraph_extractor::TelegraphContent;
 use crate::tools::twitter_extractor::TwitterContent;
+use crate::utils::telegram::{message_entities_for_text, message_text_or_caption};
 use crate::utils::text::{escape_html, neutralize_tag, truncate_to_chars};
 
 /// Line that precedes every rendered source block, so the model is told what
@@ -230,11 +231,47 @@ enum FetchedSource {
     Twitter(TwitterContent),
 }
 
+fn generation_telegraph_urls(message: &Message) -> Vec<(SourceKind, String)> {
+    let mut seen = HashSet::new();
+    let mut urls = Vec::new();
+    for source in std::iter::once(message).chain(message.reply_to_message()) {
+        let text = message_text_or_caption(source).unwrap_or_default();
+        let links = entity_link_urls(message_entities_for_text(source).as_deref());
+        for url in discover_telegraph_urls(text)
+            .into_iter()
+            .chain(discover_telegraph_urls(&links))
+        {
+            if seen.insert(url.clone()) {
+                urls.push((SourceKind::Telegraph, url));
+            }
+        }
+    }
+    urls
+}
+
+/// Render Telegraph articles from the command or its direct reply as prompt context.
+pub(crate) async fn generation_telegraph_context(message: &Message) -> String {
+    let budget = EnrichmentBudget {
+        max_media_files: 0,
+        ..EnrichmentBudget::for_factcheck()
+    };
+    let enrichment = enrich_sources(generation_telegraph_urls(message), Vec::new(), &budget).await;
+    render_sources(&enrichment.sources, &budget)
+}
+
 /// Extract Telegraph/Twitter links from `texts` (query, replied-to text), fetch
 /// their content, download their media within the budget, and return everything
 /// as structured untrusted sources alongside `existing_media`.
 pub async fn enrich_request(
     texts: &[&str],
+    existing_media: Vec<MediaFile>,
+    budget: &EnrichmentBudget,
+) -> Enrichment {
+    enrich_sources(unique_source_urls(texts), existing_media, budget).await
+}
+
+async fn enrich_sources(
+    candidates: Vec<(SourceKind, String)>,
     existing_media: Vec<MediaFile>,
     budget: &EnrichmentBudget,
 ) -> Enrichment {
@@ -244,7 +281,6 @@ pub async fn enrich_request(
         youtube_urls: Vec::new(),
     };
 
-    let candidates = unique_source_urls(texts);
     if candidates.is_empty() {
         return enrichment;
     }
